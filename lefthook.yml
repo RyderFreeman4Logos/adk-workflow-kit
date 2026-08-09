@@ -9,3 +9,4 @@ pre-push:
   commands:
     local-gates:
       run: just pre-push
+      use_stdin: true

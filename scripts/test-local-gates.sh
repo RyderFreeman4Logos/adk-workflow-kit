@@ -39,6 +39,12 @@ runner="$fixture/scripts/local-gates.sh"
 gate_log="$fixture/.local-gates/gate.log"
 csa_log="$fixture/.local-gates/csa.log"
 assertions=0
+lefthook_config="$(cd "$repo_root" && lefthook dump)"
+if [[ "$lefthook_config" != *$'pre-push:\n  commands:\n    local-gates:\n      run: just pre-push\n      use_stdin: true'* ]]; then
+    printf 'FAIL pre-push hook does not forward Git update records to just pre-push\n' >&2
+    exit 1
+fi
+((assertions += 1))
 
 invoke() {
     (cd "$fixture" && env \
@@ -64,6 +70,23 @@ assert_fails() {
     ((assertions += 1))
 }
 
+assert_pre_push_fails() {
+    local name="$1" expected="$2" records="$3" output rc
+    set +e
+    if [[ -n "$records" ]]; then
+        output="$(printf '%s\n' "$records" | invoke "$runner" pre-push 2>&1)"
+    else
+        output="$(invoke "$runner" pre-push </dev/null 2>&1)"
+    fi
+    rc=$?
+    set -e
+    if [[ $rc -eq 0 || "$output" != *"$expected"* ]]; then
+        printf 'FAIL %s: exit=%s output=%s\n' "$name" "$rc" "$output" >&2
+        exit 1
+    fi
+    ((assertions += 1))
+}
+
 assert_fails protected-branch 'main' "$runner" check-branch
 git -C "$fixture" switch -qc feature/test
 invoke "$runner" check-branch
@@ -71,9 +94,40 @@ invoke "$runner" check-branch
 assert_fails missing-receipt 'missing' "$runner" verify
 invoke "$runner" produce
 invoke "$runner" verify
-invoke "$runner" pre-push
+((assertions += 2))
+
+current_oid="$(git -C "$fixture" rev-parse HEAD)"
+main_oid="$(git -C "$fixture" rev-parse main)"
+zero_oid="${current_oid//?/0}"
+current_record="refs/heads/feature/test $current_oid refs/heads/feature/test $zero_oid"
+git -C "$fixture" switch -qc feature/other
+printf '%s\n' unreviewed >> "$fixture/tracked.txt"
+git -C "$fixture" add tracked.txt
+git -C "$fixture" -c user.name='Gate Test' -c user.email='gate-test@example.invalid' \
+    commit -qm 'test: create unreviewed branch'
+other_oid="$(git -C "$fixture" rev-parse HEAD)"
+git -C "$fixture" switch -q feature/test
+other_record="refs/heads/feature/other $other_oid refs/heads/feature/other $main_oid"
+
+assert_pre_push_fails outgoing-other \
+    'outgoing local ref must match checked-out branch' "$other_record"
+assert_pre_push_fails empty-update 'missing outgoing ref update' ''
+assert_pre_push_fails malformed-update 'malformed outgoing ref update' 'malformed'
+assert_pre_push_fails deletion-update 'ref deletions are unsupported' \
+    "(delete) $zero_oid refs/heads/feature/test $main_oid"
+assert_pre_push_fails protected-remote "'refs/heads/main' is protected" \
+    "refs/heads/feature/test $current_oid refs/heads/main $main_oid"
+assert_pre_push_fails tag-update \
+    'outgoing remote ref must match checked-out branch' \
+    "refs/heads/feature/test $current_oid refs/tags/test $zero_oid"
+assert_pre_push_fails multiple-updates 'multiple outgoing ref updates are unsupported' \
+    "$current_record"$'\n'"$other_record"
+assert_pre_push_fails mismatched-oid \
+    'outgoing object ID does not match reviewed HEAD' \
+    "refs/heads/feature/test $other_oid refs/heads/feature/test $main_oid"
+printf '%s\n' "$current_record" | invoke "$runner" pre-push
 [[ "$(<"$csa_log")" == 'review --check-verdict --range main...HEAD' ]]
-((assertions += 4))
+((assertions += 2))
 
 printf '%s\n' malformed > "$fixture/.local-gates/quality-gate.receipt"
 assert_fails malformed-receipt 'malformed or stale' "$runner" verify

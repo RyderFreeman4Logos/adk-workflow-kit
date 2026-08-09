@@ -116,12 +116,38 @@ verify_receipt() {
 }
 
 pre_push() {
-    local before_branch before_head before_tree
+    local before_branch before_head before_tree expected_ref
+    local update local_ref local_oid remote_ref remote_oid
     check_branch
     before_branch="$CURRENT_BRANCH"
+    if ! IFS= read -r update; then
+        push_blocked 'missing outgoing ref update'
+    fi
+    if [[ ! "$update" =~ ^([^[:space:]]+)\ ([0-9a-f]+)\ ([^[:space:]]+)\ ([0-9a-f]+)$ ]]; then
+        push_blocked 'malformed outgoing ref update'
+    fi
+    local_ref="${BASH_REMATCH[1]}"
+    local_oid="${BASH_REMATCH[2]}"
+    remote_ref="${BASH_REMATCH[3]}"
+    remote_oid="${BASH_REMATCH[4]}"
+    if IFS= read -r update; then
+        push_blocked 'multiple outgoing ref updates are unsupported'
+    fi
+    [[ ! "$local_oid" =~ ^0+$ ]] || push_blocked 'ref deletions are unsupported'
+    [[ "$remote_ref" != refs/heads/main ]] \
+        || push_blocked "remote ref 'refs/heads/main' is protected"
+    expected_ref="refs/heads/$before_branch"
+    [[ "$local_ref" == "$expected_ref" ]] \
+        || push_blocked 'outgoing local ref must match checked-out branch'
+    [[ "$remote_ref" == "$expected_ref" ]] \
+        || push_blocked 'outgoing remote ref must match checked-out branch'
     git rev-parse --verify --quiet 'refs/heads/main^{commit}' >/dev/null \
         || fail 'local main branch is required for the review range'
     verify_receipt
+    [[ "$local_oid" == "$SNAPSHOT_HEAD" ]] \
+        || push_blocked 'outgoing object ID does not match reviewed HEAD'
+    [[ "${#remote_oid}" -eq "${#SNAPSHOT_HEAD}" ]] \
+        || push_blocked 'remote object ID is malformed'
     before_head="$SNAPSHOT_HEAD"
     before_tree="$SNAPSHOT_TREE"
     command -v csa >/dev/null 2>&1 || fail 'csa is required to validate the review receipt'
