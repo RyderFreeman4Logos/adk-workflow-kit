@@ -1,0 +1,11 @@
+no_tty: true
+
+pre-commit:
+  commands:
+    local-gates:
+      run: just pre-commit-fast
+
+pre-push:
+  commands:
+    local-gates:
+      run: just pre-push
