@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/workflow-spec",
+    "crates/workflow-ir",
+    "crates/workflow-compiler",
+    "crates/workflow-adk",
+    "crates/workflow-runtime",
+    "crates/workflowctl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/RyderFreeman4Logos/adk-workflow-kit"

@@ -1,0 +1,47 @@
+# Proposed platform extension alongside an Agent Skills-compatible SKILL.md.
+schema_version = 1
+
+[skill]
+id = "code-investigation"
+version = "0.3.0"
+stage = "validated"
+owner = "example-team"
+
+[integrity]
+skill_markdown_sha256 = "sha256:REPLACE_ME"
+require_locked_resources = true
+
+[execution]
+backend = "linux-bwrap"
+network = "none"
+timeout_ms = 30000
+idle_timeout_ms = 10000
+memory_mb = 256
+max_pids = 32
+max_output_bytes = 262144
+max_files = 256
+
+[resources]
+read = ["references/**", "assets/**", "schemas/**"]
+write = ["$RUN_WORK/**", "$RUN_OUT/**"]
+max_total_read_bytes = 2097152
+
+[[scripts]]
+id = "normalize-query"
+path = "scripts/normalize_query.py"
+runtime = "python3"
+sha256 = "sha256:REPLACE_ME"
+input_schema = "schemas/normalize-input.json"
+output_schema = "schemas/normalize-output.json"
+idempotent = true
+network = "none"
+
+[[scripts]]
+id = "summarize-symbols"
+path = "scripts/summarize_symbols.wasm"
+runtime = "wasm"
+sha256 = "sha256:REPLACE_ME"
+input_schema = "schemas/symbols-input.json"
+output_schema = "schemas/symbols-output.json"
+idempotent = true
+network = "none"

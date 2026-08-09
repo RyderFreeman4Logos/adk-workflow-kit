@@ -1,0 +1,676 @@
+schema_version = 1
+
+# Machine-readable seed backlog parsed from document 15.
+# Verify, merge, split, and reprioritize before creating GitHub issues.
+
+[[issues]]
+id = "GOV-001"
+priority = "P0"
+epic = "E0 \u2014 Governance and Upstream Baseline"
+title = "Create repository, license, workspace, branch protection, and baseline CI"
+blocked_by = []
+completion_signal = "Empty workspace builds and protected CI is active"
+
+[[issues]]
+id = "GOV-002"
+priority = "P0"
+epic = "E0 \u2014 Governance and Upstream Baseline"
+title = "Verify latest stable ADK-Rust, MSRV, crate feature matrix, and exact pin policy"
+blocked_by = []
+completion_signal = "Source-linked report and exact workspace pin"
+
+[[issues]]
+id = "GOV-003"
+priority = "P0"
+epic = "E0 \u2014 Governance and Upstream Baseline"
+title = "Adopt initial ADR set and architecture boundary"
+blocked_by = ["GOV-002"]
+completion_signal = "ADRs accepted; ADK/domain leakage rules explicit"
+
+[[issues]]
+id = "GOV-004"
+priority = "P1"
+epic = "E0 \u2014 Governance and Upstream Baseline"
+title = "Establish security, contribution, release, and dependency policies"
+blocked_by = ["GOV-001"]
+completion_signal = "Policy files and CI checks exist"
+
+[[issues]]
+id = "GOV-005"
+priority = "P1"
+epic = "E0 \u2014 Governance and Upstream Baseline"
+title = "Create recurring external-adopter distillation process"
+blocked_by = ["GOV-002"]
+completion_signal = "Research registry schema and scheduled issue/template"
+
+[[issues]]
+id = "GOV-006"
+priority = "P2"
+epic = "E0 \u2014 Governance and Upstream Baseline"
+title = "Define upstream issue/PR tracking workflow"
+blocked_by = ["GOV-003"]
+completion_signal = "Label/template and compatibility removal rules"
+
+[[issues]]
+id = "SPEC-001"
+priority = "P0"
+epic = "E1 \u2014 Specification, IR, and Compiler"
+title = "Define source-aware external workflow specification v1 skeleton"
+blocked_by = ["GOV-003"]
+completion_signal = "TOML parses with path-aware diagnostics"
+
+[[issues]]
+id = "IR-001"
+priority = "P0"
+epic = "E1 \u2014 Specification, IR, and Compiler"
+title = "Define canonical Workflow IR and stable identifiers"
+blocked_by = ["SPEC-001"]
+completion_signal = "Canonical serialization and hash tests pass"
+
+[[issues]]
+id = "DIAG-001"
+priority = "P0"
+epic = "E1 \u2014 Specification, IR, and Compiler"
+title = "Implement stable compiler diagnostic codes and JSON output"
+blocked_by = ["SPEC-001"]
+completion_signal = "Human/JSON snapshots pass"
+
+[[issues]]
+id = "REG-001"
+priority = "P0"
+epic = "E1 \u2014 Specification, IR, and Compiler"
+title = "Define model/tool/node/validator/predicate/Skill registry contracts"
+blocked_by = ["GOV-003"]
+completion_signal = "Fake registries resolve versioned metadata"
+
+[[issues]]
+id = "COMP-001"
+priority = "P0"
+epic = "E1 \u2014 Specification, IR, and Compiler"
+title = "Implement parse\u2192normalize\u2192resolve compiler pipeline"
+blocked_by = ["IR-001", "REG-001", "DIAG-001"]
+completion_signal = "Minimal plan compiles to locked executable plan"
+
+[[issues]]
+id = "COMP-002"
+priority = "P0"
+epic = "E1 \u2014 Specification, IR, and Compiler"
+title = "Implement graph reachability, terminal, and cycle analysis"
+blocked_by = ["IR-001"]
+completion_signal = "Invalid graphs fail with exact diagnostics"
+
+[[issues]]
+id = "COMP-003"
+priority = "P0"
+epic = "E1 \u2014 Specification, IR, and Compiler"
+title = "Implement closed route operators"
+blocked_by = ["IR-001"]
+completion_signal = "Operator unit/property tests pass"
+
+[[issues]]
+id = "COMP-004"
+priority = "P1"
+epic = "E1 \u2014 Specification, IR, and Compiler"
+title = "Implement registered Rust predicate routing"
+blocked_by = ["REG-001", "COMP-003"]
+completion_signal = "Versioned predicate fixture routes correctly"
+
+[[issues]]
+id = "STATE-001"
+priority = "P1"
+epic = "E1 \u2014 Specification, IR, and Compiler"
+title = "Define state key/schema contracts and artifact-handle convention"
+blocked_by = ["IR-001"]
+completion_signal = "Missing/incompatible state caught preflight where possible"
+
+[[issues]]
+id = "LOCK-001"
+priority = "P0"
+epic = "E1 \u2014 Specification, IR, and Compiler"
+title = "Define and generate workflow lockfile v1"
+blocked_by = ["COMP-001"]
+completion_signal = "All semantic resource hashes recorded"
+
+[[issues]]
+id = "MIGRATE-001"
+priority = "P2"
+epic = "E1 \u2014 Specification, IR, and Compiler"
+title = "Define explicit workflow/lock schema migration API"
+blocked_by = ["LOCK-001"]
+completion_signal = "Old fixture migration tested"
+
+[[issues]]
+id = "SUBWF-001"
+priority = "P2"
+epic = "E1 \u2014 Specification, IR, and Compiler"
+title = "Evaluate typed subworkflow invocation"
+blocked_by = ["COMP-001", "STATE-001"]
+completion_signal = "ADR accepts or defers with prototype evidence"
+
+[[issues]]
+id = "RUN-001"
+priority = "P0"
+epic = "E2 \u2014 Runtime, Artifacts, Workdirs, and Sandbox"
+title = "Define run context, statuses, limits, and typed terminal result"
+blocked_by = ["GOV-003"]
+completion_signal = "Pure contract tests and serialization pass"
+
+[[issues]]
+id = "RUN-002"
+priority = "P0"
+epic = "E2 \u2014 Runtime, Artifacts, Workdirs, and Sandbox"
+title = "Implement host-enforced counters, wall/idle/tool limits, and cancellation"
+blocked_by = ["RUN-001"]
+completion_signal = "Runaway fixture terminates and cleans up"
+
+[[issues]]
+id = "SESSION-001"
+priority = "P0"
+epic = "E2 \u2014 Runtime, Artifacts, Workdirs, and Sandbox"
+title = "Implement per-run/per-role ADK session isolation helpers"
+blocked_by = ["GOV-002", "RUN-001"]
+completion_signal = "Producer/reviewer IDs differ; history tests pass"
+
+[[issues]]
+id = "ART-001"
+priority = "P0"
+epic = "E2 \u2014 Runtime, Artifacts, Workdirs, and Sandbox"
+title = "Define ArtifactStore, content IDs, pagination, and retention interfaces"
+blocked_by = ["RUN-001"]
+completion_signal = "In-memory store conformance passes"
+
+[[issues]]
+id = "ART-002"
+priority = "P1"
+epic = "E2 \u2014 Runtime, Artifacts, Workdirs, and Sandbox"
+title = "Implement local filesystem ArtifactStore"
+blocked_by = ["ART-001", "WORKDIR-001"]
+completion_signal = "Hash, atomic write, paging, cleanup tests pass"
+
+[[issues]]
+id = "WORKDIR-001"
+priority = "P0"
+epic = "E2 \u2014 Runtime, Artifacts, Workdirs, and Sandbox"
+title = "Implement independent per-run workdir manager and manifest"
+blocked_by = ["RUN-001"]
+completion_signal = "Parallel runs cannot see each other's mutable files"
+
+[[issues]]
+id = "WORKDIR-002"
+priority = "P1"
+epic = "E2 \u2014 Runtime, Artifacts, Workdirs, and Sandbox"
+title = "Implement immutable input/package/Skill/reference materialization"
+blocked_by = ["WORKDIR-001", "LOCK-001"]
+completion_signal = "Hash and read-only plans verified"
+
+[[issues]]
+id = "SBOX-001"
+priority = "P0"
+epic = "E2 \u2014 Runtime, Artifacts, Workdirs, and Sandbox"
+title = "Define sandbox requested-capability and backend-capability contracts"
+blocked_by = ["GOV-003"]
+completion_signal = "Unsatisfied required control fails preflight"
+
+[[issues]]
+id = "SBOX-002"
+priority = "P0"
+epic = "E2 \u2014 Runtime, Artifacts, Workdirs, and Sandbox"
+title = "Implement fake sandbox backend and common conformance suite"
+blocked_by = ["SBOX-001", "WORKDIR-001"]
+completion_signal = "Suite can validate allow/deny fixtures"
+
+[[issues]]
+id = "SBOX-003"
+priority = "P1"
+epic = "E2 \u2014 Runtime, Artifacts, Workdirs, and Sandbox"
+title = "Implement Linux bubblewrap backend"
+blocked_by = ["SBOX-002", "WORKDIR-002"]
+completion_signal = "Full Linux conformance suite passes"
+
+[[issues]]
+id = "SBOX-004"
+priority = "P1"
+epic = "E2 \u2014 Runtime, Artifacts, Workdirs, and Sandbox"
+title = "Integrate WASM/embedded-JS pure-transform backend"
+blocked_by = ["SBOX-001"]
+completion_signal = "No-host-access transform fixtures pass"
+
+[[issues]]
+id = "SBOX-005"
+priority = "P2"
+epic = "E2 \u2014 Runtime, Artifacts, Workdirs, and Sandbox"
+title = "Implement rootless OCI/Podman backend"
+blocked_by = ["SBOX-002"]
+completion_signal = "Image-digest and isolation conformance passes"
+
+[[issues]]
+id = "CHECK-001"
+priority = "P2"
+epic = "E2 \u2014 Runtime, Artifacts, Workdirs, and Sandbox"
+title = "Integrate external durable checkpoint backend"
+blocked_by = ["RUN-002", "LOCK-001"]
+completion_signal = "Kill/resume fixture avoids duplicate side effect"
+
+[[issues]]
+id = "TOOL-001"
+priority = "P0"
+epic = "E3 \u2014 Tools, Policy, and Skills"
+title = "Extract generic typed ToolEnvelope, ToolFailure, provenance, and metadata"
+blocked_by = ["REG-001", "ART-001"]
+completion_signal = "CodeSeek-compatible fixtures pass"
+
+[[issues]]
+id = "TOOL-002"
+priority = "P0"
+epic = "E3 \u2014 Tools, Policy, and Skills"
+title = "Build typed FunctionTool registration helper"
+blocked_by = ["TOOL-001", "GOV-002"]
+completion_signal = "Input/output schema and flags generated correctly"
+
+[[issues]]
+id = "TOOL-003"
+priority = "P1"
+epic = "E3 \u2014 Tools, Policy, and Skills"
+title = "Implement structured terminal/output tool helper"
+blocked_by = ["TOOL-002", "RUN-001"]
+completion_signal = "Valid output terminates; invalid output does not"
+
+[[issues]]
+id = "POLICY-001"
+priority = "P0"
+epic = "E3 \u2014 Tools, Policy, and Skills"
+title = "Implement effective capability intersection"
+blocked_by = ["REG-001", "SBOX-001"]
+completion_signal = "Property tests prove no privilege expansion"
+
+[[issues]]
+id = "POLICY-002"
+priority = "P1"
+epic = "E3 \u2014 Tools, Policy, and Skills"
+title = "Add role, tenant, data classification, and network profile policy"
+blocked_by = ["POLICY-001"]
+completion_signal = "Denial and redaction fixtures pass"
+
+[[issues]]
+id = "APPROVAL-001"
+priority = "P1"
+epic = "E3 \u2014 Tools, Policy, and Skills"
+title = "Compile approval/HITL node with timeout and denial semantics"
+blocked_by = ["RUN-002", "POLICY-001"]
+completion_signal = "Approval grant/deny/expire tests pass"
+
+[[issues]]
+id = "SKILL-001"
+priority = "P0"
+epic = "E3 \u2014 Tools, Policy, and Skills"
+title = "Integrate `adk-skill` discovery, parse, and explicit activation"
+blocked_by = ["REG-001", "GOV-002"]
+completion_signal = "Valid/invalid Agent Skills fixtures pass"
+
+[[issues]]
+id = "SKILL-002"
+priority = "P0"
+epic = "E3 \u2014 Tools, Policy, and Skills"
+title = "Implement bounded Skill resource listing/read tools"
+blocked_by = ["SKILL-001", "ART-001", "POLICY-001"]
+completion_signal = "Traversal/symlink/size tests pass"
+
+[[issues]]
+id = "SKILL-003"
+priority = "P0"
+epic = "E3 \u2014 Tools, Policy, and Skills"
+title = "Define `skill.runtime.toml` schema and integrity lock"
+blocked_by = ["SKILL-001", "LOCK-001", "SBOX-001"]
+completion_signal = "Declared scripts/resources lock deterministically"
+
+[[issues]]
+id = "SKILL-004"
+priority = "P1"
+epic = "E3 \u2014 Tools, Policy, and Skills"
+title = "Implement declared Skill script execution by ID"
+blocked_by = ["SKILL-003", "SBOX-002", "WORKDIR-002"]
+completion_signal = "No arbitrary path/command; schema tests pass"
+
+[[issues]]
+id = "SKILL-005"
+priority = "P1"
+epic = "E3 \u2014 Tools, Policy, and Skills"
+title = "Define Skill Evidence Package and promotion metadata"
+blocked_by = ["SKILL-001", "RUN-001"]
+completion_signal = "Redacted evidence fixture validates"
+
+[[issues]]
+id = "SKILL-006"
+priority = "P2"
+epic = "E3 \u2014 Tools, Policy, and Skills"
+title = "Add semantic Skill candidate retrieval adapter"
+blocked_by = ["SKILL-001", "POLICY-001"]
+completion_signal = "Relevance cannot alter capability set"
+
+[[issues]]
+id = "SECRET-001"
+priority = "P2"
+epic = "E3 \u2014 Tools, Policy, and Skills"
+title = "Define brokered secret/credential interface"
+blocked_by = ["POLICY-002", "SBOX-001"]
+completion_signal = "Secrets absent from state/workdir/trace fixtures"
+
+[[issues]]
+id = "REVIEW-001"
+priority = "P0"
+epic = "E4 \u2014 Review, Reliability, and Evaluation"
+title = "Define typed ReviewVerdict and Defect contracts"
+blocked_by = ["RUN-001", "STATE-001"]
+completion_signal = "Schema and serialization tests pass"
+
+[[issues]]
+id = "REVIEW-002"
+priority = "P0"
+epic = "E4 \u2014 Review, Reliability, and Evaluation"
+title = "Compile producer\u2192validator\u2192reviewer\u2192reviser pattern"
+blocked_by = ["REVIEW-001", "SESSION-001", "COMP-003"]
+completion_signal = "Scripted model graph reaches all routes"
+
+[[issues]]
+id = "REVIEW-003"
+priority = "P0"
+epic = "E4 \u2014 Review, Reliability, and Evaluation"
+title = "Implement repeated-output, repeated-defect, and two-cycle detection"
+blocked_by = ["REVIEW-001", "RUN-002"]
+completion_signal = "Non-progress fixtures abstain within bounds"
+
+[[issues]]
+id = "REVIEW-004"
+priority = "P1"
+epic = "E4 \u2014 Review, Reliability, and Evaluation"
+title = "Enforce repaired-output deterministic revalidation"
+blocked_by = ["REVIEW-002"]
+completion_signal = "Reviewer cannot bypass validator"
+
+[[issues]]
+id = "REVIEW-005"
+priority = "P1"
+epic = "E4 \u2014 Review, Reliability, and Evaluation"
+title = "Add multi-reviewer disagreement policy prototype"
+blocked_by = ["REVIEW-002"]
+completion_signal = "ADR and eval fixture accept/defer default"
+
+[[issues]]
+id = "TESTKIT-001"
+priority = "P0"
+epic = "E4 \u2014 Review, Reliability, and Evaluation"
+title = "Implement scripted LLM and fake Tool/Registry harness"
+blocked_by = ["REG-001", "RUN-001"]
+completion_signal = "Deterministic tool loop fixture passes"
+
+[[issues]]
+id = "TESTKIT-002"
+priority = "P0"
+epic = "E4 \u2014 Review, Reliability, and Evaluation"
+title = "Implement record/replay bundle format"
+blocked_by = ["TESTKIT-001", "LOCK-001", "ART-001"]
+completion_signal = "Replay reproduces structural trace"
+
+[[issues]]
+id = "TESTKIT-003"
+priority = "P1"
+epic = "E4 \u2014 Review, Reliability, and Evaluation"
+title = "Implement fault-injection utilities"
+blocked_by = ["TESTKIT-001", "RUN-002"]
+completion_signal = "Timeout/rate/invalid/output flood fixtures pass"
+
+[[issues]]
+id = "EVAL-001"
+priority = "P1"
+epic = "E4 \u2014 Review, Reliability, and Evaluation"
+title = "Integrate `adk-eval` behind platform test API"
+blocked_by = ["TESTKIT-001", "GOV-002"]
+completion_signal = "One trajectory and rubric fixture runs"
+
+[[issues]]
+id = "OBS-001"
+priority = "P1"
+epic = "E4 \u2014 Review, Reliability, and Evaluation"
+title = "Define redacted event, call-ledger, and OTel mapping"
+blocked_by = ["RUN-001", "TOOL-001"]
+completion_signal = "No chain-of-thought/raw secret snapshots"
+
+[[issues]]
+id = "BENCH-001"
+priority = "P2"
+epic = "E4 \u2014 Review, Reliability, and Evaluation"
+title = "Add compiler/runtime/sandbox benchmark suite"
+blocked_by = ["COMP-001", "SBOX-003"]
+completion_signal = "Baseline report generated"
+
+[[issues]]
+id = "CLI-001"
+priority = "P0"
+epic = "E5 \u2014 CLI, Packaging, and Developer Experience"
+title = "Scaffold thin `workflowctl` with human/JSON diagnostics"
+blocked_by = ["DIAG-001", "GOV-001"]
+completion_signal = "Help and JSON error fixtures pass"
+
+[[issues]]
+id = "CLI-002"
+priority = "P0"
+epic = "E5 \u2014 CLI, Packaging, and Developer Experience"
+title = "Implement `validate`, `graph`, and `lock`"
+blocked_by = ["COMP-001", "COMP-002", "LOCK-001", "CLI-001"]
+completion_signal = "Example package validates and renders graph"
+
+[[issues]]
+id = "CLI-003"
+priority = "P1"
+epic = "E5 \u2014 CLI, Packaging, and Developer Experience"
+title = "Implement `run` and `explain-run`"
+blocked_by = ["RUN-002", "WORKDIR-001", "CLI-001"]
+completion_signal = "Scripted example runs and explains artifacts"
+
+[[issues]]
+id = "CLI-004"
+priority = "P1"
+epic = "E5 \u2014 CLI, Packaging, and Developer Experience"
+title = "Implement `test`, `eval`, and `replay`"
+blocked_by = ["TESTKIT-002", "EVAL-001", "CLI-001"]
+completion_signal = "Local CI workflow uses commands"
+
+[[issues]]
+id = "CLI-005"
+priority = "P1"
+epic = "E5 \u2014 CLI, Packaging, and Developer Experience"
+title = "Implement Skill lint/test commands"
+blocked_by = ["SKILL-003", "SKILL-004", "CLI-001"]
+completion_signal = "Invalid manifests/scripts fail clearly"
+
+[[issues]]
+id = "PKG-001"
+priority = "P1"
+epic = "E5 \u2014 CLI, Packaging, and Developer Experience"
+title = "Define workflow package manifest/archive validation"
+blocked_by = ["LOCK-001", "WORKDIR-002"]
+completion_signal = "Path/hash/secret-scan fixtures pass"
+
+[[issues]]
+id = "TEMPLATE-001"
+priority = "P1"
+epic = "E5 \u2014 CLI, Packaging, and Developer Experience"
+title = "Add initial pattern scaffolds and Developer Skills"
+blocked_by = ["CLI-002", "TESTKIT-001"]
+completion_signal = "New workflow passes offline tests immediately"
+
+[[issues]]
+id = "HOTRELOAD-001"
+priority = "P2"
+epic = "E5 \u2014 CLI, Packaging, and Developer Experience"
+title = "Add development-only immutable hot reload"
+blocked_by = ["CLI-003", "LOCK-001"]
+completion_signal = "In-flight run remains on old package"
+
+[[issues]]
+id = "CS-001"
+priority = "P0"
+epic = "E6 \u2014 CodeSeek Dogfood"
+title = "Pin CodeSeek characterization commit and inventory generic candidates"
+blocked_by = ["GOV-003"]
+completion_signal = "Source-linked extraction report"
+
+[[issues]]
+id = "CS-002"
+priority = "P0"
+epic = "E6 \u2014 CodeSeek Dogfood"
+title = "Add/confirm lifecycle and ToolEnvelope characterization tests"
+blocked_by = ["CS-001"]
+completion_signal = "Existing behavior captured"
+
+[[issues]]
+id = "CS-003"
+priority = "P1"
+epic = "E6 \u2014 CodeSeek Dogfood"
+title = "Migrate generic tool/artifact contracts to platform"
+blocked_by = ["TOOL-001", "ART-001", "CS-002"]
+completion_signal = "CodeSeek tests unchanged in intent"
+
+[[issues]]
+id = "CS-004"
+priority = "P1"
+epic = "E6 \u2014 CodeSeek Dogfood"
+title = "Migrate lifecycle/session/trace helpers"
+blocked_by = ["RUN-002", "SESSION-001", "OBS-001", "CS-002"]
+completion_signal = "Limit and isolation parity passes"
+
+[[issues]]
+id = "CS-005"
+priority = "P1"
+epic = "E6 \u2014 CodeSeek Dogfood"
+title = "Express CodeSeek investigator workflow declaratively"
+blocked_by = ["CLI-003", "TOOL-003", "CS-003", "CS-004"]
+completion_signal = "Paired fixture structural parity"
+
+[[issues]]
+id = "CS-006"
+priority = "P1"
+epic = "E6 \u2014 CodeSeek Dogfood"
+title = "Express isolated reviewer/repair declaratively"
+blocked_by = ["REVIEW-004", "CS-005"]
+completion_signal = "Revalidation and session parity"
+
+[[issues]]
+id = "CS-007"
+priority = "P1"
+epic = "E6 \u2014 CodeSeek Dogfood"
+title = "Integrate per-run workdir/sandbox into CodeSeek workflow"
+blocked_by = ["SBOX-003", "CS-005"]
+completion_signal = "Repository access constrained; parity passes"
+
+[[issues]]
+id = "CS-008"
+priority = "P2"
+epic = "E6 \u2014 CodeSeek Dogfood"
+title = "Decide old workflow path removal"
+blocked_by = ["CS-006", "CS-007"]
+completion_signal = "ADR with benchmark and rollback evidence"
+
+[[issues]]
+id = "VB-001"
+priority = "P0"
+epic = "E7 \u2014 Verbatim Dogfood"
+title = "Pin Verbatim contract commit and map adapters/validators"
+blocked_by = ["GOV-003"]
+completion_signal = "Domain-boundary report"
+
+[[issues]]
+id = "VB-002"
+priority = "P1"
+epic = "E7 \u2014 Verbatim Dogfood"
+title = "Implement Verbatim platform adapter without ADK type leakage"
+blocked_by = ["REG-001", "VB-001"]
+completion_signal = "Boundary tests reject leakage"
+
+[[issues]]
+id = "VB-003"
+priority = "P1"
+epic = "E7 \u2014 Verbatim Dogfood"
+title = "Compile grounded-answer workflow package"
+blocked_by = ["REVIEW-004", "TOOL-003", "VB-002"]
+completion_signal = "Publish/abstain transition parity"
+
+[[issues]]
+id = "VB-004"
+priority = "P1"
+epic = "E7 \u2014 Verbatim Dogfood"
+title = "Bind deterministic claim/citation validators"
+blocked_by = ["VB-003"]
+completion_signal = "Unsupported claim never publishes"
+
+[[issues]]
+id = "VB-005"
+priority = "P1"
+epic = "E7 \u2014 Verbatim Dogfood"
+title = "Compile multi-hop decomposition/fanout/coverage workflow"
+blocked_by = ["COMP-004", "VB-002", "TESTKIT-001"]
+completion_signal = "Complete/corrective/incomplete fixtures pass"
+
+[[issues]]
+id = "VB-006"
+priority = "P1"
+epic = "E7 \u2014 Verbatim Dogfood"
+title = "Bind budgets, coverage predicate, and attributed merge"
+blocked_by = ["VB-005"]
+completion_signal = "Bounded corrective parity"
+
+[[issues]]
+id = "VB-007"
+priority = "P2"
+epic = "E7 \u2014 Verbatim Dogfood"
+title = "Add production sandbox/workdir profile for Verbatim workflows"
+blocked_by = ["SBOX-003", "VB-003", "VB-005"]
+completion_signal = "Source truth/ACL boundaries remain intact"
+
+[[issues]]
+id = "DOC-001"
+priority = "P1"
+epic = "E8 \u2014 Release and Upstream"
+title = "Publish architecture, spec, Skill, sandbox, and security docs"
+blocked_by = ["CS-006", "VB-006", "PKG-001", "SBOX-003", "SKILL-004"]
+completion_signal = "Docs match implemented contracts"
+
+[[issues]]
+id = "UP-001"
+priority = "P2"
+epic = "E8 \u2014 Release and Upstream"
+title = "Prototype upstream graph builder with registries"
+blocked_by = ["COMP-001", "GOV-006"]
+completion_signal = "Minimal patch/issue or explicit rejection"
+
+[[issues]]
+id = "UP-002"
+priority = "P2"
+epic = "E8 \u2014 Release and Upstream"
+title = "Propose upstream Skill resource/script hooks"
+blocked_by = ["SKILL-004", "GOV-006"]
+completion_signal = "Minimal upstream design submitted"
+
+[[issues]]
+id = "RELEASE-001"
+priority = "P1"
+epic = "E8 \u2014 Release and Upstream"
+title = "Define v0.1 compatibility and release checklist"
+blocked_by = ["CS-006", "VB-006", "PKG-001"]
+completion_signal = "Checklist and migration guarantees accepted"
+
+[[issues]]
+id = "RELEASE-002"
+priority = "P1"
+epic = "E8 \u2014 Release and Upstream"
+title = "Run security review and dependency audit"
+blocked_by = ["SBOX-003", "POLICY-002", "SKILL-004"]
+completion_signal = "No unresolved critical findings"
+
+[[issues]]
+id = "RELEASE-003"
+priority = "P1"
+epic = "E8 \u2014 Release and Upstream"
+title = "Publish v0.1 crates/binary and dogfood migration guidance"
+blocked_by = ["RELEASE-001", "RELEASE-002", "DOC-001"]
+completion_signal = "Reproducible signed release"

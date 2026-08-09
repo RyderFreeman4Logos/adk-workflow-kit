@@ -1,0 +1,85 @@
+id,priority,epic,title,blocked_by,completion_signal
+GOV-001,P0,E0 — Governance and Upstream Baseline,"Create repository, license, workspace, branch protection, and baseline CI",,Empty workspace builds and protected CI is active
+GOV-002,P0,E0 — Governance and Upstream Baseline,"Verify latest stable ADK-Rust, MSRV, crate feature matrix, and exact pin policy",,Source-linked report and exact workspace pin
+GOV-003,P0,E0 — Governance and Upstream Baseline,Adopt initial ADR set and architecture boundary,GOV-002,ADRs accepted; ADK/domain leakage rules explicit
+GOV-004,P1,E0 — Governance and Upstream Baseline,"Establish security, contribution, release, and dependency policies",GOV-001,Policy files and CI checks exist
+GOV-005,P1,E0 — Governance and Upstream Baseline,Create recurring external-adopter distillation process,GOV-002,Research registry schema and scheduled issue/template
+GOV-006,P2,E0 — Governance and Upstream Baseline,Define upstream issue/PR tracking workflow,GOV-003,Label/template and compatibility removal rules
+SPEC-001,P0,"E1 — Specification, IR, and Compiler",Define source-aware external workflow specification v1 skeleton,GOV-003,TOML parses with path-aware diagnostics
+IR-001,P0,"E1 — Specification, IR, and Compiler",Define canonical Workflow IR and stable identifiers,SPEC-001,Canonical serialization and hash tests pass
+DIAG-001,P0,"E1 — Specification, IR, and Compiler",Implement stable compiler diagnostic codes and JSON output,SPEC-001,Human/JSON snapshots pass
+REG-001,P0,"E1 — Specification, IR, and Compiler",Define model/tool/node/validator/predicate/Skill registry contracts,GOV-003,Fake registries resolve versioned metadata
+COMP-001,P0,"E1 — Specification, IR, and Compiler",Implement parse→normalize→resolve compiler pipeline,"IR-001,REG-001,DIAG-001",Minimal plan compiles to locked executable plan
+COMP-002,P0,"E1 — Specification, IR, and Compiler","Implement graph reachability, terminal, and cycle analysis",IR-001,Invalid graphs fail with exact diagnostics
+COMP-003,P0,"E1 — Specification, IR, and Compiler",Implement closed route operators,IR-001,Operator unit/property tests pass
+COMP-004,P1,"E1 — Specification, IR, and Compiler",Implement registered Rust predicate routing,"REG-001,COMP-003",Versioned predicate fixture routes correctly
+STATE-001,P1,"E1 — Specification, IR, and Compiler",Define state key/schema contracts and artifact-handle convention,IR-001,Missing/incompatible state caught preflight where possible
+LOCK-001,P0,"E1 — Specification, IR, and Compiler",Define and generate workflow lockfile v1,COMP-001,All semantic resource hashes recorded
+MIGRATE-001,P2,"E1 — Specification, IR, and Compiler",Define explicit workflow/lock schema migration API,LOCK-001,Old fixture migration tested
+SUBWF-001,P2,"E1 — Specification, IR, and Compiler",Evaluate typed subworkflow invocation,"COMP-001,STATE-001",ADR accepts or defers with prototype evidence
+RUN-001,P0,"E2 — Runtime, Artifacts, Workdirs, and Sandbox","Define run context, statuses, limits, and typed terminal result",GOV-003,Pure contract tests and serialization pass
+RUN-002,P0,"E2 — Runtime, Artifacts, Workdirs, and Sandbox","Implement host-enforced counters, wall/idle/tool limits, and cancellation",RUN-001,Runaway fixture terminates and cleans up
+SESSION-001,P0,"E2 — Runtime, Artifacts, Workdirs, and Sandbox",Implement per-run/per-role ADK session isolation helpers,"GOV-002,RUN-001",Producer/reviewer IDs differ; history tests pass
+ART-001,P0,"E2 — Runtime, Artifacts, Workdirs, and Sandbox","Define ArtifactStore, content IDs, pagination, and retention interfaces",RUN-001,In-memory store conformance passes
+ART-002,P1,"E2 — Runtime, Artifacts, Workdirs, and Sandbox",Implement local filesystem ArtifactStore,"ART-001,WORKDIR-001","Hash, atomic write, paging, cleanup tests pass"
+WORKDIR-001,P0,"E2 — Runtime, Artifacts, Workdirs, and Sandbox",Implement independent per-run workdir manager and manifest,RUN-001,Parallel runs cannot see each other's mutable files
+WORKDIR-002,P1,"E2 — Runtime, Artifacts, Workdirs, and Sandbox",Implement immutable input/package/Skill/reference materialization,"WORKDIR-001,LOCK-001",Hash and read-only plans verified
+SBOX-001,P0,"E2 — Runtime, Artifacts, Workdirs, and Sandbox",Define sandbox requested-capability and backend-capability contracts,GOV-003,Unsatisfied required control fails preflight
+SBOX-002,P0,"E2 — Runtime, Artifacts, Workdirs, and Sandbox",Implement fake sandbox backend and common conformance suite,"SBOX-001,WORKDIR-001",Suite can validate allow/deny fixtures
+SBOX-003,P1,"E2 — Runtime, Artifacts, Workdirs, and Sandbox",Implement Linux bubblewrap backend,"SBOX-002,WORKDIR-002",Full Linux conformance suite passes
+SBOX-004,P1,"E2 — Runtime, Artifacts, Workdirs, and Sandbox",Integrate WASM/embedded-JS pure-transform backend,SBOX-001,No-host-access transform fixtures pass
+SBOX-005,P2,"E2 — Runtime, Artifacts, Workdirs, and Sandbox",Implement rootless OCI/Podman backend,SBOX-002,Image-digest and isolation conformance passes
+CHECK-001,P2,"E2 — Runtime, Artifacts, Workdirs, and Sandbox",Integrate external durable checkpoint backend,"RUN-002,LOCK-001",Kill/resume fixture avoids duplicate side effect
+TOOL-001,P0,"E3 — Tools, Policy, and Skills","Extract generic typed ToolEnvelope, ToolFailure, provenance, and metadata","REG-001,ART-001",CodeSeek-compatible fixtures pass
+TOOL-002,P0,"E3 — Tools, Policy, and Skills",Build typed FunctionTool registration helper,"TOOL-001,GOV-002",Input/output schema and flags generated correctly
+TOOL-003,P1,"E3 — Tools, Policy, and Skills",Implement structured terminal/output tool helper,"TOOL-002,RUN-001",Valid output terminates; invalid output does not
+POLICY-001,P0,"E3 — Tools, Policy, and Skills",Implement effective capability intersection,"REG-001,SBOX-001",Property tests prove no privilege expansion
+POLICY-002,P1,"E3 — Tools, Policy, and Skills","Add role, tenant, data classification, and network profile policy",POLICY-001,Denial and redaction fixtures pass
+APPROVAL-001,P1,"E3 — Tools, Policy, and Skills",Compile approval/HITL node with timeout and denial semantics,"RUN-002,POLICY-001",Approval grant/deny/expire tests pass
+SKILL-001,P0,"E3 — Tools, Policy, and Skills","Integrate `adk-skill` discovery, parse, and explicit activation","REG-001,GOV-002",Valid/invalid Agent Skills fixtures pass
+SKILL-002,P0,"E3 — Tools, Policy, and Skills",Implement bounded Skill resource listing/read tools,"SKILL-001,ART-001,POLICY-001",Traversal/symlink/size tests pass
+SKILL-003,P0,"E3 — Tools, Policy, and Skills",Define `skill.runtime.toml` schema and integrity lock,"SKILL-001,LOCK-001,SBOX-001",Declared scripts/resources lock deterministically
+SKILL-004,P1,"E3 — Tools, Policy, and Skills",Implement declared Skill script execution by ID,"SKILL-003,SBOX-002,WORKDIR-002",No arbitrary path/command; schema tests pass
+SKILL-005,P1,"E3 — Tools, Policy, and Skills",Define Skill Evidence Package and promotion metadata,"SKILL-001,RUN-001",Redacted evidence fixture validates
+SKILL-006,P2,"E3 — Tools, Policy, and Skills",Add semantic Skill candidate retrieval adapter,"SKILL-001,POLICY-001",Relevance cannot alter capability set
+SECRET-001,P2,"E3 — Tools, Policy, and Skills",Define brokered secret/credential interface,"POLICY-002,SBOX-001",Secrets absent from state/workdir/trace fixtures
+REVIEW-001,P0,"E4 — Review, Reliability, and Evaluation",Define typed ReviewVerdict and Defect contracts,"RUN-001,STATE-001",Schema and serialization tests pass
+REVIEW-002,P0,"E4 — Review, Reliability, and Evaluation",Compile producer→validator→reviewer→reviser pattern,"REVIEW-001,SESSION-001,COMP-003",Scripted model graph reaches all routes
+REVIEW-003,P0,"E4 — Review, Reliability, and Evaluation","Implement repeated-output, repeated-defect, and two-cycle detection","REVIEW-001,RUN-002",Non-progress fixtures abstain within bounds
+REVIEW-004,P1,"E4 — Review, Reliability, and Evaluation",Enforce repaired-output deterministic revalidation,REVIEW-002,Reviewer cannot bypass validator
+REVIEW-005,P1,"E4 — Review, Reliability, and Evaluation",Add multi-reviewer disagreement policy prototype,REVIEW-002,ADR and eval fixture accept/defer default
+TESTKIT-001,P0,"E4 — Review, Reliability, and Evaluation",Implement scripted LLM and fake Tool/Registry harness,"REG-001,RUN-001",Deterministic tool loop fixture passes
+TESTKIT-002,P0,"E4 — Review, Reliability, and Evaluation",Implement record/replay bundle format,"TESTKIT-001,LOCK-001,ART-001",Replay reproduces structural trace
+TESTKIT-003,P1,"E4 — Review, Reliability, and Evaluation",Implement fault-injection utilities,"TESTKIT-001,RUN-002",Timeout/rate/invalid/output flood fixtures pass
+EVAL-001,P1,"E4 — Review, Reliability, and Evaluation",Integrate `adk-eval` behind platform test API,"TESTKIT-001,GOV-002",One trajectory and rubric fixture runs
+OBS-001,P1,"E4 — Review, Reliability, and Evaluation","Define redacted event, call-ledger, and OTel mapping","RUN-001,TOOL-001",No chain-of-thought/raw secret snapshots
+BENCH-001,P2,"E4 — Review, Reliability, and Evaluation",Add compiler/runtime/sandbox benchmark suite,"COMP-001,SBOX-003",Baseline report generated
+CLI-001,P0,"E5 — CLI, Packaging, and Developer Experience",Scaffold thin `workflowctl` with human/JSON diagnostics,"DIAG-001,GOV-001",Help and JSON error fixtures pass
+CLI-002,P0,"E5 — CLI, Packaging, and Developer Experience","Implement `validate`, `graph`, and `lock`","COMP-001,COMP-002,LOCK-001,CLI-001",Example package validates and renders graph
+CLI-003,P1,"E5 — CLI, Packaging, and Developer Experience",Implement `run` and `explain-run`,"RUN-002,WORKDIR-001,CLI-001",Scripted example runs and explains artifacts
+CLI-004,P1,"E5 — CLI, Packaging, and Developer Experience","Implement `test`, `eval`, and `replay`","TESTKIT-002,EVAL-001,CLI-001",Local CI workflow uses commands
+CLI-005,P1,"E5 — CLI, Packaging, and Developer Experience",Implement Skill lint/test commands,"SKILL-003,SKILL-004,CLI-001",Invalid manifests/scripts fail clearly
+PKG-001,P1,"E5 — CLI, Packaging, and Developer Experience",Define workflow package manifest/archive validation,"LOCK-001,WORKDIR-002",Path/hash/secret-scan fixtures pass
+TEMPLATE-001,P1,"E5 — CLI, Packaging, and Developer Experience",Add initial pattern scaffolds and Developer Skills,"CLI-002,TESTKIT-001",New workflow passes offline tests immediately
+HOTRELOAD-001,P2,"E5 — CLI, Packaging, and Developer Experience",Add development-only immutable hot reload,"CLI-003,LOCK-001",In-flight run remains on old package
+CS-001,P0,E6 — CodeSeek Dogfood,Pin CodeSeek characterization commit and inventory generic candidates,GOV-003,Source-linked extraction report
+CS-002,P0,E6 — CodeSeek Dogfood,Add/confirm lifecycle and ToolEnvelope characterization tests,CS-001,Existing behavior captured
+CS-003,P1,E6 — CodeSeek Dogfood,Migrate generic tool/artifact contracts to platform,"TOOL-001,ART-001,CS-002",CodeSeek tests unchanged in intent
+CS-004,P1,E6 — CodeSeek Dogfood,Migrate lifecycle/session/trace helpers,"RUN-002,SESSION-001,OBS-001,CS-002",Limit and isolation parity passes
+CS-005,P1,E6 — CodeSeek Dogfood,Express CodeSeek investigator workflow declaratively,"CLI-003,TOOL-003,CS-003,CS-004",Paired fixture structural parity
+CS-006,P1,E6 — CodeSeek Dogfood,Express isolated reviewer/repair declaratively,"REVIEW-004,CS-005",Revalidation and session parity
+CS-007,P1,E6 — CodeSeek Dogfood,Integrate per-run workdir/sandbox into CodeSeek workflow,"SBOX-003,CS-005",Repository access constrained; parity passes
+CS-008,P2,E6 — CodeSeek Dogfood,Decide old workflow path removal,"CS-006,CS-007",ADR with benchmark and rollback evidence
+VB-001,P0,E7 — Verbatim Dogfood,Pin Verbatim contract commit and map adapters/validators,GOV-003,Domain-boundary report
+VB-002,P1,E7 — Verbatim Dogfood,Implement Verbatim platform adapter without ADK type leakage,"REG-001,VB-001",Boundary tests reject leakage
+VB-003,P1,E7 — Verbatim Dogfood,Compile grounded-answer workflow package,"REVIEW-004,TOOL-003,VB-002",Publish/abstain transition parity
+VB-004,P1,E7 — Verbatim Dogfood,Bind deterministic claim/citation validators,VB-003,Unsupported claim never publishes
+VB-005,P1,E7 — Verbatim Dogfood,Compile multi-hop decomposition/fanout/coverage workflow,"COMP-004,VB-002,TESTKIT-001",Complete/corrective/incomplete fixtures pass
+VB-006,P1,E7 — Verbatim Dogfood,"Bind budgets, coverage predicate, and attributed merge",VB-005,Bounded corrective parity
+VB-007,P2,E7 — Verbatim Dogfood,Add production sandbox/workdir profile for Verbatim workflows,"SBOX-003,VB-003,VB-005",Source truth/ACL boundaries remain intact
+DOC-001,P1,E8 — Release and Upstream,"Publish architecture, spec, Skill, sandbox, and security docs","CS-006,VB-006,PKG-001,SBOX-003,SKILL-004",Docs match implemented contracts
+UP-001,P2,E8 — Release and Upstream,Prototype upstream graph builder with registries,"COMP-001,GOV-006",Minimal patch/issue or explicit rejection
+UP-002,P2,E8 — Release and Upstream,Propose upstream Skill resource/script hooks,"SKILL-004,GOV-006",Minimal upstream design submitted
+RELEASE-001,P1,E8 — Release and Upstream,Define v0.1 compatibility and release checklist,"CS-006,VB-006,PKG-001",Checklist and migration guarantees accepted
+RELEASE-002,P1,E8 — Release and Upstream,Run security review and dependency audit,"SBOX-003,POLICY-002,SKILL-004",No unresolved critical findings
+RELEASE-003,P1,E8 — Release and Upstream,Publish v0.1 crates/binary and dogfood migration guidance,"RELEASE-001,RELEASE-002,DOC-001",Reproducible signed release

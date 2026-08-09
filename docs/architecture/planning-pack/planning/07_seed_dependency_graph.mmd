@@ -1,0 +1,246 @@
+graph TD
+  GOV_001["GOV-001: Create repository, license, workspace, branch protection, and baseline CI"]
+  GOV_002["GOV-002: Verify latest stable ADK-Rust, MSRV, crate feature matrix, and exact pin policy"]
+  GOV_003["GOV-003: Adopt initial ADR set and architecture boundary"]
+  GOV_004["GOV-004: Establish security, contribution, release, and dependency policies"]
+  GOV_005["GOV-005: Create recurring external-adopter distillation process"]
+  GOV_006["GOV-006: Define upstream issue/PR tracking workflow"]
+  SPEC_001["SPEC-001: Define source-aware external workflow specification v1 skeleton"]
+  IR_001["IR-001: Define canonical Workflow IR and stable identifiers"]
+  DIAG_001["DIAG-001: Implement stable compiler diagnostic codes and JSON output"]
+  REG_001["REG-001: Define model/tool/node/validator/predicate/Skill registry contracts"]
+  COMP_001["COMP-001: Implement parse→normalize→resolve compiler pipeline"]
+  COMP_002["COMP-002: Implement graph reachability, terminal, and cycle analysis"]
+  COMP_003["COMP-003: Implement closed route operators"]
+  COMP_004["COMP-004: Implement registered Rust predicate routing"]
+  STATE_001["STATE-001: Define state key/schema contracts and artifact-handle convention"]
+  LOCK_001["LOCK-001: Define and generate workflow lockfile v1"]
+  MIGRATE_001["MIGRATE-001: Define explicit workflow/lock schema migration API"]
+  SUBWF_001["SUBWF-001: Evaluate typed subworkflow invocation"]
+  RUN_001["RUN-001: Define run context, statuses, limits, and typed terminal result"]
+  RUN_002["RUN-002: Implement host-enforced counters, wall/idle/tool limits, and cancellation"]
+  SESSION_001["SESSION-001: Implement per-run/per-role ADK session isolation helpers"]
+  ART_001["ART-001: Define ArtifactStore, content IDs, pagination, and retention interfaces"]
+  ART_002["ART-002: Implement local filesystem ArtifactStore"]
+  WORKDIR_001["WORKDIR-001: Implement independent per-run workdir manager and manifest"]
+  WORKDIR_002["WORKDIR-002: Implement immutable input/package/Skill/reference materialization"]
+  SBOX_001["SBOX-001: Define sandbox requested-capability and backend-capability contracts"]
+  SBOX_002["SBOX-002: Implement fake sandbox backend and common conformance suite"]
+  SBOX_003["SBOX-003: Implement Linux bubblewrap backend"]
+  SBOX_004["SBOX-004: Integrate WASM/embedded-JS pure-transform backend"]
+  SBOX_005["SBOX-005: Implement rootless OCI/Podman backend"]
+  CHECK_001["CHECK-001: Integrate external durable checkpoint backend"]
+  TOOL_001["TOOL-001: Extract generic typed ToolEnvelope, ToolFailure, provenance, and metadata"]
+  TOOL_002["TOOL-002: Build typed FunctionTool registration helper"]
+  TOOL_003["TOOL-003: Implement structured terminal/output tool helper"]
+  POLICY_001["POLICY-001: Implement effective capability intersection"]
+  POLICY_002["POLICY-002: Add role, tenant, data classification, and network profile policy"]
+  APPROVAL_001["APPROVAL-001: Compile approval/HITL node with timeout and denial semantics"]
+  SKILL_001["SKILL-001: Integrate `adk-skill` discovery, parse, and explicit activation"]
+  SKILL_002["SKILL-002: Implement bounded Skill resource listing/read tools"]
+  SKILL_003["SKILL-003: Define `skill.runtime.toml` schema and integrity lock"]
+  SKILL_004["SKILL-004: Implement declared Skill script execution by ID"]
+  SKILL_005["SKILL-005: Define Skill Evidence Package and promotion metadata"]
+  SKILL_006["SKILL-006: Add semantic Skill candidate retrieval adapter"]
+  SECRET_001["SECRET-001: Define brokered secret/credential interface"]
+  REVIEW_001["REVIEW-001: Define typed ReviewVerdict and Defect contracts"]
+  REVIEW_002["REVIEW-002: Compile producer→validator→reviewer→reviser pattern"]
+  REVIEW_003["REVIEW-003: Implement repeated-output, repeated-defect, and two-cycle detection"]
+  REVIEW_004["REVIEW-004: Enforce repaired-output deterministic revalidation"]
+  REVIEW_005["REVIEW-005: Add multi-reviewer disagreement policy prototype"]
+  TESTKIT_001["TESTKIT-001: Implement scripted LLM and fake Tool/Registry harness"]
+  TESTKIT_002["TESTKIT-002: Implement record/replay bundle format"]
+  TESTKIT_003["TESTKIT-003: Implement fault-injection utilities"]
+  EVAL_001["EVAL-001: Integrate `adk-eval` behind platform test API"]
+  OBS_001["OBS-001: Define redacted event, call-ledger, and OTel mapping"]
+  BENCH_001["BENCH-001: Add compiler/runtime/sandbox benchmark suite"]
+  CLI_001["CLI-001: Scaffold thin `workflowctl` with human/JSON diagnostics"]
+  CLI_002["CLI-002: Implement `validate`, `graph`, and `lock`"]
+  CLI_003["CLI-003: Implement `run` and `explain-run`"]
+  CLI_004["CLI-004: Implement `test`, `eval`, and `replay`"]
+  CLI_005["CLI-005: Implement Skill lint/test commands"]
+  PKG_001["PKG-001: Define workflow package manifest/archive validation"]
+  TEMPLATE_001["TEMPLATE-001: Add initial pattern scaffolds and Developer Skills"]
+  HOTRELOAD_001["HOTRELOAD-001: Add development-only immutable hot reload"]
+  CS_001["CS-001: Pin CodeSeek characterization commit and inventory generic candidates"]
+  CS_002["CS-002: Add/confirm lifecycle and ToolEnvelope characterization tests"]
+  CS_003["CS-003: Migrate generic tool/artifact contracts to platform"]
+  CS_004["CS-004: Migrate lifecycle/session/trace helpers"]
+  CS_005["CS-005: Express CodeSeek investigator workflow declaratively"]
+  CS_006["CS-006: Express isolated reviewer/repair declaratively"]
+  CS_007["CS-007: Integrate per-run workdir/sandbox into CodeSeek workflow"]
+  CS_008["CS-008: Decide old workflow path removal"]
+  VB_001["VB-001: Pin Verbatim contract commit and map adapters/validators"]
+  VB_002["VB-002: Implement Verbatim platform adapter without ADK type leakage"]
+  VB_003["VB-003: Compile grounded-answer workflow package"]
+  VB_004["VB-004: Bind deterministic claim/citation validators"]
+  VB_005["VB-005: Compile multi-hop decomposition/fanout/coverage workflow"]
+  VB_006["VB-006: Bind budgets, coverage predicate, and attributed merge"]
+  VB_007["VB-007: Add production sandbox/workdir profile for Verbatim workflows"]
+  DOC_001["DOC-001: Publish architecture, spec, Skill, sandbox, and security docs"]
+  UP_001["UP-001: Prototype upstream graph builder with registries"]
+  UP_002["UP-002: Propose upstream Skill resource/script hooks"]
+  RELEASE_001["RELEASE-001: Define v0.1 compatibility and release checklist"]
+  RELEASE_002["RELEASE-002: Run security review and dependency audit"]
+  RELEASE_003["RELEASE-003: Publish v0.1 crates/binary and dogfood migration guidance"]
+  GOV_002 --> GOV_003
+  GOV_001 --> GOV_004
+  GOV_002 --> GOV_005
+  GOV_003 --> GOV_006
+  GOV_003 --> SPEC_001
+  SPEC_001 --> IR_001
+  SPEC_001 --> DIAG_001
+  GOV_003 --> REG_001
+  IR_001 --> COMP_001
+  REG_001 --> COMP_001
+  DIAG_001 --> COMP_001
+  IR_001 --> COMP_002
+  IR_001 --> COMP_003
+  REG_001 --> COMP_004
+  COMP_003 --> COMP_004
+  IR_001 --> STATE_001
+  COMP_001 --> LOCK_001
+  LOCK_001 --> MIGRATE_001
+  COMP_001 --> SUBWF_001
+  STATE_001 --> SUBWF_001
+  GOV_003 --> RUN_001
+  RUN_001 --> RUN_002
+  GOV_002 --> SESSION_001
+  RUN_001 --> SESSION_001
+  RUN_001 --> ART_001
+  ART_001 --> ART_002
+  WORKDIR_001 --> ART_002
+  RUN_001 --> WORKDIR_001
+  WORKDIR_001 --> WORKDIR_002
+  LOCK_001 --> WORKDIR_002
+  GOV_003 --> SBOX_001
+  SBOX_001 --> SBOX_002
+  WORKDIR_001 --> SBOX_002
+  SBOX_002 --> SBOX_003
+  WORKDIR_002 --> SBOX_003
+  SBOX_001 --> SBOX_004
+  SBOX_002 --> SBOX_005
+  RUN_002 --> CHECK_001
+  LOCK_001 --> CHECK_001
+  REG_001 --> TOOL_001
+  ART_001 --> TOOL_001
+  TOOL_001 --> TOOL_002
+  GOV_002 --> TOOL_002
+  TOOL_002 --> TOOL_003
+  RUN_001 --> TOOL_003
+  REG_001 --> POLICY_001
+  SBOX_001 --> POLICY_001
+  POLICY_001 --> POLICY_002
+  RUN_002 --> APPROVAL_001
+  POLICY_001 --> APPROVAL_001
+  REG_001 --> SKILL_001
+  GOV_002 --> SKILL_001
+  SKILL_001 --> SKILL_002
+  ART_001 --> SKILL_002
+  POLICY_001 --> SKILL_002
+  SKILL_001 --> SKILL_003
+  LOCK_001 --> SKILL_003
+  SBOX_001 --> SKILL_003
+  SKILL_003 --> SKILL_004
+  SBOX_002 --> SKILL_004
+  WORKDIR_002 --> SKILL_004
+  SKILL_001 --> SKILL_005
+  RUN_001 --> SKILL_005
+  SKILL_001 --> SKILL_006
+  POLICY_001 --> SKILL_006
+  POLICY_002 --> SECRET_001
+  SBOX_001 --> SECRET_001
+  RUN_001 --> REVIEW_001
+  STATE_001 --> REVIEW_001
+  REVIEW_001 --> REVIEW_002
+  SESSION_001 --> REVIEW_002
+  COMP_003 --> REVIEW_002
+  REVIEW_001 --> REVIEW_003
+  RUN_002 --> REVIEW_003
+  REVIEW_002 --> REVIEW_004
+  REVIEW_002 --> REVIEW_005
+  REG_001 --> TESTKIT_001
+  RUN_001 --> TESTKIT_001
+  TESTKIT_001 --> TESTKIT_002
+  LOCK_001 --> TESTKIT_002
+  ART_001 --> TESTKIT_002
+  TESTKIT_001 --> TESTKIT_003
+  RUN_002 --> TESTKIT_003
+  TESTKIT_001 --> EVAL_001
+  GOV_002 --> EVAL_001
+  RUN_001 --> OBS_001
+  TOOL_001 --> OBS_001
+  COMP_001 --> BENCH_001
+  SBOX_003 --> BENCH_001
+  DIAG_001 --> CLI_001
+  GOV_001 --> CLI_001
+  COMP_001 --> CLI_002
+  COMP_002 --> CLI_002
+  LOCK_001 --> CLI_002
+  CLI_001 --> CLI_002
+  RUN_002 --> CLI_003
+  WORKDIR_001 --> CLI_003
+  CLI_001 --> CLI_003
+  TESTKIT_002 --> CLI_004
+  EVAL_001 --> CLI_004
+  CLI_001 --> CLI_004
+  SKILL_003 --> CLI_005
+  SKILL_004 --> CLI_005
+  CLI_001 --> CLI_005
+  LOCK_001 --> PKG_001
+  WORKDIR_002 --> PKG_001
+  CLI_002 --> TEMPLATE_001
+  TESTKIT_001 --> TEMPLATE_001
+  CLI_003 --> HOTRELOAD_001
+  LOCK_001 --> HOTRELOAD_001
+  GOV_003 --> CS_001
+  CS_001 --> CS_002
+  TOOL_001 --> CS_003
+  ART_001 --> CS_003
+  CS_002 --> CS_003
+  RUN_002 --> CS_004
+  SESSION_001 --> CS_004
+  OBS_001 --> CS_004
+  CS_002 --> CS_004
+  CLI_003 --> CS_005
+  TOOL_003 --> CS_005
+  CS_003 --> CS_005
+  CS_004 --> CS_005
+  REVIEW_004 --> CS_006
+  CS_005 --> CS_006
+  SBOX_003 --> CS_007
+  CS_005 --> CS_007
+  CS_006 --> CS_008
+  CS_007 --> CS_008
+  GOV_003 --> VB_001
+  REG_001 --> VB_002
+  VB_001 --> VB_002
+  REVIEW_004 --> VB_003
+  TOOL_003 --> VB_003
+  VB_002 --> VB_003
+  VB_003 --> VB_004
+  COMP_004 --> VB_005
+  VB_002 --> VB_005
+  TESTKIT_001 --> VB_005
+  VB_005 --> VB_006
+  SBOX_003 --> VB_007
+  VB_003 --> VB_007
+  VB_005 --> VB_007
+  CS_006 --> DOC_001
+  VB_006 --> DOC_001
+  PKG_001 --> DOC_001
+  SBOX_003 --> DOC_001
+  SKILL_004 --> DOC_001
+  COMP_001 --> UP_001
+  GOV_006 --> UP_001
+  SKILL_004 --> UP_002
+  GOV_006 --> UP_002
+  CS_006 --> RELEASE_001
+  VB_006 --> RELEASE_001
+  PKG_001 --> RELEASE_001
+  SBOX_003 --> RELEASE_002
+  POLICY_002 --> RELEASE_002
+  SKILL_004 --> RELEASE_002
+  RELEASE_001 --> RELEASE_003
+  RELEASE_002 --> RELEASE_003
+  DOC_001 --> RELEASE_003

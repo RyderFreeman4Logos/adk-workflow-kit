@@ -1,0 +1,165 @@
+# Proposed design example. This is not an implemented stable schema.
+schema_version = 1
+
+[workflow]
+id = "code.investigate-review"
+version = "0.1.0"
+description = "Investigate a repository question using bounded read-only tools, validate the result, and optionally repair it after isolated review."
+entry = "investigate"
+input_schema = "schemas/investigation-input.json"
+output_schema = "schemas/investigation-output.json"
+
+[limits]
+max_model_turns = 18
+max_tool_calls = 48
+max_calls_per_tool = 10
+max_node_visits = 32
+max_wall_time_ms = 180000
+max_idle_time_ms = 60000
+max_tool_time_ms = 30000
+max_tool_output_bytes = 1048576
+max_total_artifact_bytes = 16777216
+on_exhausted = "abstain"
+
+[workdir]
+mode = "isolated"
+retain = "on_failure"
+max_bytes = 268435456
+max_files = 4096
+
+[sandbox]
+profile = "linux-readonly-repository-v1"
+network = "none"
+required_capabilities = [
+  "filesystem_read_isolation",
+  "filesystem_write_isolation",
+  "pid_isolation",
+  "wall_timeout",
+  "output_limit",
+]
+
+[models.worker]
+profile = "local-qwen-worker"
+temperature = 0.1
+max_output_tokens = 8192
+
+[models.reviewer]
+profile = "local-reviewer"
+temperature = 0.0
+max_output_tokens = 4096
+
+[[skills]]
+id = "code-investigation"
+path = "skills/code-investigation"
+activation = "required"
+resource_access = "on_demand"
+script_policy = "declared_only"
+
+[[nodes]]
+id = "investigate"
+kind = "agent"
+role = "producer"
+model = "worker"
+prompt_file = "prompts/investigate.md"
+skills = ["code-investigation"]
+tools = [
+  "search_evidence",
+  "read_source_range",
+  "inspect_symbol",
+  "callers",
+  "callees",
+  "call_path",
+  "list_directory",
+  "git_status",
+  "git_diff",
+  "read_artifact",
+  "finish_investigation",
+]
+output_key = "candidate"
+output_schema = "schemas/investigation-output.json"
+read_only = true
+max_visits = 1
+
+[[nodes]]
+id = "validate"
+kind = "validator"
+implementation = "codeseek.grounded-investigation-v1"
+input_key = "candidate"
+output_key = "validation"
+max_visits = 3
+
+[[nodes]]
+id = "review"
+kind = "agent"
+role = "reviewer"
+model = "reviewer"
+prompt_file = "prompts/review.md"
+tools = ["read_source_range", "read_artifact", "finish_review"]
+input_keys = ["candidate", "validation", "evidence_handle"]
+output_key = "review"
+output_schema = "schemas/review.json"
+read_only = true
+max_visits = 2
+
+[[nodes]]
+id = "revise"
+kind = "agent"
+role = "reviser"
+model = "worker"
+prompt_file = "prompts/revise.md"
+skills = ["code-investigation"]
+tools = [
+  "search_evidence",
+  "read_source_range",
+  "inspect_symbol",
+  "callers",
+  "callees",
+  "read_artifact",
+  "finish_investigation",
+]
+input_keys = ["candidate", "validation", "review", "evidence_handle"]
+output_key = "candidate"
+output_schema = "schemas/investigation-output.json"
+read_only = true
+max_visits = 2
+
+[[nodes]]
+id = "publish"
+kind = "terminal"
+status = "completed"
+publish_keys = ["candidate", "validation", "review"]
+requires_validators = ["codeseek.grounded-investigation-v1"]
+
+[[nodes]]
+id = "abstain"
+kind = "terminal"
+status = "abstained"
+publish_keys = ["validation", "review"]
+
+[[edges]]
+from = "investigate"
+to = "validate"
+
+[[routes]]
+from = "validate"
+source = "/validation/verdict"
+operator = "enum_case"
+cases = { pass = "review", revise = "revise", abstain = "abstain" }
+
+[[routes]]
+from = "review"
+source = "/review/verdict"
+operator = "enum_case"
+cases = { pass = "publish", revise = "revise", abstain = "abstain" }
+
+[[edges]]
+from = "revise"
+to = "validate"
+
+[review]
+max_revisions = 2
+max_same_defect_rounds = 1
+stop_on_repeated_output_hash = true
+stop_on_two_cycle = true
+require_revalidation_after_repair = true
+on_exhausted = "abstain"

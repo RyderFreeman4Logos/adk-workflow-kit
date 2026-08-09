@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "run_id": "019-example",
+  "workflow": {
+    "id": "code.investigate-review",
+    "version": "0.1.0",
+    "package_sha256": "sha256:PACKAGE",
+    "lock_sha256": "sha256:LOCK"
+  },
+  "identity": {
+    "tenant_id": "tenant-example",
+    "actor_id": "actor-pseudonym",
+    "role": "employee",
+    "data_classification": "internal"
+  },
+  "workdir": {
+    "logical_root": "$RUN_ROOT",
+    "retention": "on_failure",
+    "max_bytes": 268435456,
+    "max_files": 4096
+  },
+  "sandbox": {
+    "profile": "linux-readonly-repository-v1",
+    "backend": "bubblewrap",
+    "network": "none",
+    "required_capabilities": [
+      "filesystem_read_isolation",
+      "filesystem_write_isolation",
+      "pid_isolation",
+      "wall_timeout",
+      "output_limit"
+    ]
+  },
+  "limits": {
+    "max_model_turns": 18,
+    "max_tool_calls": 48,
+    "max_wall_time_ms": 180000
+  },
+  "created_at": "2026-08-03T00:00:00Z"
+}

@@ -1,0 +1,105 @@
+# Proposed design example. Domain validators remain implemented by Verbatim.
+schema_version = 1
+
+[workflow]
+id = "verbatim.grounded-answer"
+version = "0.1.0"
+description = "Publish only claims supported by authorized evidence, with deterministic citation rendering."
+entry = "retrieve"
+input_schema = "schemas/query-plan.json"
+output_schema = "schemas/grounded-answer-outcome.json"
+
+[limits]
+max_model_turns = 8
+max_tool_calls = 20
+max_node_visits = 20
+max_revisions = 1
+max_wall_time_ms = 120000
+on_exhausted = "abstain"
+
+[sandbox]
+profile = "verbatim-readonly-evidence-v1"
+network = "none"
+
+[models.writer]
+profile = "local-grounded-writer"
+temperature = 0.1
+
+[[nodes]]
+id = "retrieve"
+kind = "registered"
+implementation = "verbatim.retrieve-evidence-pack-v1"
+input_key = "input"
+output_key = "evidence_pack"
+max_visits = 1
+
+[[nodes]]
+id = "assemble"
+kind = "registered"
+implementation = "verbatim.assemble-context-pack-v1"
+input_key = "evidence_pack"
+output_key = "context_pack"
+max_visits = 1
+
+[[nodes]]
+id = "draft"
+kind = "agent"
+role = "producer"
+model = "writer"
+prompt_file = "prompts/draft-grounded-answer.md"
+tools = ["read_context_artifact", "finish_answer_draft"]
+input_keys = ["input", "context_pack"]
+output_key = "answer_draft"
+output_schema = "schemas/answer-draft.json"
+read_only = true
+max_visits = 2
+
+[[nodes]]
+id = "verify"
+kind = "validator"
+implementation = "verbatim.verify-claims-v1"
+input_keys = ["context_pack", "answer_draft"]
+output_key = "claim_report"
+max_visits = 2
+
+[[nodes]]
+id = "render"
+kind = "registered"
+implementation = "verbatim.render-citations-v1"
+input_keys = ["context_pack", "answer_draft", "claim_report"]
+output_key = "grounded_answer"
+max_visits = 1
+
+[[nodes]]
+id = "publish"
+kind = "terminal"
+status = "completed"
+publish_keys = ["grounded_answer", "claim_report"]
+requires_validators = ["verbatim.verify-claims-v1"]
+
+[[nodes]]
+id = "abstain"
+kind = "terminal"
+status = "abstained"
+publish_keys = ["claim_report"]
+
+[[edges]]
+from = "retrieve"
+to = "assemble"
+
+[[edges]]
+from = "assemble"
+to = "draft"
+
+[[edges]]
+from = "draft"
+to = "verify"
+
+[[routes]]
+from = "verify"
+predicate = "verbatim.claim-publication-decision-v1"
+cases = { publishable = "render", revise = "draft", abstain = "abstain" }
+
+[[edges]]
+from = "render"
+to = "publish"

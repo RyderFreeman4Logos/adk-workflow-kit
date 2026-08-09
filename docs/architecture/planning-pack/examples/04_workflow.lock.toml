@@ -1,0 +1,74 @@
+# Illustrative lockfile only. Hashes and identities are placeholders.
+schema_version = 1
+
+[workflow]
+id = "code.investigate-review"
+version = "0.1.0"
+package_sha256 = "sha256:PACKAGE"
+canonical_ir_sha256 = "sha256:IR"
+
+[runtime]
+workflow_kit_version = "0.1.0"
+rust_version = "1.94.0"
+adk_rust_version = "1.0.0"
+compiler_profile = "default-v1"
+
+[sandbox]
+profile = "linux-readonly-repository-v1"
+backend = "bubblewrap"
+backend_version = "REPLACE_ME"
+capability_profile_sha256 = "sha256:SBOX"
+
+[policy]
+profile = "default-internal-readonly-v1"
+profile_sha256 = "sha256:POLICY"
+
+[[models]]
+role = "worker"
+requested_profile = "local-qwen-worker"
+provider = "openai-compatible"
+resolved_model_id = "Qwen/Qwen3.6-27B"
+provider_revision = "REPLACE_ME"
+tool_parser = "qwen3_coder"
+request_extension_sha256 = "sha256:WORKER_EXTENSION"
+
+[[models]]
+role = "reviewer"
+requested_profile = "local-reviewer"
+provider = "openai-compatible"
+resolved_model_id = "REPLACE_ME"
+provider_revision = "REPLACE_ME"
+tool_parser = "REPLACE_ME"
+request_extension_sha256 = "sha256:REVIEW_EXTENSION"
+
+[[skills]]
+id = "code-investigation"
+version = "0.3.0"
+content_sha256 = "sha256:SKILL"
+runtime_manifest_sha256 = "sha256:SKILL_RUNTIME"
+
+[[resources]]
+path = "prompts/investigate.md"
+sha256 = "sha256:PROMPT_INVESTIGATE"
+
+[[resources]]
+path = "prompts/review.md"
+sha256 = "sha256:PROMPT_REVIEW"
+
+[[resources]]
+path = "schemas/investigation-output.json"
+sha256 = "sha256:OUTPUT_SCHEMA"
+
+[[implementations]]
+kind = "tool"
+id = "search_evidence"
+version = "1.0.0"
+schema_sha256 = "sha256:TOOL_SCHEMA"
+build_sha256 = "sha256:TOOL_BUILD"
+
+[[implementations]]
+kind = "validator"
+id = "codeseek.grounded-investigation-v1"
+version = "1.0.0"
+schema_sha256 = "sha256:VALIDATOR_SCHEMA"
+build_sha256 = "sha256:VALIDATOR_BUILD"
