@@ -3,7 +3,11 @@
 Thank you for contributing!
 
 ## Development Workflow
-1. Check open feature issues in GitHub issues.
-2. Follow the issue priorities (`P0` -> `P1` -> `P2`).
-3. Ensure all code passes `cargo check`, `cargo fmt`, and `cargo clippy`.
-4. Open a Pull Request targeting `main`.
+
+1. Check open feature issues and follow their priorities (`P0` -> `P1` -> `P2`).
+2. Create a feature branch; direct work on `main` is blocked.
+3. Install the repository hooks once with `lefthook install`.
+4. Use `just fmt`, `just check`, `just clippy`, and `just test` instead of invoking Cargo directly.
+5. Run `just pre-commit-fast` before committing.
+6. On the clean committed candidate, run `just quality-gates` once. The pre-push hook reuses its exact-tree receipt and requires a passing CSA review of `main...HEAD`.
+7. Open a pull request targeting `main`.
