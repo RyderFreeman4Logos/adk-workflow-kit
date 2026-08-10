@@ -44,7 +44,7 @@ gate_log="$fixture/.local-gates/gate.log"
 csa_log="$fixture/.local-gates/csa.log"
 assertions=0
 lefthook_config="$(cd "$repo_root" && lefthook dump)"
-if [[ "$lefthook_config" != *$'pre-commit:\n  commands:\n    branch-protection:\n      run: just check-branch\n    local-gates:\n      run: just pre-commit-fast'* ]]; then
+if [[ "$lefthook_config" != *$'pre-commit:\n  piped: true\n  commands:\n    branch-protection:\n      run: just check-branch\n    local-gates:\n      run: just pre-commit-fast'* ]]; then
     printf 'FAIL pre-commit hook does not reject main before running local gates\n' >&2
     exit 1
 fi
@@ -53,6 +53,37 @@ if [[ "$lefthook_config" != *$'pre-push:\n  commands:\n    local-gates:\n      r
     exit 1
 fi
 ((assertions += 2))
+
+hook_fixture="$test_root/hook-repo"
+mkdir -p "$hook_fixture"
+git -C "$hook_fixture" init -q -b main
+git -C "$hook_fixture" config user.name 'Gate Test'
+git -C "$hook_fixture" config user.email 'gate-test@example.invalid'
+printf '%s\n' seed > "$hook_fixture/tracked.txt"
+git -C "$hook_fixture" add tracked.txt
+git -C "$hook_fixture" commit -qm 'test: initialize hook fixture'
+printf '%s\n' staged >> "$hook_fixture/tracked.txt"
+git -C "$hook_fixture" add tracked.txt
+cp "$repo_root/lefthook.yml" "$hook_fixture/lefthook.yml"
+printf '%s\n' \
+    'check-branch:' \
+    '    @printf "branch-protection\\n" >> hook.log' \
+    '    @false' \
+    'pre-commit-fast:' \
+    '    @printf "local-gates\\n" >> hook.log' \
+    > "$hook_fixture/justfile"
+set +e
+hook_output="$(cd "$hook_fixture" && lefthook run pre-commit 2>&1)"
+hook_rc=$?
+set -e
+if [[ $hook_rc -eq 0 || ! -e "$hook_fixture/hook.log" ||
+    "$(<"$hook_fixture/hook.log")" != *branch-protection* ||
+    "$(<"$hook_fixture/hook.log")" == *local-gates* ]]; then
+    printf 'FAIL pre-commit branch protection started local gates: exit=%s output=%s\n' \
+        "$hook_rc" "$hook_output" >&2
+    exit 1
+fi
+((assertions += 1))
 
 invoke() {
     (cd "$fixture" && env \
