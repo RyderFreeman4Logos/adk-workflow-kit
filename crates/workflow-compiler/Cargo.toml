@@ -6,3 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+workflow-ir = { path = "../workflow-ir" }
+
+[dev-dependencies]
+workflow-spec = { path = "../workflow-spec" }
