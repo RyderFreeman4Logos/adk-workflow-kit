@@ -1,8 +1,12 @@
 //! Deterministic, stack-safe validation for canonical workflow graphs.
 
+mod diagnostics;
+
 use std::collections::VecDeque;
 
 use workflow_ir::{IrNode, IrNodeKind, NodeId, WorkflowIr};
+
+pub use diagnostics::{Diagnostic, DiagnosticProjectionError};
 
 type Adjacency = Vec<Vec<usize>>;
 
