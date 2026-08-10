@@ -25,11 +25,12 @@ id = "done"
 kind = "terminal"
 "#;
 
-const STABLE_CODES: [&str; 11] = [
+const STABLE_CODES: [&str; 12] = [
     "workflow.source.read_failed",
     "workflow.source.invalid_utf8",
     "workflow.source.decode_failed",
     "workflow.schema.unsupported_version",
+    "workflow.graph.invalid_identifier",
     "workflow.graph.duplicate_node_id",
     "workflow.graph.missing_entry_node",
     "workflow.graph.dangling_edge",
@@ -192,6 +193,7 @@ fn projects_source_errors_with_exact_human_and_json_v1() {
 
 #[test]
 fn projects_graph_errors_with_exact_human_and_json_v1() {
+    let invalid_identifier = graph_error(&MINIMAL.replacen("id = \"workflow\"", "id = \"\"", 1));
     let duplicate = graph_error(
         r#"
 schema_version = 1
@@ -296,6 +298,11 @@ to = "sink"
 
     let cases = [
         (
+            invalid_identifier,
+            "[workflow.graph.invalid_identifier] invalid identifier location=null details={field_path=\"workflow.id\"}",
+            json!({"code": "workflow.graph.invalid_identifier", "details": {"field_path": "workflow.id"}}),
+        ),
+        (
             duplicate,
             "[workflow.graph.duplicate_node_id] duplicate node ID location=null details={node_id=\"dup\", occurrences=2}",
             json!({"code": "workflow.graph.duplicate_node_id", "details": {"node_id": "dup", "occurrences": 2}}),
@@ -362,6 +369,7 @@ to = "sink"
 
 fn diagnostic_message(diagnostic: &Diagnostic) -> &'static str {
     match diagnostic.code() {
+        "workflow.graph.invalid_identifier" => "invalid identifier",
         "workflow.graph.duplicate_node_id" => "duplicate node ID",
         "workflow.graph.missing_entry_node" => "missing entry node",
         "workflow.graph.dangling_edge" => "dangling edge",
