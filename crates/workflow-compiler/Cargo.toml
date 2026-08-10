@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+serde.workspace = true
 workflow-ir = { path = "../workflow-ir" }
+workflow-spec = { path = "../workflow-spec" }
 
 [dev-dependencies]
-workflow-spec = { path = "../workflow-spec" }
+serde_json.workspace = true
