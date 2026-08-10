@@ -20,5 +20,6 @@ repository = "https://github.com/RyderFreeman4Logos/adk-workflow-kit"
 adk-rust = { version = "=1.0.0", default-features = false, features = ["agents", "models", "graph", "guardrail", "telemetry"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_path_to_error = "0.1.20"
+sha2 = "0.10.9"
 thiserror = "2.0.20"
 toml = "0.9.12"

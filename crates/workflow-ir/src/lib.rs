@@ -1,1 +1,597 @@
-//! workflow-ir crate
+//! Canonical, source-free workflow intermediate representation.
+
+use sha2::{Digest, Sha256};
+use workflow_spec::{NodeKind as SpecNodeKind, SchemaVersion, WorkflowSpec};
+
+/// The canonical byte-wire version used for content identity.
+pub const CANONICAL_IR_WIRE_VERSION_V1: u16 = 1;
+
+const DOMAIN: &[u8] = b"adk-workflow-kit/workflow-ir\0";
+const IR_SCHEMA_VERSION_V1: u32 = 1;
+
+/// The normalized IR schema version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrSchemaVersion {
+    /// Version 1 of the normalized workflow IR.
+    V1,
+}
+
+impl IrSchemaVersion {
+    fn tag(self) -> u32 {
+        match self {
+            Self::V1 => IR_SCHEMA_VERSION_V1,
+        }
+    }
+}
+
+/// A source-free workflow identifier.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct WorkflowId(String);
+
+impl WorkflowId {
+    /// Returns the authored identifier exactly as represented in the IR.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A source-free workflow node identifier.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct NodeId(String);
+
+impl NodeId {
+    /// Returns the authored identifier exactly as represented in the IR.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The closed set of normalized workflow node kinds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrNodeKind {
+    /// An agent node.
+    Agent,
+    /// An action node.
+    Action,
+    /// A validator node.
+    Validator,
+    /// A registered node implementation.
+    Registered,
+    /// An approval node.
+    Approval,
+    /// A terminal node.
+    Terminal,
+}
+
+impl IrNodeKind {
+    fn tag(self) -> u8 {
+        match self {
+            Self::Agent => 1,
+            Self::Action => 2,
+            Self::Validator => 3,
+            Self::Registered => 4,
+            Self::Approval => 5,
+            Self::Terminal => 6,
+        }
+    }
+}
+
+/// A normalized node record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrNode {
+    id: NodeId,
+    kind: IrNodeKind,
+}
+
+impl IrNode {
+    /// Returns the node identifier.
+    pub fn id(&self) -> &NodeId {
+        &self.id
+    }
+
+    /// Returns the node kind.
+    pub fn kind(&self) -> IrNodeKind {
+        self.kind
+    }
+}
+
+/// A normalized directed edge record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrEdge {
+    from: NodeId,
+    to: NodeId,
+}
+
+impl IrEdge {
+    /// Returns the edge origin identifier.
+    pub fn from(&self) -> &NodeId {
+        &self.from
+    }
+
+    /// Returns the edge destination identifier.
+    pub fn to(&self) -> &NodeId {
+        &self.to
+    }
+}
+
+/// A source-free normalized workflow graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowIr {
+    schema_version: IrSchemaVersion,
+    workflow_id: WorkflowId,
+    workflow_version: String,
+    entry_node_id: NodeId,
+    nodes: Vec<IrNode>,
+    edges: Vec<IrEdge>,
+}
+
+impl WorkflowIr {
+    /// Returns the normalized IR schema version.
+    pub fn schema_version(&self) -> IrSchemaVersion {
+        self.schema_version
+    }
+
+    /// Returns the workflow identifier.
+    pub fn workflow_id(&self) -> &WorkflowId {
+        &self.workflow_id
+    }
+
+    /// Returns the authored workflow version.
+    pub fn workflow_version(&self) -> &str {
+        &self.workflow_version
+    }
+
+    /// Returns the configured entry node identifier.
+    pub fn entry_node_id(&self) -> &NodeId {
+        &self.entry_node_id
+    }
+
+    /// Returns nodes in canonical raw UTF-8 order.
+    pub fn nodes(&self) -> &[IrNode] {
+        &self.nodes
+    }
+
+    /// Returns edges in canonical raw UTF-8 order.
+    pub fn edges(&self) -> &[IrEdge] {
+        &self.edges
+    }
+
+    /// Returns the SHA-256 content identity of the canonical IR wire.
+    pub fn canonical_hash(&self) -> CanonicalIrHash {
+        let mut hasher = Sha256::new();
+        encode_canonical(self, &mut hasher);
+        CanonicalIrHash(hasher.finalize().into())
+    }
+}
+
+impl From<&WorkflowSpec> for WorkflowIr {
+    fn from(spec: &WorkflowSpec) -> Self {
+        let schema_version = match spec.schema_version() {
+            SchemaVersion::V1 => IrSchemaVersion::V1,
+        };
+        let workflow = spec.workflow();
+        let mut nodes = spec
+            .nodes()
+            .iter()
+            .map(|node| IrNode {
+                id: NodeId(node.id().as_str().to_owned()),
+                kind: match node.kind() {
+                    SpecNodeKind::Agent => IrNodeKind::Agent,
+                    SpecNodeKind::Action => IrNodeKind::Action,
+                    SpecNodeKind::Validator => IrNodeKind::Validator,
+                    SpecNodeKind::Registered => IrNodeKind::Registered,
+                    SpecNodeKind::Approval => IrNodeKind::Approval,
+                    SpecNodeKind::Terminal => IrNodeKind::Terminal,
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut edges = spec
+            .edges()
+            .iter()
+            .map(|edge| IrEdge {
+                from: NodeId(edge.from().as_str().to_owned()),
+                to: NodeId(edge.to().as_str().to_owned()),
+            })
+            .collect::<Vec<_>>();
+
+        nodes.sort_by(|left, right| {
+            left.id
+                .as_str()
+                .as_bytes()
+                .cmp(right.id.as_str().as_bytes())
+                .then(left.kind.tag().cmp(&right.kind.tag()))
+        });
+        edges.sort_by(|left, right| {
+            left.from
+                .as_str()
+                .as_bytes()
+                .cmp(right.from.as_str().as_bytes())
+                .then(
+                    left.to
+                        .as_str()
+                        .as_bytes()
+                        .cmp(right.to.as_str().as_bytes()),
+                )
+        });
+
+        Self {
+            schema_version,
+            workflow_id: WorkflowId(workflow.id().as_str().to_owned()),
+            workflow_version: workflow.version().to_owned(),
+            entry_node_id: NodeId(workflow.entry().as_str().to_owned()),
+            nodes,
+            edges,
+        }
+    }
+}
+
+/// An opaque SHA-256 identity for a canonical workflow IR.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalIrHash([u8; 32]);
+
+impl CanonicalIrHash {
+    /// Returns the raw SHA-256 digest bytes.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+trait ChunkSink {
+    fn write_chunk(&mut self, bytes: &[u8]);
+}
+
+impl ChunkSink for Sha256 {
+    fn write_chunk(&mut self, bytes: &[u8]) {
+        self.update(bytes);
+    }
+}
+
+#[cfg(test)]
+impl ChunkSink for Vec<u8> {
+    fn write_chunk(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
+    sink.write_chunk(DOMAIN);
+    write_u16(sink, CANONICAL_IR_WIRE_VERSION_V1);
+    write_u32(sink, ir.schema_version.tag());
+    write_frame(sink, ir.workflow_id.as_str());
+    write_frame(sink, &ir.workflow_version);
+    write_frame(sink, ir.entry_node_id.as_str());
+    write_u64(sink, u64_from_usize(ir.nodes.len()));
+    for node in &ir.nodes {
+        write_frame(sink, node.id.as_str());
+        sink.write_chunk(&[node.kind.tag()]);
+    }
+    write_u64(sink, u64_from_usize(ir.edges.len()));
+    for edge in &ir.edges {
+        write_frame(sink, edge.from.as_str());
+        write_frame(sink, edge.to.as_str());
+    }
+}
+
+fn write_frame(sink: &mut impl ChunkSink, value: &str) {
+    write_u64(sink, u64_from_usize(value.len()));
+    sink.write_chunk(value.as_bytes());
+}
+
+fn write_u16(sink: &mut impl ChunkSink, value: u16) {
+    sink.write_chunk(&value.to_be_bytes());
+}
+
+fn write_u32(sink: &mut impl ChunkSink, value: u32) {
+    sink.write_chunk(&value.to_be_bytes());
+}
+
+fn write_u64(sink: &mut impl ChunkSink, value: u64) {
+    sink.write_chunk(&value.to_be_bytes());
+}
+
+fn u64_from_usize(value: usize) -> u64 {
+    match u64::try_from(value) {
+        Ok(value) => value,
+        Err(_) => panic!("canonical wire v1 cannot encode a usize wider than u64"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sha2::{Digest, Sha256};
+    use workflow_spec::parse_str;
+
+    use super::{encode_canonical, u64_from_usize, write_u64, IrNodeKind, WorkflowIr};
+
+    const GOLDEN: &str = r#"
+schema_version = 1
+
+[workflow]
+id = "w"
+version = "1"
+entry = "a"
+
+[[nodes]]
+id = "b"
+kind = "agent"
+
+[[nodes]]
+id = "a"
+kind = "terminal"
+
+[[edges]]
+from = "b"
+to = "a"
+
+[[edges]]
+from = "a"
+to = "b"
+"#;
+
+    const GOLDEN_BYTES: &[u8] = &[
+        0x61, 0x64, 0x6b, 0x2d, 0x77, 0x6f, 0x72, 0x6b, 0x66, 0x6c, 0x6f, 0x77, 0x2d, 0x6b, 0x69,
+        0x74, 0x2f, 0x77, 0x6f, 0x72, 0x6b, 0x66, 0x6c, 0x6f, 0x77, 0x2d, 0x69, 0x72, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x77, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x61, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x62, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x62, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x62, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x61,
+    ];
+
+    fn ir(source: &str) -> WorkflowIr {
+        WorkflowIr::from(&parse_str("fixture.workflow.toml", source).expect("fixture should parse"))
+    }
+
+    fn canonical_bytes(ir: &WorkflowIr) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        encode_canonical(ir, &mut bytes);
+        bytes
+    }
+
+    #[test]
+    fn canonical_bytes_and_hash_match_the_golden_vector() {
+        let ir = ir(GOLDEN);
+
+        assert_eq!(canonical_bytes(&ir), GOLDEN_BYTES);
+        assert_eq!(
+            ir.canonical_hash().as_bytes(),
+            &[
+                0x86, 0x41, 0x4c, 0xb6, 0xa6, 0x6a, 0x7e, 0x5c, 0x07, 0xb5, 0xfc, 0x17, 0xbe, 0x4e,
+                0xb1, 0x19, 0x85, 0x9f, 0xda, 0xd4, 0xff, 0x10, 0x1c, 0x1a, 0x48, 0xd7, 0xb6, 0x34,
+                0xb3, 0xc4, 0xe8, 0x30,
+            ]
+        );
+    }
+
+    #[test]
+    fn streaming_hash_matches_sha256_of_the_collected_chunks() {
+        let ir = ir(GOLDEN);
+        let bytes = canonical_bytes(&ir);
+
+        assert_eq!(
+            ir.canonical_hash().as_bytes(),
+            Sha256::digest(bytes).as_slice()
+        );
+    }
+
+    #[test]
+    fn every_semantic_field_and_duplicate_count_changes_identity() {
+        let cases = [
+            (
+                "workflow id",
+                GOLDEN.replacen("id = \"w\"", "id = \"other\"", 1),
+            ),
+            (
+                "workflow version",
+                GOLDEN.replacen("version = \"1\"", "version = \"2\"", 1),
+            ),
+            (
+                "entry node",
+                GOLDEN.replacen("entry = \"a\"", "entry = \"b\"", 1),
+            ),
+            ("node id", GOLDEN.replacen("id = \"b\"", "id = \"c\"", 1)),
+            (
+                "node kind",
+                GOLDEN.replacen("kind = \"agent\"", "kind = \"action\"", 1),
+            ),
+            (
+                "edge origin",
+                GOLDEN.replacen("from = \"b\"\nto = \"a\"", "from = \"c\"\nto = \"a\"", 1),
+            ),
+            (
+                "edge destination",
+                GOLDEN.replacen("from = \"b\"\nto = \"a\"", "from = \"b\"\nto = \"c\"", 1),
+            ),
+            (
+                "duplicate node count",
+                format!("{GOLDEN}\n[[nodes]]\nid = \"a\"\nkind = \"terminal\""),
+            ),
+            (
+                "duplicate edge count",
+                format!("{GOLDEN}\n[[edges]]\nfrom = \"a\"\nto = \"b\""),
+            ),
+        ];
+        let original = ir(GOLDEN);
+        let original_bytes = canonical_bytes(&original);
+        let original_hash = original.canonical_hash();
+
+        for (name, source) in cases {
+            let changed = ir(&source);
+            assert_ne!(canonical_bytes(&changed), original_bytes, "{name}");
+            assert_ne!(changed.canonical_hash(), original_hash, "{name}");
+        }
+    }
+
+    #[test]
+    fn framing_keeps_empty_nul_and_adjacent_scalars_distinct() {
+        let empty = ir(r#"
+schema_version = 1
+nodes = []
+edges = []
+
+[workflow]
+id = ""
+version = ""
+entry = ""
+"#);
+        let nul = ir(r#"
+schema_version = 1
+nodes = []
+edges = []
+
+[workflow]
+id = "\u0000"
+version = ""
+entry = ""
+"#);
+        let a_bc = ir(r#"
+schema_version = 1
+nodes = []
+edges = []
+
+[workflow]
+id = "a"
+version = "bc"
+entry = ""
+"#);
+        let ab_c = ir(r#"
+schema_version = 1
+nodes = []
+edges = []
+
+[workflow]
+id = "ab"
+version = "c"
+entry = ""
+"#);
+
+        assert_ne!(canonical_bytes(&empty), canonical_bytes(&nul));
+        assert_ne!(canonical_bytes(&a_bc), canonical_bytes(&ab_c));
+    }
+
+    #[test]
+    fn raw_utf8_ordering_and_normalization_remain_semantic() {
+        let unicode = ir(r#"
+schema_version = 1
+edges = []
+
+[workflow]
+id = "é"
+version = "é"
+entry = "𐐷"
+
+[[nodes]]
+id = "𐐷"
+kind = "agent"
+
+[[nodes]]
+id = "é"
+kind = "action"
+
+[[nodes]]
+id = "é"
+kind = "terminal"
+"#);
+        let reordered = ir(r#"
+schema_version = 1
+edges = []
+
+[workflow]
+id = "é"
+version = "é"
+entry = "𐐷"
+
+[[nodes]]
+id = "é"
+kind = "terminal"
+
+[[nodes]]
+id = "é"
+kind = "action"
+
+[[nodes]]
+id = "𐐷"
+kind = "agent"
+"#);
+        let normalized = ir(r#"
+schema_version = 1
+edges = []
+
+[workflow]
+id = "é"
+version = "é"
+entry = "𐐷"
+
+[[nodes]]
+id = "é"
+kind = "terminal"
+
+[[nodes]]
+id = "é"
+kind = "action"
+
+[[nodes]]
+id = "𐐷"
+kind = "agent"
+"#);
+
+        assert_eq!(unicode, reordered);
+        assert_eq!(
+            unicode
+                .nodes()
+                .iter()
+                .map(|node| node.id().as_str())
+                .collect::<Vec<_>>(),
+            vec!["é", "é", "𐐷"]
+        );
+        assert_ne!(canonical_bytes(&unicode), canonical_bytes(&normalized));
+    }
+
+    #[test]
+    fn maps_all_source_kinds_to_pinned_tags() {
+        let cases = [
+            ("agent", IrNodeKind::Agent, 1),
+            ("action", IrNodeKind::Action, 2),
+            ("validator", IrNodeKind::Validator, 3),
+            ("registered", IrNodeKind::Registered, 4),
+            ("approval", IrNodeKind::Approval, 5),
+            ("terminal", IrNodeKind::Terminal, 6),
+        ];
+
+        for (source_kind, expected_kind, expected_tag) in cases {
+            let source = format!(
+                "schema_version = 1\nedges = []\n\n[workflow]\nid = \"w\"\nversion = \"1\"\nentry = \"n\"\n\n[[nodes]]\nid = \"n\"\nkind = \"{source_kind}\""
+            );
+            let lowered = ir(&source);
+            let node = &lowered.nodes()[0];
+            assert_eq!(node.kind(), expected_kind);
+            assert_eq!(node.kind().tag(), expected_tag);
+        }
+    }
+
+    #[test]
+    fn empty_graph_and_fixed_width_helpers_do_not_need_large_allocations() {
+        let empty = ir(r#"
+schema_version = 1
+nodes = []
+edges = []
+
+[workflow]
+id = ""
+version = ""
+entry = ""
+"#);
+        let mut bytes = Vec::new();
+        write_u64(&mut bytes, u64::MAX);
+
+        assert!(empty.nodes().is_empty());
+        assert!(empty.edges().is_empty());
+        assert_eq!(
+            u64_from_usize(usize::MAX),
+            u64::try_from(usize::MAX).expect("must fit")
+        );
+        assert_eq!(bytes, u64::MAX.to_be_bytes());
+    }
+}
