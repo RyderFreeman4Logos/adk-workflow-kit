@@ -351,7 +351,11 @@ fn write_quoted(formatter: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result 
 fn is_unsafe_human_control(character: char) -> bool {
     character <= '\u{001f}'
         || character == '\u{007f}'
-        || matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}')
+        || ('\u{0080}'..='\u{009f}').contains(&character)
+        || matches!(
+            character,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}'
+        )
         || ('\u{202a}'..='\u{202e}').contains(&character)
         || ('\u{2066}'..='\u{2069}').contains(&character)
 }

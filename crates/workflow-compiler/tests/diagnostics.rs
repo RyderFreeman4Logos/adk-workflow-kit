@@ -375,7 +375,7 @@ fn diagnostic_message(diagnostic: &Diagnostic) -> &'static str {
 
 #[test]
 fn preserves_hostile_authored_unicode_in_json_and_escapes_human_output() {
-    let hostile = "quote\" slash\\ newline\n carriage\r nul\0 escape\u{1b} del\u{7f} unicodeé bidi\u{061c}\u{200e}\u{200f}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}";
+    let hostile = "quote\" slash\\ newline\n carriage\r nul\0 escape\u{1b} del\u{7f} c1\u{0080}\u{0085}\u{009b}31mspoof\u{009f} separators\u{2028}\u{2029} unicodeé bidi\u{061c}\u{200e}\u{200f}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}";
     let source = r#"
 schema_version = 1
 edges = []
@@ -383,7 +383,7 @@ edges = []
 [workflow]
 id = "hostile"
 version = "1"
-entry = "quote\" slash\\ newline\n carriage\r nul\u0000 escape\u001b del\u007f unicodeé bidi\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+entry = "quote\" slash\\ newline\n carriage\r nul\u0000 escape\u001b del\u007f c1\u0080\u0085\u009b31mspoof\u009f separators\u2028\u2029 unicodeé bidi\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
 
 [[nodes]]
 id = "done"
@@ -409,7 +409,11 @@ kind = "terminal"
     assert!(!human.chars().any(|character| {
         character <= '\u{1f}'
             || character == '\u{7f}'
-            || matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}')
+            || ('\u{0080}'..='\u{009f}').contains(&character)
+            || matches!(
+                character,
+                '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}'
+            )
             || ('\u{202a}'..='\u{202e}').contains(&character)
             || ('\u{2066}'..='\u{2069}').contains(&character)
     }));
@@ -419,9 +423,15 @@ kind = "terminal"
     assert!(human.contains("\\u{001b}"));
     assert!(human.contains("\\u{007f}"));
     for escaped in [
+        "\\u{0080}",
+        "\\u{0085}",
+        "\\u{009b}",
+        "\\u{009f}",
         "\\u{061c}",
         "\\u{200e}",
         "\\u{200f}",
+        "\\u{2028}",
+        "\\u{2029}",
         "\\u{202a}",
         "\\u{202b}",
         "\\u{202c}",
