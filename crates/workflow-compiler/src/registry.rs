@@ -1,5 +1,7 @@
+use std::fmt;
+
 /// Identifies the category that owns a registry entry.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegistryCategory {
     /// A model implementation.
     Model,
@@ -16,6 +18,9 @@ pub enum RegistryCategory {
 }
 
 /// A successful immutable registry resolution.
+///
+/// REG-001 v0.1 intentionally exposes only an opaque ID and exact opaque version.
+/// Capability, schema, provenance, and lock metadata require later ratified contracts.
 pub struct RegistryEntry<'a, T> {
     implementation: &'a T,
     id: &'a str,
@@ -49,7 +54,7 @@ impl<'a, T> RegistryEntry<'a, T> {
 }
 
 /// An exact ID and version absent from a registry.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegistryNotFound {
     category: RegistryCategory,
     id: String,
@@ -81,6 +86,18 @@ impl RegistryNotFound {
         &self.version
     }
 }
+
+impl fmt::Display for RegistryNotFound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "registry entry not found: category={:?}, id={}, version={}",
+            self.category, self.id, self.version
+        )
+    }
+}
+
+impl std::error::Error for RegistryNotFound {}
 
 /// Resolves immutable model implementations by exact ID and version.
 pub trait ModelRegistry {

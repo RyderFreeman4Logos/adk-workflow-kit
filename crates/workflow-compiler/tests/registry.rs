@@ -245,3 +245,16 @@ fn fake_registries_resolve_only_exact_versioned_entries() {
         }
     }
 }
+
+#[test]
+fn registry_not_found_is_a_standard_error_with_exact_lookup_context() {
+    let error = RegistryNotFound::new(RegistryCategory::Tool, "tool-id", "1");
+
+    fn assert_standard_error<T: std::error::Error + std::fmt::Debug + std::fmt::Display>(_: &T) {}
+
+    assert_standard_error(&error);
+    assert_eq!(
+        error.to_string(),
+        "registry entry not found: category=Tool, id=tool-id, version=1"
+    );
+}
