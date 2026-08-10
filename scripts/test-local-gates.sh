@@ -14,7 +14,10 @@ fixture="$test_root/repo"
 mkdir -p "$fixture/scripts" "$fixture/bin"
 git -C "$fixture" init -q -b main
 cp "$source_runner" "$fixture/scripts/local-gates.sh"
-printf '%s\n' '.local-gates/' > "$fixture/.gitignore"
+printf '%s\n' \
+    '.local-gates/' \
+    '.csa/' \
+    > "$fixture/.gitignore"
 printf '%s\n' seed > "$fixture/tracked.txt"
 printf '%s\n' \
     '#!/usr/bin/env bash' \
@@ -29,6 +32,7 @@ printf '%s\n' \
     'set -euo pipefail' \
     'printf "%s\\n" "$*" > "${FAKE_CSA_LOG:?}"' \
     '[[ "$*" == "review --check-verdict --range main...HEAD" ]]' \
+    '[[ "${FAKE_CSA_FAIL:-0}" != 1 ]]' \
     > "$fixture/bin/csa"
 chmod +x "$fixture/scripts/local-gates.sh" "$fixture/bin/just" "$fixture/bin/csa"
 git -C "$fixture" add .
@@ -53,6 +57,7 @@ invoke() {
         FAKE_CSA_LOG="$csa_log" \
         FAKE_GATE_FAIL="${FAKE_GATE_FAIL:-0}" \
         FAKE_GATE_DIRTY="${FAKE_GATE_DIRTY:-0}" \
+        FAKE_CSA_FAIL="${FAKE_CSA_FAIL:-0}" \
         "$@")
 }
 
@@ -85,6 +90,24 @@ assert_pre_push_fails() {
         exit 1
     fi
     ((assertions += 1))
+}
+
+write_native_receipt() {
+    local head tree report_sha256
+    mkdir -p "$fixture/.csa"
+    printf '%s\n' 'native review report' > "$fixture/.csa/native-review.report"
+    head="$(git -C "$fixture" rev-parse HEAD)"
+    tree="$(git -C "$fixture" rev-parse HEAD^{tree})"
+    report_sha256="$(sha256sum < "$fixture/.csa/native-review.report")"
+    printf '%s\n' \
+        'schema=adk-workflow-kit-native-review-v1' \
+        'status=PASS' \
+        "head=$head" \
+        "tree=$tree" \
+        'range=main...HEAD' \
+        "report_sha256=${report_sha256%% *}" \
+        "report_path=$fixture/.csa/native-review.report" \
+        > "$fixture/.csa/native-review.receipt"
 }
 
 assert_fails protected-branch 'main' "$runner" check-branch
@@ -128,6 +151,27 @@ assert_pre_push_fails mismatched-oid \
 printf '%s\n' "$current_record" | invoke "$runner" pre-push
 [[ "$(<"$csa_log")" == 'review --check-verdict --range main...HEAD' ]]
 ((assertions += 2))
+CSA_SKIP_REVIEW_CHECK=1 FAKE_CSA_FAIL=1 assert_pre_push_fails native-receipt-missing \
+    'CSA review for main...HEAD or a valid native review receipt' "$current_record"
+mkdir -p "$fixture/.csa"
+printf '%s\n' malformed > "$fixture/.csa/native-review.receipt"
+FAKE_CSA_FAIL=1 assert_pre_push_fails native-receipt-malformed \
+    'CSA review for main...HEAD or a valid native review receipt' "$current_record"
+printf '%s\n' \
+    'schema=adk-workflow-kit-native-review-v1' \
+    'status=PASS' \
+    "head=$zero_oid" \
+    "tree=$(git -C "$fixture" rev-parse HEAD^{tree})" \
+    'range=main...HEAD' \
+    'report_sha256=0000000000000000000000000000000000000000000000000000000000000000' \
+    > "$fixture/.csa/native-review.receipt"
+FAKE_CSA_FAIL=1 assert_pre_push_fails native-receipt-stale-head \
+    'CSA review for main...HEAD or a valid native review receipt' "$current_record"
+write_native_receipt
+native_output="$(printf '%s\n' "$current_record" | FAKE_CSA_FAIL=1 invoke "$runner" pre-push 2>&1)"
+[[ "$native_output" == *'PASS native review receipt for main...'* ]]
+((assertions += 1))
+rm -rf -- "$fixture/.csa"
 
 printf '%s\n' malformed > "$fixture/.local-gates/quality-gate.receipt"
 assert_fails malformed-receipt 'malformed or stale' "$runner" verify

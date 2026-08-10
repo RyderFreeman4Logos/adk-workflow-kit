@@ -9,5 +9,5 @@ Thank you for contributing!
 3. Install the repository hooks once with `lefthook install`.
 4. Use `just fmt`, `just check`, `just clippy`, and `just test` instead of invoking Cargo directly.
 5. Run `just pre-commit-fast` before committing.
-6. On the clean committed candidate, run `just quality-gates` once. The pre-push hook reuses its exact-tree receipt and requires a passing CSA review of `main...HEAD`.
+6. On the clean committed candidate, run `just quality-gates` once. The pre-push hook reuses its exact-tree receipt and requires a passing CSA review of `main...HEAD` or an exact-tree native receipt at `.csa/native-review.receipt`.
 7. Open a pull request targeting `main`.
