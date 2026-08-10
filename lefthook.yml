@@ -1,7 +1,10 @@
 no_tty: true
 
 pre-commit:
+  piped: true
   commands:
+    branch-protection:
+      run: just check-branch
     local-gates:
       run: just pre-commit-fast
 
