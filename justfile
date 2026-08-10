@@ -19,6 +19,12 @@ clippy:
 test:
     {{_io}} cargo test --workspace --locked
 
+lock:
+    {{_io}} cargo generate-lockfile
+
+metadata:
+    {{_io}} cargo metadata --format-version 1 --locked
+
 test-local-gates:
     bash scripts/test-local-gates.sh
 

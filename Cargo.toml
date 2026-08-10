@@ -12,5 +12,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.94.0"
 license = "Apache-2.0"
 repository = "https://github.com/RyderFreeman4Logos/adk-workflow-kit"
+
+[workspace.dependencies]
+adk-rust = { version = "=1.0.0", default-features = false, features = ["agents", "models", "graph", "guardrail", "telemetry"] }
