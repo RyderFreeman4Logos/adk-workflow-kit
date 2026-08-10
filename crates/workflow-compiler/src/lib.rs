@@ -264,3 +264,36 @@ fn first_cyclic_component(forward: &Adjacency, reverse: &Adjacency) -> Option<Ve
 
     first
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{first_cyclic_component, Adjacency};
+
+    #[test]
+    fn finds_a_deep_cycle_on_a_bounded_stack() {
+        const NODES: usize = 8_192;
+        let worker = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let mut forward: Adjacency = vec![Vec::new(); NODES];
+                let mut reverse: Adjacency = vec![Vec::new(); NODES];
+                for index in 0..NODES - 1 {
+                    forward[index].push(index + 1);
+                    reverse[index + 1].push(index);
+                }
+                forward[NODES - 1].push(0);
+                reverse[0].push(NODES - 1);
+
+                // A recursive DFS cannot traverse this heap-built chain within 64 KiB.
+                assert_eq!(
+                    first_cyclic_component(&forward, &reverse),
+                    Some((0..NODES).collect())
+                );
+            })
+            .expect("bounded-stack worker should start");
+
+        worker
+            .join()
+            .expect("bounded-stack traversal should complete");
+    }
+}
