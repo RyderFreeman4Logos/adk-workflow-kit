@@ -1,6 +1,7 @@
 //! Deterministic, stack-safe validation for canonical workflow graphs.
 
 mod diagnostics;
+mod lock;
 mod registry;
 
 use std::{collections::VecDeque, fmt};
@@ -9,6 +10,7 @@ use workflow_ir::{IrNode, IrNodeKind, NodeId, WorkflowIr};
 use workflow_spec::{parse_str, SourcePath, SpecError};
 
 pub use diagnostics::{Diagnostic, DiagnosticProjectionError};
+pub use lock::{WorkflowLock, WorkflowLockError};
 pub use registry::{
     ModelRegistry, NodeRegistry, PredicateRegistry, RegistryCategory, RegistryEntry,
     RegistryNotFound, SkillRegistry, ToolRegistry, ValidatorRegistry,
