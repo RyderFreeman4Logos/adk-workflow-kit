@@ -1706,6 +1706,10 @@ dependencies = [
 [[package]]
 name = "workflow-compiler"
 version = "0.1.0"
+dependencies = [
+ "workflow-ir",
+ "workflow-spec",
+]
 
 [[package]]
 name = "workflow-ir"
