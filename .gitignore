@@ -2,5 +2,6 @@
 **/*.rs.bk
 .runs/
 .local-gates/
+.csa/
 *.log
 *_output.*
