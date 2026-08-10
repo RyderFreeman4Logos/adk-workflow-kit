@@ -44,11 +44,15 @@ gate_log="$fixture/.local-gates/gate.log"
 csa_log="$fixture/.local-gates/csa.log"
 assertions=0
 lefthook_config="$(cd "$repo_root" && lefthook dump)"
+if [[ "$lefthook_config" != *$'pre-commit:\n  commands:\n    branch-protection:\n      run: just check-branch\n    local-gates:\n      run: just pre-commit-fast'* ]]; then
+    printf 'FAIL pre-commit hook does not reject main before running local gates\n' >&2
+    exit 1
+fi
 if [[ "$lefthook_config" != *$'pre-push:\n  commands:\n    local-gates:\n      run: just pre-push\n      use_stdin: true'* ]]; then
     printf 'FAIL pre-push hook does not forward Git update records to just pre-push\n' >&2
     exit 1
 fi
-((assertions += 1))
+((assertions += 2))
 
 invoke() {
     (cd "$fixture" && env \

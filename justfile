@@ -22,6 +22,10 @@ test:
 lock:
     {{_io}} cargo generate-lockfile
 
+# Verify Cargo.lock already matches the workspace manifests without rewriting it.
+lock-check:
+    {{_io}} cargo generate-lockfile --locked
+
 metadata:
     {{_io}} cargo metadata --format-version 1 --locked
 
@@ -31,7 +35,7 @@ test-local-gates:
 check-branch:
     scripts/local-gates.sh check-branch
 
-pre-commit-fast: check-branch fmt-check check clippy test-local-gates
+pre-commit-fast: check-branch fmt-check lock-check check clippy test-local-gates
 
 _quality-gates: fmt-check check clippy test test-local-gates
 
@@ -40,3 +44,7 @@ quality-gates:
 
 pre-push:
     scripts/local-gates.sh pre-push
+
+# Install the repository's Lefthook-managed local gates after cloning.
+install-hooks:
+    lefthook install

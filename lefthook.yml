@@ -2,6 +2,8 @@ no_tty: true
 
 pre-commit:
   commands:
+    branch-protection:
+      run: just check-branch
     local-gates:
       run: just pre-commit-fast
 
