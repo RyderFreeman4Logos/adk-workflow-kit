@@ -1,0 +1,161 @@
+/// Identifies the category that owns a registry entry.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum RegistryCategory {
+    /// A model implementation.
+    Model,
+    /// A tool implementation.
+    Tool,
+    /// A workflow node implementation.
+    Node,
+    /// A validator implementation.
+    Validator,
+    /// A predicate implementation.
+    Predicate,
+    /// A Skill implementation.
+    Skill,
+}
+
+/// A successful immutable registry resolution.
+pub struct RegistryEntry<'a, T> {
+    implementation: &'a T,
+    id: &'a str,
+    version: &'a str,
+}
+
+impl<'a, T> RegistryEntry<'a, T> {
+    /// Creates a borrowed registry resolution with its exact identity and version.
+    pub fn new(implementation: &'a T, id: &'a str, version: &'a str) -> Self {
+        Self {
+            implementation,
+            id,
+            version,
+        }
+    }
+
+    /// Returns the original borrowed implementation.
+    pub fn implementation(&self) -> &'a T {
+        self.implementation
+    }
+
+    /// Returns the resolved opaque ID.
+    pub fn id(&self) -> &'a str {
+        self.id
+    }
+
+    /// Returns the resolved exact version.
+    pub fn version(&self) -> &'a str {
+        self.version
+    }
+}
+
+/// An exact ID and version absent from a registry.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RegistryNotFound {
+    category: RegistryCategory,
+    id: String,
+    version: String,
+}
+
+impl RegistryNotFound {
+    /// Creates a typed exact-lookup failure.
+    pub fn new(category: RegistryCategory, id: &str, version: &str) -> Self {
+        Self {
+            category,
+            id: id.to_owned(),
+            version: version.to_owned(),
+        }
+    }
+
+    /// Returns the registry category that was queried.
+    pub fn category(&self) -> RegistryCategory {
+        self.category
+    }
+
+    /// Returns the requested opaque ID.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the requested exact version.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+}
+
+/// Resolves immutable model implementations by exact ID and version.
+pub trait ModelRegistry {
+    /// The model implementation type.
+    type Implementation;
+
+    /// Resolves an implementation only when both ID and version match exactly.
+    fn resolve(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<RegistryEntry<'_, Self::Implementation>, RegistryNotFound>;
+}
+
+/// Resolves immutable tool implementations by exact ID and version.
+pub trait ToolRegistry {
+    /// The tool implementation type.
+    type Implementation;
+
+    /// Resolves an implementation only when both ID and version match exactly.
+    fn resolve(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<RegistryEntry<'_, Self::Implementation>, RegistryNotFound>;
+}
+
+/// Resolves immutable workflow node implementations by exact ID and version.
+pub trait NodeRegistry {
+    /// The workflow node implementation type.
+    type Implementation;
+
+    /// Resolves an implementation only when both ID and version match exactly.
+    fn resolve(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<RegistryEntry<'_, Self::Implementation>, RegistryNotFound>;
+}
+
+/// Resolves immutable validator implementations by exact ID and version.
+pub trait ValidatorRegistry {
+    /// The validator implementation type.
+    type Implementation;
+
+    /// Resolves an implementation only when both ID and version match exactly.
+    fn resolve(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<RegistryEntry<'_, Self::Implementation>, RegistryNotFound>;
+}
+
+/// Resolves immutable predicate implementations by exact ID and version.
+pub trait PredicateRegistry {
+    /// The predicate implementation type.
+    type Implementation;
+
+    /// Resolves an implementation only when both ID and version match exactly.
+    fn resolve(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<RegistryEntry<'_, Self::Implementation>, RegistryNotFound>;
+}
+
+/// Resolves immutable Skill implementations by exact ID and version.
+pub trait SkillRegistry {
+    /// The Skill implementation type.
+    type Implementation;
+
+    /// Resolves an implementation only when both ID and version match exactly.
+    fn resolve(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<RegistryEntry<'_, Self::Implementation>, RegistryNotFound>;
+}
