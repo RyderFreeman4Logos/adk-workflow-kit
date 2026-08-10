@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, fmt};
 use serde::Serialize;
 use workflow_spec::{SourceLocation, SpecError};
 
-use crate::{GraphValidationError, MissingEdgeEndpoint};
+use crate::{CompileError, GraphValidationError, MissingEdgeEndpoint};
 
 const DIAGNOSTIC_VERSION: u8 = 1;
 
@@ -223,6 +223,17 @@ impl TryFrom<&GraphValidationError> for Diagnostic {
             location: None,
             details,
         })
+    }
+}
+
+impl TryFrom<&CompileError> for Diagnostic {
+    type Error = DiagnosticProjectionError;
+
+    fn try_from(error: &CompileError) -> Result<Self, Self::Error> {
+        match error {
+            CompileError::Parse(error) => Self::try_from(error),
+            CompileError::Graph(error) => Self::try_from(error),
+        }
     }
 }
 

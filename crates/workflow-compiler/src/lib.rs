@@ -6,12 +6,56 @@ mod registry;
 use std::collections::VecDeque;
 
 use workflow_ir::{IrNode, IrNodeKind, NodeId, WorkflowIr};
+use workflow_spec::{parse_str, SourcePath, SpecError};
 
 pub use diagnostics::{Diagnostic, DiagnosticProjectionError};
 pub use registry::{
     ModelRegistry, NodeRegistry, PredicateRegistry, RegistryCategory, RegistryEntry,
     RegistryNotFound, SkillRegistry, ToolRegistry, ValidatorRegistry,
 };
+
+/// A typed failure from one compiler pipeline stage.
+#[derive(Debug)]
+pub enum CompileError {
+    /// Strict workflow text parsing failed.
+    Parse(SpecError),
+    /// Canonical workflow graph validation failed.
+    Graph(GraphValidationError),
+}
+
+/// A successful in-memory compiler result with validated IR and exact registry bindings.
+///
+/// Resolved bindings remain fixed for this value's lifetime. The current IR declares no registry
+/// references, so its exact-resolution stage is vacuous and successful plans have zero bindings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompiledPlan {
+    ir: WorkflowIr,
+}
+
+impl CompiledPlan {
+    /// Returns the normalized canonical workflow IR.
+    pub fn ir(&self) -> &WorkflowIr {
+        &self.ir
+    }
+
+    /// Returns the number of exact registry bindings.
+    ///
+    /// The current canonical IR has no registry-reference fields, so this is always zero.
+    pub fn registry_binding_count(&self) -> usize {
+        0
+    }
+}
+
+/// Parses, canonically normalizes, validates, and exact-resolves workflow text in memory.
+pub fn compile_str(
+    source: impl Into<SourcePath>,
+    toml: &str,
+) -> Result<CompiledPlan, CompileError> {
+    let spec = parse_str(source, toml).map_err(CompileError::Parse)?;
+    let ir = WorkflowIr::from(&spec);
+    validate_graph(&ir).map_err(CompileError::Graph)?;
+    Ok(CompiledPlan { ir })
+}
 
 type Adjacency = Vec<Vec<usize>>;
 
