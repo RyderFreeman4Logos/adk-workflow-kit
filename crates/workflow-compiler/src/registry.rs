@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::diagnostics::write_quoted;
+
 /// Identifies the category that owns a registry entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegistryCategory {
@@ -91,9 +93,12 @@ impl fmt::Display for RegistryNotFound {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "registry entry not found: category={:?}, id={}, version={}",
-            self.category, self.id, self.version
-        )
+            "registry entry not found: category={:?}, id=",
+            self.category
+        )?;
+        write_quoted(formatter, &self.id)?;
+        formatter.write_str(", version=")?;
+        write_quoted(formatter, &self.version)
     }
 }
 

@@ -331,7 +331,7 @@ impl fmt::Display for DiagnosticDetails {
     }
 }
 
-fn write_quoted(formatter: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
+pub(crate) fn write_quoted(formatter: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
     formatter.write_str("\"")?;
     for character in value.chars() {
         match character {

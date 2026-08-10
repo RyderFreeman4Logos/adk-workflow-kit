@@ -255,6 +255,40 @@ fn registry_not_found_is_a_standard_error_with_exact_lookup_context() {
     assert_standard_error(&error);
     assert_eq!(
         error.to_string(),
-        "registry entry not found: category=Tool, id=tool-id, version=1"
+        "registry entry not found: category=Tool, id=\"tool-id\", version=\"1\""
     );
+}
+
+#[test]
+fn registry_not_found_escapes_hostile_opaque_lookup_context() {
+    let error = RegistryNotFound::new(
+        RegistryCategory::Tool,
+        "id\n\u{1b}\u{0080}\u{2028}\u{2029}\u{202e}",
+        "version\r\0\u{009b}\u{2067}",
+    );
+
+    let human = error.to_string();
+    assert_eq!(human.lines().count(), 1);
+    assert!(!human.chars().any(|character| {
+        character <= '\u{1f}'
+            || character == '\u{7f}'
+            || ('\u{0080}'..='\u{009f}').contains(&character)
+            || matches!(character, '\u{2028}' | '\u{2029}')
+            || ('\u{202a}'..='\u{202e}').contains(&character)
+            || ('\u{2066}'..='\u{2069}').contains(&character)
+    }));
+    for escaped in [
+        "\\n",
+        "\\r",
+        "\\u{0000}",
+        "\\u{001b}",
+        "\\u{0080}",
+        "\\u{009b}",
+        "\\u{2028}",
+        "\\u{2029}",
+        "\\u{202e}",
+        "\\u{2067}",
+    ] {
+        assert!(human.contains(escaped));
+    }
 }
