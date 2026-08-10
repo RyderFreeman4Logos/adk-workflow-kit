@@ -57,6 +57,9 @@ struct DiagnosticSpan {
 #[serde(untagged)]
 enum DiagnosticDetails {
     Empty {},
+    InvalidIdentifier {
+        field_path: &'static str,
+    },
     UnsupportedSchemaVersion {
         found: u64,
     },
@@ -131,6 +134,11 @@ impl TryFrom<&GraphValidationError> for Diagnostic {
 
     fn try_from(error: &GraphValidationError) -> Result<Self, Self::Error> {
         let (code, message, details) = match error {
+            GraphValidationError::InvalidIdentifier { field_path } => (
+                "workflow.graph.invalid_identifier",
+                "invalid identifier",
+                DiagnosticDetails::InvalidIdentifier { field_path },
+            ),
             GraphValidationError::DuplicateNodeId {
                 node_id,
                 occurrences,
@@ -298,6 +306,11 @@ impl fmt::Display for DiagnosticDetails {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty {} => formatter.write_str("{}"),
+            Self::InvalidIdentifier { field_path } => {
+                formatter.write_str("{field_path=")?;
+                write_quoted(formatter, field_path)?;
+                formatter.write_str("}")
+            }
             Self::UnsupportedSchemaVersion { found } => {
                 write!(formatter, "{{found={found}}}")
             }
@@ -370,3 +383,14 @@ fn is_unsafe_human_control(character: char) -> bool {
         || ('\u{202a}'..='\u{202e}').contains(&character)
         || ('\u{2066}'..='\u{2069}').contains(&character)
 }
+
+impl fmt::Display for GraphValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match Diagnostic::try_from(self) {
+            Ok(diagnostic) => diagnostic.fmt(formatter),
+            Err(_) => formatter.write_str("invalid workflow graph diagnostic"),
+        }
+    }
+}
+
+impl std::error::Error for GraphValidationError {}

@@ -3,7 +3,7 @@
 mod diagnostics;
 mod registry;
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, fmt};
 
 use workflow_ir::{IrNode, IrNodeKind, NodeId, WorkflowIr};
 use workflow_spec::{parse_str, SourcePath, SpecError};
@@ -19,8 +19,26 @@ pub use registry::{
 pub enum CompileError {
     /// Strict workflow text parsing failed.
     Parse(SpecError),
-    /// Canonical workflow graph validation failed.
+    /// Canonical workflow semantic validation failed.
     Graph(GraphValidationError),
+}
+
+impl fmt::Display for CompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parse(error) => write!(formatter, "workflow parsing failed: {error}"),
+            Self::Graph(error) => write!(formatter, "workflow graph validation failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Parse(error) => Some(error),
+            Self::Graph(error) => Some(error),
+        }
+    }
 }
 
 /// A successful in-memory compiler result with validated IR and exact registry bindings.
@@ -70,9 +88,14 @@ pub enum MissingEdgeEndpoint {
     Both,
 }
 
-/// A semantic graph failure with source-free canonical IR identifiers.
+/// A semantic workflow failure with source-free canonical IR identifiers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GraphValidationError {
+    /// A workflow or graph identifier is empty.
+    InvalidIdentifier {
+        /// The stable structural path of the invalid identifier.
+        field_path: &'static str,
+    },
     /// More than one declared node has the same identifier.
     DuplicateNodeId {
         /// The duplicated identifier.
@@ -113,11 +136,14 @@ pub enum GraphValidationError {
     },
 }
 
-/// Validates graph structure and terminal liveness for canonical workflow IR.
+/// Validates identifiers, graph structure, and terminal liveness for canonical workflow IR.
 ///
 /// The validator is deterministic, uses no recursive traversal, and accepts duplicate edges.
 pub fn validate_graph(ir: &WorkflowIr) -> Result<(), GraphValidationError> {
     let nodes = ir.nodes();
+    if let Some(error) = invalid_identifier_error(ir) {
+        return Err(error);
+    }
     if let Some(error) = duplicate_node_error(nodes) {
         return Err(error);
     }
@@ -168,6 +194,35 @@ pub fn validate_graph(ir: &WorkflowIr) -> Result<(), GraphValidationError> {
     }
 
     Ok(())
+}
+
+fn invalid_identifier_error(ir: &WorkflowIr) -> Option<GraphValidationError> {
+    for (field_path, value) in [
+        ("workflow.id", ir.workflow_id().as_str()),
+        ("workflow.entry", ir.entry_node_id().as_str()),
+    ] {
+        if value.is_empty() {
+            return Some(GraphValidationError::InvalidIdentifier { field_path });
+        }
+    }
+    if ir.nodes().iter().any(|node| node.id().as_str().is_empty()) {
+        return Some(GraphValidationError::InvalidIdentifier {
+            field_path: "nodes[].id",
+        });
+    }
+    for edge in ir.edges() {
+        if edge.from().as_str().is_empty() {
+            return Some(GraphValidationError::InvalidIdentifier {
+                field_path: "edges[].from",
+            });
+        }
+        if edge.to().as_str().is_empty() {
+            return Some(GraphValidationError::InvalidIdentifier {
+                field_path: "edges[].to",
+            });
+        }
+    }
+    None
 }
 
 fn duplicate_node_error(nodes: &[IrNode]) -> Option<GraphValidationError> {
