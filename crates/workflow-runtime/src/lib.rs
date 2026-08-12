@@ -1,9 +1,13 @@
 //! Cooperative run enforcement, terminal contracts, and sandbox preflight.
 
 mod controller;
+mod workdir;
 
 pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
+};
+pub use workdir::{
+    CleanupOutcome, RunWorkdir, WorkdirError, WorkdirErrorKind, WorkdirId, WorkdirManager,
 };
 
 use std::{collections::HashSet, fmt, num::NonZeroU64};
