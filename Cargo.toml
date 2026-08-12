@@ -4,6 +4,7 @@ members = [
     "crates/workflow-spec",
     "crates/workflow-ir",
     "crates/workflow-compiler",
+    "crates/workflow-testkit",
     "crates/workflow-adk",
     "crates/workflow-runtime",
     "crates/workflowctl",
