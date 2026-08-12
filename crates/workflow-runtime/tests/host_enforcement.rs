@@ -185,6 +185,50 @@ fn output_is_charged_before_acceptance_without_partial_mutation() {
 }
 
 #[test]
+fn automatic_progress_events_reset_idle_to_the_exact_boundary() {
+    type ProgressEvent = for<'limits> fn(&mut RunController<'limits>) -> Result<(), RunTermination>;
+
+    let cases: [(&str, ProgressEvent); 4] = [
+        ("model admission", |controller| {
+            controller.admit_model_turn(elapsed(4))
+        }),
+        ("tool admission", |controller| {
+            controller.begin_tool_call(elapsed(4), "tool", "1")
+        }),
+        ("positive tool output", |controller| {
+            pass(controller.begin_tool_call(Duration::ZERO, "tool", "1"));
+            controller.accept_tool_output(elapsed(4), 1)
+        }),
+        ("tool completion", |controller| {
+            pass(controller.begin_tool_call(Duration::ZERO, "tool", "1"));
+            controller.finish_tool_call(elapsed(4))
+        }),
+    ];
+
+    for (name, progress) in cases {
+        let context = run_context([10, 10, 10, 100, 5, 100, 100]);
+        let mut controller = RunController::new(&context);
+        progress(&mut controller).unwrap_or_else(|termination| {
+            panic!("{name} must succeed at 4 ms: {:?}", termination.cause())
+        });
+        controller.poll(elapsed(8)).unwrap_or_else(|termination| {
+            panic!(
+                "{name} must keep the run alive through 8 ms: {:?}",
+                termination.cause()
+            )
+        });
+        let termination = controller
+            .poll(elapsed(9))
+            .expect_err("renewed idle deadline must terminate at 9 ms");
+        assert_eq!(
+            termination.cause(),
+            RunTerminalCause::TimedOut(RunTimeoutKind::IdleTime),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn duration_boundaries_reset_only_on_progress_and_choose_earliest_deadline() {
     for (values, kind) in [
         ([10, 10, 10, 10, 100, 100, 100], RunTimeoutKind::WallTime),
