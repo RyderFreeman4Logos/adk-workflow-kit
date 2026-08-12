@@ -1,5 +1,38 @@
-use workflow_ir::{IrNodeKind, IrSchemaVersion, WorkflowIr};
-use workflow_spec::parse_str;
+use workflow_ir::{IrNodeKind, IrRouteOperator, IrSchemaVersion, WorkflowIr};
+use workflow_spec::{parse_str, RouteOperator, UnsupportedRouteOperator};
+
+const ROUTE_OPERATOR_PAIRS: [(RouteOperator, IrRouteOperator); 9] = [
+    (RouteOperator::Equals, IrRouteOperator::Equals),
+    (RouteOperator::NotEquals, IrRouteOperator::NotEquals),
+    (RouteOperator::IsTrue, IrRouteOperator::IsTrue),
+    (RouteOperator::IsFalse, IrRouteOperator::IsFalse),
+    (RouteOperator::Exists, IrRouteOperator::Exists),
+    (RouteOperator::IsEmpty, IrRouteOperator::IsEmpty),
+    (RouteOperator::EnumCase, IrRouteOperator::EnumCase),
+    (RouteOperator::NumericRange, IrRouteOperator::NumericRange),
+    (RouteOperator::StatusClass, IrRouteOperator::StatusClass),
+];
+
+const NONCANONICAL_ROUTE_OPERATORS: [&str; 18] = [
+    "",
+    " equals",
+    "equals ",
+    "Equals",
+    "EQUALS",
+    "not-equals",
+    "equal",
+    "not_equal",
+    "true",
+    "false",
+    "exist",
+    "empty",
+    "enum",
+    "numeric_ranges",
+    "status_classes",
+    "range",
+    "status",
+    "contains",
+];
 
 const GOLDEN_WORKFLOW: &str = r#"
 schema_version = 1
@@ -25,6 +58,37 @@ to = "a"
 from = "a"
 to = "b"
 "#;
+
+#[test]
+fn route_operators_map_exhaustively_and_preserve_identity() {
+    let mut mapped = Vec::new();
+
+    for (operator, expected) in ROUTE_OPERATOR_PAIRS {
+        let actual = IrRouteOperator::from(operator);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.as_str(), operator.as_str());
+        assert!(!mapped.contains(&actual));
+        mapped.push(actual);
+    }
+
+    assert_eq!(mapped.len(), 9);
+}
+
+#[test]
+fn invalid_route_operator_names_never_construct_ir() {
+    for input in NONCANONICAL_ROUTE_OPERATORS {
+        let mut constructed = 0;
+        let result: Result<IrRouteOperator, UnsupportedRouteOperator> =
+            input.parse::<RouteOperator>().map(|operator| {
+                constructed += 1;
+                IrRouteOperator::from(operator)
+            });
+
+        let error = result.expect_err("noncanonical operator should not construct IR");
+        assert_eq!(constructed, 0);
+        assert_eq!(error.input(), input);
+    }
+}
 
 #[test]
 fn lowers_to_a_normalized_source_free_ir_with_a_stable_hash() {
