@@ -24,7 +24,7 @@ lock:
 
 # Verify Cargo.lock already matches the workspace manifests without rewriting it.
 lock-check:
-    {{_io}} cargo generate-lockfile --locked
+    {{_io}} cargo metadata --format-version 1 --locked > /dev/null
 
 metadata:
     {{_io}} cargo metadata --format-version 1 --locked
