@@ -186,6 +186,81 @@ pub enum NodeKind {
     Terminal,
 }
 
+/// The closed route-operator identity vocabulary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteOperator {
+    /// The `equals` identity.
+    Equals,
+    /// The `not_equals` identity.
+    NotEquals,
+    /// The `is_true` identity.
+    IsTrue,
+    /// The `is_false` identity.
+    IsFalse,
+    /// The `exists` identity.
+    Exists,
+    /// The `is_empty` identity.
+    IsEmpty,
+    /// The `enum_case` identity.
+    EnumCase,
+    /// The `numeric_range` identity.
+    NumericRange,
+    /// The `status_class` identity.
+    StatusClass,
+}
+
+impl RouteOperator {
+    /// Returns the canonical operator name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Equals => "equals",
+            Self::NotEquals => "not_equals",
+            Self::IsTrue => "is_true",
+            Self::IsFalse => "is_false",
+            Self::Exists => "exists",
+            Self::IsEmpty => "is_empty",
+            Self::EnumCase => "enum_case",
+            Self::NumericRange => "numeric_range",
+            Self::StatusClass => "status_class",
+        }
+    }
+}
+
+/// An exact route-operator name that is outside the closed vocabulary.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("unsupported route operator {input:?}")]
+pub struct UnsupportedRouteOperator {
+    input: String,
+}
+
+impl UnsupportedRouteOperator {
+    /// Returns the unsupported input exactly as supplied.
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+}
+
+impl std::str::FromStr for RouteOperator {
+    type Err = UnsupportedRouteOperator;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input {
+            "equals" => Ok(Self::Equals),
+            "not_equals" => Ok(Self::NotEquals),
+            "is_true" => Ok(Self::IsTrue),
+            "is_false" => Ok(Self::IsFalse),
+            "exists" => Ok(Self::Exists),
+            "is_empty" => Ok(Self::IsEmpty),
+            "enum_case" => Ok(Self::EnumCase),
+            "numeric_range" => Ok(Self::NumericRange),
+            "status_class" => Ok(Self::StatusClass),
+            input => Err(UnsupportedRouteOperator {
+                input: input.to_owned(),
+            }),
+        }
+    }
+}
+
 /// A source-level node without variant payload fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Node {

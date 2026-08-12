@@ -1,7 +1,7 @@
 //! Canonical, source-free workflow intermediate representation.
 
 use sha2::{Digest, Sha256};
-use workflow_spec::{NodeKind as SpecNodeKind, SchemaVersion, WorkflowSpec};
+use workflow_spec::{NodeKind as SpecNodeKind, RouteOperator, SchemaVersion, WorkflowSpec};
 
 /// The canonical byte-wire version used for content identity.
 pub const CANONICAL_IR_WIRE_VERSION_V1: u16 = 1;
@@ -72,6 +72,62 @@ impl IrNodeKind {
             Self::Registered => 4,
             Self::Approval => 5,
             Self::Terminal => 6,
+        }
+    }
+}
+
+/// The closed set of normalized route-operator identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrRouteOperator {
+    /// The `equals` identity.
+    Equals,
+    /// The `not_equals` identity.
+    NotEquals,
+    /// The `is_true` identity.
+    IsTrue,
+    /// The `is_false` identity.
+    IsFalse,
+    /// The `exists` identity.
+    Exists,
+    /// The `is_empty` identity.
+    IsEmpty,
+    /// The `enum_case` identity.
+    EnumCase,
+    /// The `numeric_range` identity.
+    NumericRange,
+    /// The `status_class` identity.
+    StatusClass,
+}
+
+impl IrRouteOperator {
+    /// Returns the canonical operator name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Equals => "equals",
+            Self::NotEquals => "not_equals",
+            Self::IsTrue => "is_true",
+            Self::IsFalse => "is_false",
+            Self::Exists => "exists",
+            Self::IsEmpty => "is_empty",
+            Self::EnumCase => "enum_case",
+            Self::NumericRange => "numeric_range",
+            Self::StatusClass => "status_class",
+        }
+    }
+}
+
+impl From<RouteOperator> for IrRouteOperator {
+    fn from(operator: RouteOperator) -> Self {
+        match operator {
+            RouteOperator::Equals => Self::Equals,
+            RouteOperator::NotEquals => Self::NotEquals,
+            RouteOperator::IsTrue => Self::IsTrue,
+            RouteOperator::IsFalse => Self::IsFalse,
+            RouteOperator::Exists => Self::Exists,
+            RouteOperator::IsEmpty => Self::IsEmpty,
+            RouteOperator::EnumCase => Self::EnumCase,
+            RouteOperator::NumericRange => Self::NumericRange,
+            RouteOperator::StatusClass => Self::StatusClass,
         }
     }
 }

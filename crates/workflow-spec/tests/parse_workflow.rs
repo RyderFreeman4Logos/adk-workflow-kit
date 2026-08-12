@@ -6,8 +6,8 @@ use std::{
 };
 
 use workflow_spec::{
-    parse_file, parse_str, FieldPath, NodeKind, SchemaVersion, SourcePath, SpecError,
-    WORKFLOW_SCHEMA_VERSION_V1,
+    parse_file, parse_str, FieldPath, NodeKind, RouteOperator, SchemaVersion, SourcePath,
+    SpecError, UnsupportedRouteOperator, WORKFLOW_SCHEMA_VERSION_V1,
 };
 
 const MINIMAL: &str = r#"
@@ -23,6 +23,53 @@ entry = "finish"
 id = "finish"
 kind = "terminal"
 "#;
+
+const ROUTE_OPERATORS: [(RouteOperator, &str); 9] = [
+    (RouteOperator::Equals, "equals"),
+    (RouteOperator::NotEquals, "not_equals"),
+    (RouteOperator::IsTrue, "is_true"),
+    (RouteOperator::IsFalse, "is_false"),
+    (RouteOperator::Exists, "exists"),
+    (RouteOperator::IsEmpty, "is_empty"),
+    (RouteOperator::EnumCase, "enum_case"),
+    (RouteOperator::NumericRange, "numeric_range"),
+    (RouteOperator::StatusClass, "status_class"),
+];
+
+const NONCANONICAL_ROUTE_OPERATORS: [&str; 18] = [
+    "",
+    " equals",
+    "equals ",
+    "Equals",
+    "EQUALS",
+    "not-equals",
+    "equal",
+    "not_equal",
+    "true",
+    "false",
+    "exist",
+    "empty",
+    "enum",
+    "numeric_ranges",
+    "status_classes",
+    "range",
+    "status",
+    "contains",
+];
+
+fn route_operator_ordinal(operator: RouteOperator) -> usize {
+    match operator {
+        RouteOperator::Equals => 0,
+        RouteOperator::NotEquals => 1,
+        RouteOperator::IsTrue => 2,
+        RouteOperator::IsFalse => 3,
+        RouteOperator::Exists => 4,
+        RouteOperator::IsEmpty => 5,
+        RouteOperator::EnumCase => 6,
+        RouteOperator::NumericRange => 7,
+        RouteOperator::StatusClass => 8,
+    }
+}
 
 static TEMP_DIR_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -63,6 +110,42 @@ fn parses_a_strict_v1_workflow_from_text() {
     assert_eq!(spec.nodes()[0].id().as_str(), "finish");
     assert_eq!(spec.nodes()[0].kind(), NodeKind::Terminal);
     assert!(spec.edges().is_empty());
+}
+
+#[test]
+fn route_operator_names_are_closed_exact_and_round_trip() {
+    let mut names = ROUTE_OPERATORS.map(|(_, name)| name);
+    names.sort_unstable();
+    assert!(names.windows(2).all(|pair| pair[0] != pair[1]));
+
+    for (ordinal, (operator, name)) in ROUTE_OPERATORS.iter().copied().enumerate() {
+        assert_eq!(route_operator_ordinal(operator), ordinal);
+        assert_eq!(operator.as_str(), name);
+        assert_eq!(name.parse::<RouteOperator>(), Ok(operator));
+    }
+}
+
+#[test]
+fn route_operator_rejects_noncanonical_names_without_losing_input() {
+    for input in NONCANONICAL_ROUTE_OPERATORS {
+        let error: UnsupportedRouteOperator = input
+            .parse::<RouteOperator>()
+            .expect_err("noncanonical operator should fail");
+        assert_eq!(error.input(), input);
+    }
+}
+
+#[test]
+fn route_operator_diagnostics_escape_hostile_input() {
+    let input = "\n\t\0\u{7f}\"\\";
+    let error = input
+        .parse::<RouteOperator>()
+        .expect_err("hostile operator should fail");
+    let diagnostic = error.to_string();
+
+    assert_eq!(error.input(), input);
+    assert_eq!(diagnostic, format!("unsupported route operator {input:?}"));
+    assert!(!diagnostic.chars().any(char::is_control));
 }
 
 #[test]
@@ -145,6 +228,21 @@ fn rejects_unknown_root_workflow_and_node_kind_values() {
     assert!(matches!(
         parse_str("kind.workflow.toml", &kind),
         Err(SpecError::Decode { location, .. }) if location.field.as_str() == "nodes[0].kind"
+    ));
+}
+
+#[test]
+fn rejects_illustrative_routes_as_an_unknown_root_field() {
+    let input = MINIMAL.replacen(
+        "edges = []",
+        r#"edges = []
+routes = [{ operator = "equals", target = "finish" }]"#,
+        1,
+    );
+
+    assert!(matches!(
+        parse_str("routes.workflow.toml", &input),
+        Err(SpecError::Decode { location, .. }) if location.field.as_str() == "routes"
     ));
 }
 
