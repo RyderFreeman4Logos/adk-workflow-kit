@@ -1741,6 +1741,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "workflow-testkit"
+version = "0.1.0"
+dependencies = [
+ "adk-rust",
+ "serde_json",
+ "tokio",
+ "workflow-compiler",
+]
+
+[[package]]
 name = "workflowctl"
 version = "0.1.0"
 
