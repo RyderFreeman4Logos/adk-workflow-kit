@@ -1,4 +1,10 @@
-//! Immutable terminal run and sandbox preflight contracts.
+//! Cooperative run enforcement, terminal contracts, and sandbox preflight.
+
+mod controller;
+
+pub use controller::{
+    RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
+};
 
 use std::{collections::HashSet, fmt, num::NonZeroU64};
 
