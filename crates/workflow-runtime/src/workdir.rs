@@ -9,7 +9,7 @@ use std::{
 
 use serde::Serialize;
 
-use crate::RunId;
+use crate::{encode_hex, RunId};
 
 /// Allocates one owned filesystem root per run.
 ///
@@ -55,7 +55,7 @@ impl WorkdirManager {
                 entropy
                     .read_exact(&mut bytes)
                     .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::Entropy, error))?;
-                Ok(WorkdirId(hex(&bytes)))
+                Ok(WorkdirId(encode_hex(&bytes)))
             },
             initialize_layout,
         )
@@ -425,17 +425,6 @@ impl RunWorkdir {
         self.active = false;
         Ok(outcome)
     }
-}
-
-fn hex(bytes: &[u8; 16]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-
-    let mut encoded = String::with_capacity(32);
-    for byte in bytes {
-        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
-    }
-    encoded
 }
 
 #[cfg(test)]

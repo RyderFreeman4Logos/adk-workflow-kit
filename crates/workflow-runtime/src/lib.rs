@@ -1,10 +1,14 @@
 //! Cooperative run enforcement, terminal contracts, and sandbox preflight.
 
 mod controller;
+mod session;
 mod workdir;
 
 pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
+};
+pub use session::{
+    RunSessionIds, SessionId, SessionIdentityError, SessionIdentityErrorKind, SessionRole,
 };
 pub use workdir::{
     CleanupOutcome, RunWorkdir, WorkdirError, WorkdirErrorKind, WorkdirId, WorkdirManager,
@@ -13,6 +17,17 @@ pub use workdir::{
 use std::{collections::HashSet, fmt, num::NonZeroU64};
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
 
 /// An opaque caller-supplied run identifier.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
