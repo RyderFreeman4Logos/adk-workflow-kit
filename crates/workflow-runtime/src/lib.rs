@@ -1,9 +1,14 @@
 //! Cooperative run enforcement, terminal contracts, and sandbox preflight.
 
+mod artifact;
 mod controller;
 mod session;
 mod workdir;
 
+pub use artifact::{
+    ArtifactError, ArtifactErrorKind, ArtifactId, ArtifactPage, ArtifactStore,
+    InMemoryArtifactStore, PageRequest, RetentionPolicy,
+};
 pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
 };
