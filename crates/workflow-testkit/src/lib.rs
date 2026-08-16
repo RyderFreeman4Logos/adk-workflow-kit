@@ -1,5 +1,7 @@
 //! Deterministic offline ADK-Rust test doubles and exact tool registry fixtures.
 
+mod sandbox;
+
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
@@ -11,6 +13,11 @@ use adk_rust::{
 };
 use serde_json::Value;
 use workflow_compiler::{RegistryCategory, RegistryEntry, RegistryNotFound, ToolRegistry};
+
+pub use sandbox::{
+    FakeSandboxBackend, FakeSandboxReceipt, FakeSandboxRequest, FakeSandboxRequestError,
+    FakeSandboxRequestErrorKind,
+};
 
 type RequestPredicate = dyn Fn(&LlmRequest) -> Result<(), String> + Send + Sync;
 
