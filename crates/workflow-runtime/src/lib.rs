@@ -3,6 +3,7 @@
 mod artifact;
 mod controller;
 mod session;
+mod tool;
 mod workdir;
 
 pub use artifact::{
@@ -15,6 +16,7 @@ pub use controller::{
 pub use session::{
     RunSessionIds, SessionId, SessionIdentityError, SessionIdentityErrorKind, SessionRole,
 };
+pub use tool::{ToolEnvelope, ToolFailure, ToolProvenance};
 pub use workdir::{
     CleanupOutcome, RunWorkdir, WorkdirError, WorkdirErrorKind, WorkdirId, WorkdirManager,
 };
