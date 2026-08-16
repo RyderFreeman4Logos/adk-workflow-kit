@@ -9,6 +9,7 @@ license.workspace = true
 adk-rust.workspace = true
 serde_json.workspace = true
 workflow-compiler = { path = "../workflow-compiler" }
+workflow-runtime = { path = "../workflow-runtime" }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
