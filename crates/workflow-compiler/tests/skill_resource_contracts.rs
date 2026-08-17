@@ -161,6 +161,30 @@ fn bounded_list_and_paged_read_require_activation_without_dispatch() {
     };
     assert_eq!(second.bytes(), b"d");
     assert_eq!(second.next_offset(), None);
+
+    let terminal = match resources.read_skill_resource(&guide, PageRequest::new(4, nonzero_u64(8)))
+    {
+        Ok(read) => read.into_page(),
+        Err(error) => panic!("payload-end page must read: {error}"),
+    };
+    assert!(terminal.bytes().is_empty());
+    assert_eq!(terminal.next_offset(), None);
+
+    let missing = resource_id("references/missing=do-not-echo");
+    match resources.read_skill_resource(&missing, PageRequest::new(0, nonzero_u64(8))) {
+        Err(error @ SkillResourceError::ResourceNotFound) => {
+            assert_private_error(error, "do-not-echo")
+        }
+        Ok(_) => panic!("missing resource must fail closed"),
+        Err(error) => panic!("wrong missing-resource error: {error}"),
+    }
+    match resources.read_skill_resource(&guide, PageRequest::new(5, nonzero_u64(8))) {
+        Err(error @ SkillResourceError::PageOutOfBounds) => {
+            assert_private_error(error, "do-not-echo")
+        }
+        Ok(_) => panic!("past-end page must fail closed"),
+        Err(error) => panic!("wrong past-end page error: {error}"),
+    }
 }
 
 #[test]
@@ -224,11 +248,79 @@ fn symlink_escape_is_rejected_without_echoing_target() {
 
 #[test]
 fn oversized_payload_and_total_read_budget_fail_closed() {
+    struct TooManyResourcesCanary {
+        pulled: usize,
+    }
+
+    impl Iterator for TooManyResourcesCanary {
+        type Item = SkillResourceInput;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.pulled += 1;
+            match self.pulled {
+                1 => Some(SkillResourceInput::file(
+                    resource_id("assets/first"),
+                    b"one".to_vec(),
+                )),
+                2 => Some(SkillResourceInput::file(
+                    resource_id("assets/too-many=do-not-echo"),
+                    b"two".to_vec(),
+                )),
+                _ => panic!("resource iterator was read past max_resources + 1"),
+            }
+        }
+    }
+
     let registry = TestSkillRegistry {
         manifest: manifest(""),
     };
     let receipt = activate(&registry);
     let capabilities = effective(&[SandboxCapability::FilesystemRead]);
+
+    let too_many = receipt.attach_resources(
+        &capabilities,
+        limits(1, 4, 2, 3),
+        TooManyResourcesCanary { pulled: 0 },
+    );
+    match too_many {
+        Err(error @ SkillResourceError::TooManyResources) => {
+            assert_private_error(error, "do-not-echo")
+        }
+        Ok(_) => panic!("resource count over the limit must fail closed"),
+        Err(error) => panic!("wrong resource-count error: {error}"),
+    }
+
+    let duplicate_id = resource_id("assets/duplicate=do-not-echo");
+    let duplicate = receipt.attach_resources(
+        &capabilities,
+        limits(2, 4, 2, 3),
+        [
+            SkillResourceInput::file(duplicate_id.clone(), b"one".to_vec()),
+            SkillResourceInput::file(duplicate_id, b"two".to_vec()),
+        ],
+    );
+    match duplicate {
+        Err(error @ SkillResourceError::DuplicateResource) => {
+            assert_private_error(error, "do-not-echo")
+        }
+        Ok(_) => panic!("duplicate resource IDs must fail closed"),
+        Err(error) => panic!("wrong duplicate-resource error: {error}"),
+    }
+
+    let empty = receipt.attach_resources(
+        &capabilities,
+        limits(1, 4, 2, 3),
+        [SkillResourceInput::file(
+            resource_id("assets/empty=do-not-echo"),
+            Vec::new(),
+        )],
+    );
+    match empty {
+        Err(error @ SkillResourceError::EmptyPayload) => assert_private_error(error, "do-not-echo"),
+        Ok(_) => panic!("empty resource payload must fail closed"),
+        Err(error) => panic!("wrong empty-payload error: {error}"),
+    }
+
     let oversized = receipt.attach_resources(
         &capabilities,
         limits(1, 4, 2, 3),

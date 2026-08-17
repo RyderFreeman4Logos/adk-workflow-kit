@@ -313,15 +313,15 @@ impl<'a> SkillActivationReceipt<'a> {
             return Err(SkillResourceError::CapabilityDenied);
         }
 
-        let inputs = resources.into_iter().collect::<Vec<_>>();
-        if inputs.len() > limits.max_resources.get() {
-            return Err(SkillResourceError::TooManyResources);
-        }
-
         let mut metadata = BTreeMap::new();
         let mut store =
             InMemoryArtifactStore::new(limits.max_resource_bytes, limits.max_page_bytes);
-        for input in inputs {
+        let mut remaining_resources = limits.max_resources.get();
+        for input in resources {
+            if remaining_resources == 0 {
+                return Err(SkillResourceError::TooManyResources);
+            }
+            remaining_resources -= 1;
             let (id, bytes) = match input {
                 SkillResourceInput::File { id, bytes } => (id, bytes),
                 SkillResourceInput::Symlink { id: _, target: _ } => {
