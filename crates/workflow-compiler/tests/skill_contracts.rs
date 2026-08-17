@@ -112,6 +112,48 @@ fn valid_fixture_discovers_parses_and_activates_explicitly_without_dispatch() {
 }
 
 #[test]
+fn yaml_frontmatter_preserves_valid_scalar_forms_and_flow_metadata() {
+    let cases = [
+        (
+            "unseparated hash",
+            "---\nname: valid-skill\ndescription: Use https://example.com/foo#bar\n---\n",
+            "Use https://example.com/foo#bar",
+        ),
+        (
+            "apostrophe before a comment",
+            "---\nname: valid-skill\ndescription: It's useful # comment\n---\n",
+            "It's useful",
+        ),
+        (
+            "folded description",
+            "---\nname: valid-skill\ndescription: >\n  Folded descriptions\n  remain strings.\n---\n",
+            "Folded descriptions remain strings.",
+        ),
+        (
+            "literal description",
+            "---\nname: valid-skill\ndescription: |\n  Literal descriptions\n  keep newlines.\n---\n",
+            "Literal descriptions\nkeep newlines.",
+        ),
+        (
+            "flow metadata",
+            "---\nname: valid-skill\ndescription: Flow metadata parses.\nmetadata: {note: \"alpha,beta\"}\n---\n",
+            "Flow metadata parses.",
+        ),
+    ];
+
+    for (case, markdown, expected_description) in cases {
+        let manifest = match SkillManifest::parse(Path::new("valid-skill"), markdown.as_bytes()) {
+            Ok(manifest) => manifest,
+            Err(error) => panic!("{case} should be valid YAML frontmatter: {error}"),
+        };
+        assert_eq!(
+            manifest.discovery_metadata().description(),
+            expected_description
+        );
+    }
+}
+
+#[test]
 fn empty_or_malformed_manifest_fields_fail_closed() {
     let cases = [
         (

@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, ffi::OsStr, fmt, path::Path};
+use std::{ffi::OsStr, fmt, path::Path};
 
 use crate::SkillRegistry;
 
@@ -305,6 +305,12 @@ fn strip_cr(line: &str) -> &str {
 }
 
 fn parse_frontmatter(frontmatter: &str) -> Result<FrontmatterFields, SkillManifestError> {
+    let frontmatter =
+        serde_yaml::from_str(frontmatter).map_err(|_| SkillManifestError::InvalidFrontmatter)?;
+    let mapping = match frontmatter {
+        serde_yaml::Value::Mapping(mapping) => mapping,
+        _ => return Err(SkillManifestError::InvalidFrontmatter),
+    };
     let mut fields = FrontmatterFields {
         name: None,
         description: None,
@@ -312,46 +318,14 @@ fn parse_frontmatter(frontmatter: &str) -> Result<FrontmatterFields, SkillManife
     let mut license_seen = false;
     let mut compatibility_seen = false;
     let mut allowed_tools_seen = false;
-    let mut metadata: Option<Metadata> = None;
-    let mut metadata_active = false;
+    let mut metadata_seen = false;
 
-    for raw_line in frontmatter.lines() {
-        let line = strip_cr(raw_line);
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if line.starts_with('\t') {
-            return Err(SkillManifestError::InvalidFrontmatter);
-        }
-        if line.starts_with(' ') {
-            if !metadata_active {
-                return Err(SkillManifestError::InvalidFrontmatter);
-            }
-            let metadata = metadata
-                .as_mut()
-                .ok_or(SkillManifestError::InvalidFrontmatter)?;
-            if !metadata.requires_entry {
-                return Err(SkillManifestError::InvalidFrontmatter);
-            }
-            let (key, value) = split_mapping(trimmed)?;
-            validate_metadata_entry(key, value, metadata)?;
-            continue;
-        }
-
-        if metadata_active
-            && metadata
-                .as_ref()
-                .is_some_and(|metadata| !metadata.is_complete())
-        {
-            return Err(SkillManifestError::InvalidFrontmatter);
-        }
-        metadata_active = false;
-        let (key, value) = split_mapping(line)?;
-        match key {
-            "name" => set_field(&mut fields.name, parse_string(value)?)?,
+    for (key, value) in mapping {
+        let key = yaml_string(key)?;
+        match key.as_str() {
+            "name" => set_field(&mut fields.name, yaml_string(value)?)?,
             "description" => {
-                let description = parse_string(value)?;
+                let description = yaml_string(value)?;
                 let description = description.trim();
                 if description.is_empty() || description.chars().count() > MAX_DESCRIPTION_SCALARS {
                     return Err(SkillManifestError::InvalidDescription);
@@ -362,14 +336,14 @@ fn parse_frontmatter(frontmatter: &str) -> Result<FrontmatterFields, SkillManife
                 if license_seen {
                     return Err(SkillManifestError::InvalidFrontmatter);
                 }
-                let _license = parse_string(value)?;
+                let _license = yaml_string(value)?;
                 license_seen = true;
             }
             "compatibility" => {
                 if compatibility_seen {
                     return Err(SkillManifestError::InvalidFrontmatter);
                 }
-                let compatibility = parse_string(value)?;
+                let compatibility = yaml_string(value)?;
                 let compatibility = compatibility.trim();
                 if compatibility.is_empty()
                     || compatibility.chars().count() > MAX_COMPATIBILITY_SCALARS
@@ -379,42 +353,24 @@ fn parse_frontmatter(frontmatter: &str) -> Result<FrontmatterFields, SkillManife
                 compatibility_seen = true;
             }
             "metadata" => {
-                if metadata.is_some() {
+                if metadata_seen {
                     return Err(SkillManifestError::InvalidFrontmatter);
                 }
-                metadata = Some(Metadata::new(value)?);
-                metadata_active = true;
+                validate_metadata(value)?;
+                metadata_seen = true;
             }
             "allowed-tools" => {
                 if allowed_tools_seen {
                     return Err(SkillManifestError::InvalidFrontmatter);
                 }
-                let _allowed_tools = parse_string(value)?;
+                let _allowed_tools = yaml_string(value)?;
                 allowed_tools_seen = true;
             }
             _ => return Err(SkillManifestError::InvalidFrontmatter),
         }
     }
 
-    if metadata_active
-        && metadata
-            .as_ref()
-            .is_some_and(|metadata| !metadata.is_complete())
-    {
-        return Err(SkillManifestError::InvalidFrontmatter);
-    }
     Ok(fields)
-}
-
-fn split_mapping(line: &str) -> Result<(&str, &str), SkillManifestError> {
-    let (key, value) = line
-        .split_once(':')
-        .ok_or(SkillManifestError::InvalidFrontmatter)?;
-    let key = key.trim();
-    if key.is_empty() {
-        return Err(SkillManifestError::InvalidFrontmatter);
-    }
-    Ok((key, value))
 }
 
 fn set_field(field: &mut Option<String>, value: String) -> Result<(), SkillManifestError> {
@@ -424,188 +380,21 @@ fn set_field(field: &mut Option<String>, value: String) -> Result<(), SkillManif
     Ok(())
 }
 
-struct Metadata {
-    entries: BTreeSet<String>,
-    requires_entry: bool,
-}
-
-impl Metadata {
-    fn new(value: &str) -> Result<Self, SkillManifestError> {
-        let value = without_comment(value).trim();
-        if value.is_empty() {
-            return Ok(Self {
-                entries: BTreeSet::new(),
-                requires_entry: true,
-            });
-        }
-        if value == "{}" {
-            return Ok(Self {
-                entries: BTreeSet::new(),
-                requires_entry: false,
-            });
-        }
-        let inner = value
-            .strip_prefix('{')
-            .and_then(|value| value.strip_suffix('}'))
-            .ok_or(SkillManifestError::InvalidFrontmatter)?;
-        let mut metadata = Self {
-            entries: BTreeSet::new(),
-            requires_entry: false,
-        };
-        for entry in inner.split(',') {
-            let (key, value) = split_mapping(entry)?;
-            validate_metadata_entry(key, value, &mut metadata)?;
-        }
-        if metadata.entries.is_empty() {
-            return Err(SkillManifestError::InvalidFrontmatter);
-        }
-        Ok(metadata)
-    }
-
-    fn is_complete(&self) -> bool {
-        !self.requires_entry || !self.entries.is_empty()
-    }
-}
-
-fn validate_metadata_entry(
-    key: &str,
-    value: &str,
-    metadata: &mut Metadata,
-) -> Result<(), SkillManifestError> {
-    let key = parse_string(key)?;
-    let _value = parse_string(value)?;
-    if !metadata.entries.insert(key) {
-        return Err(SkillManifestError::InvalidFrontmatter);
+fn validate_metadata(value: serde_yaml::Value) -> Result<(), SkillManifestError> {
+    let mapping = match value {
+        serde_yaml::Value::Mapping(mapping) => mapping,
+        _ => return Err(SkillManifestError::InvalidFrontmatter),
+    };
+    for (key, value) in mapping {
+        let _key = yaml_string(key)?;
+        let _value = yaml_string(value)?;
     }
     Ok(())
 }
 
-fn parse_string(raw: &str) -> Result<String, SkillManifestError> {
-    let value = without_comment(raw).trim();
-    if value.is_empty()
-        || looks_like_non_string_scalar(value)
-        || value.starts_with(['[', '{', '|', '>'])
-    {
-        return Err(SkillManifestError::InvalidFrontmatter);
+fn yaml_string(value: serde_yaml::Value) -> Result<String, SkillManifestError> {
+    match value {
+        serde_yaml::Value::String(value) => Ok(value),
+        _ => Err(SkillManifestError::InvalidFrontmatter),
     }
-    match value.chars().next() {
-        Some('\'') => parse_single_quoted(value),
-        Some('"') => parse_double_quoted(value),
-        Some(_) if value.ends_with(['\'', '"']) => Err(SkillManifestError::InvalidFrontmatter),
-        Some(_) => Ok(value.to_owned()),
-        None => Err(SkillManifestError::InvalidFrontmatter),
-    }
-}
-
-fn looks_like_non_string_scalar(value: &str) -> bool {
-    if value.eq_ignore_ascii_case("null")
-        || value.eq_ignore_ascii_case("true")
-        || value.eq_ignore_ascii_case("false")
-        || matches!(
-            value,
-            "~" | ".inf" | ".Inf" | ".INF" | ".nan" | ".NaN" | ".NAN"
-        )
-    {
-        return true;
-    }
-    let bytes = value.as_bytes();
-    matches!(bytes.first(), Some(b'0'..=b'9')) || matches!(bytes, [b'+' | b'-', b'0'..=b'9', ..])
-}
-
-fn without_comment(value: &str) -> &str {
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in value.char_indices() {
-        match quote {
-            Some('"') if escaped => escaped = false,
-            Some('"') if character == '\\' => escaped = true,
-            Some(delimiter) if character == delimiter => quote = None,
-            Some(_) => {}
-            None if matches!(character, '\'' | '"') => quote = Some(character),
-            None if character == '#' => return &value[..index],
-            None => {}
-        }
-    }
-    value
-}
-
-fn parse_single_quoted(value: &str) -> Result<String, SkillManifestError> {
-    let inner = value
-        .strip_prefix('\'')
-        .and_then(|value| value.strip_suffix('\''))
-        .ok_or(SkillManifestError::InvalidFrontmatter)?;
-    let mut parsed = String::with_capacity(inner.len());
-    let mut characters = inner.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\'' && characters.next_if_eq(&'\'').is_none() {
-            return Err(SkillManifestError::InvalidFrontmatter);
-        }
-        parsed.push(character);
-    }
-    Ok(parsed)
-}
-
-fn parse_double_quoted(value: &str) -> Result<String, SkillManifestError> {
-    let inner = value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .ok_or(SkillManifestError::InvalidFrontmatter)?;
-    let mut parsed = String::with_capacity(inner.len());
-    let mut characters = inner.chars();
-    while let Some(character) = characters.next() {
-        if character == '"' {
-            return Err(SkillManifestError::InvalidFrontmatter);
-        }
-        if character != '\\' {
-            parsed.push(character);
-            continue;
-        }
-        let escaped = characters
-            .next()
-            .ok_or(SkillManifestError::InvalidFrontmatter)?;
-        match escaped {
-            '0' => parsed.push('\0'),
-            'a' => parsed.push('\u{7}'),
-            'b' => parsed.push('\u{8}'),
-            't' => parsed.push('\t'),
-            'n' => parsed.push('\n'),
-            'v' => parsed.push('\u{b}'),
-            'f' => parsed.push('\u{c}'),
-            'r' => parsed.push('\r'),
-            'e' => parsed.push('\u{1b}'),
-            ' ' => parsed.push(' '),
-            '"' => parsed.push('"'),
-            '/' => parsed.push('/'),
-            '\\' => parsed.push('\\'),
-            'N' => parsed.push('\u{85}'),
-            '_' => parsed.push('\u{a0}'),
-            'L' => parsed.push('\u{2028}'),
-            'P' => parsed.push('\u{2029}'),
-            'x' => push_unicode_escape(&mut characters, 2, &mut parsed)?,
-            'u' => push_unicode_escape(&mut characters, 4, &mut parsed)?,
-            'U' => push_unicode_escape(&mut characters, 8, &mut parsed)?,
-            _ => return Err(SkillManifestError::InvalidFrontmatter),
-        }
-    }
-    Ok(parsed)
-}
-
-fn push_unicode_escape(
-    characters: &mut std::str::Chars<'_>,
-    digits: usize,
-    output: &mut String,
-) -> Result<(), SkillManifestError> {
-    let mut encoded = String::with_capacity(digits);
-    for _ in 0..digits {
-        encoded.push(
-            characters
-                .next()
-                .ok_or(SkillManifestError::InvalidFrontmatter)?,
-        );
-    }
-    let codepoint =
-        u32::from_str_radix(&encoded, 16).map_err(|_| SkillManifestError::InvalidFrontmatter)?;
-    let character = char::from_u32(codepoint).ok_or(SkillManifestError::InvalidFrontmatter)?;
-    output.push(character);
-    Ok(())
 }
