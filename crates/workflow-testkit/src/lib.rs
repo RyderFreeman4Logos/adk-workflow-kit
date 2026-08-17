@@ -1,5 +1,6 @@
 //! Deterministic offline ADK-Rust test doubles and exact tool registry fixtures.
 
+mod replay;
 mod sandbox;
 
 use std::{
@@ -14,6 +15,7 @@ use adk_rust::{
 use serde_json::Value;
 use workflow_compiler::{RegistryCategory, RegistryEntry, RegistryNotFound, ToolRegistry};
 
+pub use replay::{ReplayBundle, ReplayError, ReplayErrorKind, ReplayEvent, StructuralTrace};
 pub use sandbox::{
     FakeSandboxBackend, FakeSandboxReceipt, FakeSandboxRequest, FakeSandboxRequestError,
     FakeSandboxRequestErrorKind,
