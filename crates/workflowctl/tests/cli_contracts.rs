@@ -1,17 +1,26 @@
 use std::{
     ffi::OsString,
+    fs,
     io::Read,
     os::unix::ffi::OsStringExt,
+    path::PathBuf,
     process::{Child, Command, Output, Stdio},
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
-const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS]\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n\nPlanned commands (not available in v0.1): validate, graph, lock\n";
+const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const HUMAN_ERROR: &str =
     "[workflow.cli.invalid_arguments] invalid command-line arguments location=null details={}\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}\n";
 const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 const SUBPROCESS_TIMEOUT_MESSAGE: &str = "workflowctl contract subprocess timed out";
+const MINIMAL_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/minimal.workflow.toml"
+);
+
+static TEMP_FILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 struct ChildGuard {
     child: Option<Child>,
@@ -108,6 +117,14 @@ fn assert_error(output: Output, expected_stderr: &str) {
     assert_eq!(output.stderr, expected_stderr.as_bytes());
 }
 
+fn temporary_fixture_path(name: &str) -> PathBuf {
+    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "workflowctl-cli-contract-{name}-{}-{sequence}.workflow.toml",
+        std::process::id()
+    ))
+}
+
 #[test]
 fn help_is_deterministic_success_with_empty_stderr_and_no_dispatch() {
     for arguments in [
@@ -185,4 +202,176 @@ fn oversized_argument_is_rejected_before_dispatch() {
     let mut rejected_command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
     rejected_command.args(["--json", rejected.as_str()]);
     assert_error(output(&mut rejected_command), JSON_ERROR);
+}
+
+#[test]
+fn minimal_fixture_validates_and_emits_exact_graph_and_lock_bytes() {
+    let mut validate = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+    validate.args(["validate", MINIMAL_FIXTURE]);
+    let validate_output = output(&mut validate);
+    assert!(validate_output.status.success());
+    assert_eq!(validate_output.stdout, b"valid\n");
+    assert!(validate_output.stderr.is_empty());
+
+    let mut graph = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+    graph.args(["graph", MINIMAL_FIXTURE, "--format", "mermaid"]);
+    let graph_output = output(&mut graph);
+    assert!(graph_output.status.success());
+    assert_eq!(
+        graph_output.stdout,
+        b"graph TD\n  n646f6e65[\"done (terminal)\"]\n  n7374617274[\"start (agent)\"]\n  n7374617274 --> n646f6e65\n"
+    );
+    assert!(graph_output.stderr.is_empty());
+
+    let mut lock = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+    lock.args(["lock", MINIMAL_FIXTURE]);
+    let lock_output = output(&mut lock);
+    assert!(lock_output.status.success());
+    assert_eq!(
+        lock_output.stdout,
+        b"lock_version = 1\ncanonical_ir_wire_version = 1\nir_schema_version = 1\nworkflow_id = \"minimal\"\nworkflow_version = \"1\"\nir_hash = \"sha256:46959e152a1ba0d913d74b1c18a5f19f8a9655394275494e0f508f2e4c0a9b5c\"\nsemantic_resource_hashes = []\n"
+    );
+    assert!(lock_output.stderr.is_empty());
+}
+
+#[test]
+fn graph_percent_encodes_hostile_ids_in_canonical_order() {
+    let fixture = temporary_fixture_path("hostile");
+    fs::write(
+        &fixture,
+        r#"schema_version = 1
+
+[workflow]
+id = "hostile"
+version = "1"
+entry = "start %é"
+
+[[nodes]]
+id = "start %é"
+kind = "agent"
+
+[[nodes]]
+id = "done/✓"
+kind = "terminal"
+
+[[edges]]
+from = "start %é"
+to = "done/✓"
+"#,
+    )
+    .expect("hostile fixture should be writable");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+    command.args([
+        "graph",
+        fixture.to_str().expect("temporary path should be UTF-8"),
+        "--format",
+        "mermaid",
+    ]);
+    let graph = output(&mut command);
+    assert!(graph.status.success());
+    assert_eq!(
+        graph.stdout,
+        b"graph TD\n  n646f6e652fe29c93[\"done%2F%E2%9C%93 (terminal)\"]\n  n73746172742025c3a9[\"start%20%25%C3%A9 (agent)\"]\n  n73746172742025c3a9 --> n646f6e652fe29c93\n"
+    );
+    assert!(graph.stderr.is_empty());
+    fs::remove_file(fixture).expect("hostile fixture should be removable");
+}
+
+#[test]
+fn subcommand_usage_errors_preserve_cli_001_contract() {
+    for arguments in [
+        ["validate"].as_slice(),
+        ["graph", MINIMAL_FIXTURE].as_slice(),
+        ["graph", MINIMAL_FIXTURE, "--format", "dot"].as_slice(),
+        ["lock", MINIMAL_FIXTURE, "extra"].as_slice(),
+        ["--unknown"].as_slice(),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+        command.args(arguments);
+        assert_error(output(&mut command), HUMAN_ERROR);
+    }
+
+    let mut json_command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+    json_command.args(["graph", MINIMAL_FIXTURE, "--json"]);
+    assert_error(output(&mut json_command), JSON_ERROR);
+}
+
+#[test]
+fn source_and_compile_failures_are_redacted_diagnostics_without_partial_stdout() {
+    let missing = temporary_fixture_path("secret-missing");
+    let invalid_utf8 = temporary_fixture_path("secret-invalid-utf8");
+    let decode = temporary_fixture_path("secret-decode");
+    let graph = temporary_fixture_path("secret-graph");
+    fs::write(&invalid_utf8, [0xff]).expect("invalid UTF-8 fixture should be writable");
+    fs::write(&decode, "schema_version = [").expect("decode fixture should be writable");
+    fs::write(
+        &graph,
+        r#"schema_version = 1
+edges = []
+
+[workflow]
+id = "invalid"
+version = "1"
+entry = "done"
+
+[[nodes]]
+id = "done"
+kind = "terminal"
+
+[[nodes]]
+id = "orphan"
+kind = "agent"
+"#,
+    )
+    .expect("graph fixture should be writable");
+
+    for (path, code) in [
+        (&missing, "workflow.source.read_failed"),
+        (&invalid_utf8, "workflow.source.invalid_utf8"),
+        (&decode, "workflow.source.decode_failed"),
+        (&graph, "workflow.graph.unreachable_node"),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+        command.args([
+            "validate",
+            path.to_str().expect("temporary path should be UTF-8"),
+        ]);
+        let failure = output(&mut command);
+        assert_eq!(failure.status.code(), Some(2));
+        assert!(failure.stdout.is_empty());
+        let stderr = String::from_utf8(failure.stderr).expect("diagnostic should be UTF-8");
+        assert!(stderr.starts_with(&format!("[{code}]")));
+        assert!(!stderr.contains("secret-"));
+    }
+
+    let mut json_command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+    json_command.args([
+        "--json",
+        "validate",
+        missing.to_str().expect("temporary path should be UTF-8"),
+    ]);
+    let json_failure = output(&mut json_command);
+    assert_eq!(json_failure.status.code(), Some(2));
+    assert!(json_failure.stdout.is_empty());
+    let json_stderr = String::from_utf8(json_failure.stderr).expect("diagnostic should be UTF-8");
+    assert!(json_stderr.contains("\"code\":\"workflow.source.read_failed\""));
+    assert!(!json_stderr.contains("secret-"));
+
+    for path in [invalid_utf8, decode, graph] {
+        fs::remove_file(path).expect("temporary fixture should be removable");
+    }
+}
+
+#[test]
+fn hostile_and_oversized_paths_fail_before_dispatch_without_echo() {
+    let hostile = OsString::from("\u{001f}");
+    let mut hostile_command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+    hostile_command.arg("validate").arg(hostile);
+    assert_error(output(&mut hostile_command), HUMAN_ERROR);
+
+    let oversized = "a".repeat(4097);
+    let mut oversized_command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+    oversized_command.args(["--json", "validate", oversized.as_str()]);
+    assert_error(output(&mut oversized_command), JSON_ERROR);
 }
