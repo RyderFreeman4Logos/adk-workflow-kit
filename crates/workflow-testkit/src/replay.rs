@@ -264,6 +264,11 @@ impl ReplayError {
     const fn new(kind: ReplayErrorKind) -> Self {
         Self { kind }
     }
+
+    /// Returns the stable category for this rejected replay document.
+    pub const fn kind(&self) -> ReplayErrorKind {
+        self.kind
+    }
 }
 
 impl fmt::Display for ReplayError {
