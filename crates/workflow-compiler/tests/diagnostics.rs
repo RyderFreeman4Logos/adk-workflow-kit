@@ -4,6 +4,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+#[cfg(unix)]
+use std::process::Command;
+
 use serde_json::{json, Value};
 use workflow_compiler::{
     compile_file, validate_graph, Diagnostic, DiagnosticProjectionError, GraphValidationError,
@@ -614,7 +617,7 @@ fn compile_file_projects_read_utf8_decode_and_graph_failures_without_paths() {
     let graph = temp_dir.path().join("secret-graph.workflow.toml");
     let oversized = temp_dir.path().join("secret-oversized.workflow.toml");
     #[cfg(unix)]
-    let non_regular = PathBuf::from("/dev/null");
+    let writerless_fifo = temp_dir.path().join("secret-writerless-fifo.workflow.toml");
     fs::write(&invalid_utf8, [0xff]).expect("invalid UTF-8 fixture should be writable");
     fs::write(&decode, "schema_version = [").expect("decode fixture should be writable");
     fs::write(&oversized, vec![b'x'; 1_048_577]).expect("oversized fixture should be writable");
@@ -638,6 +641,17 @@ kind = "agent"
 "#,
     )
     .expect("graph fixture should be writable");
+    #[cfg(unix)]
+    {
+        let creation = Command::new("mkfifo")
+            .arg(&writerless_fifo)
+            .status()
+            .expect("writerless FIFO fixture should be creatable");
+        assert!(
+            creation.success(),
+            "writerless FIFO fixture creation failed"
+        );
+    }
 
     let mut cases = vec![
         (&missing, "workflow.source.read_failed"),
@@ -647,7 +661,7 @@ kind = "agent"
         (&oversized, "workflow.source.read_failed"),
     ];
     #[cfg(unix)]
-    cases.push((&non_regular, "workflow.source.read_failed"));
+    cases.push((&writerless_fifo, "workflow.source.read_failed"));
 
     for (path, code) in cases {
         let error = compile_file(path).expect_err("invalid file fixture should fail");

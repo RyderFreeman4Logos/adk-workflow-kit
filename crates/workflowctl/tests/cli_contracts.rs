@@ -353,6 +353,8 @@ fn source_and_compile_failures_are_redacted_diagnostics_without_partial_stdout()
     let decode = temporary_fixture_path("secret-decode");
     let graph = temporary_fixture_path("secret-graph");
     let oversized = temporary_fixture_path("secret-oversized");
+    #[cfg(unix)]
+    let writerless_fifo = temporary_fixture_path("secret-writerless-fifo");
     fs::write(&invalid_utf8, [0xff]).expect("invalid UTF-8 fixture should be writable");
     fs::write(&decode, "schema_version = [").expect("decode fixture should be writable");
     fs::write(&oversized, vec![b'x'; 1_048_577]).expect("oversized fixture should be writable");
@@ -376,6 +378,17 @@ kind = "agent"
 "#,
     )
     .expect("graph fixture should be writable");
+    #[cfg(unix)]
+    {
+        let creation = Command::new("mkfifo")
+            .arg(&writerless_fifo)
+            .status()
+            .expect("writerless FIFO fixture should be creatable");
+        assert!(
+            creation.success(),
+            "writerless FIFO fixture creation failed"
+        );
+    }
 
     for (path, code) in [
         (&missing, "workflow.source.read_failed"),
@@ -411,7 +424,7 @@ kind = "agent"
 
     let mut unsafe_paths = vec![oversized.as_path()];
     #[cfg(unix)]
-    unsafe_paths.push(std::path::Path::new("/dev/null"));
+    unsafe_paths.push(writerless_fifo.as_path());
     for path in unsafe_paths {
         let path = path.to_str().expect("unsafe fixture path should be UTF-8");
         for arguments in [
@@ -433,6 +446,8 @@ kind = "agent"
     for path in [invalid_utf8, decode, graph, oversized] {
         fs::remove_file(path).expect("temporary fixture should be removable");
     }
+    #[cfg(unix)]
+    fs::remove_file(writerless_fifo).expect("writerless FIFO fixture should be removable");
 }
 
 #[test]

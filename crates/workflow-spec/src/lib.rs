@@ -14,6 +14,9 @@ pub const WORKFLOW_SCHEMA_VERSION_V1: u32 = 1;
 
 const MAX_SOURCE_BYTES: usize = 1_048_576;
 
+#[cfg(target_os = "linux")]
+const LINUX_O_NONBLOCK: i32 = 0o4_000;
+
 /// The original filesystem or logical path associated with workflow source text.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourcePath(PathBuf);
@@ -420,8 +423,21 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<WorkflowSpec, SpecError> {
 }
 
 fn read_source_file(source: &SourcePath) -> Result<Vec<u8>, SpecError> {
-    let metadata =
-        std::fs::metadata(source.as_path()).map_err(|error| source_read_error(source, error))?;
+    #[cfg(target_os = "linux")]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(LINUX_O_NONBLOCK)
+            .open(source.as_path())
+    };
+    #[cfg(not(target_os = "linux"))]
+    let file = std::fs::File::open(source.as_path());
+    let file = file.map_err(|error| source_read_error(source, error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| source_read_error(source, error))?;
     if !metadata.is_file() {
         return Err(source_read_error(
             source,
@@ -432,8 +448,6 @@ fn read_source_file(source: &SourcePath) -> Result<Vec<u8>, SpecError> {
         ));
     }
 
-    let file =
-        std::fs::File::open(source.as_path()).map_err(|error| source_read_error(source, error))?;
     let mut bytes = Vec::new();
     file.take((MAX_SOURCE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
