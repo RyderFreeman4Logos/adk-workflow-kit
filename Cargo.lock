@@ -1733,9 +1733,11 @@ dependencies = [
 name = "workflow-compiler"
 version = "0.1.0"
 dependencies = [
+ "jsonschema 0.45.1",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "toml",
  "workflow-ir",
  "workflow-runtime",

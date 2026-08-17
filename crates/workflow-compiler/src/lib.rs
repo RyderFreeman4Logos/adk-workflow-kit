@@ -5,6 +5,7 @@ mod lock;
 mod registry;
 mod skill;
 mod skill_resource;
+mod skill_runtime;
 
 use std::{collections::VecDeque, fmt};
 
@@ -25,6 +26,10 @@ pub use skill_resource::{
     ActivatedSkillResources, SkillResourceError, SkillResourceId, SkillResourceIdError,
     SkillResourceInput, SkillResourceLimits, SkillResourceList, SkillResourceMetadata,
     SkillResourceRead,
+};
+pub use skill_runtime::{
+    DeclaredSkillResource, DeclaredSkillScript, SkillRuntimeLock, SkillRuntimeLockError,
+    SkillRuntimeManifest, SkillRuntimeManifestError,
 };
 
 /// A typed failure from one compiler pipeline stage.
