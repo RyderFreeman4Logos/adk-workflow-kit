@@ -1778,7 +1778,9 @@ name = "workflow-testkit"
 version = "0.1.0"
 dependencies = [
  "adk-rust",
+ "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "workflow-compiler",
  "workflow-runtime",
