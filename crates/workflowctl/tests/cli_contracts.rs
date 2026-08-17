@@ -36,22 +36,36 @@ impl Drop for ChildGuard {
 }
 
 fn output(command: &mut Command) -> Output {
+    output_with_stdout(command, true)
+}
+
+#[cfg(unix)]
+fn output_with_closed_stdout(command: &mut Command) -> Output {
+    use std::os::{
+        fd::{FromRawFd, IntoRawFd, OwnedFd},
+        unix::net::UnixStream,
+    };
+
+    let (stdout, peer) = UnixStream::pair().expect("stdout socket pair should be creatable");
+    drop(peer);
+    // SAFETY: `into_raw_fd` transfers sole ownership of `stdout` to the new `OwnedFd`.
+    let stdout = unsafe { OwnedFd::from_raw_fd(stdout.into_raw_fd()) };
+    command.stdout(Stdio::from(stdout));
+    output_with_stdout(command, false)
+}
+
+fn output_with_stdout(command: &mut Command, read_stdout: bool) -> Output {
+    if read_stdout {
+        command.stdout(Stdio::piped());
+    }
     let mut child = ChildGuard {
         child: Some(
             command
-                .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
                 .unwrap_or_else(|error| panic!("workflowctl should start: {error}")),
         ),
     };
-    let mut stdout = child
-        .child
-        .as_mut()
-        .expect("workflowctl child missing")
-        .stdout
-        .take()
-        .expect("workflowctl stdout missing");
     let mut stderr = child
         .child
         .as_mut()
@@ -59,12 +73,21 @@ fn output(command: &mut Command) -> Output {
         .stderr
         .take()
         .expect("workflowctl stderr missing");
-    let stdout_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .read_to_end(&mut bytes)
-            .expect("workflowctl stdout read failed");
-        bytes
+    let stdout_reader = read_stdout.then(|| {
+        let mut stdout = child
+            .child
+            .as_mut()
+            .expect("workflowctl child missing")
+            .stdout
+            .take()
+            .expect("workflowctl stdout missing");
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout
+                .read_to_end(&mut bytes)
+                .expect("workflowctl stdout read failed");
+            bytes
+        })
     });
     let stderr_reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -98,9 +121,9 @@ fn output(command: &mut Command) -> Output {
 
     let output = Output {
         status,
-        stdout: stdout_reader
-            .join()
-            .expect("workflowctl stdout reader failed"),
+        stdout: stdout_reader.map_or_else(Vec::new, |reader| {
+            reader.join().expect("workflowctl stdout reader failed")
+        }),
         stderr: stderr_reader
             .join()
             .expect("workflowctl stderr reader failed"),
@@ -232,6 +255,16 @@ fn minimal_fixture_validates_and_emits_exact_graph_and_lock_bytes() {
         b"lock_version = 1\ncanonical_ir_wire_version = 1\nir_schema_version = 1\nworkflow_id = \"minimal\"\nworkflow_version = \"1\"\nir_hash = \"sha256:46959e152a1ba0d913d74b1c18a5f19f8a9655394275494e0f508f2e4c0a9b5c\"\nsemantic_resource_hashes = []\n"
     );
     assert!(lock_output.stderr.is_empty());
+
+    #[cfg(unix)]
+    {
+        let mut closed_stdout = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+        closed_stdout.args(["validate", MINIMAL_FIXTURE]);
+        assert_error(
+            output_with_closed_stdout(&mut closed_stdout),
+            "[workflow.cli.stdout_write_failed] failed to write command output location=null details={}\n",
+        );
+    }
 }
 
 #[test]
@@ -295,6 +328,22 @@ fn subcommand_usage_errors_preserve_cli_001_contract() {
     let mut json_command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
     json_command.args(["graph", MINIMAL_FIXTURE, "--json"]);
     assert_error(output(&mut json_command), JSON_ERROR);
+
+    let separator_directory = temporary_fixture_path("separator");
+    fs::create_dir(&separator_directory).expect("separator directory should be creatable");
+    for arguments in [
+        ["validate", "--", "--json"].as_slice(),
+        ["graph", "--format", "mermaid", "--", "--json"].as_slice(),
+        ["lock", "--", "--json"].as_slice(),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+        command.current_dir(&separator_directory).args(arguments);
+        assert_error(
+            output(&mut command),
+            "[workflow.source.read_failed] failed to read workflow source location={field_path=\".\", span=null} details={}\n",
+        );
+    }
+    fs::remove_dir(separator_directory).expect("separator directory should be removable");
 }
 
 #[test]
@@ -303,8 +352,10 @@ fn source_and_compile_failures_are_redacted_diagnostics_without_partial_stdout()
     let invalid_utf8 = temporary_fixture_path("secret-invalid-utf8");
     let decode = temporary_fixture_path("secret-decode");
     let graph = temporary_fixture_path("secret-graph");
+    let oversized = temporary_fixture_path("secret-oversized");
     fs::write(&invalid_utf8, [0xff]).expect("invalid UTF-8 fixture should be writable");
     fs::write(&decode, "schema_version = [").expect("decode fixture should be writable");
+    fs::write(&oversized, vec![b'x'; 1_048_577]).expect("oversized fixture should be writable");
     fs::write(
         &graph,
         r#"schema_version = 1
@@ -358,7 +409,28 @@ kind = "agent"
     assert!(json_stderr.contains("\"code\":\"workflow.source.read_failed\""));
     assert!(!json_stderr.contains("secret-"));
 
-    for path in [invalid_utf8, decode, graph] {
+    let mut unsafe_paths = vec![oversized.as_path()];
+    #[cfg(unix)]
+    unsafe_paths.push(std::path::Path::new("/dev/null"));
+    for path in unsafe_paths {
+        let path = path.to_str().expect("unsafe fixture path should be UTF-8");
+        for arguments in [
+            ["validate", path].as_slice(),
+            ["graph", path, "--format", "mermaid"].as_slice(),
+            ["lock", path].as_slice(),
+        ] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+            command.args(arguments);
+            let failure = output(&mut command);
+            assert_eq!(failure.status.code(), Some(2));
+            assert!(failure.stdout.is_empty());
+            let stderr = String::from_utf8(failure.stderr).expect("diagnostic should be UTF-8");
+            assert!(stderr.starts_with("[workflow.source.read_failed]"));
+            assert!(!stderr.contains("secret-"));
+        }
+    }
+
+    for path in [invalid_utf8, decode, graph, oversized] {
         fs::remove_file(path).expect("temporary fixture should be removable");
     }
 }

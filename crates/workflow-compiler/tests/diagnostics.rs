@@ -612,8 +612,12 @@ fn compile_file_projects_read_utf8_decode_and_graph_failures_without_paths() {
     let invalid_utf8 = temp_dir.path().join("secret-invalid-utf8.workflow.toml");
     let decode = temp_dir.path().join("secret-decode.workflow.toml");
     let graph = temp_dir.path().join("secret-graph.workflow.toml");
+    let oversized = temp_dir.path().join("secret-oversized.workflow.toml");
+    #[cfg(unix)]
+    let non_regular = PathBuf::from("/dev/null");
     fs::write(&invalid_utf8, [0xff]).expect("invalid UTF-8 fixture should be writable");
     fs::write(&decode, "schema_version = [").expect("decode fixture should be writable");
+    fs::write(&oversized, vec![b'x'; 1_048_577]).expect("oversized fixture should be writable");
     fs::write(
         &graph,
         r#"schema_version = 1
@@ -635,12 +639,17 @@ kind = "agent"
     )
     .expect("graph fixture should be writable");
 
-    for (path, code) in [
+    let mut cases = vec![
         (&missing, "workflow.source.read_failed"),
         (&invalid_utf8, "workflow.source.invalid_utf8"),
         (&decode, "workflow.source.decode_failed"),
         (&graph, "workflow.graph.unreachable_node"),
-    ] {
+        (&oversized, "workflow.source.read_failed"),
+    ];
+    #[cfg(unix)]
+    cases.push((&non_regular, "workflow.source.read_failed"));
+
+    for (path, code) in cases {
         let error = compile_file(path).expect_err("invalid file fixture should fail");
         let diagnostic = Diagnostic::try_from(&error).expect("compile error should project");
         assert_eq!(diagnostic.code(), code);

@@ -29,6 +29,17 @@ impl Diagnostic {
         }
     }
 
+    /// Returns the fixed diagnostic for a failed workflowctl success-output write.
+    pub fn stdout_write_failed() -> Self {
+        Self {
+            diagnostic_version: DIAGNOSTIC_VERSION,
+            code: "workflow.cli.stdout_write_failed",
+            message: "failed to write command output",
+            location: None,
+            details: DiagnosticDetails::Empty {},
+        }
+    }
+
     /// Returns the stable machine-readable diagnostic code.
     pub fn code(&self) -> &'static str {
         self.code

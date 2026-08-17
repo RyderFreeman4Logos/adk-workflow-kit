@@ -1,4 +1,4 @@
-use std::{ffi::OsString, process::exit};
+use std::{ffi::OsString, io::Write, process::exit};
 
 use clap::{Arg, ArgAction, Command};
 use workflow_compiler::{compile_file, render_mermaid, Diagnostic, WorkflowLock};
@@ -76,9 +76,22 @@ fn exit_invalid_arguments(json: bool) -> ! {
     exit_diagnostic(Diagnostic::invalid_cli_arguments(), json)
 }
 
+fn write_stdout(output: &str, json: bool) {
+    if std::io::stdout()
+        .lock()
+        .write_all(output.as_bytes())
+        .is_err()
+    {
+        exit_diagnostic(Diagnostic::stdout_write_failed(), json);
+    }
+}
+
 fn main() {
     let arguments = std::env::args_os().skip(1).collect::<Vec<OsString>>();
-    let json = arguments.iter().any(|argument| argument == "--json");
+    let json = arguments
+        .iter()
+        .take_while(|argument| argument.as_encoded_bytes() != b"--")
+        .any(|argument| argument == "--json");
     let valid = arguments.iter().all(|argument| {
         argument.as_encoded_bytes().len() <= 4096
             && argument.to_str().is_some_and(|value| {
@@ -109,7 +122,7 @@ fn main() {
     };
 
     if matches.get_flag("help") {
-        print!("{HELP}");
+        write_stdout(HELP, json);
         return;
     }
 
@@ -119,7 +132,7 @@ fn main() {
                 exit_invalid_arguments(json);
             };
             match compile_file(path.as_str()) {
-                Ok(_) => println!("valid"),
+                Ok(_) => write_stdout("valid\n", json),
                 Err(error) => {
                     let diagnostic = match Diagnostic::try_from(&error) {
                         Ok(diagnostic) => diagnostic,
@@ -134,7 +147,7 @@ fn main() {
                 exit_invalid_arguments(json);
             };
             match compile_file(path.as_str()) {
-                Ok(plan) => print!("{}", render_mermaid(&plan)),
+                Ok(plan) => write_stdout(&render_mermaid(&plan), json),
                 Err(error) => {
                     let diagnostic = match Diagnostic::try_from(&error) {
                         Ok(diagnostic) => diagnostic,
@@ -169,7 +182,7 @@ fn main() {
                 }
             };
             match workflow_lock.to_toml() {
-                Ok(toml) => print!("{toml}"),
+                Ok(toml) => write_stdout(&toml, json),
                 Err(error) => {
                     let diagnostic = match Diagnostic::try_from(&error) {
                         Ok(diagnostic) => diagnostic,
