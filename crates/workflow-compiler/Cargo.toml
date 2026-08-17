@@ -7,9 +7,11 @@ license.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_yaml = "0.9.34"
 toml.workspace = true
 workflow-ir = { path = "../workflow-ir" }
 workflow-spec = { path = "../workflow-spec" }
 
 [dev-dependencies]
 serde_json.workspace = true
+workflow-runtime = { path = "../workflow-runtime" }
