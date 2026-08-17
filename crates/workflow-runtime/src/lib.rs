@@ -16,7 +16,9 @@ pub use controller::{
 pub use session::{
     RunSessionIds, SessionId, SessionIdentityError, SessionIdentityErrorKind, SessionRole,
 };
-pub use tool::{ToolEnvelope, ToolFailure, ToolProvenance};
+pub use tool::{
+    ToolEnvelope, ToolFailure, ToolFlags, ToolProvenance, ToolRegistration, ToolRegistrationError,
+};
 pub use workdir::{
     CleanupOutcome, RunWorkdir, WorkdirError, WorkdirErrorKind, WorkdirId, WorkdirManager,
 };

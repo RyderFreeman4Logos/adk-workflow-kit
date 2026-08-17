@@ -1726,6 +1726,8 @@ dependencies = [
 name = "workflow-runtime"
 version = "0.1.0"
 dependencies = [
+ "jsonschema 0.45.1",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",
