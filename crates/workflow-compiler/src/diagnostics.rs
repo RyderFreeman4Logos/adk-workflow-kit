@@ -18,6 +18,17 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
+    /// Returns the fixed diagnostic for invalid workflowctl arguments.
+    pub fn invalid_cli_arguments() -> Self {
+        Self {
+            diagnostic_version: DIAGNOSTIC_VERSION,
+            code: "workflow.cli.invalid_arguments",
+            message: "invalid command-line arguments",
+            location: None,
+            details: DiagnosticDetails::Empty {},
+        }
+    }
+
     /// Returns the stable machine-readable diagnostic code.
     pub fn code(&self) -> &'static str {
         self.code
