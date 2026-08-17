@@ -1,9 +1,9 @@
-use std::{ffi::OsString, process::exit};
+use std::{ffi::OsString, io::Write, process::exit};
 
 use clap::{Arg, ArgAction, Command};
-use workflow_compiler::Diagnostic;
+use workflow_compiler::{compile_file, render_mermaid, Diagnostic, WorkflowLock};
 
-const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS]\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n\nPlanned commands (not available in v0.1): validate, graph, lock\n";
+const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}";
 
 fn command() -> Command {
@@ -24,10 +24,42 @@ fn command() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Print help"),
         )
+        .subcommand(
+            Command::new("validate").arg(
+                Arg::new("path")
+                    .value_name("PATH")
+                    .required(true)
+                    .help("Workflow source file"),
+            ),
+        )
+        .subcommand(
+            Command::new("graph")
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .help("Workflow source file"),
+                )
+                .arg(
+                    Arg::new("format")
+                        .long("format")
+                        .required(true)
+                        .value_name("FORMAT")
+                        .value_parser(["mermaid"])
+                        .help("Graph output format"),
+                ),
+        )
+        .subcommand(
+            Command::new("lock").arg(
+                Arg::new("path")
+                    .value_name("PATH")
+                    .required(true)
+                    .help("Workflow source file"),
+            ),
+        )
 }
 
-fn exit_invalid_arguments(json: bool) -> ! {
-    let diagnostic = Diagnostic::invalid_cli_arguments();
+fn exit_diagnostic(diagnostic: Diagnostic, json: bool) -> ! {
     if json {
         let rendered = match serde_json::to_string(&diagnostic) {
             Ok(rendered) => rendered,
@@ -40,9 +72,26 @@ fn exit_invalid_arguments(json: bool) -> ! {
     exit(2)
 }
 
+fn exit_invalid_arguments(json: bool) -> ! {
+    exit_diagnostic(Diagnostic::invalid_cli_arguments(), json)
+}
+
+fn write_stdout(output: &str, json: bool) {
+    if std::io::stdout()
+        .lock()
+        .write_all(output.as_bytes())
+        .is_err()
+    {
+        exit_diagnostic(Diagnostic::stdout_write_failed(), json);
+    }
+}
+
 fn main() {
     let arguments = std::env::args_os().skip(1).collect::<Vec<OsString>>();
-    let json = arguments.iter().any(|argument| argument == "--json");
+    let json = arguments
+        .iter()
+        .take_while(|argument| argument.as_encoded_bytes() != b"--")
+        .any(|argument| argument == "--json");
     let valid = arguments.iter().all(|argument| {
         argument.as_encoded_bytes().len() <= 4096
             && argument.to_str().is_some_and(|value| {
@@ -73,8 +122,76 @@ fn main() {
     };
 
     if matches.get_flag("help") {
-        print!("{HELP}");
-    } else {
-        exit_invalid_arguments(json);
+        write_stdout(HELP, json);
+        return;
+    }
+
+    match matches.subcommand() {
+        Some(("validate", subcommand)) => {
+            let Some(path) = subcommand.get_one::<String>("path") else {
+                exit_invalid_arguments(json);
+            };
+            match compile_file(path.as_str()) {
+                Ok(_) => write_stdout("valid\n", json),
+                Err(error) => {
+                    let diagnostic = match Diagnostic::try_from(&error) {
+                        Ok(diagnostic) => diagnostic,
+                        Err(_) => Diagnostic::invalid_cli_arguments(),
+                    };
+                    exit_diagnostic(diagnostic, json);
+                }
+            }
+        }
+        Some(("graph", subcommand)) => {
+            let Some(path) = subcommand.get_one::<String>("path") else {
+                exit_invalid_arguments(json);
+            };
+            match compile_file(path.as_str()) {
+                Ok(plan) => write_stdout(&render_mermaid(&plan), json),
+                Err(error) => {
+                    let diagnostic = match Diagnostic::try_from(&error) {
+                        Ok(diagnostic) => diagnostic,
+                        Err(_) => Diagnostic::invalid_cli_arguments(),
+                    };
+                    exit_diagnostic(diagnostic, json);
+                }
+            }
+        }
+        Some(("lock", subcommand)) => {
+            let Some(path) = subcommand.get_one::<String>("path") else {
+                exit_invalid_arguments(json);
+            };
+            let plan = match compile_file(path.as_str()) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    let diagnostic = match Diagnostic::try_from(&error) {
+                        Ok(diagnostic) => diagnostic,
+                        Err(_) => Diagnostic::invalid_cli_arguments(),
+                    };
+                    exit_diagnostic(diagnostic, json);
+                }
+            };
+            let workflow_lock = match WorkflowLock::try_from_plan(&plan) {
+                Ok(workflow_lock) => workflow_lock,
+                Err(error) => {
+                    let diagnostic = match Diagnostic::try_from(&error) {
+                        Ok(diagnostic) => diagnostic,
+                        Err(_) => Diagnostic::invalid_cli_arguments(),
+                    };
+                    exit_diagnostic(diagnostic, json);
+                }
+            };
+            match workflow_lock.to_toml() {
+                Ok(toml) => write_stdout(&toml, json),
+                Err(error) => {
+                    let diagnostic = match Diagnostic::try_from(&error) {
+                        Ok(diagnostic) => diagnostic,
+                        Err(_) => Diagnostic::invalid_cli_arguments(),
+                    };
+                    exit_diagnostic(diagnostic, json);
+                }
+            }
+        }
+        _ => exit_invalid_arguments(json),
     }
 }

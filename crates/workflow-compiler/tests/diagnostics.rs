@@ -4,9 +4,13 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+#[cfg(unix)]
+use std::process::Command;
+
 use serde_json::{json, Value};
 use workflow_compiler::{
-    validate_graph, Diagnostic, DiagnosticProjectionError, GraphValidationError,
+    compile_file, validate_graph, Diagnostic, DiagnosticProjectionError, GraphValidationError,
+    WorkflowLockError,
 };
 use workflow_ir::WorkflowIr;
 use workflow_spec::{parse_file, parse_str, FieldPath, SourceLocation, SourcePath, SpecError};
@@ -25,7 +29,7 @@ id = "done"
 kind = "terminal"
 "#;
 
-const STABLE_CODES: [&str; 12] = [
+const STABLE_CODES: [&str; 14] = [
     "workflow.source.read_failed",
     "workflow.source.invalid_utf8",
     "workflow.source.decode_failed",
@@ -38,6 +42,8 @@ const STABLE_CODES: [&str; 12] = [
     "workflow.graph.no_reachable_terminal",
     "workflow.graph.cycle",
     "workflow.graph.cannot_reach_terminal",
+    "workflow.lock.unsupported_semantic_resources",
+    "workflow.lock.serialization_failed",
 ];
 
 static TEMP_DIR_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -600,4 +606,113 @@ fn stable_codes_are_unique() {
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(codes.len(), STABLE_CODES.len());
+}
+
+#[test]
+fn compile_file_projects_read_utf8_decode_and_graph_failures_without_paths() {
+    let temp_dir = TempDir::new();
+    let missing = temp_dir.path().join("secret-missing.workflow.toml");
+    let invalid_utf8 = temp_dir.path().join("secret-invalid-utf8.workflow.toml");
+    let decode = temp_dir.path().join("secret-decode.workflow.toml");
+    let graph = temp_dir.path().join("secret-graph.workflow.toml");
+    let oversized = temp_dir.path().join("secret-oversized.workflow.toml");
+    #[cfg(unix)]
+    let writerless_fifo = temp_dir.path().join("secret-writerless-fifo.workflow.toml");
+    fs::write(&invalid_utf8, [0xff]).expect("invalid UTF-8 fixture should be writable");
+    fs::write(&decode, "schema_version = [").expect("decode fixture should be writable");
+    fs::write(&oversized, vec![b'x'; 1_048_577]).expect("oversized fixture should be writable");
+    fs::write(
+        &graph,
+        r#"schema_version = 1
+edges = []
+
+[workflow]
+id = "invalid"
+version = "1"
+entry = "done"
+
+[[nodes]]
+id = "done"
+kind = "terminal"
+
+[[nodes]]
+id = "orphan"
+kind = "agent"
+"#,
+    )
+    .expect("graph fixture should be writable");
+    #[cfg(unix)]
+    {
+        let creation = Command::new("mkfifo")
+            .arg(&writerless_fifo)
+            .status()
+            .expect("writerless FIFO fixture should be creatable");
+        assert!(
+            creation.success(),
+            "writerless FIFO fixture creation failed"
+        );
+    }
+
+    let mut cases = vec![
+        (&missing, "workflow.source.read_failed"),
+        (&invalid_utf8, "workflow.source.invalid_utf8"),
+        (&decode, "workflow.source.decode_failed"),
+        (&graph, "workflow.graph.unreachable_node"),
+        (&oversized, "workflow.source.read_failed"),
+    ];
+    #[cfg(unix)]
+    cases.push((&writerless_fifo, "workflow.source.read_failed"));
+
+    for (path, code) in cases {
+        let error = compile_file(path).expect_err("invalid file fixture should fail");
+        let diagnostic = Diagnostic::try_from(&error).expect("compile error should project");
+        assert_eq!(diagnostic.code(), code);
+        let human = diagnostic.to_string();
+        let json = serde_json::to_string(&diagnostic).expect("diagnostic should serialize");
+        assert!(!human.contains("secret-"));
+        assert!(!json.contains("secret-"));
+        assert!(!human.contains(&temp_dir.path().display().to_string()));
+        assert!(!json.contains(&temp_dir.path().display().to_string()));
+    }
+}
+
+#[test]
+fn projects_workflow_lock_errors_with_exact_human_and_json_v1() {
+    let serialization = <toml::ser::Error as serde::ser::Error>::custom("secret serialization");
+    let cases = [
+        (
+            WorkflowLockError::UnsupportedSemanticResources {
+                registry_binding_count: 2,
+            },
+            "[workflow.lock.unsupported_semantic_resources] workflow lock cannot represent semantic resources location=null details={registry_binding_count=2}",
+            json!({
+                "diagnostic_version": 1,
+                "code": "workflow.lock.unsupported_semantic_resources",
+                "message": "workflow lock cannot represent semantic resources",
+                "location": null,
+                "details": {"registry_binding_count": 2},
+            }),
+        ),
+        (
+            WorkflowLockError::Serialization(serialization),
+            "[workflow.lock.serialization_failed] failed to serialize workflow lock location=null details={}",
+            json!({
+                "diagnostic_version": 1,
+                "code": "workflow.lock.serialization_failed",
+                "message": "failed to serialize workflow lock",
+                "location": null,
+                "details": {},
+            }),
+        ),
+    ];
+
+    for (error, expected_human, expected_json) in cases {
+        let diagnostic = Diagnostic::try_from(&error).expect("lock error should project");
+        assert_eq!(diagnostic.to_string(), expected_human);
+        assert_eq!(json_value(&diagnostic), expected_json);
+        assert!(!diagnostic.to_string().contains("secret serialization"));
+        assert!(!serde_json::to_string(&diagnostic)
+            .expect("diagnostic should serialize")
+            .contains("secret serialization"));
+    }
 }

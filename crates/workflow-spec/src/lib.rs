@@ -1,6 +1,7 @@
 //! Strict, source-aware decoding for workflow specification version 1.
 
 use std::{
+    io::Read,
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -10,6 +11,11 @@ use thiserror::Error;
 
 /// The only workflow schema version supported by this crate.
 pub const WORKFLOW_SCHEMA_VERSION_V1: u32 = 1;
+
+const MAX_SOURCE_BYTES: usize = 1_048_576;
+
+#[cfg(target_os = "linux")]
+const LINUX_O_NONBLOCK: i32 = 0o4_000;
 
 /// The original filesystem or logical path associated with workflow source text.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -407,16 +413,62 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
 /// Reads and parses a strict v1 TOML workflow without lossy path conversion.
 pub fn parse_file(path: impl AsRef<Path>) -> Result<WorkflowSpec, SpecError> {
     let source = SourcePath::from(path.as_ref());
-    let bytes = std::fs::read(source.as_path()).map_err(|error| SpecError::Read {
-        location: SourceLocation::root(source.clone()),
-        source: error,
-    })?;
+    let bytes = read_source_file(&source)?;
     let toml = std::str::from_utf8(&bytes).map_err(|error| SpecError::InvalidUtf8 {
         location: SourceLocation::root(source.clone()),
         source: error,
     })?;
 
     parse_str(source, toml)
+}
+
+fn read_source_file(source: &SourcePath) -> Result<Vec<u8>, SpecError> {
+    #[cfg(target_os = "linux")]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(LINUX_O_NONBLOCK)
+            .open(source.as_path())
+    };
+    #[cfg(not(target_os = "linux"))]
+    let file = std::fs::File::open(source.as_path());
+    let file = file.map_err(|error| source_read_error(source, error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| source_read_error(source, error))?;
+    if !metadata.is_file() {
+        return Err(source_read_error(
+            source,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workflow source is not a regular file",
+            ),
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    file.take((MAX_SOURCE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| source_read_error(source, error))?;
+    if bytes.len() > MAX_SOURCE_BYTES {
+        return Err(source_read_error(
+            source,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "workflow source exceeds the byte limit",
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn source_read_error(source: &SourcePath, error: std::io::Error) -> SpecError {
+    SpecError::Read {
+        location: SourceLocation::root(source.clone()),
+        source: error,
+    }
 }
 
 #[derive(Deserialize)]

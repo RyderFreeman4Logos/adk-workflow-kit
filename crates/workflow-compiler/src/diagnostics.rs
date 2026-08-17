@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, fmt};
 use serde::Serialize;
 use workflow_spec::{SourceLocation, SpecError};
 
-use crate::{CompileError, GraphValidationError, MissingEdgeEndpoint};
+use crate::{CompileError, GraphValidationError, MissingEdgeEndpoint, WorkflowLockError};
 
 const DIAGNOSTIC_VERSION: u8 = 1;
 
@@ -24,6 +24,17 @@ impl Diagnostic {
             diagnostic_version: DIAGNOSTIC_VERSION,
             code: "workflow.cli.invalid_arguments",
             message: "invalid command-line arguments",
+            location: None,
+            details: DiagnosticDetails::Empty {},
+        }
+    }
+
+    /// Returns the fixed diagnostic for a failed workflowctl success-output write.
+    pub fn stdout_write_failed() -> Self {
+        Self {
+            diagnostic_version: DIAGNOSTIC_VERSION,
+            code: "workflow.cli.stdout_write_failed",
+            message: "failed to write command output",
             location: None,
             details: DiagnosticDetails::Empty {},
         }
@@ -94,6 +105,9 @@ enum DiagnosticDetails {
     },
     CannotReachTerminal {
         node_id: String,
+    },
+    UnsupportedSemanticResources {
+        registry_binding_count: u64,
     },
 }
 
@@ -256,6 +270,37 @@ impl TryFrom<&CompileError> for Diagnostic {
     }
 }
 
+impl TryFrom<&WorkflowLockError> for Diagnostic {
+    type Error = DiagnosticProjectionError;
+
+    fn try_from(error: &WorkflowLockError) -> Result<Self, Self::Error> {
+        let (code, message, details) = match error {
+            WorkflowLockError::UnsupportedSemanticResources {
+                registry_binding_count,
+            } => (
+                "workflow.lock.unsupported_semantic_resources",
+                "workflow lock cannot represent semantic resources",
+                DiagnosticDetails::UnsupportedSemanticResources {
+                    registry_binding_count: stable_integer(*registry_binding_count)?,
+                },
+            ),
+            WorkflowLockError::Serialization(_) => (
+                "workflow.lock.serialization_failed",
+                "failed to serialize workflow lock",
+                DiagnosticDetails::Empty {},
+            ),
+        };
+
+        Ok(Self {
+            diagnostic_version: DIAGNOSTIC_VERSION,
+            code,
+            message,
+            location: None,
+            details,
+        })
+    }
+}
+
 fn project_location(
     location: &SourceLocation,
 ) -> Result<DiagnosticLocation, DiagnosticProjectionError> {
@@ -351,6 +396,14 @@ impl fmt::Display for DiagnosticDetails {
                 formatter.write_str("{node_id=")?;
                 write_quoted(formatter, node_id)?;
                 formatter.write_str("}")
+            }
+            Self::UnsupportedSemanticResources {
+                registry_binding_count,
+            } => {
+                write!(
+                    formatter,
+                    "{{registry_binding_count={registry_binding_count}}}"
+                )
             }
             Self::Cycle { node_ids } => {
                 formatter.write_str("{node_ids=[")?;

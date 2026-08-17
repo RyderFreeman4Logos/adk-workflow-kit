@@ -10,7 +10,7 @@ mod skill_runtime;
 use std::{collections::VecDeque, fmt};
 
 use workflow_ir::{IrNode, IrNodeKind, NodeId, WorkflowIr};
-use workflow_spec::{parse_str, SourcePath, SpecError};
+use workflow_spec::{parse_file, parse_str, SourcePath, SpecError};
 
 pub use diagnostics::{Diagnostic, DiagnosticProjectionError};
 pub use lock::{WorkflowLock, WorkflowLockError};
@@ -91,6 +91,69 @@ pub fn compile_str(
     let ir = WorkflowIr::from(&spec);
     validate_graph(&ir).map_err(CompileError::Graph)?;
     Ok(CompiledPlan { ir })
+}
+
+/// Reads, parses, canonically normalizes, validates, and exact-resolves one workflow file.
+pub fn compile_file(path: impl AsRef<std::path::Path>) -> Result<CompiledPlan, CompileError> {
+    let spec = parse_file(path).map_err(CompileError::Parse)?;
+    let ir = WorkflowIr::from(&spec);
+    validate_graph(&ir).map_err(CompileError::Graph)?;
+    Ok(CompiledPlan { ir })
+}
+
+/// Renders a validated workflow plan as deterministic Mermaid graph source.
+pub fn render_mermaid(plan: &CompiledPlan) -> String {
+    const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+    const UPPER_HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let node_name = |identifier: &str| {
+        let mut name = String::from("n");
+        for byte in identifier.bytes() {
+            name.push(char::from(LOWER_HEX[usize::from(byte >> 4)]));
+            name.push(char::from(LOWER_HEX[usize::from(byte & 0x0f)]));
+        }
+        name
+    };
+    let encoded_identifier = |identifier: &str| {
+        let mut encoded = String::new();
+        for byte in identifier.bytes() {
+            if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'~' | b'-') {
+                encoded.push(char::from(byte));
+            } else {
+                encoded.push('%');
+                encoded.push(char::from(UPPER_HEX[usize::from(byte >> 4)]));
+                encoded.push(char::from(UPPER_HEX[usize::from(byte & 0x0f)]));
+            }
+        }
+        encoded
+    };
+
+    let mut mermaid = String::from("graph TD\n");
+    for node in plan.ir().nodes() {
+        let kind = match node.kind() {
+            IrNodeKind::Agent => "agent",
+            IrNodeKind::Action => "action",
+            IrNodeKind::Validator => "validator",
+            IrNodeKind::Registered => "registered",
+            IrNodeKind::Approval => "approval",
+            IrNodeKind::Terminal => "terminal",
+        };
+        mermaid.push_str("  ");
+        mermaid.push_str(&node_name(node.id().as_str()));
+        mermaid.push_str("[\"");
+        mermaid.push_str(&encoded_identifier(node.id().as_str()));
+        mermaid.push_str(" (");
+        mermaid.push_str(kind);
+        mermaid.push_str(")\"]\n");
+    }
+    for edge in plan.ir().edges() {
+        mermaid.push_str("  ");
+        mermaid.push_str(&node_name(edge.from().as_str()));
+        mermaid.push_str(" --> ");
+        mermaid.push_str(&node_name(edge.to().as_str()));
+        mermaid.push('\n');
+    }
+    mermaid
 }
 
 type Adjacency = Vec<Vec<usize>>;
