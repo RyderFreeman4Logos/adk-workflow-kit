@@ -1,19 +1,105 @@
 use std::{
     ffi::OsString,
+    io::Read,
     os::unix::ffi::OsStringExt,
-    process::{Command, Output},
+    process::{Child, Command, Output, Stdio},
+    time::{Duration, Instant},
 };
 
 const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS]\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n\nPlanned commands (not available in v0.1): validate, graph, lock\n";
 const HUMAN_ERROR: &str =
     "[workflow.cli.invalid_arguments] invalid command-line arguments location=null details={}\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}\n";
+const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(5);
+const SUBPROCESS_TIMEOUT_MESSAGE: &str = "workflowctl contract subprocess timed out";
+
+struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 fn output(command: &mut Command) -> Output {
-    match command.output() {
-        Ok(output) => output,
-        Err(error) => panic!("workflowctl should start: {error}"),
+    let mut child = ChildGuard {
+        child: Some(
+            command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap_or_else(|error| panic!("workflowctl should start: {error}")),
+        ),
+    };
+    let mut stdout = child
+        .child
+        .as_mut()
+        .expect("workflowctl child missing")
+        .stdout
+        .take()
+        .expect("workflowctl stdout missing");
+    let mut stderr = child
+        .child
+        .as_mut()
+        .expect("workflowctl child missing")
+        .stderr
+        .take()
+        .expect("workflowctl stderr missing");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .read_to_end(&mut bytes)
+            .expect("workflowctl stdout read failed");
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr
+            .read_to_end(&mut bytes)
+            .expect("workflowctl stderr read failed");
+        bytes
+    });
+
+    let deadline = Instant::now() + SUBPROCESS_TIMEOUT;
+    let (status, timed_out) = loop {
+        let child_process = child.child.as_mut().expect("workflowctl child missing");
+        match child_process.try_wait() {
+            Ok(Some(status)) => break (status, false),
+            Ok(None) if Instant::now() >= deadline => {
+                child_process
+                    .kill()
+                    .unwrap_or_else(|error| panic!("workflowctl kill failed: {error}"));
+                break (
+                    child_process
+                        .wait()
+                        .unwrap_or_else(|error| panic!("workflowctl wait failed: {error}")),
+                    true,
+                );
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => panic!("workflowctl wait failed: {error}"),
+        }
+    };
+    child.child = None;
+
+    let output = Output {
+        status,
+        stdout: stdout_reader
+            .join()
+            .expect("workflowctl stdout reader failed"),
+        stderr: stderr_reader
+            .join()
+            .expect("workflowctl stderr reader failed"),
+    };
+    if timed_out {
+        panic!("{SUBPROCESS_TIMEOUT_MESSAGE}");
     }
+    output
 }
 
 fn assert_error(output: Output, expected_stderr: &str) {
@@ -38,6 +124,17 @@ fn help_is_deterministic_success_with_empty_stderr_and_no_dispatch() {
         assert_eq!(output.stdout, HELP.as_bytes());
         assert!(output.stderr.is_empty());
     }
+
+    let mut timeout_command = Command::new("sleep");
+    timeout_command.arg((SUBPROCESS_TIMEOUT.as_secs() + 1).to_string());
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        output(&mut timeout_command)
+    }))
+    .expect_err("timed-out subprocess should fail the test");
+    assert_eq!(
+        panic.downcast_ref::<String>().map(String::as_str),
+        Some(SUBPROCESS_TIMEOUT_MESSAGE)
+    );
 }
 
 #[test]
