@@ -1,4 +1,7 @@
-use workflow_ir::{IrNodeKind, IrRouteOperator, IrSchemaVersion, WorkflowIr};
+use sha2::{Digest, Sha256};
+use workflow_ir::{
+    IrNodeKind, IrRouteOperator, IrSchemaVersion, WorkflowIr, CANONICAL_IR_WIRE_VERSION_V2,
+};
 use workflow_spec::{parse_str, RouteOperator, UnsupportedRouteOperator};
 
 const ROUTE_OPERATOR_PAIRS: [(RouteOperator, IrRouteOperator); 9] = [
@@ -91,7 +94,7 @@ fn invalid_route_operator_names_never_construct_ir() {
 }
 
 #[test]
-fn lowers_to_a_normalized_source_free_ir_with_a_stable_hash() {
+fn route_free_v1_canonical_golden_remains_unchanged() {
     let spec = parse_str("first.workflow.toml", GOLDEN_WORKFLOW).expect("fixture should parse");
     let ir = WorkflowIr::from(&spec);
 
@@ -120,6 +123,106 @@ fn lowers_to_a_normalized_source_free_ir_with_a_stable_hash() {
             0xb1, 0x19, 0x85, 0x9f, 0xda, 0xd4, 0xff, 0x10, 0x1c, 0x1a, 0x48, 0xd7, 0xb6, 0x34,
             0xb3, 0xc4, 0xe8, 0x30,
         ]
+    );
+}
+
+#[test]
+fn registered_predicate_routes_use_canonical_wire_v2() {
+    let spec = parse_str(
+        "routes.workflow.toml",
+        r#"
+schema_version = 1
+edges = []
+
+[workflow]
+id = "route"
+version = "1"
+entry = "a"
+
+[[nodes]]
+id = "z"
+kind = "action"
+
+[[nodes]]
+id = "done"
+kind = "terminal"
+
+[[nodes]]
+id = "a"
+kind = "agent"
+
+[[routes]]
+from = "z"
+predicate = { id = "pred-z", version = "2" }
+cases = { only = "done" }
+
+[[routes]]
+from = "a"
+predicate = { id = "pred-a", version = "1" }
+cases = { z = "done", a = "done" }
+"#,
+    )
+    .expect("route fixture should parse");
+    let ir = WorkflowIr::from(&spec);
+
+    assert_eq!(CANONICAL_IR_WIRE_VERSION_V2, 2);
+    assert_eq!(
+        ir.routes()
+            .iter()
+            .map(|route| {
+                (
+                    route.from().as_str(),
+                    route.predicate().id(),
+                    route.predicate().version(),
+                    route
+                        .cases()
+                        .iter()
+                        .map(|case| (case.key(), case.target().as_str()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [
+            ("a", "pred-a", "1", vec![("a", "done"), ("z", "done")]),
+            ("z", "pred-z", "2", vec![("only", "done")]),
+        ]
+    );
+
+    let mut wire = b"adk-workflow-kit/workflow-ir\0".to_vec();
+    wire.extend_from_slice(&2_u16.to_be_bytes());
+    wire.extend_from_slice(&1_u32.to_be_bytes());
+    for frame in ["route", "1", "a"] {
+        wire.extend_from_slice(&(frame.len() as u64).to_be_bytes());
+        wire.extend_from_slice(frame.as_bytes());
+    }
+    wire.extend_from_slice(&3_u64.to_be_bytes());
+    for (node, kind) in [("a", 1_u8), ("done", 6), ("z", 2)] {
+        wire.extend_from_slice(&(node.len() as u64).to_be_bytes());
+        wire.extend_from_slice(node.as_bytes());
+        wire.push(kind);
+    }
+    wire.extend_from_slice(&0_u64.to_be_bytes());
+    wire.extend_from_slice(&2_u64.to_be_bytes());
+    for (from, predicate_id, version, cases) in [
+        ("a", "pred-a", "1", vec![("a", "done"), ("z", "done")]),
+        ("z", "pred-z", "2", vec![("only", "done")]),
+    ] {
+        for frame in [from, predicate_id, version] {
+            wire.extend_from_slice(&(frame.len() as u64).to_be_bytes());
+            wire.extend_from_slice(frame.as_bytes());
+        }
+        wire.extend_from_slice(&(cases.len() as u64).to_be_bytes());
+        for (key, target) in cases {
+            for frame in [key, target] {
+                wire.extend_from_slice(&(frame.len() as u64).to_be_bytes());
+                wire.extend_from_slice(frame.as_bytes());
+            }
+        }
+    }
+
+    assert_eq!(
+        ir.canonical_hash().as_bytes(),
+        Sha256::digest(wire).as_slice()
     );
 }
 

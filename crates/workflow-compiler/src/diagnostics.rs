@@ -200,6 +200,26 @@ impl TryFrom<&GraphValidationError> for Diagnostic {
                     },
                 },
             ),
+            GraphValidationError::EmptyRouteCases => (
+                "workflow.graph.empty_route_cases",
+                "predicate route has no cases",
+                DiagnosticDetails::Empty {},
+            ),
+            GraphValidationError::DuplicateRouteOrigin => (
+                "workflow.graph.duplicate_route_origin",
+                "duplicate predicate route origin",
+                DiagnosticDetails::Empty {},
+            ),
+            GraphValidationError::MixedRouteAndEdgeOrigin => (
+                "workflow.graph.mixed_route_and_edge_origin",
+                "predicate route origin also has an unconditional edge",
+                DiagnosticDetails::Empty {},
+            ),
+            GraphValidationError::DanglingRoute => (
+                "workflow.graph.dangling_route",
+                "dangling predicate route",
+                DiagnosticDetails::Empty {},
+            ),
             GraphValidationError::UnreachableNode { node_id } => (
                 "workflow.graph.unreachable_node",
                 "unreachable node",
@@ -266,6 +286,20 @@ impl TryFrom<&CompileError> for Diagnostic {
         match error {
             CompileError::Parse(error) => Self::try_from(error),
             CompileError::Graph(error) => Self::try_from(error),
+            CompileError::PredicateRegistryRequired => Ok(Self {
+                diagnostic_version: DIAGNOSTIC_VERSION,
+                code: "workflow.registry.predicate_registry_required",
+                message: "predicate registry is required",
+                location: None,
+                details: DiagnosticDetails::Empty {},
+            }),
+            CompileError::Registry(_) => Ok(Self {
+                diagnostic_version: DIAGNOSTIC_VERSION,
+                code: "workflow.registry.entry_not_found",
+                message: "registry entry not found",
+                location: None,
+                details: DiagnosticDetails::Empty {},
+            }),
         }
     }
 }

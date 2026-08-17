@@ -9,8 +9,8 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 use workflow_compiler::{
-    compile_file, validate_graph, Diagnostic, DiagnosticProjectionError, GraphValidationError,
-    WorkflowLockError,
+    compile_file, validate_graph, CompileError, Diagnostic, DiagnosticProjectionError,
+    GraphValidationError, RegistryCategory, RegistryNotFound, WorkflowLockError,
 };
 use workflow_ir::WorkflowIr;
 use workflow_spec::{parse_file, parse_str, FieldPath, SourceLocation, SourcePath, SpecError};
@@ -29,7 +29,7 @@ id = "done"
 kind = "terminal"
 "#;
 
-const STABLE_CODES: [&str; 14] = [
+const STABLE_CODES: [&str; 20] = [
     "workflow.source.read_failed",
     "workflow.source.invalid_utf8",
     "workflow.source.decode_failed",
@@ -38,10 +38,16 @@ const STABLE_CODES: [&str; 14] = [
     "workflow.graph.duplicate_node_id",
     "workflow.graph.missing_entry_node",
     "workflow.graph.dangling_edge",
+    "workflow.graph.empty_route_cases",
+    "workflow.graph.duplicate_route_origin",
+    "workflow.graph.mixed_route_and_edge_origin",
+    "workflow.graph.dangling_route",
     "workflow.graph.unreachable_node",
     "workflow.graph.no_reachable_terminal",
     "workflow.graph.cycle",
     "workflow.graph.cannot_reach_terminal",
+    "workflow.registry.predicate_registry_required",
+    "workflow.registry.entry_not_found",
     "workflow.lock.unsupported_semantic_resources",
     "workflow.lock.serialization_failed",
 ];
@@ -124,6 +130,77 @@ to = "done"
 "#,
     ));
     assert_eq!(graph_diagnostic.code(), "workflow.graph.dangling_edge");
+}
+
+#[test]
+fn projects_predicate_registry_failures_with_stable_diagnostics() {
+    let required = CompileError::PredicateRegistryRequired;
+    let required = Diagnostic::try_from(&required).expect("required registry should project");
+    assert_eq!(
+        required.code(),
+        "workflow.registry.predicate_registry_required"
+    );
+    assert_eq!(
+        json_value(&required),
+        json!({
+            "diagnostic_version": 1,
+            "code": "workflow.registry.predicate_registry_required",
+            "message": "predicate registry is required",
+            "location": null,
+            "details": {},
+        })
+    );
+
+    let hostile_id = "secret\n\u{1b}predicate";
+    let hostile_version = "secret\r\0version";
+    let missing = CompileError::Registry(RegistryNotFound::new(
+        RegistryCategory::Predicate,
+        hostile_id,
+        hostile_version,
+    ));
+    let missing = Diagnostic::try_from(&missing).expect("missing registry entry should project");
+    assert_eq!(missing.code(), "workflow.registry.entry_not_found");
+    let human = missing.to_string();
+    let json = serde_json::to_string(&missing).expect("diagnostic should serialize");
+    assert!(!human.contains("secret"));
+    assert!(!json.contains("secret"));
+    assert_eq!(
+        json_value(&missing),
+        json!({
+            "diagnostic_version": 1,
+            "code": "workflow.registry.entry_not_found",
+            "message": "registry entry not found",
+            "location": null,
+            "details": {},
+        })
+    );
+
+    for (error, code) in [
+        (
+            GraphValidationError::EmptyRouteCases,
+            "workflow.graph.empty_route_cases",
+        ),
+        (
+            GraphValidationError::DuplicateRouteOrigin,
+            "workflow.graph.duplicate_route_origin",
+        ),
+        (
+            GraphValidationError::MixedRouteAndEdgeOrigin,
+            "workflow.graph.mixed_route_and_edge_origin",
+        ),
+        (
+            GraphValidationError::DanglingRoute,
+            "workflow.graph.dangling_route",
+        ),
+    ] {
+        let diagnostic = Diagnostic::try_from(&error).expect("route graph error should project");
+        assert_eq!(diagnostic.code(), code);
+        assert_eq!(
+            json_value(&diagnostic)["details"],
+            json!({}),
+            "route diagnostics must not echo authored identifiers"
+        );
+    }
 }
 
 #[test]

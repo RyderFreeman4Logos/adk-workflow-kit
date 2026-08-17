@@ -5,6 +5,8 @@ use workflow_spec::{NodeKind as SpecNodeKind, RouteOperator, SchemaVersion, Work
 
 /// The canonical byte-wire version used for content identity.
 pub const CANONICAL_IR_WIRE_VERSION_V1: u16 = 1;
+/// The canonical byte-wire version for IR containing registered-predicate routes.
+pub const CANONICAL_IR_WIRE_VERSION_V2: u16 = 2;
 
 const DOMAIN: &[u8] = b"adk-workflow-kit/workflow-ir\0";
 const IR_SCHEMA_VERSION_V1: u32 = 1;
@@ -158,6 +160,69 @@ pub struct IrEdge {
     to: NodeId,
 }
 
+/// A normalized registered-predicate route.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct IrPredicateRoute {
+    from: NodeId,
+    predicate: IrPredicateReference,
+    cases: Vec<IrRouteCase>,
+}
+
+impl IrPredicateRoute {
+    /// Returns the route origin identifier.
+    pub fn from(&self) -> &NodeId {
+        &self.from
+    }
+
+    /// Returns the exact registered predicate reference.
+    pub fn predicate(&self) -> &IrPredicateReference {
+        &self.predicate
+    }
+
+    /// Returns cases in canonical raw UTF-8 key order.
+    pub fn cases(&self) -> &[IrRouteCase] {
+        &self.cases
+    }
+}
+
+/// A normalized exact registered-predicate identity.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct IrPredicateReference {
+    id: String,
+    version: String,
+}
+
+impl IrPredicateReference {
+    /// Returns the opaque predicate ID.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the exact predicate version.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+}
+
+/// A normalized predicate case and target node.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct IrRouteCase {
+    key: String,
+    target: NodeId,
+}
+
+impl IrRouteCase {
+    /// Returns the opaque case key.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Returns the case target node identifier.
+    pub fn target(&self) -> &NodeId {
+        &self.target
+    }
+}
+
 impl IrEdge {
     /// Returns the edge origin identifier.
     pub fn from(&self) -> &NodeId {
@@ -179,6 +244,7 @@ pub struct WorkflowIr {
     entry_node_id: NodeId,
     nodes: Vec<IrNode>,
     edges: Vec<IrEdge>,
+    routes: Vec<IrPredicateRoute>,
 }
 
 impl WorkflowIr {
@@ -210,6 +276,11 @@ impl WorkflowIr {
     /// Returns edges in canonical raw UTF-8 order.
     pub fn edges(&self) -> &[IrEdge] {
         &self.edges
+    }
+
+    /// Returns registered-predicate routes in canonical raw UTF-8 origin order.
+    pub fn routes(&self) -> &[IrPredicateRoute] {
+        &self.routes
     }
 
     /// Returns the SHA-256 content identity of the canonical IR wire.
@@ -249,6 +320,34 @@ impl From<&WorkflowSpec> for WorkflowIr {
                 to: NodeId(edge.to().as_str().to_owned()),
             })
             .collect::<Vec<_>>();
+        let mut routes = spec
+            .routes()
+            .iter()
+            .map(|route| {
+                let mut cases = route
+                    .cases()
+                    .iter()
+                    .map(|case| IrRouteCase {
+                        key: case.key().to_owned(),
+                        target: NodeId(case.target().as_str().to_owned()),
+                    })
+                    .collect::<Vec<_>>();
+                cases.sort_by(|left, right| {
+                    left.key
+                        .as_bytes()
+                        .cmp(right.key.as_bytes())
+                        .then(left.target.cmp(&right.target))
+                });
+                IrPredicateRoute {
+                    from: NodeId(route.from().as_str().to_owned()),
+                    predicate: IrPredicateReference {
+                        id: route.predicate().id().to_owned(),
+                        version: route.predicate().version().to_owned(),
+                    },
+                    cases,
+                }
+            })
+            .collect::<Vec<_>>();
 
         nodes.sort_by(|left, right| {
             left.id
@@ -269,6 +368,14 @@ impl From<&WorkflowSpec> for WorkflowIr {
                         .cmp(right.to.as_str().as_bytes()),
                 )
         });
+        routes.sort_by(|left, right| {
+            left.from
+                .as_str()
+                .as_bytes()
+                .cmp(right.from.as_str().as_bytes())
+                .then(left.predicate.cmp(&right.predicate))
+                .then(left.cases.cmp(&right.cases))
+        });
 
         Self {
             schema_version,
@@ -277,6 +384,7 @@ impl From<&WorkflowSpec> for WorkflowIr {
             entry_node_id: NodeId(workflow.entry().as_str().to_owned()),
             nodes,
             edges,
+            routes,
         }
     }
 }
@@ -311,7 +419,14 @@ impl ChunkSink for Vec<u8> {
 
 fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
     sink.write_chunk(DOMAIN);
-    write_u16(sink, CANONICAL_IR_WIRE_VERSION_V1);
+    write_u16(
+        sink,
+        if ir.routes.is_empty() {
+            CANONICAL_IR_WIRE_VERSION_V1
+        } else {
+            CANONICAL_IR_WIRE_VERSION_V2
+        },
+    );
     write_u32(sink, ir.schema_version.tag());
     write_frame(sink, ir.workflow_id.as_str());
     write_frame(sink, &ir.workflow_version);
@@ -325,6 +440,19 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
     for edge in &ir.edges {
         write_frame(sink, edge.from.as_str());
         write_frame(sink, edge.to.as_str());
+    }
+    if !ir.routes.is_empty() {
+        write_u64(sink, u64_from_usize(ir.routes.len()));
+        for route in &ir.routes {
+            write_frame(sink, route.from.as_str());
+            write_frame(sink, route.predicate.id());
+            write_frame(sink, route.predicate.version());
+            write_u64(sink, u64_from_usize(route.cases.len()));
+            for case in &route.cases {
+                write_frame(sink, case.key());
+                write_frame(sink, case.target().as_str());
+            }
+        }
     }
 }
 

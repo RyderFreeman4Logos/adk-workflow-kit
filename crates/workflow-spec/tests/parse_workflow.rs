@@ -113,6 +113,74 @@ fn parses_a_strict_v1_workflow_from_text() {
 }
 
 #[test]
+fn parses_registered_predicate_route_with_separate_exact_identity() {
+    let input = MINIMAL.replacen(
+        "edges = []",
+        r#"edges = []
+
+[[routes]]
+from = "finish"
+predicate = { id = "predicate@opaque", version = "v1+exact" }
+cases = { publishable = "finish", revise = "finish" }"#,
+        1,
+    );
+
+    let spec = parse_str("predicate-route.workflow.toml", &input)
+        .expect("registered predicate route should parse");
+    let route = &spec.routes()[0];
+
+    assert_eq!(route.from().as_str(), "finish");
+    assert_eq!(route.predicate().id(), "predicate@opaque");
+    assert_eq!(route.predicate().version(), "v1+exact");
+    assert_eq!(
+        route
+            .cases()
+            .iter()
+            .map(|case| (case.key(), case.target().as_str()))
+            .collect::<Vec<_>>(),
+        [("publishable", "finish"), ("revise", "finish")]
+    );
+}
+
+#[test]
+fn rejects_version_suffixed_predicate_scalar() {
+    let input = MINIMAL.replacen(
+        "edges = []",
+        r#"edges = []
+
+[[routes]]
+from = "finish"
+predicate = "predicate@1"
+cases = { done = "finish" }"#,
+        1,
+    );
+
+    assert!(matches!(
+        parse_str("scalar-predicate.workflow.toml", &input),
+        Err(SpecError::Decode { location, .. })
+            if location.field.as_str() == "routes[0].predicate"
+    ));
+
+    for predicate in [
+        r#"{ id = "predicate", version = "1", extra = true }"#,
+        r#"{ id = "predicate" }"#,
+        r#"{ version = "1" }"#,
+    ] {
+        let input = MINIMAL.replacen(
+            "edges = []",
+            &format!(
+                "edges = []\n\n[[routes]]\nfrom = \"finish\"\npredicate = {predicate}\ncases = {{ done = \"finish\" }}"
+            ),
+            1,
+        );
+        assert!(matches!(
+            parse_str("strict-predicate.workflow.toml", &input),
+            Err(SpecError::Decode { .. })
+        ));
+    }
+}
+
+#[test]
 fn route_operator_names_are_closed_exact_and_round_trip() {
     let mut names = ROUTE_OPERATORS.map(|(_, name)| name);
     names.sort_unstable();
@@ -232,7 +300,7 @@ fn rejects_unknown_root_workflow_and_node_kind_values() {
 }
 
 #[test]
-fn rejects_illustrative_routes_as_an_unknown_root_field() {
+fn rejects_illustrative_route_shape() {
     let input = MINIMAL.replacen(
         "edges = []",
         r#"edges = []
@@ -242,7 +310,7 @@ routes = [{ operator = "equals", target = "finish" }]"#,
 
     assert!(matches!(
         parse_str("routes.workflow.toml", &input),
-        Err(SpecError::Decode { location, .. }) if location.field.as_str() == "routes"
+        Err(SpecError::Decode { location, .. }) if location.field.as_str() == "routes[0].operator"
     ));
 }
 

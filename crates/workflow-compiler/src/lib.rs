@@ -10,7 +10,7 @@ mod skill_runtime;
 use std::{collections::VecDeque, fmt};
 
 use workflow_ir::{IrNode, IrNodeKind, NodeId, WorkflowIr};
-use workflow_spec::{parse_file, parse_str, SourcePath, SpecError};
+use workflow_spec::{parse_file, parse_str, SourcePath, SpecError, WorkflowSpec};
 
 pub use diagnostics::{Diagnostic, DiagnosticProjectionError};
 pub use lock::{WorkflowLock, WorkflowLockError};
@@ -39,6 +39,10 @@ pub enum CompileError {
     Parse(SpecError),
     /// Canonical workflow semantic validation failed.
     Graph(GraphValidationError),
+    /// The workflow declares predicate routes but no registry was supplied.
+    PredicateRegistryRequired,
+    /// Exact predicate registry resolution failed.
+    Registry(RegistryNotFound),
 }
 
 impl fmt::Display for CompileError {
@@ -46,6 +50,10 @@ impl fmt::Display for CompileError {
         match self {
             Self::Parse(error) => write!(formatter, "workflow parsing failed: {error}"),
             Self::Graph(error) => write!(formatter, "workflow graph validation failed: {error}"),
+            Self::PredicateRegistryRequired => {
+                formatter.write_str("predicate registry is required")
+            }
+            Self::Registry(_) => formatter.write_str("predicate registry entry not found"),
         }
     }
 }
@@ -55,17 +63,19 @@ impl std::error::Error for CompileError {
         match self {
             Self::Parse(error) => Some(error),
             Self::Graph(error) => Some(error),
+            Self::PredicateRegistryRequired => None,
+            Self::Registry(error) => Some(error),
         }
     }
 }
 
 /// A successful in-memory compiler result with validated IR and exact registry bindings.
 ///
-/// Resolved bindings remain fixed for this value's lifetime. The current IR declares no registry
-/// references, so its exact-resolution stage is vacuous and successful plans have zero bindings.
+/// Predicate implementations remain owned by their registry and are not retained or invoked.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledPlan {
     ir: WorkflowIr,
+    registry_binding_count: usize,
 }
 
 impl CompiledPlan {
@@ -75,10 +85,8 @@ impl CompiledPlan {
     }
 
     /// Returns the number of exact registry bindings.
-    ///
-    /// The current canonical IR has no registry-reference fields, so this is always zero.
     pub fn registry_binding_count(&self) -> usize {
-        0
+        self.registry_binding_count
     }
 }
 
@@ -88,17 +96,66 @@ pub fn compile_str(
     toml: &str,
 ) -> Result<CompiledPlan, CompileError> {
     let spec = parse_str(source, toml).map_err(CompileError::Parse)?;
-    let ir = WorkflowIr::from(&spec);
-    validate_graph(&ir).map_err(CompileError::Graph)?;
-    Ok(CompiledPlan { ir })
+    compile_without_predicates(&spec)
+}
+
+/// Parses, validates, and exact-resolves registered predicate routes without invoking them.
+pub fn compile_str_with_predicates<R: PredicateRegistry>(
+    source: impl Into<SourcePath>,
+    toml: &str,
+    registry: &R,
+) -> Result<CompiledPlan, CompileError> {
+    let spec = parse_str(source, toml).map_err(CompileError::Parse)?;
+    compile_with_predicates(&spec, registry)
 }
 
 /// Reads, parses, canonically normalizes, validates, and exact-resolves one workflow file.
 pub fn compile_file(path: impl AsRef<std::path::Path>) -> Result<CompiledPlan, CompileError> {
     let spec = parse_file(path).map_err(CompileError::Parse)?;
-    let ir = WorkflowIr::from(&spec);
+    compile_without_predicates(&spec)
+}
+
+/// Reads, validates, and exact-resolves registered predicate routes without invoking them.
+pub fn compile_file_with_predicates<R: PredicateRegistry>(
+    path: impl AsRef<std::path::Path>,
+    registry: &R,
+) -> Result<CompiledPlan, CompileError> {
+    let spec = parse_file(path).map_err(CompileError::Parse)?;
+    compile_with_predicates(&spec, registry)
+}
+
+fn compile_without_predicates(spec: &WorkflowSpec) -> Result<CompiledPlan, CompileError> {
+    let ir = validated_ir(spec)?;
+    if !ir.routes().is_empty() {
+        return Err(CompileError::PredicateRegistryRequired);
+    }
+    Ok(CompiledPlan {
+        ir,
+        registry_binding_count: 0,
+    })
+}
+
+fn compile_with_predicates<R: PredicateRegistry>(
+    spec: &WorkflowSpec,
+    registry: &R,
+) -> Result<CompiledPlan, CompileError> {
+    let ir = validated_ir(spec)?;
+    for route in ir.routes() {
+        registry
+            .resolve(route.predicate().id(), route.predicate().version())
+            .map_err(CompileError::Registry)?;
+    }
+    let registry_binding_count = ir.routes().len();
+    Ok(CompiledPlan {
+        ir,
+        registry_binding_count,
+    })
+}
+
+fn validated_ir(spec: &WorkflowSpec) -> Result<WorkflowIr, CompileError> {
+    let ir = WorkflowIr::from(spec);
     validate_graph(&ir).map_err(CompileError::Graph)?;
-    Ok(CompiledPlan { ir })
+    Ok(ir)
 }
 
 /// Renders a validated workflow plan as deterministic Mermaid graph source.
@@ -198,6 +255,14 @@ pub enum GraphValidationError {
         /// Which endpoint(s) are absent.
         missing: MissingEdgeEndpoint,
     },
+    /// A registered predicate route declares no cases.
+    EmptyRouteCases,
+    /// More than one registered predicate route has the same origin.
+    DuplicateRouteOrigin,
+    /// An origin has both an unconditional edge and a predicate route.
+    MixedRouteAndEdgeOrigin,
+    /// A predicate route references an absent origin or target node.
+    DanglingRoute,
     /// A declared node cannot be reached from the configured entry.
     UnreachableNode {
         /// The canonical-first unreachable identifier.
@@ -226,6 +291,9 @@ pub fn validate_graph(ir: &WorkflowIr) -> Result<(), GraphValidationError> {
         return Err(error);
     }
     if let Some(error) = duplicate_node_error(nodes) {
+        return Err(error);
+    }
+    if let Some(error) = route_structure_error(ir) {
         return Err(error);
     }
 
@@ -303,6 +371,27 @@ fn invalid_identifier_error(ir: &WorkflowIr) -> Option<GraphValidationError> {
             });
         }
     }
+    for route in ir.routes() {
+        for (field_path, value) in [
+            ("routes[].from", route.from().as_str()),
+            ("routes[].predicate.id", route.predicate().id()),
+            ("routes[].predicate.version", route.predicate().version()),
+        ] {
+            if value.is_empty() {
+                return Some(GraphValidationError::InvalidIdentifier { field_path });
+            }
+        }
+        for case in route.cases() {
+            for (field_path, value) in [
+                ("routes[].cases[].key", case.key()),
+                ("routes[].cases[].target", case.target().as_str()),
+            ] {
+                if value.is_empty() {
+                    return Some(GraphValidationError::InvalidIdentifier { field_path });
+                }
+            }
+        }
+    }
     None
 }
 
@@ -354,8 +443,41 @@ fn adjacency(
         forward[from].push(to);
         reverse[to].push(from);
     }
+    for route in ir.routes() {
+        let Some(from) = find_node_index(nodes, route.from()) else {
+            return Err(GraphValidationError::DanglingRoute);
+        };
+        for case in route.cases() {
+            let Some(to) = find_node_index(nodes, case.target()) else {
+                return Err(GraphValidationError::DanglingRoute);
+            };
+            forward[from].push(to);
+            reverse[to].push(from);
+        }
+    }
 
     Ok((forward, reverse))
+}
+
+fn route_structure_error(ir: &WorkflowIr) -> Option<GraphValidationError> {
+    if ir.routes().iter().any(|route| route.cases().is_empty()) {
+        return Some(GraphValidationError::EmptyRouteCases);
+    }
+    if ir
+        .routes()
+        .windows(2)
+        .any(|routes| routes[0].from() == routes[1].from())
+    {
+        return Some(GraphValidationError::DuplicateRouteOrigin);
+    }
+    if ir.routes().iter().any(|route| {
+        ir.edges()
+            .binary_search_by(|edge| edge.from().cmp(route.from()))
+            .is_ok()
+    }) {
+        return Some(GraphValidationError::MixedRouteAndEdgeOrigin);
+    }
+    None
 }
 
 fn find_node_index(nodes: &[IrNode], node_id: &NodeId) -> Option<usize> {
