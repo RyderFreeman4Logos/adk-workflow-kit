@@ -718,10 +718,10 @@ fn has_only_local_references(value: &Value) -> bool {
     match value {
         Value::Array(values) => values.iter().all(has_only_local_references),
         Value::Object(object) => object.iter().all(|(key, value)| {
-            (key != "$ref"
+            (!matches!(key.as_str(), "$ref" | "$dynamicRef")
                 || value
                     .as_str()
-                    .is_some_and(|reference| reference == "#" || reference.starts_with("#/")))
+                    .is_some_and(|reference| reference.starts_with('#')))
                 && has_only_local_references(value)
         }),
         _ => true,

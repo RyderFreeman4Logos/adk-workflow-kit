@@ -162,6 +162,50 @@ fn empty_hostile_and_unknown_manifest_fields_fail_closed_without_echo() {
 fn oversized_ids_paths_hashes_and_schemas_fail_closed_without_echo() {
     let registry = registry();
     let receipt = activation(&registry);
+    let schema_id = resource_id("references/schema.json");
+
+    for (schema, hostile_reference) in [
+        (
+            br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"https://attacker.example/schema"}"#
+                .as_slice(),
+            "https://attacker.example/schema",
+        ),
+        (
+            br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","$dynamicRef":"https://attacker.example/schema"}"#
+                .as_slice(),
+            "https://attacker.example/schema",
+        ),
+    ] {
+        let schema_digest = digest(schema);
+        let document = runtime_manifest(
+            &[("script", "scripts/ok.py", &digest(b"ok"), &[])],
+            &[("references/schema.json", &schema_digest)],
+        );
+        let manifest = parse_runtime(&receipt, document);
+        match SkillRuntimeLock::try_from_declared_bytes(
+            &manifest,
+            skill_markdown(),
+            [("script", b"ok".as_slice())],
+            [(&schema_id, schema)],
+        ) {
+            Err(error) => assert_private_error(error, hostile_reference),
+            Ok(_) => panic!("remote schema references must fail closed"),
+        }
+    }
+
+    let local_anchor_schema =
+        br##"{"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"#node"}"##;
+    let local_anchor_digest = digest(local_anchor_schema);
+    let local_anchor_document = runtime_manifest(
+        &[("script", "scripts/ok.py", &digest(b"ok"), &[])],
+        &[("references/schema.json", &local_anchor_digest)],
+    );
+    let local_anchor_manifest = parse_runtime(&receipt, local_anchor_document);
+    let _ = lock(
+        &local_anchor_manifest,
+        &[("script", b"ok")],
+        &[(&schema_id, local_anchor_schema)],
+    );
 
     let oversized_id = "a".repeat(65);
     let oversized_id_document = runtime_manifest(
@@ -200,7 +244,6 @@ fn oversized_ids_paths_hashes_and_schemas_fail_closed_without_echo() {
         &[("references/schema.json", &oversized_schema_digest)],
     );
     let manifest = parse_runtime(&receipt, document);
-    let schema_id = resource_id("references/schema.json");
     match SkillRuntimeLock::try_from_declared_bytes(
         &manifest,
         skill_markdown(),
