@@ -3,6 +3,7 @@
 mod diagnostics;
 mod lock;
 mod registry;
+mod skill;
 
 use std::{collections::VecDeque, fmt};
 
@@ -14,6 +15,10 @@ pub use lock::{WorkflowLock, WorkflowLockError};
 pub use registry::{
     ModelRegistry, NodeRegistry, PredicateRegistry, RegistryCategory, RegistryEntry,
     RegistryNotFound, SkillRegistry, ToolRegistry, ValidatorRegistry,
+};
+pub use skill::{
+    activate_skill, SkillActivationError, SkillActivationReceipt, SkillDiscoveryMetadata, SkillId,
+    SkillIdError, SkillManifest, SkillManifestError,
 };
 
 /// A typed failure from one compiler pipeline stage.

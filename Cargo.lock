@@ -1711,6 +1711,7 @@ dependencies = [
  "serde_json",
  "toml",
  "workflow-ir",
+ "workflow-runtime",
  "workflow-spec",
 ]
 

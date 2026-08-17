@@ -13,3 +13,4 @@ workflow-spec = { path = "../workflow-spec" }
 
 [dev-dependencies]
 serde_json.workspace = true
+workflow-runtime = { path = "../workflow-runtime" }
