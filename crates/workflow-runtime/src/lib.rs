@@ -370,6 +370,81 @@ impl RequestedCapabilities {
     }
 }
 
+/// Capability classes allowed by one anonymous policy layer.
+pub struct PolicyCapabilities(HashSet<SandboxCapability>);
+
+impl PolicyCapabilities {
+    /// Collects and deduplicates capability classes allowed by this layer.
+    pub fn new(capabilities: impl IntoIterator<Item = SandboxCapability>) -> Self {
+        Self(capabilities.into_iter().collect())
+    }
+}
+
+/// Capability classes authorized by every policy layer for one request.
+pub struct EffectiveCapabilities(Vec<SandboxCapability>);
+
+impl EffectiveCapabilities {
+    /// Returns authorized capability classes in stable diagnostic-name order.
+    pub fn capabilities(&self) -> &[SandboxCapability] {
+        &self.0
+    }
+}
+
+/// Requested capability classes that policy layers do not authorize.
+#[derive(Debug)]
+pub struct CapabilityPolicyDenied {
+    missing: Vec<SandboxCapability>,
+}
+
+impl CapabilityPolicyDenied {
+    /// Returns missing capability classes in stable diagnostic-name order.
+    pub fn missing(&self) -> &[SandboxCapability] {
+        &self.missing
+    }
+}
+
+impl fmt::Display for CapabilityPolicyDenied {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("capability policy denied")?;
+        for capability in &self.missing {
+            formatter.write_str(": ")?;
+            formatter.write_str(capability.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CapabilityPolicyDenied {}
+
+/// Authorizes a complete request only when every policy layer allows it.
+pub fn intersect_policy_capabilities(
+    requested: &RequestedCapabilities,
+    policy_layers: &[PolicyCapabilities],
+) -> Result<EffectiveCapabilities, CapabilityPolicyDenied> {
+    let mut allowed = HashSet::new();
+    if let Some((first_layer, remaining_layers)) = policy_layers.split_first() {
+        allowed.clone_from(&first_layer.0);
+        for layer in remaining_layers {
+            allowed.retain(|capability| layer.0.contains(capability));
+        }
+    }
+
+    let mut missing = requested
+        .0
+        .difference(&allowed)
+        .copied()
+        .collect::<Vec<_>>();
+    missing.sort_unstable_by_key(SandboxCapability::as_str);
+
+    if requested.0.is_empty() || !missing.is_empty() {
+        return Err(CapabilityPolicyDenied { missing });
+    }
+
+    let mut effective = requested.0.iter().copied().collect::<Vec<_>>();
+    effective.sort_unstable_by_key(SandboxCapability::as_str);
+    Ok(EffectiveCapabilities(effective))
+}
+
 /// Capability classes a backend can enforce.
 pub struct BackendCapabilities(HashSet<SandboxCapability>);
 
