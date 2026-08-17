@@ -4,6 +4,7 @@ mod diagnostics;
 mod lock;
 mod registry;
 mod skill;
+mod skill_resource;
 
 use std::{collections::VecDeque, fmt};
 
@@ -19,6 +20,11 @@ pub use registry::{
 pub use skill::{
     activate_skill, SkillActivationError, SkillActivationReceipt, SkillDiscoveryMetadata, SkillId,
     SkillIdError, SkillManifest, SkillManifestError,
+};
+pub use skill_resource::{
+    ActivatedSkillResources, SkillResourceError, SkillResourceId, SkillResourceIdError,
+    SkillResourceInput, SkillResourceLimits, SkillResourceList, SkillResourceMetadata,
+    SkillResourceRead,
 };
 
 /// A typed failure from one compiler pipeline stage.
