@@ -19,6 +19,7 @@ repository = "https://github.com/RyderFreeman4Logos/adk-workflow-kit"
 
 [workspace.dependencies]
 adk-rust = { version = "=1.0.0", default-features = false, features = ["agents", "models", "graph", "guardrail", "telemetry"] }
+clap = "4.6.1"
 jsonschema = { version = "=0.45.1", default-features = false }
 schemars = "=1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
