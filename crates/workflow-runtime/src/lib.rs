@@ -20,7 +20,8 @@ pub use tool::{
     ToolEnvelope, ToolFailure, ToolFlags, ToolProvenance, ToolRegistration, ToolRegistrationError,
 };
 pub use workdir::{
-    CleanupOutcome, RunWorkdir, WorkdirError, WorkdirErrorKind, WorkdirId, WorkdirManager,
+    CleanupOutcome, Materialization, RunWorkdir, WorkdirError, WorkdirErrorKind, WorkdirId,
+    WorkdirManager,
 };
 
 use std::{collections::HashSet, fmt, num::NonZeroU64};

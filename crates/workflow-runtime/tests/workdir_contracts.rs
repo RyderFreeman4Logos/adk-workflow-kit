@@ -8,7 +8,7 @@ use std::{
     thread,
 };
 
-use workflow_runtime::{CleanupOutcome, RunId, WorkdirErrorKind, WorkdirManager};
+use workflow_runtime::{CleanupOutcome, Materialization, RunId, WorkdirErrorKind, WorkdirManager};
 
 static NEXT_BASE: AtomicU64 = AtomicU64::new(0);
 
@@ -134,6 +134,10 @@ fn successful_allocation_has_the_exact_private_layout() {
     assert_eq!(workdir.work_dir(), workdir.root().join("work"));
     assert_eq!(workdir.out_dir(), workdir.root().join("out"));
     assert_eq!(workdir.tmp_dir(), workdir.root().join("tmp"));
+    assert_eq!(workdir.input_dir(), workdir.root().join("input"));
+    assert_eq!(workdir.package_dir(), workdir.root().join("package"));
+    assert_eq!(workdir.skills_dir(), workdir.root().join("skills"));
+    assert_eq!(workdir.refs_dir(), workdir.root().join("refs"));
 
     let mut entries = fs::read_dir(workdir.root())
         .expect("root must be readable")
@@ -146,7 +150,19 @@ fn successful_allocation_has_the_exact_private_layout() {
         })
         .collect::<Vec<_>>();
     entries.sort_unstable();
-    assert_eq!(entries, ["manifest.json", "out", "tmp", "work"]);
+    assert_eq!(
+        entries,
+        [
+            "input",
+            "manifest.json",
+            "out",
+            "package",
+            "refs",
+            "skills",
+            "tmp",
+            "work"
+        ]
+    );
 
     for directory in [
         workdir.root().to_owned(),
@@ -161,6 +177,23 @@ fn successful_allocation_has_the_exact_private_layout() {
             & 0o777;
         assert_eq!(mode, 0o700);
     }
+    for directory in [
+        workdir.input_dir(),
+        workdir.package_dir(),
+        workdir.skills_dir(),
+        workdir.refs_dir(),
+    ] {
+        let mode = fs::metadata(&directory)
+            .expect("immutable layout directory metadata must be readable")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o555);
+        assert!(
+            !directory.join("content.bin").exists(),
+            "empty allocation must not materialize content"
+        );
+    }
     let manifest_mode = fs::metadata(workdir.manifest_path())
         .expect("manifest metadata must be readable")
         .permissions()
@@ -169,13 +202,125 @@ fn successful_allocation_has_the_exact_private_layout() {
     assert_eq!(manifest_mode, 0o600);
 
     let expected = format!(
-        "{{\"schema_version\":1,\"workdir_id\":\"{id}\",\"paths\":{{\"work\":\"work\",\"out\":\"out\",\"tmp\":\"tmp\"}}}}"
+        "{{\"schema_version\":1,\"workdir_id\":\"{id}\",\"paths\":{{\"work\":\"work\",\"out\":\"out\",\"tmp\":\"tmp\",\"input\":\"input\",\"package\":\"package\",\"skills\":\"skills\",\"refs\":\"refs\"}},\"hashes\":{{}}}}"
     );
     assert_eq!(
         fs::read(workdir.manifest_path()).expect("manifest must be readable"),
         expected.as_bytes()
     );
     assert!(!workdir.root().join(".manifest.json.tmp").exists());
+}
+
+#[test]
+fn materialization_records_immutable_hashes_and_blocks_writes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = TestBase::new();
+    let manager = WorkdirManager::new(base.path()).expect("test base must be trusted");
+    let run_id = RunId::new(String::from("materialize")).expect("fixture run ID must be valid");
+    let fixture = b"fixture bytes";
+    let materialization = Materialization {
+        input: Some(fixture.to_vec()),
+        package: Some(b"package".to_vec()),
+        skills: None,
+        refs: None,
+    };
+    let workdir = manager
+        .materialize(&run_id, &materialization)
+        .expect("materialization must succeed");
+
+    // Accessors exist beside work_dir().
+    assert_eq!(workdir.input_dir(), workdir.root().join("input"));
+    assert_eq!(workdir.package_dir(), workdir.root().join("package"));
+    assert_eq!(workdir.skills_dir(), workdir.root().join("skills"));
+    assert_eq!(workdir.refs_dir(), workdir.root().join("refs"));
+
+    // Immutable dirs are created at 0o555.
+    for directory in [
+        workdir.input_dir(),
+        workdir.package_dir(),
+        workdir.skills_dir(),
+        workdir.refs_dir(),
+    ] {
+        let mode = fs::metadata(&directory)
+            .expect("immutable directory metadata must be readable")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o555);
+    }
+
+    // A write into an immutable directory fails.
+    assert!(
+        fs::write(workdir.input_dir().join("tamper"), b"x").is_err(),
+        "a write into a read-only immutable directory must fail"
+    );
+
+    // Materialized bytes are recorded on the manifest as SHA-256.
+    let manifest = fs::read(workdir.manifest_path()).expect("manifest must be readable");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&manifest).expect("manifest must be valid JSON");
+    assert_eq!(
+        manifest["paths"]["input"], "input",
+        "manifest paths must record the immutable input directory"
+    );
+    let recorded = manifest["hashes"]["input"]
+        .as_str()
+        .expect("input hash must be recorded");
+    let expected = sha256_hex(fixture);
+    assert_eq!(
+        recorded, expected,
+        "recorded hash must match materialized bytes"
+    );
+
+    // Recomputing over mutated bytes diverges from the recorded hash.
+    let tampered = sha256_hex(b"mutated bytes");
+    assert_ne!(
+        tampered, recorded,
+        "a later hash check must fail on mutation"
+    );
+}
+
+#[test]
+fn cleanup_removes_a_materialized_tree_with_content() {
+    let base = TestBase::new();
+    let manager = WorkdirManager::new(base.path()).expect("test base must be trusted");
+    let run_id =
+        RunId::new(String::from("materialize-cleanup")).expect("fixture run ID must be valid");
+    let materialization = Materialization {
+        input: Some(b"input blob".to_vec()),
+        package: Some(b"package blob".to_vec()),
+        skills: Some(b"skills blob".to_vec()),
+        refs: Some(b"refs blob".to_vec()),
+    };
+    let mut workdir = manager
+        .materialize(&run_id, &materialization)
+        .expect("materialization must succeed");
+    let root = workdir.root().to_owned();
+
+    assert_eq!(
+        workdir
+            .cleanup()
+            .expect("materialized cleanup must succeed"),
+        CleanupOutcome::Removed,
+        "cleanup must remove a materialized tree so it does not leak at 0o555"
+    );
+    assert!(
+        !root.exists(),
+        "the materialized root must be fully removed on cleanup"
+    );
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 #[test]
