@@ -1,6 +1,7 @@
 //! Strict, source-aware decoding for workflow specification version 1.
 
 use std::{
+    collections::BTreeMap,
     io::Read,
     ops::Range,
     path::{Path, PathBuf},
@@ -103,6 +104,7 @@ pub struct WorkflowSpec {
     workflow: Workflow,
     nodes: Vec<Node>,
     edges: Vec<Edge>,
+    routes: Vec<PredicateRoute>,
 }
 
 impl WorkflowSpec {
@@ -124,6 +126,11 @@ impl WorkflowSpec {
     /// Returns parsed edges in source order.
     pub fn edges(&self) -> &[Edge] {
         &self.edges
+    }
+
+    /// Returns parsed registered-predicate routes in source order.
+    pub fn routes(&self) -> &[PredicateRoute] {
+        &self.routes
     }
 }
 
@@ -293,6 +300,69 @@ pub struct Edge {
     to: NodeId,
 }
 
+/// A source-level registered-predicate route without graph validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PredicateRoute {
+    from: NodeId,
+    predicate: PredicateReference,
+    cases: Vec<RouteCase>,
+}
+
+impl PredicateRoute {
+    /// Returns the route origin identifier.
+    pub fn from(&self) -> &NodeId {
+        &self.from
+    }
+
+    /// Returns the exact registered predicate reference.
+    pub fn predicate(&self) -> &PredicateReference {
+        &self.predicate
+    }
+
+    /// Returns route cases in raw UTF-8 key order.
+    pub fn cases(&self) -> &[RouteCase] {
+        &self.cases
+    }
+}
+
+/// An exact opaque registered-predicate identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PredicateReference {
+    id: String,
+    version: String,
+}
+
+impl PredicateReference {
+    /// Returns the predicate ID exactly as authored.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the exact predicate version as authored.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+}
+
+/// A source-level predicate case and target node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteCase {
+    key: String,
+    target: NodeId,
+}
+
+impl RouteCase {
+    /// Returns the opaque case key exactly as authored.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Returns the case target node identifier.
+    pub fn target(&self) -> &NodeId {
+        &self.target
+    }
+}
+
 impl Edge {
     /// Returns the edge origin identifier.
     pub fn from(&self) -> &NodeId {
@@ -407,6 +477,25 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
                 to: NodeId(edge.to),
             })
             .collect(),
+        routes: raw
+            .routes
+            .into_iter()
+            .map(|route| PredicateRoute {
+                from: NodeId(route.from),
+                predicate: PredicateReference {
+                    id: route.predicate.id,
+                    version: route.predicate.version,
+                },
+                cases: route
+                    .cases
+                    .into_iter()
+                    .map(|(key, target)| RouteCase {
+                        key,
+                        target: NodeId(target),
+                    })
+                    .collect(),
+            })
+            .collect(),
     })
 }
 
@@ -478,6 +567,8 @@ struct RawWorkflowSpec {
     workflow: RawWorkflow,
     nodes: Vec<RawNode>,
     edges: Vec<RawEdge>,
+    #[serde(default)]
+    routes: Vec<RawPredicateRoute>,
 }
 
 #[derive(Deserialize)]
@@ -500,4 +591,19 @@ struct RawNode {
 struct RawEdge {
     from: String,
     to: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPredicateRoute {
+    from: String,
+    predicate: RawPredicateReference,
+    cases: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPredicateReference {
+    id: String,
+    version: String,
 }
