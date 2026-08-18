@@ -1,13 +1,15 @@
 use std::{
+    collections::BTreeMap,
     error::Error,
     fmt,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::{encode_hex, RunId};
 
@@ -43,8 +45,19 @@ impl WorkdirManager {
         })
     }
 
-    /// Allocates a fresh root for `run_id`.
+    /// Allocates a fresh root for `run_id` with no materialized inputs.
     pub fn allocate(&self, run_id: &RunId) -> Result<RunWorkdir, WorkdirError> {
+        self.materialize(run_id, &Materialization::default())
+    }
+
+    /// Allocates a fresh root for `run_id`, materializing `materialization`
+    /// into the immutable `input/`/`package/`/`skills/`/`refs/` directories and
+    /// recording each blob's SHA-256 on the manifest.
+    pub fn materialize(
+        &self,
+        run_id: &RunId,
+        materialization: &Materialization,
+    ) -> Result<RunWorkdir, WorkdirError> {
         self.verify_base()?;
         let mut entropy = File::open("/dev/urandom")
             .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::Entropy, error))?;
@@ -57,7 +70,7 @@ impl WorkdirManager {
                     .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::Entropy, error))?;
                 Ok(WorkdirId(encode_hex(&bytes)))
             },
-            initialize_layout,
+            |root, id| initialize_layout(root, id, materialization),
         )
     }
 
@@ -175,6 +188,7 @@ struct Manifest<'a> {
     schema_version: u8,
     workdir_id: &'a str,
     paths: ManifestPaths,
+    hashes: BTreeMap<&'static str, String>,
 }
 
 #[derive(Serialize)]
@@ -182,9 +196,30 @@ struct ManifestPaths {
     work: &'static str,
     out: &'static str,
     tmp: &'static str,
+    input: &'static str,
+    package: &'static str,
+    skills: &'static str,
+    refs: &'static str,
 }
 
-fn initialize_layout(root: &Path, id: &WorkdirId) -> Result<(), WorkdirError> {
+/// Read-only blobs to materialize into a run's immutable directories.
+///
+/// Each present blob is written as `content.bin` inside its directory, the
+/// directory is locked to `0o555`, and the blob's SHA-256 is recorded on the
+/// manifest so a later hash check detects mutation.
+#[derive(Clone, Default)]
+pub struct Materialization {
+    pub input: Option<Vec<u8>>,
+    pub package: Option<Vec<u8>>,
+    pub skills: Option<Vec<u8>>,
+    pub refs: Option<Vec<u8>>,
+}
+
+fn initialize_layout(
+    root: &Path,
+    id: &WorkdirId,
+    materialization: &Materialization,
+) -> Result<(), WorkdirError> {
     for name in ["work", "out", "tmp"] {
         DirBuilder::new()
             .mode(0o700)
@@ -194,6 +229,18 @@ fn initialize_layout(root: &Path, id: &WorkdirId) -> Result<(), WorkdirError> {
             })?;
     }
 
+    let mut hashes = BTreeMap::new();
+    for (name, bytes) in [
+        ("input", materialization.input.as_deref()),
+        ("package", materialization.package.as_deref()),
+        ("skills", materialization.skills.as_deref()),
+        ("refs", materialization.refs.as_deref()),
+    ] {
+        if let Some(hash) = materialize_immutable_dir(root, name, bytes)? {
+            hashes.insert(name, hash);
+        }
+    }
+
     let manifest = serde_json::to_vec(&Manifest {
         schema_version: 1,
         workdir_id: id.as_str(),
@@ -201,7 +248,12 @@ fn initialize_layout(root: &Path, id: &WorkdirId) -> Result<(), WorkdirError> {
             work: "work",
             out: "out",
             tmp: "tmp",
+            input: "input",
+            package: "package",
+            skills: "skills",
+            refs: "refs",
         },
+        hashes,
     })
     .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::InitializeLayout, error))?;
     let temporary = root.join(".manifest.json.tmp");
@@ -217,6 +269,36 @@ fn initialize_layout(root: &Path, id: &WorkdirId) -> Result<(), WorkdirError> {
     fs::rename(temporary, root.join("manifest.json"))
         .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::PublishManifest, error))?;
     Ok(())
+}
+
+/// Creates one immutable directory, writes its blob if any, locks it read-only,
+/// and returns the blob's SHA-256 when materialized.
+fn materialize_immutable_dir(
+    root: &Path,
+    name: &str,
+    bytes: Option<&[u8]>,
+) -> Result<Option<String>, WorkdirError> {
+    let dir = root.join(name);
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::InitializeLayout, error))?;
+    let hash = match bytes {
+        Some(bytes) => {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            File::create(dir.join("content.bin"))
+                .and_then(|mut file| file.write_all(bytes))
+                .map_err(|error| {
+                    WorkdirError::with_source(WorkdirErrorKind::InitializeLayout, error)
+                })?;
+            Some(encode_hex(&hasher.finalize()))
+        }
+        None => None,
+    };
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555))
+        .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::InitializeLayout, error))?;
+    Ok(hash)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -401,6 +483,26 @@ impl RunWorkdir {
         self.root.join("work")
     }
 
+    /// Returns the immutable input directory.
+    pub fn input_dir(&self) -> PathBuf {
+        self.root.join("input")
+    }
+
+    /// Returns the immutable workflow package directory.
+    pub fn package_dir(&self) -> PathBuf {
+        self.root.join("package")
+    }
+
+    /// Returns the immutable active Skill packages directory.
+    pub fn skills_dir(&self) -> PathBuf {
+        self.root.join("skills")
+    }
+
+    /// Returns the immutable external references directory.
+    pub fn refs_dir(&self) -> PathBuf {
+        self.root.join("refs")
+    }
+
     /// Returns the output directory.
     pub fn out_dir(&self) -> PathBuf {
         self.root.join("out")
@@ -435,7 +537,10 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{initialize_layout, WorkdirError, WorkdirErrorKind, WorkdirId, WorkdirManager};
+    use super::{
+        initialize_layout, Materialization, WorkdirError, WorkdirErrorKind, WorkdirId,
+        WorkdirManager,
+    };
     use crate::RunId;
 
     static NEXT_BASE: AtomicU64 = AtomicU64::new(0);
@@ -493,7 +598,7 @@ mod tests {
             .allocate_with(
                 &run_id(),
                 || Ok(ids.next().expect("deterministic ID must exist")),
-                initialize_layout,
+                |root, id| initialize_layout(root, id, &Materialization::default()),
             )
             .expect("the second deterministic ID must allocate");
 
@@ -520,7 +625,7 @@ mod tests {
                 calls += 1;
                 Ok(collision.clone())
             },
-            initialize_layout,
+            |root, id| initialize_layout(root, id, &Materialization::default()),
         ) {
             Ok(_) => panic!("eight collisions must exhaust allocation"),
             Err(error) => error,
@@ -646,7 +751,7 @@ mod tests {
                     std::io::Error::other("injected entropy failure"),
                 ))
             },
-            initialize_layout,
+            |root, id| initialize_layout(root, id, &Materialization::default()),
         ) {
             Ok(_) => panic!("injected entropy failure must fail allocation"),
             Err(error) => error,
@@ -663,7 +768,11 @@ mod tests {
         let manager = WorkdirManager::new(base.path()).expect("test base must be trusted");
         fs::set_permissions(base.path(), fs::Permissions::from_mode(0o500))
             .expect("base permissions must be restricted");
-        let error = match manager.allocate_with(&run_id(), || Ok(id(6)), initialize_layout) {
+        let error = match manager.allocate_with(
+            &run_id(),
+            || Ok(id(6)),
+            |root, id| initialize_layout(root, id, &Materialization::default()),
+        ) {
             Ok(_) => panic!("non-writable base must fail root creation"),
             Err(error) => error,
         };
@@ -680,7 +789,7 @@ mod tests {
         fs::create_dir(&root).expect("root must be created");
         fs::create_dir(root.join("work")).expect("conflicting work entry must be created");
 
-        let error = initialize_layout(&root, &id(7))
+        let error = initialize_layout(&root, &id(7), &Materialization::default())
             .expect_err("an existing layout entry must fail initialization");
 
         assert_eq!(error.kind(), WorkdirErrorKind::InitializeLayout);
@@ -694,7 +803,7 @@ mod tests {
         fs::create_dir(root.join("manifest.json"))
             .expect("conflicting manifest directory must be created");
 
-        let error = initialize_layout(&root, &id(8))
+        let error = initialize_layout(&root, &id(8), &Materialization::default())
             .expect_err("manifest rename conflict must fail publication");
 
         assert_eq!(error.kind(), WorkdirErrorKind::PublishManifest);
