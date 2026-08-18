@@ -7,6 +7,7 @@ members = [
     "crates/workflow-testkit",
     "crates/workflow-adk",
     "crates/workflow-runtime",
+    "crates/workflow-review",
     "crates/workflowctl",
 ]
 
