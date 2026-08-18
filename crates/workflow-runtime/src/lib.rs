@@ -1,6 +1,7 @@
 //! Cooperative run enforcement, terminal contracts, and sandbox preflight.
 
 mod artifact;
+mod bubblewrap;
 mod controller;
 mod session;
 mod tool;
@@ -9,6 +10,10 @@ mod workdir;
 pub use artifact::{
     ArtifactError, ArtifactErrorKind, ArtifactId, ArtifactPage, ArtifactStore,
     FilesystemArtifactStore, InMemoryArtifactStore, PageRequest, RetentionPolicy,
+};
+pub use bubblewrap::{
+    BubblewrapError, BubblewrapReceipt, BubblewrapRequest, BubblewrapRequestError,
+    BubblewrapRequestErrorKind, LinuxBubblewrapBackend,
 };
 pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
@@ -368,6 +373,11 @@ impl RequestedCapabilities {
     /// Collects and deduplicates required capability classes.
     pub fn new(capabilities: impl IntoIterator<Item = SandboxCapability>) -> Self {
         Self(capabilities.into_iter().collect())
+    }
+
+    /// Returns whether the request requires the supplied capability class.
+    pub fn contains(&self, capability: SandboxCapability) -> bool {
+        self.0.contains(&capability)
     }
 }
 
