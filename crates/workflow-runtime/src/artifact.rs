@@ -1,4 +1,13 @@
-use std::{collections::HashMap, fmt, num::NonZeroU64, time::SystemTime};
+use std::{
+    collections::HashMap,
+    fmt,
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    num::NonZeroU64,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 use sha2::{Digest, Sha256};
 
@@ -85,6 +94,8 @@ pub enum ArtifactErrorKind {
     NotFound,
     /// Matching content IDs referred to different bytes.
     ContentIdCollision,
+    /// The underlying storage failed while reading or writing content.
+    Io,
 }
 
 /// A categorized artifact failure with a privacy-safe message.
@@ -112,6 +123,7 @@ impl fmt::Display for ArtifactError {
             ArtifactErrorKind::PageOutOfBounds => "artifact page offset is out of bounds",
             ArtifactErrorKind::NotFound => "artifact was not found",
             ArtifactErrorKind::ContentIdCollision => "artifact content ID collision",
+            ArtifactErrorKind::Io => "storage I/O error",
         })
     }
 }
@@ -242,6 +254,161 @@ impl ArtifactStore for InMemoryArtifactStore {
         self.entries
             .get(id)
             .map(|entry| entry.retention)
+            .ok_or_else(|| ArtifactError::new(ArtifactErrorKind::NotFound))
+    }
+}
+
+/// Stores and retrieves opaque artifacts as content-addressed files on disk.
+///
+/// Each stored artifact is one file named by its lowercase hex SHA-256 ID,
+/// so hostile bytes never reach the filesystem path. Writes are atomic
+/// (temp + fsync + rename); retention is metadata kept alongside the store
+/// and never triggers deletion.
+pub struct FilesystemArtifactStore {
+    root: PathBuf,
+    retention: HashMap<ArtifactId, RetentionPolicy>,
+    max_content_bytes: NonZeroU64,
+    max_page_bytes: NonZeroU64,
+}
+
+impl FilesystemArtifactStore {
+    /// Creates an empty store rooted at `root`, creating the directory if needed.
+    pub fn new(
+        root: impl AsRef<Path>,
+        max_content_bytes: NonZeroU64,
+        max_page_bytes: NonZeroU64,
+    ) -> Self {
+        fs::create_dir_all(root.as_ref()).expect("configured store root must be created");
+        Self {
+            root: root.as_ref().to_path_buf(),
+            retention: HashMap::new(),
+            max_content_bytes,
+            max_page_bytes,
+        }
+    }
+
+    /// Removes the entire store directory; later reads become `NotFound`.
+    pub fn remove_all(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+
+    fn path_for(&self, id: &ArtifactId) -> PathBuf {
+        self.root.join(id.as_str())
+    }
+
+    fn storage_error(error: io::Error) -> ArtifactError {
+        ArtifactError::new(if error.kind() == io::ErrorKind::NotFound {
+            ArtifactErrorKind::NotFound
+        } else {
+            ArtifactErrorKind::Io
+        })
+    }
+}
+
+impl ArtifactStore for FilesystemArtifactStore {
+    fn put(&mut self, bytes: &[u8]) -> Result<ArtifactId, ArtifactError> {
+        if bytes.is_empty() {
+            return Err(ArtifactError::new(ArtifactErrorKind::EmptyContent));
+        }
+        if u64::try_from(bytes.len()).map_or(true, |length| length > self.max_content_bytes.get()) {
+            return Err(ArtifactError::new(ArtifactErrorKind::ContentTooLarge));
+        }
+
+        let id = ArtifactId(encode_hex(&Sha256::digest(bytes)));
+        let final_path = self.path_for(&id);
+        match fs::read(&final_path) {
+            Ok(existing) => {
+                if existing.as_slice() != bytes {
+                    return Err(ArtifactError::new(ArtifactErrorKind::ContentIdCollision));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // Fresh content: atomic write, mirroring workdir.rs publication.
+                let temporary = self.root.join(format!(".tmp-{}", id.as_str()));
+                let result = (|| {
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&temporary)
+                        .map_err(Self::storage_error)?;
+                    file.write_all(bytes).map_err(Self::storage_error)?;
+                    file.sync_all().map_err(Self::storage_error)?;
+                    drop(file);
+                    fs::rename(&temporary, &final_path).map_err(Self::storage_error)
+                })();
+                if result.is_err() {
+                    let _ = fs::remove_file(&temporary);
+                }
+                result?;
+            }
+            Err(error) => return Err(Self::storage_error(error)),
+        }
+
+        self.retention
+            .entry(id.clone())
+            .or_insert(RetentionPolicy::Retain);
+        Ok(id)
+    }
+
+    fn read_page(
+        &self,
+        id: &ArtifactId,
+        request: PageRequest,
+    ) -> Result<ArtifactPage, ArtifactError> {
+        let bytes = fs::read(self.path_for(id)).map_err(Self::storage_error)?;
+        let content_len = u64::try_from(bytes.len())
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ContentTooLarge))?;
+        if request.offset > content_len {
+            return Err(ArtifactError::new(ArtifactErrorKind::PageOutOfBounds));
+        }
+
+        let page_len = request
+            .limit
+            .get()
+            .min(self.max_page_bytes.get())
+            .min(content_len - request.offset);
+        let end_offset = request
+            .offset
+            .checked_add(page_len)
+            .ok_or_else(|| ArtifactError::new(ArtifactErrorKind::PageOutOfBounds))?;
+        let start = usize::try_from(request.offset)
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::PageOutOfBounds))?;
+        let end = usize::try_from(end_offset)
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::PageOutOfBounds))?;
+
+        Ok(ArtifactPage {
+            bytes: bytes[start..end].to_vec(),
+            next_offset: (end_offset < content_len).then_some(end_offset),
+        })
+    }
+
+    fn set_retention(
+        &mut self,
+        id: &ArtifactId,
+        policy: RetentionPolicy,
+    ) -> Result<(), ArtifactError> {
+        match fs::metadata(self.path_for(id)) {
+            Ok(_) => self.retention.insert(id.clone(), policy),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ArtifactError::new(ArtifactErrorKind::NotFound))
+            }
+            Err(error) => return Err(Self::storage_error(error)),
+        };
+        Ok(())
+    }
+
+    fn retention(&self, id: &ArtifactId) -> Result<RetentionPolicy, ArtifactError> {
+        match fs::metadata(self.path_for(id)) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ArtifactError::new(ArtifactErrorKind::NotFound))
+            }
+            Err(error) => return Err(Self::storage_error(error)),
+        }
+        self.retention
+            .get(id)
+            .copied()
             .ok_or_else(|| ArtifactError::new(ArtifactErrorKind::NotFound))
     }
 }
