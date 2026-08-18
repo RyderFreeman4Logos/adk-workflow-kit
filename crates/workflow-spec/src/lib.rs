@@ -1,7 +1,7 @@
 //! Strict, source-aware decoding for workflow specification version 1.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::Read,
     ops::Range,
     path::{Path, PathBuf},
@@ -105,6 +105,7 @@ pub struct WorkflowSpec {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
     routes: Vec<PredicateRoute>,
+    state: Option<StateSpec>,
 }
 
 impl WorkflowSpec {
@@ -131,6 +132,11 @@ impl WorkflowSpec {
     /// Returns parsed registered-predicate routes in source order.
     pub fn routes(&self) -> &[PredicateRoute] {
         &self.routes
+    }
+
+    /// Returns the parsed v1 state declaration, when the document declares one.
+    pub fn state(&self) -> Option<&StateSpec> {
+        self.state.as_ref()
     }
 }
 
@@ -363,6 +369,69 @@ impl RouteCase {
     }
 }
 
+/// The v1 state declaration: an opaque schema identity, required keys, and
+/// declared keys with their own opaque schema identities and handle shapes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateSpec {
+    schema_id: String,
+    schema_version: String,
+    required_keys: BTreeSet<String>,
+    keys: Vec<StateKey>,
+}
+
+impl StateSpec {
+    /// Returns the opaque state-schema identifier exactly as authored.
+    pub fn schema_id(&self) -> &str {
+        &self.schema_id
+    }
+
+    /// Returns the exact state-schema version as authored.
+    pub fn schema_version(&self) -> &str {
+        &self.schema_version
+    }
+
+    /// Returns required key names in canonical raw UTF-8 order.
+    pub fn required_keys(&self) -> impl Iterator<Item = &str> {
+        self.required_keys.iter().map(String::as_str)
+    }
+
+    /// Returns declared keys in canonical raw UTF-8 name order.
+    pub fn keys(&self) -> &[StateKey] {
+        &self.keys
+    }
+}
+
+/// A declared state key with its opaque schema identity and optional handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateKey {
+    name: String,
+    schema_id: String,
+    schema_version: String,
+    handle: Option<String>,
+}
+
+impl StateKey {
+    /// Returns the opaque key name exactly as authored.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the key schema identifier exactly as authored.
+    pub fn schema_id(&self) -> &str {
+        &self.schema_id
+    }
+
+    /// Returns the exact key schema version as authored.
+    pub fn schema_version(&self) -> &str {
+        &self.schema_version
+    }
+
+    /// Returns the opaque handle shape token when the key declares one.
+    pub fn handle(&self) -> Option<&str> {
+        self.handle.as_deref()
+    }
+}
+
 impl Edge {
     /// Returns the edge origin identifier.
     pub fn from(&self) -> &NodeId {
@@ -496,6 +565,21 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
                     .collect(),
             })
             .collect(),
+        state: raw.state.map(|state| StateSpec {
+            schema_id: state.schema_id,
+            schema_version: state.schema_version,
+            required_keys: state.required_keys,
+            keys: state
+                .keys
+                .into_iter()
+                .map(|(name, key)| StateKey {
+                    name,
+                    schema_id: key.schema_id,
+                    schema_version: key.schema_version,
+                    handle: key.handle,
+                })
+                .collect(),
+        }),
     })
 }
 
@@ -569,6 +653,8 @@ struct RawWorkflowSpec {
     edges: Vec<RawEdge>,
     #[serde(default)]
     routes: Vec<RawPredicateRoute>,
+    #[serde(default)]
+    state: Option<RawState>,
 }
 
 #[derive(Deserialize)]
@@ -606,4 +692,23 @@ struct RawPredicateRoute {
 struct RawPredicateReference {
     id: String,
     version: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawState {
+    schema_id: String,
+    schema_version: String,
+    #[serde(default)]
+    required_keys: BTreeSet<String>,
+    keys: BTreeMap<String, RawStateKey>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStateKey {
+    schema_id: String,
+    schema_version: String,
+    #[serde(default)]
+    handle: Option<String>,
 }

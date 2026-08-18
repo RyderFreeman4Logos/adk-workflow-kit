@@ -39,6 +39,8 @@ pub enum CompileError {
     Parse(SpecError),
     /// Canonical workflow semantic validation failed.
     Graph(GraphValidationError),
+    /// Declared state key/schema/handle preflight failed.
+    State(StateValidationError),
     /// The workflow declares predicate routes but no registry was supplied.
     PredicateRegistryRequired,
     /// Exact predicate registry resolution failed.
@@ -50,6 +52,7 @@ impl fmt::Display for CompileError {
         match self {
             Self::Parse(error) => write!(formatter, "workflow parsing failed: {error}"),
             Self::Graph(error) => write!(formatter, "workflow graph validation failed: {error}"),
+            Self::State(error) => write!(formatter, "workflow state validation failed: {error}"),
             Self::PredicateRegistryRequired => {
                 formatter.write_str("predicate registry is required")
             }
@@ -63,6 +66,7 @@ impl std::error::Error for CompileError {
         match self {
             Self::Parse(error) => Some(error),
             Self::Graph(error) => Some(error),
+            Self::State(error) => Some(error),
             Self::PredicateRegistryRequired => None,
             Self::Registry(error) => Some(error),
         }
@@ -155,6 +159,7 @@ fn compile_with_predicates<R: PredicateRegistry>(
 fn validated_ir(spec: &WorkflowSpec) -> Result<WorkflowIr, CompileError> {
     let ir = WorkflowIr::from(spec);
     validate_graph(&ir).map_err(CompileError::Graph)?;
+    validate_state(&ir).map_err(CompileError::State)?;
     Ok(ir)
 }
 
@@ -340,6 +345,99 @@ pub fn validate_graph(ir: &WorkflowIr) -> Result<(), GraphValidationError> {
         return Err(GraphValidationError::CannotReachTerminal {
             node_id: nodes[index].id().clone(),
         });
+    }
+
+    Ok(())
+}
+
+/// The exact state-schema version supported by v1 preflight.
+const STATE_SCHEMA_VERSION_V1: &str = "1";
+
+/// The handle-shape tokens accepted by v1 preflight.
+///
+/// `inline` is normalized away at IR construction; `artifact` marks a key whose
+/// value is carried by an opaque artifact handle at runtime (ART-001/ART-002).
+const HANDLE_SHAPES: [&str; 2] = ["inline", "artifact"];
+
+/// A declared state key/schema/handle preflight failure with source-free
+/// opaque identifiers retained for programmatic inspection. Diagnostics never
+/// echo these identifiers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StateValidationError {
+    /// A state schema or key identifier is empty.
+    InvalidIdentifier {
+        /// The stable structural path of the invalid identifier.
+        field_path: &'static str,
+    },
+    /// The declared state schema version is not supported.
+    UnsupportedSchemaVersion {
+        /// The authored state schema version.
+        found: String,
+    },
+    /// A required key name is absent from the declared key set.
+    MissingRequiredKey {
+        /// The opaque required key name.
+        key_name: String,
+    },
+    /// A declared handle shape is outside the closed v1 vocabulary.
+    InvalidHandleShape {
+        /// The authored handle shape token.
+        shape: String,
+    },
+}
+
+/// Validates the declared v1 state contract: identifiers, schema version,
+/// required-key membership, and handle-shape vocabulary.
+///
+/// The validator is deterministic, purely in-memory, and never touches the
+/// host filesystem, subprocesses, or the network.
+pub fn validate_state(ir: &WorkflowIr) -> Result<(), StateValidationError> {
+    let Some(state) = ir.state() else {
+        return Ok(());
+    };
+
+    for (field_path, value) in [
+        ("state.schema_id", state.schema_id()),
+        ("state.schema_version", state.schema_version()),
+    ] {
+        if value.is_empty() {
+            return Err(StateValidationError::InvalidIdentifier { field_path });
+        }
+    }
+    for key in state.keys() {
+        for (field_path, value) in [
+            ("state.keys[].name", key.name()),
+            ("state.keys[].schema_id", key.schema_id()),
+            ("state.keys[].schema_version", key.schema_version()),
+        ] {
+            if value.is_empty() {
+                return Err(StateValidationError::InvalidIdentifier { field_path });
+            }
+        }
+    }
+
+    if state.schema_version() != STATE_SCHEMA_VERSION_V1 {
+        return Err(StateValidationError::UnsupportedSchemaVersion {
+            found: state.schema_version().to_owned(),
+        });
+    }
+
+    for name in state.required_keys() {
+        if !state.keys().iter().any(|key| key.name() == name) {
+            return Err(StateValidationError::MissingRequiredKey {
+                key_name: name.to_owned(),
+            });
+        }
+    }
+
+    for key in state.keys() {
+        if let Some(shape) = key.handle() {
+            if !HANDLE_SHAPES.contains(&shape) {
+                return Err(StateValidationError::InvalidHandleShape {
+                    shape: shape.to_owned(),
+                });
+            }
+        }
     }
 
     Ok(())
