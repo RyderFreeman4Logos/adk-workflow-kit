@@ -1,0 +1,25 @@
+# REVIEW-004: a reviewer `pass` must never route straight to publish.
+#
+# Fail-closed guard target: the walk must refuse to follow `review pass ->
+# publish`; the repaired output must re-enter a validator, not a terminal.
+
+schema_version = 1
+edges = []
+
+[workflow]
+id = "review.bypass-reviewer"
+version = "1"
+entry = "review"
+
+[[nodes]]
+id = "review"
+kind = "agent"
+
+[[nodes]]
+id = "publish"
+kind = "terminal"
+
+[[routes]]
+from = "review"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "publish" }

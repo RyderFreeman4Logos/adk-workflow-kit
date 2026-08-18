@@ -66,7 +66,16 @@ cases = { pass = "validate-final", revise = "revise-1", abstain = "abstain" }
 
 [[edges]]
 from = "revise-1"
-to = "review-2"
+to = "validate-1"
+
+[[nodes]]
+id = "validate-1"
+kind = "validator"
+
+[[routes]]
+from = "validate-1"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-2", fail = "fail" }
 
 [[nodes]]
 id = "review-2"
@@ -83,7 +92,16 @@ cases = { pass = "validate-final", revise = "revise-2", abstain = "abstain" }
 
 [[edges]]
 from = "revise-2"
-to = "review-3"
+to = "validate-2"
+
+[[nodes]]
+id = "validate-2"
+kind = "validator"
+
+[[routes]]
+from = "validate-2"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-3", fail = "fail" }
 
 [[nodes]]
 id = "review-3"
@@ -100,7 +118,16 @@ cases = { pass = "validate-final", revise = "revise-3", abstain = "abstain" }
 
 [[edges]]
 from = "revise-3"
-to = "review-4"
+to = "validate-3"
+
+[[nodes]]
+id = "validate-3"
+kind = "validator"
+
+[[routes]]
+from = "validate-3"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-4", fail = "fail" }
 
 [[nodes]]
 id = "review-4"
@@ -117,7 +144,16 @@ cases = { pass = "validate-final", revise = "revise-4", abstain = "abstain" }
 
 [[edges]]
 from = "revise-4"
-to = "review-5"
+to = "validate-4"
+
+[[nodes]]
+id = "validate-4"
+kind = "validator"
+
+[[routes]]
+from = "validate-4"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-5", fail = "fail" }
 
 [[nodes]]
 id = "review-5"
@@ -134,7 +170,16 @@ cases = { pass = "validate-final", revise = "revise-5", abstain = "abstain" }
 
 [[edges]]
 from = "revise-5"
-to = "review-6"
+to = "validate-5"
+
+[[nodes]]
+id = "validate-5"
+kind = "validator"
+
+[[routes]]
+from = "validate-5"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-6", fail = "fail" }
 
 [[nodes]]
 id = "review-6"
@@ -151,7 +196,16 @@ cases = { pass = "validate-final", revise = "revise-6", abstain = "abstain" }
 
 [[edges]]
 from = "revise-6"
-to = "review-7"
+to = "validate-6"
+
+[[nodes]]
+id = "validate-6"
+kind = "validator"
+
+[[routes]]
+from = "validate-6"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-7", fail = "fail" }
 
 [[nodes]]
 id = "review-7"
@@ -168,7 +222,16 @@ cases = { pass = "validate-final", revise = "revise-7", abstain = "abstain" }
 
 [[edges]]
 from = "revise-7"
-to = "review-8"
+to = "validate-7"
+
+[[nodes]]
+id = "validate-7"
+kind = "validator"
+
+[[routes]]
+from = "validate-7"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-8", fail = "fail" }
 
 [[nodes]]
 id = "review-8"
@@ -185,7 +248,16 @@ cases = { pass = "validate-final", revise = "revise-8", abstain = "abstain" }
 
 [[edges]]
 from = "revise-8"
-to = "review-9"
+to = "validate-8"
+
+[[nodes]]
+id = "validate-8"
+kind = "validator"
+
+[[routes]]
+from = "validate-8"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-9", fail = "fail" }
 
 [[nodes]]
 id = "review-9"
@@ -202,7 +274,16 @@ cases = { pass = "validate-final", revise = "revise-9", abstain = "abstain" }
 
 [[edges]]
 from = "revise-9"
-to = "review-10"
+to = "validate-9"
+
+[[nodes]]
+id = "validate-9"
+kind = "validator"
+
+[[routes]]
+from = "validate-9"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-10", fail = "fail" }
 
 [[nodes]]
 id = "review-10"
@@ -219,7 +300,16 @@ cases = { pass = "validate-final", revise = "revise-10", abstain = "abstain" }
 
 [[edges]]
 from = "revise-10"
-to = "review-11"
+to = "validate-10"
+
+[[nodes]]
+id = "validate-10"
+kind = "validator"
+
+[[routes]]
+from = "validate-10"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-11", fail = "fail" }
 
 [[nodes]]
 id = "review-11"
@@ -236,7 +326,16 @@ cases = { pass = "validate-final", revise = "revise-11", abstain = "abstain" }
 
 [[edges]]
 from = "revise-11"
-to = "review-12"
+to = "validate-11"
+
+[[nodes]]
+id = "validate-11"
+kind = "validator"
+
+[[routes]]
+from = "validate-11"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-12", fail = "fail" }
 
 [[nodes]]
 id = "review-12"
@@ -253,7 +352,16 @@ cases = { pass = "validate-final", revise = "revise-12", abstain = "abstain" }
 
 [[edges]]
 from = "revise-12"
-to = "review-13"
+to = "validate-12"
+
+[[nodes]]
+id = "validate-12"
+kind = "validator"
+
+[[routes]]
+from = "validate-12"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-13", fail = "fail" }
 
 [[nodes]]
 id = "review-13"
@@ -270,7 +378,16 @@ cases = { pass = "validate-final", revise = "revise-13", abstain = "abstain" }
 
 [[edges]]
 from = "revise-13"
-to = "review-14"
+to = "validate-13"
+
+[[nodes]]
+id = "validate-13"
+kind = "validator"
+
+[[routes]]
+from = "validate-13"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-14", fail = "fail" }
 
 [[nodes]]
 id = "review-14"
@@ -287,7 +404,16 @@ cases = { pass = "validate-final", revise = "revise-14", abstain = "abstain" }
 
 [[edges]]
 from = "revise-14"
-to = "review-15"
+to = "validate-14"
+
+[[nodes]]
+id = "validate-14"
+kind = "validator"
+
+[[routes]]
+from = "validate-14"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-15", fail = "fail" }
 
 [[nodes]]
 id = "review-15"
@@ -304,7 +430,16 @@ cases = { pass = "validate-final", revise = "revise-15", abstain = "abstain" }
 
 [[edges]]
 from = "revise-15"
-to = "review-16"
+to = "validate-15"
+
+[[nodes]]
+id = "validate-15"
+kind = "validator"
+
+[[routes]]
+from = "validate-15"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-16", fail = "fail" }
 
 [[nodes]]
 id = "review-16"
@@ -321,7 +456,16 @@ cases = { pass = "validate-final", revise = "revise-16", abstain = "abstain" }
 
 [[edges]]
 from = "revise-16"
-to = "review-17"
+to = "validate-16"
+
+[[nodes]]
+id = "validate-16"
+kind = "validator"
+
+[[routes]]
+from = "validate-16"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-17", fail = "fail" }
 
 [[nodes]]
 id = "review-17"
@@ -338,7 +482,16 @@ cases = { pass = "validate-final", revise = "revise-17", abstain = "abstain" }
 
 [[edges]]
 from = "revise-17"
-to = "review-18"
+to = "validate-17"
+
+[[nodes]]
+id = "validate-17"
+kind = "validator"
+
+[[routes]]
+from = "validate-17"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-18", fail = "fail" }
 
 [[nodes]]
 id = "review-18"
@@ -355,7 +508,16 @@ cases = { pass = "validate-final", revise = "revise-18", abstain = "abstain" }
 
 [[edges]]
 from = "revise-18"
-to = "review-19"
+to = "validate-18"
+
+[[nodes]]
+id = "validate-18"
+kind = "validator"
+
+[[routes]]
+from = "validate-18"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-19", fail = "fail" }
 
 [[nodes]]
 id = "review-19"
@@ -372,7 +534,16 @@ cases = { pass = "validate-final", revise = "revise-19", abstain = "abstain" }
 
 [[edges]]
 from = "revise-19"
-to = "review-20"
+to = "validate-19"
+
+[[nodes]]
+id = "validate-19"
+kind = "validator"
+
+[[routes]]
+from = "validate-19"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-20", fail = "fail" }
 
 [[nodes]]
 id = "review-20"
@@ -389,7 +560,16 @@ cases = { pass = "validate-final", revise = "revise-20", abstain = "abstain" }
 
 [[edges]]
 from = "revise-20"
-to = "review-21"
+to = "validate-20"
+
+[[nodes]]
+id = "validate-20"
+kind = "validator"
+
+[[routes]]
+from = "validate-20"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-21", fail = "fail" }
 
 [[nodes]]
 id = "review-21"
@@ -406,7 +586,16 @@ cases = { pass = "validate-final", revise = "revise-21", abstain = "abstain" }
 
 [[edges]]
 from = "revise-21"
-to = "review-22"
+to = "validate-21"
+
+[[nodes]]
+id = "validate-21"
+kind = "validator"
+
+[[routes]]
+from = "validate-21"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-22", fail = "fail" }
 
 [[nodes]]
 id = "review-22"
@@ -423,7 +612,16 @@ cases = { pass = "validate-final", revise = "revise-22", abstain = "abstain" }
 
 [[edges]]
 from = "revise-22"
-to = "review-23"
+to = "validate-22"
+
+[[nodes]]
+id = "validate-22"
+kind = "validator"
+
+[[routes]]
+from = "validate-22"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-23", fail = "fail" }
 
 [[nodes]]
 id = "review-23"
@@ -440,7 +638,16 @@ cases = { pass = "validate-final", revise = "revise-23", abstain = "abstain" }
 
 [[edges]]
 from = "revise-23"
-to = "review-24"
+to = "validate-23"
+
+[[nodes]]
+id = "validate-23"
+kind = "validator"
+
+[[routes]]
+from = "validate-23"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-24", fail = "fail" }
 
 [[nodes]]
 id = "review-24"
