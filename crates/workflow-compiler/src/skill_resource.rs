@@ -227,6 +227,8 @@ pub enum SkillResourceError {
     PageOutOfBounds,
     /// The explicit read would exceed the cumulative byte budget.
     TotalReadExceeded,
+    /// The underlying storage failed while reading or writing content.
+    Io,
 }
 
 impl fmt::Display for SkillResourceError {
@@ -242,6 +244,7 @@ impl fmt::Display for SkillResourceError {
             Self::ResourceNotFound => "skill resource was not found",
             Self::PageOutOfBounds => "skill resource page is out of bounds",
             Self::TotalReadExceeded => "skill resource total read budget exceeded",
+            Self::Io => "skill resource storage I/O error",
         })
     }
 }
@@ -371,5 +374,6 @@ fn map_artifact_error(kind: workflow_runtime::ArtifactError) -> SkillResourceErr
         ArtifactErrorKind::PageOutOfBounds => SkillResourceError::PageOutOfBounds,
         ArtifactErrorKind::NotFound => SkillResourceError::ResourceNotFound,
         ArtifactErrorKind::ContentIdCollision => SkillResourceError::ContentIdentityFailure,
+        ArtifactErrorKind::Io => SkillResourceError::Io,
     }
 }

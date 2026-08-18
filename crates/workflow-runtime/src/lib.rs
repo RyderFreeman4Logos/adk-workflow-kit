@@ -8,7 +8,7 @@ mod workdir;
 
 pub use artifact::{
     ArtifactError, ArtifactErrorKind, ArtifactId, ArtifactPage, ArtifactStore,
-    InMemoryArtifactStore, PageRequest, RetentionPolicy,
+    FilesystemArtifactStore, InMemoryArtifactStore, PageRequest, RetentionPolicy,
 };
 pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
