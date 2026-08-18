@@ -167,6 +167,13 @@ fn remove_owned_root(
         return Err(WorkdirError::new(WorkdirErrorKind::RootChanged));
     }
 
+    // Restore owner-write on the four immutable layout dirs so `remove_dir_all`
+    // can unlink the `content.bin` children they hold when materialized. Their
+    // published run-time mode stays 0o555; this write bit is teardown-only.
+    for name in ["input", "package", "skills", "refs"] {
+        let _ = fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o700));
+    }
+
     match fs::remove_dir_all(root) {
         Ok(()) => Ok(CleanupOutcome::Removed),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(CleanupOutcome::AlreadyAbsent),

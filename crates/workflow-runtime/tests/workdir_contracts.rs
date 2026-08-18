@@ -281,6 +281,36 @@ fn materialization_records_immutable_hashes_and_blocks_writes() {
     );
 }
 
+#[test]
+fn cleanup_removes_a_materialized_tree_with_content() {
+    let base = TestBase::new();
+    let manager = WorkdirManager::new(base.path()).expect("test base must be trusted");
+    let run_id =
+        RunId::new(String::from("materialize-cleanup")).expect("fixture run ID must be valid");
+    let materialization = Materialization {
+        input: Some(b"input blob".to_vec()),
+        package: Some(b"package blob".to_vec()),
+        skills: Some(b"skills blob".to_vec()),
+        refs: Some(b"refs blob".to_vec()),
+    };
+    let mut workdir = manager
+        .materialize(&run_id, &materialization)
+        .expect("materialization must succeed");
+    let root = workdir.root().to_owned();
+
+    assert_eq!(
+        workdir
+            .cleanup()
+            .expect("materialized cleanup must succeed"),
+        CleanupOutcome::Removed,
+        "cleanup must remove a materialized tree so it does not leak at 0o555"
+    );
+    assert!(
+        !root.exists(),
+        "the materialized root must be fully removed on cleanup"
+    );
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
