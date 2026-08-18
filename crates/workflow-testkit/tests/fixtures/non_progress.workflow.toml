@@ -1,0 +1,460 @@
+# REVIEW-003: statically unrolled revisit loop for no-progress detection.
+#
+# The compiler rejects directed cycles (ADR-0009), so the bounded repair
+# loop is expressed as 24 unrolled review -> revise hops. The walk's
+# NonProgressDetector must abstain at the borrowed RUN-002 model-turn cap
+# (MODEL_TURNS_BOUND) long before the fixture tail, while a progressing
+# walk may still reach publish through any review node.
+
+schema_version = 1
+
+[workflow]
+id = "review.non-progress"
+version = "1"
+entry = "produce"
+
+[[nodes]]
+id = "produce"
+kind = "agent"
+
+[[nodes]]
+id = "validate"
+kind = "validator"
+
+[[nodes]]
+id = "validate-final"
+kind = "validator"
+
+[[nodes]]
+id = "publish"
+kind = "terminal"
+
+[[nodes]]
+id = "abstain"
+kind = "terminal"
+
+[[nodes]]
+id = "fail"
+kind = "terminal"
+
+[[edges]]
+from = "produce"
+to = "validate"
+
+[[routes]]
+from = "validate"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review-1", fail = "fail" }
+
+[[routes]]
+from = "validate-final"
+predicate = { id = "final-validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "publish", fail = "fail" }
+
+[[nodes]]
+id = "review-1"
+kind = "agent"
+
+[[nodes]]
+id = "revise-1"
+kind = "agent"
+
+[[routes]]
+from = "review-1"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-1", abstain = "abstain" }
+
+[[edges]]
+from = "revise-1"
+to = "review-2"
+
+[[nodes]]
+id = "review-2"
+kind = "agent"
+
+[[nodes]]
+id = "revise-2"
+kind = "agent"
+
+[[routes]]
+from = "review-2"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-2", abstain = "abstain" }
+
+[[edges]]
+from = "revise-2"
+to = "review-3"
+
+[[nodes]]
+id = "review-3"
+kind = "agent"
+
+[[nodes]]
+id = "revise-3"
+kind = "agent"
+
+[[routes]]
+from = "review-3"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-3", abstain = "abstain" }
+
+[[edges]]
+from = "revise-3"
+to = "review-4"
+
+[[nodes]]
+id = "review-4"
+kind = "agent"
+
+[[nodes]]
+id = "revise-4"
+kind = "agent"
+
+[[routes]]
+from = "review-4"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-4", abstain = "abstain" }
+
+[[edges]]
+from = "revise-4"
+to = "review-5"
+
+[[nodes]]
+id = "review-5"
+kind = "agent"
+
+[[nodes]]
+id = "revise-5"
+kind = "agent"
+
+[[routes]]
+from = "review-5"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-5", abstain = "abstain" }
+
+[[edges]]
+from = "revise-5"
+to = "review-6"
+
+[[nodes]]
+id = "review-6"
+kind = "agent"
+
+[[nodes]]
+id = "revise-6"
+kind = "agent"
+
+[[routes]]
+from = "review-6"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-6", abstain = "abstain" }
+
+[[edges]]
+from = "revise-6"
+to = "review-7"
+
+[[nodes]]
+id = "review-7"
+kind = "agent"
+
+[[nodes]]
+id = "revise-7"
+kind = "agent"
+
+[[routes]]
+from = "review-7"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-7", abstain = "abstain" }
+
+[[edges]]
+from = "revise-7"
+to = "review-8"
+
+[[nodes]]
+id = "review-8"
+kind = "agent"
+
+[[nodes]]
+id = "revise-8"
+kind = "agent"
+
+[[routes]]
+from = "review-8"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-8", abstain = "abstain" }
+
+[[edges]]
+from = "revise-8"
+to = "review-9"
+
+[[nodes]]
+id = "review-9"
+kind = "agent"
+
+[[nodes]]
+id = "revise-9"
+kind = "agent"
+
+[[routes]]
+from = "review-9"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-9", abstain = "abstain" }
+
+[[edges]]
+from = "revise-9"
+to = "review-10"
+
+[[nodes]]
+id = "review-10"
+kind = "agent"
+
+[[nodes]]
+id = "revise-10"
+kind = "agent"
+
+[[routes]]
+from = "review-10"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-10", abstain = "abstain" }
+
+[[edges]]
+from = "revise-10"
+to = "review-11"
+
+[[nodes]]
+id = "review-11"
+kind = "agent"
+
+[[nodes]]
+id = "revise-11"
+kind = "agent"
+
+[[routes]]
+from = "review-11"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-11", abstain = "abstain" }
+
+[[edges]]
+from = "revise-11"
+to = "review-12"
+
+[[nodes]]
+id = "review-12"
+kind = "agent"
+
+[[nodes]]
+id = "revise-12"
+kind = "agent"
+
+[[routes]]
+from = "review-12"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-12", abstain = "abstain" }
+
+[[edges]]
+from = "revise-12"
+to = "review-13"
+
+[[nodes]]
+id = "review-13"
+kind = "agent"
+
+[[nodes]]
+id = "revise-13"
+kind = "agent"
+
+[[routes]]
+from = "review-13"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-13", abstain = "abstain" }
+
+[[edges]]
+from = "revise-13"
+to = "review-14"
+
+[[nodes]]
+id = "review-14"
+kind = "agent"
+
+[[nodes]]
+id = "revise-14"
+kind = "agent"
+
+[[routes]]
+from = "review-14"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-14", abstain = "abstain" }
+
+[[edges]]
+from = "revise-14"
+to = "review-15"
+
+[[nodes]]
+id = "review-15"
+kind = "agent"
+
+[[nodes]]
+id = "revise-15"
+kind = "agent"
+
+[[routes]]
+from = "review-15"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-15", abstain = "abstain" }
+
+[[edges]]
+from = "revise-15"
+to = "review-16"
+
+[[nodes]]
+id = "review-16"
+kind = "agent"
+
+[[nodes]]
+id = "revise-16"
+kind = "agent"
+
+[[routes]]
+from = "review-16"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-16", abstain = "abstain" }
+
+[[edges]]
+from = "revise-16"
+to = "review-17"
+
+[[nodes]]
+id = "review-17"
+kind = "agent"
+
+[[nodes]]
+id = "revise-17"
+kind = "agent"
+
+[[routes]]
+from = "review-17"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-17", abstain = "abstain" }
+
+[[edges]]
+from = "revise-17"
+to = "review-18"
+
+[[nodes]]
+id = "review-18"
+kind = "agent"
+
+[[nodes]]
+id = "revise-18"
+kind = "agent"
+
+[[routes]]
+from = "review-18"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-18", abstain = "abstain" }
+
+[[edges]]
+from = "revise-18"
+to = "review-19"
+
+[[nodes]]
+id = "review-19"
+kind = "agent"
+
+[[nodes]]
+id = "revise-19"
+kind = "agent"
+
+[[routes]]
+from = "review-19"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-19", abstain = "abstain" }
+
+[[edges]]
+from = "revise-19"
+to = "review-20"
+
+[[nodes]]
+id = "review-20"
+kind = "agent"
+
+[[nodes]]
+id = "revise-20"
+kind = "agent"
+
+[[routes]]
+from = "review-20"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-20", abstain = "abstain" }
+
+[[edges]]
+from = "revise-20"
+to = "review-21"
+
+[[nodes]]
+id = "review-21"
+kind = "agent"
+
+[[nodes]]
+id = "revise-21"
+kind = "agent"
+
+[[routes]]
+from = "review-21"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-21", abstain = "abstain" }
+
+[[edges]]
+from = "revise-21"
+to = "review-22"
+
+[[nodes]]
+id = "review-22"
+kind = "agent"
+
+[[nodes]]
+id = "revise-22"
+kind = "agent"
+
+[[routes]]
+from = "review-22"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-22", abstain = "abstain" }
+
+[[edges]]
+from = "revise-22"
+to = "review-23"
+
+[[nodes]]
+id = "review-23"
+kind = "agent"
+
+[[nodes]]
+id = "revise-23"
+kind = "agent"
+
+[[routes]]
+from = "review-23"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-23", abstain = "abstain" }
+
+[[edges]]
+from = "revise-23"
+to = "review-24"
+
+[[nodes]]
+id = "review-24"
+kind = "agent"
+
+[[nodes]]
+id = "revise-24"
+kind = "agent"
+
+[[routes]]
+from = "review-24"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise-24", abstain = "abstain" }
+
+[[edges]]
+from = "revise-24"
+to = "validate-final"
