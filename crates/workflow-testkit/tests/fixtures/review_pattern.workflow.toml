@@ -1,0 +1,66 @@
+# REVIEW-002: producer -> validator -> reviewer -> reviser -> final validation.
+#
+# Statically unrolled DAG (the compiler rejects cycles; the bounded repair loop
+# is expressed as a single repair hop through `revise`, then a final
+# deterministic validation must pass before `publish` — ADR-0009).
+schema_version = 1
+
+[workflow]
+id = "review.pattern"
+version = "1"
+entry = "produce"
+
+[[nodes]]
+id = "produce"
+kind = "agent"
+
+[[nodes]]
+id = "validate"
+kind = "validator"
+
+[[nodes]]
+id = "review"
+kind = "agent"
+
+[[nodes]]
+id = "revise"
+kind = "agent"
+
+[[nodes]]
+id = "validate-final"
+kind = "validator"
+
+[[nodes]]
+id = "publish"
+kind = "terminal"
+
+[[nodes]]
+id = "abstain"
+kind = "terminal"
+
+[[nodes]]
+id = "fail"
+kind = "terminal"
+
+[[edges]]
+from = "produce"
+to = "validate"
+
+[[edges]]
+from = "revise"
+to = "validate-final"
+
+[[routes]]
+from = "validate"
+predicate = { id = "validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "review", fail = "revise" }
+
+[[routes]]
+from = "review"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { pass = "validate-final", revise = "revise", abstain = "abstain" }
+
+[[routes]]
+from = "validate-final"
+predicate = { id = "final-validator.verdict@v1", version = "1.0.0" }
+cases = { pass = "publish", fail = "fail" }
