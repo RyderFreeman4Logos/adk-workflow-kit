@@ -1860,6 +1860,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "workflow-review"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "workflow-runtime"
 version = "0.1.0"
 dependencies = [
