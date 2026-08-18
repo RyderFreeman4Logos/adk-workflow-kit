@@ -3,7 +3,10 @@ use std::{collections::BTreeSet, fmt};
 use serde::Serialize;
 use workflow_spec::{SourceLocation, SpecError};
 
-use crate::{CompileError, GraphValidationError, MissingEdgeEndpoint, WorkflowLockError};
+use crate::{
+    CompileError, GraphValidationError, MissingEdgeEndpoint, StateValidationError,
+    WorkflowLockError,
+};
 
 const DIAGNOSTIC_VERSION: u8 = 1;
 
@@ -279,6 +282,44 @@ impl TryFrom<&GraphValidationError> for Diagnostic {
     }
 }
 
+impl TryFrom<&StateValidationError> for Diagnostic {
+    type Error = DiagnosticProjectionError;
+
+    fn try_from(error: &StateValidationError) -> Result<Self, Self::Error> {
+        let (code, message, details) = match error {
+            StateValidationError::InvalidIdentifier { field_path } => (
+                "workflow.state.invalid_identifier",
+                "invalid state identifier",
+                DiagnosticDetails::InvalidIdentifier { field_path },
+            ),
+            // Authored identifiers are never echoed: details stay empty.
+            StateValidationError::UnsupportedSchemaVersion { .. } => (
+                "workflow.state.unsupported_schema",
+                "unsupported state schema version",
+                DiagnosticDetails::Empty {},
+            ),
+            StateValidationError::MissingRequiredKey { .. } => (
+                "workflow.state.missing_required_key",
+                "missing required state key",
+                DiagnosticDetails::Empty {},
+            ),
+            StateValidationError::InvalidHandleShape { .. } => (
+                "workflow.state.invalid_handle",
+                "invalid state handle shape",
+                DiagnosticDetails::Empty {},
+            ),
+        };
+
+        Ok(Self {
+            diagnostic_version: DIAGNOSTIC_VERSION,
+            code,
+            message,
+            location: None,
+            details,
+        })
+    }
+}
+
 impl TryFrom<&CompileError> for Diagnostic {
     type Error = DiagnosticProjectionError;
 
@@ -286,6 +327,7 @@ impl TryFrom<&CompileError> for Diagnostic {
         match error {
             CompileError::Parse(error) => Self::try_from(error),
             CompileError::Graph(error) => Self::try_from(error),
+            CompileError::State(error) => Self::try_from(error),
             CompileError::PredicateRegistryRequired => Ok(Self {
                 diagnostic_version: DIAGNOSTIC_VERSION,
                 code: "workflow.registry.predicate_registry_required",
@@ -492,3 +534,14 @@ impl fmt::Display for GraphValidationError {
 }
 
 impl std::error::Error for GraphValidationError {}
+
+impl fmt::Display for StateValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match Diagnostic::try_from(self) {
+            Ok(diagnostic) => diagnostic.fmt(formatter),
+            Err(_) => formatter.write_str("invalid workflow state diagnostic"),
+        }
+    }
+}
+
+impl std::error::Error for StateValidationError {}

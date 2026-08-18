@@ -7,6 +7,8 @@ use workflow_spec::{NodeKind as SpecNodeKind, RouteOperator, SchemaVersion, Work
 pub const CANONICAL_IR_WIRE_VERSION_V1: u16 = 1;
 /// The canonical byte-wire version for IR containing registered-predicate routes.
 pub const CANONICAL_IR_WIRE_VERSION_V2: u16 = 2;
+/// The canonical byte-wire version for IR containing a declared state section.
+pub const CANONICAL_IR_WIRE_VERSION_V3: u16 = 3;
 
 const DOMAIN: &[u8] = b"adk-workflow-kit/workflow-ir\0";
 const IR_SCHEMA_VERSION_V1: u32 = 1;
@@ -235,6 +237,72 @@ impl IrEdge {
     }
 }
 
+/// A normalized state declaration: opaque schema identity, required keys, and
+/// declared keys with their own opaque schema identities and handle shapes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrState {
+    schema_id: String,
+    schema_version: String,
+    required_keys: Vec<String>,
+    keys: Vec<IrStateKey>,
+}
+
+impl IrState {
+    /// Returns the opaque state-schema identifier.
+    pub fn schema_id(&self) -> &str {
+        &self.schema_id
+    }
+
+    /// Returns the exact state-schema version.
+    pub fn schema_version(&self) -> &str {
+        &self.schema_version
+    }
+
+    /// Returns required key names in canonical raw UTF-8 order.
+    pub fn required_keys(&self) -> &[String] {
+        &self.required_keys
+    }
+
+    /// Returns declared keys in canonical raw UTF-8 name order.
+    pub fn keys(&self) -> &[IrStateKey] {
+        &self.keys
+    }
+}
+
+/// A normalized declared state key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrStateKey {
+    name: String,
+    schema_id: String,
+    schema_version: String,
+    handle: Option<String>,
+}
+
+impl IrStateKey {
+    /// Returns the opaque key name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the key schema identifier.
+    pub fn schema_id(&self) -> &str {
+        &self.schema_id
+    }
+
+    /// Returns the exact key schema version.
+    pub fn schema_version(&self) -> &str {
+        &self.schema_version
+    }
+
+    /// Returns the opaque handle shape token when the key declares one.
+    ///
+    /// The default carrier `inline` is normalized away at IR construction, so
+    /// `Some` here always requires preflight scrutiny.
+    pub fn handle(&self) -> Option<&str> {
+        self.handle.as_deref()
+    }
+}
+
 /// A source-free normalized workflow graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowIr {
@@ -245,6 +313,7 @@ pub struct WorkflowIr {
     nodes: Vec<IrNode>,
     edges: Vec<IrEdge>,
     routes: Vec<IrPredicateRoute>,
+    state: Option<IrState>,
 }
 
 impl WorkflowIr {
@@ -281,6 +350,11 @@ impl WorkflowIr {
     /// Returns registered-predicate routes in canonical raw UTF-8 origin order.
     pub fn routes(&self) -> &[IrPredicateRoute] {
         &self.routes
+    }
+
+    /// Returns the normalized state declaration, when the source declared one.
+    pub fn state(&self) -> Option<&IrState> {
+        self.state.as_ref()
     }
 
     /// Returns the SHA-256 content identity of the canonical IR wire.
@@ -385,6 +459,26 @@ impl From<&WorkflowSpec> for WorkflowIr {
             nodes,
             edges,
             routes,
+            state: spec.state().map(|state| IrState {
+                schema_id: state.schema_id().to_owned(),
+                schema_version: state.schema_version().to_owned(),
+                required_keys: state.required_keys().map(str::to_owned).collect(),
+                keys: state
+                    .keys()
+                    .iter()
+                    .map(|key| IrStateKey {
+                        name: key.name().to_owned(),
+                        schema_id: key.schema_id().to_owned(),
+                        schema_version: key.schema_version().to_owned(),
+                        // `inline` is the default carrier; normalize it away so
+                        // equivalent declarations hash identically.
+                        handle: key
+                            .handle()
+                            .filter(|shape| *shape != "inline")
+                            .map(str::to_owned),
+                    })
+                    .collect(),
+            }),
         }
     }
 }
@@ -421,7 +515,9 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
     sink.write_chunk(DOMAIN);
     write_u16(
         sink,
-        if ir.routes.is_empty() {
+        if ir.state.is_some() {
+            CANONICAL_IR_WIRE_VERSION_V3
+        } else if ir.routes.is_empty() {
             CANONICAL_IR_WIRE_VERSION_V1
         } else {
             CANONICAL_IR_WIRE_VERSION_V2
@@ -451,6 +547,27 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
             for case in &route.cases {
                 write_frame(sink, case.key());
                 write_frame(sink, case.target().as_str());
+            }
+        }
+    }
+    if let Some(state) = &ir.state {
+        write_frame(sink, &state.schema_id);
+        write_frame(sink, &state.schema_version);
+        write_u64(sink, u64_from_usize(state.required_keys.len()));
+        for name in &state.required_keys {
+            write_frame(sink, name);
+        }
+        write_u64(sink, u64_from_usize(state.keys.len()));
+        for key in &state.keys {
+            write_frame(sink, &key.name);
+            write_frame(sink, &key.schema_id);
+            write_frame(sink, &key.schema_version);
+            match &key.handle {
+                Some(shape) => {
+                    sink.write_chunk(&[1]);
+                    write_frame(sink, shape);
+                }
+                None => sink.write_chunk(&[0]),
             }
         }
     }
