@@ -26,9 +26,10 @@ use workflow_review::{
     REVIEW_SCHEMA_VERSION_V1,
 };
 use workflow_runtime::{RunSessionIds, SessionRole};
-use workflow_testkit::{ScriptStep, ScriptedLlm};
+use workflow_testkit::{NoProgressError, NonProgressDetector, ScriptStep, ScriptedLlm};
 
 const FIXTURE: &str = include_str!("fixtures/review_pattern.workflow.toml");
+const NON_PROGRESS_FIXTURE: &str = include_str!("fixtures/non_progress.workflow.toml");
 
 /// The route declarations the compiled fixture must carry (planning-pack 08 §2
 /// and issue #26): validator verdicts, reviewer verdicts, and the final
@@ -336,12 +337,26 @@ impl RoleSet {
     }
 
     fn for_node(&self, id: &str) -> Option<&RoleAgent> {
-        match id {
-            "produce" => Some(&self.producer),
-            "review" => Some(&self.reviewer),
-            "revise" => Some(&self.reviser),
-            _ => None,
+        if id == "produce" {
+            return Some(&self.producer);
         }
+        // The non-progress fixture unrolls the revisit loop as numbered
+        // review-N / revise-N nodes; every such id maps to the same role.
+        if id == "review"
+            || id
+                .strip_prefix("review-")
+                .is_some_and(|suffix| suffix.parse::<usize>().is_ok())
+        {
+            return Some(&self.reviewer);
+        }
+        if id == "revise"
+            || id
+                .strip_prefix("revise-")
+                .is_some_and(|suffix| suffix.parse::<usize>().is_ok())
+        {
+            return Some(&self.reviser);
+        }
+        None
     }
 }
 
@@ -445,6 +460,7 @@ enum WalkError {
     UnknownRouteCase,
     MissingEdge,
     MalformedReview(ReviewError),
+    NoProgress(NoProgressError),
 }
 
 impl fmt::Display for WalkError {
@@ -459,6 +475,7 @@ impl fmt::Display for WalkError {
             WalkError::UnknownRouteCase => "route case not declared",
             WalkError::MissingEdge => "no edge from node",
             WalkError::MalformedReview(_) => "malformed review output",
+            WalkError::NoProgress(_) => "no-progress detection failed",
         })
     }
 }
@@ -493,8 +510,20 @@ fn verdict_key(verdict: ReviewVerdict) -> &'static str {
 
 /// Walks the compiled route graph from the entry, running scripted role
 /// agents at agent nodes and consulting deterministic validator outcomes at
-/// validator nodes, until a terminal node is reached.
+/// validator nodes, until a terminal node is reached. A fresh detector with
+/// the default cap guards each walk.
 async fn walk(plan: &CompiledPlan, roles: &RoleSet) -> Result<WalkReport, WalkError> {
+    walk_with_detector(plan, roles, &mut NonProgressDetector::default()).await
+}
+
+/// [`walk`] with a caller-owned no-progress detector: when the detector fires,
+/// the revisit loop aborts to the already-declared `abstain` terminal
+/// (REVIEW-003) instead of continuing.
+async fn walk_with_detector(
+    plan: &CompiledPlan,
+    roles: &RoleSet,
+    detector: &mut NonProgressDetector,
+) -> Result<WalkReport, WalkError> {
     let ir = plan.ir();
     let mut current = ir.entry_node_id().as_str().to_owned();
     let mut visited = Vec::new();
@@ -516,6 +545,12 @@ async fn walk(plan: &CompiledPlan, roles: &RoleSet) -> Result<WalkReport, WalkEr
                 // An agent node with a route is the semantic reviewer; its
                 // scripted output must be a schema-valid review result.
                 let review = ReviewResult::from_json(&text).map_err(WalkError::MalformedReview)?;
+                if let Some(_reason) = detector.observe(&review).map_err(WalkError::NoProgress)? {
+                    // REVIEW-003: no progress → the typed abstain terminal.
+                    // `reason` is never echoed: its Display is static text.
+                    current = "abstain".to_owned();
+                    continue;
+                }
                 parsed_key = Some(verdict_key(review.verdict()));
             }
         }
@@ -901,4 +936,91 @@ async fn malformed_scripted_review_output_fails_closed_without_panic() {
         );
         assert_eq!(error.to_string(), "malformed review output");
     }
+}
+
+fn compile_non_progress_fixture(
+    registry: &RecordingRegistry,
+) -> Result<CompiledPlan, workflow_compiler::CompileError> {
+    compile_str_with_predicates("non_progress.workflow.toml", NON_PROGRESS_FIXTURE, registry)
+}
+
+#[adk_rust::tokio::test]
+async fn progressing_revisions_still_reach_publish() {
+    let registry = RecordingRegistry::new();
+    let plan = compile_non_progress_fixture(&registry).expect("non-progress fixture must compile");
+    let sessions = RunSessionIds::allocate().expect("session ids must allocate");
+
+    // The reviewer revises twice with brand-new output each time and then
+    // passes; the reviser produces a fresh candidate per hop. Nothing repeats,
+    // so the no-progress detector must stay silent and the walk must reach
+    // publish (false-positive guard, REVIEW-003).
+    let scenario = Scenario {
+        producer: vec![text_step(CANDIDATE_V1)],
+        reviewer: vec![
+            text_step(&review_json(ReviewVerdict::Revise, "revise round one")),
+            text_step(&review_json(ReviewVerdict::Revise, "revise round two")),
+            text_step(&review_json(ReviewVerdict::Pass, "finally acceptable")),
+        ],
+        reviser: vec![text_step(CANDIDATE_V2), text_step("candidate draft v3")],
+        validator_results: HashMap::from([
+            ("validate".to_owned(), "pass"),
+            ("validate-final".to_owned(), "pass"),
+        ]),
+    };
+    let roles = RoleSet::new(&sessions, scenario);
+    let mut detector = NonProgressDetector::default();
+    let report = walk_with_detector(&plan, &roles, &mut detector)
+        .await
+        .expect("progressing scenario must walk to a terminal");
+    assert_eq!(
+        report.visited.last().map(String::as_str),
+        Some("publish"),
+        "progressing revisions must still reach publish"
+    );
+}
+
+#[adk_rust::tokio::test]
+async fn non_progress_loop_abstains_within_run_bounds() {
+    let registry = RecordingRegistry::new();
+    let plan = compile_non_progress_fixture(&registry).expect("non-progress fixture must compile");
+    let sessions = RunSessionIds::allocate().expect("session ids must allocate");
+
+    // The reviewer always returns a *new* distinct revise verdict, so no
+    // fingerprint repeats: only the detector's round cap can stop the loop.
+    // The fixture unrolls 24 hops; the cap (MODEL_TURNS_BOUND, borrowed from
+    // RUN-002 RunLimitKind::ModelTurns) must fire long before the tail.
+    let reviewer_steps = (0..24)
+        .map(|round| {
+            text_step(&review_json(
+                ReviewVerdict::Revise,
+                &format!("revision round {round}"),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let reviser_steps = (0..24)
+        .map(|round| text_step(&format!("candidate draft round {round}")))
+        .collect::<Vec<_>>();
+    let scenario = Scenario {
+        producer: vec![text_step(CANDIDATE_V1)],
+        reviewer: reviewer_steps,
+        reviser: reviser_steps,
+        validator_results: HashMap::from([
+            ("validate".to_owned(), "pass"),
+            ("validate-final".to_owned(), "pass"),
+        ]),
+    };
+    let roles = RoleSet::new(&sessions, scenario);
+    let mut detector = NonProgressDetector::default();
+    let report = walk_with_detector(&plan, &roles, &mut detector)
+        .await
+        .expect("bounded walk must terminate at a terminal");
+    assert_eq!(
+        report.visited.last().map(String::as_str),
+        Some("abstain"),
+        "a non-progress loop must abstain within the run bound"
+    );
+    assert!(
+        !report.visited.iter().any(|node| node == "publish"),
+        "the run bound must fire before the unrolled fixture tail reaches publish"
+    );
 }
