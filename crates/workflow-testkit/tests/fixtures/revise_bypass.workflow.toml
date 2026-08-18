@@ -1,0 +1,33 @@
+# REVIEW-004: a reviser hop must re-enter a validator.
+#
+# Fail-closed guard target: after `review revise -> revise`, the repaired
+# output routes to `publish` with no revalidation in between. The walk must
+# refuse to leave the reviser into a non-validator.
+
+schema_version = 1
+
+[workflow]
+id = "review.revise-bypass"
+version = "1"
+entry = "review"
+
+[[nodes]]
+id = "review"
+kind = "agent"
+
+[[nodes]]
+id = "revise"
+kind = "agent"
+
+[[nodes]]
+id = "publish"
+kind = "terminal"
+
+[[routes]]
+from = "review"
+predicate = { id = "reviewer.verdict@v1", version = "1.0.0" }
+cases = { revise = "revise" }
+
+[[edges]]
+from = "revise"
+to = "publish"

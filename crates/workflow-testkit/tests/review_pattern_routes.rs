@@ -30,6 +30,8 @@ use workflow_testkit::{NoProgressError, NonProgressDetector, ScriptStep, Scripte
 
 const FIXTURE: &str = include_str!("fixtures/review_pattern.workflow.toml");
 const NON_PROGRESS_FIXTURE: &str = include_str!("fixtures/non_progress.workflow.toml");
+const BYPASS_REVIEWER_FIXTURE: &str = include_str!("fixtures/bypass_reviewer.workflow.toml");
+const REVISE_BYPASS_FIXTURE: &str = include_str!("fixtures/revise_bypass.workflow.toml");
 
 /// The route declarations the compiled fixture must carry (planning-pack 08 §2
 /// and issue #26): validator verdicts, reviewer verdicts, and the final
@@ -461,6 +463,8 @@ enum WalkError {
     MissingEdge,
     MalformedReview(ReviewError),
     NoProgress(NoProgressError),
+    ReviewPassBypassesValidator,
+    ReviseBypassesValidator,
 }
 
 impl fmt::Display for WalkError {
@@ -476,6 +480,10 @@ impl fmt::Display for WalkError {
             WalkError::MissingEdge => "no edge from node",
             WalkError::MalformedReview(_) => "malformed review output",
             WalkError::NoProgress(_) => "no-progress detection failed",
+            WalkError::ReviewPassBypassesValidator => "reviewer pass must route to a validator",
+            WalkError::ReviseBypassesValidator => {
+                "repaired output must be revalidated before the next reviewer or publish"
+            }
         })
     }
 }
@@ -527,6 +535,10 @@ async fn walk_with_detector(
     let ir = plan.ir();
     let mut current = ir.entry_node_id().as_str().to_owned();
     let mut visited = Vec::new();
+    // REVIEW-004: set when the current node was reached via a reviewer
+    // `revise` route, marking it as a reviser hop whose repaired output must
+    // re-enter a validator before the next reviewer or publish.
+    let mut just_revised = false;
 
     loop {
         visited.push(current.clone());
@@ -555,7 +567,7 @@ async fn walk_with_detector(
             }
         }
 
-        if let Some(route) = route_from(ir, &current) {
+        current = if let Some(route) = route_from(ir, &current) {
             let key = match parsed_key {
                 Some(key) => key,
                 None => *roles
@@ -568,12 +580,29 @@ async fn walk_with_detector(
                 .iter()
                 .find(|case| case.key() == key)
                 .ok_or(WalkError::UnknownRouteCase)?;
-            current = target.target().as_str().to_owned();
+            let target_id = target.target().as_str();
+            // REVIEW-004 §1: a reviewer `pass` (a parsed review verdict) must
+            // not route a non-validator; in particular pass → publish is
+            // fail-closed. The target id is never echoed: the error is static.
+            if parsed_key == Some("pass") && node_kind(ir, target_id) != Some(IrNodeKind::Validator)
+            {
+                return Err(WalkError::ReviewPassBypassesValidator);
+            }
+            just_revised = parsed_key == Some("revise");
+            target_id.to_owned()
         } else {
-            current = edge_target(ir, &current)
+            let target_id = edge_target(ir, &current)
                 .ok_or(WalkError::MissingEdge)?
                 .to_owned();
-        }
+            // REVIEW-004 §2: a reviser hop's next node must be a validator —
+            // repaired output is revalidated before the next reviewer or
+            // publish. The target id is never echoed: the error is static.
+            if just_revised && node_kind(ir, &target_id) != Some(IrNodeKind::Validator) {
+                return Err(WalkError::ReviseBypassesValidator);
+            }
+            just_revised = false;
+            target_id
+        };
     }
 
     Ok(WalkReport { visited })
@@ -759,6 +788,129 @@ async fn reviewer_pass_cannot_waive_failed_validator() {
 }
 
 #[adk_rust::tokio::test]
+async fn reviewer_pass_cannot_route_straight_to_publish() {
+    let registry = RecordingRegistry::new();
+    let plan = compile_str_with_predicates(
+        "bypass_reviewer.workflow.toml",
+        BYPASS_REVIEWER_FIXTURE,
+        &registry,
+    )
+    .expect("bypass-reviewer fixture must compile");
+    let sessions = RunSessionIds::allocate().expect("session ids must allocate");
+
+    // The reviewer passes, but the fixture routes straight to publish with no
+    // validator in between. The walk must fail closed (REVIEW-004 §1).
+    let scenario = Scenario {
+        producer: Vec::new(),
+        reviewer: vec![text_step(&review_json(ReviewVerdict::Pass, "acceptable"))],
+        reviser: Vec::new(),
+        validator_results: HashMap::new(),
+    };
+    let roles = RoleSet::new(&sessions, scenario);
+    let error = walk(&plan, &roles)
+        .await
+        .expect_err("a reviewer pass must never route straight to publish");
+    assert_eq!(error.to_string(), "reviewer pass must route to a validator");
+}
+
+#[adk_rust::tokio::test]
+async fn walk_reenters_validator_after_every_revise() {
+    let registry = RecordingRegistry::new();
+    let plan = compile_str_with_predicates(
+        "revise_bypass.workflow.toml",
+        REVISE_BYPASS_FIXTURE,
+        &registry,
+    )
+    .expect("revise-bypass fixture must compile");
+    let sessions = RunSessionIds::allocate().expect("session ids must allocate");
+
+    // A reviser hop routes repaired output straight to publish with no
+    // revalidation. The walk must fail closed (REVIEW-004 §2).
+    let scenario = Scenario {
+        producer: Vec::new(),
+        reviewer: vec![text_step(&review_json(ReviewVerdict::Revise, "needs work"))],
+        reviser: vec![text_step(CANDIDATE_V2)],
+        validator_results: HashMap::new(),
+    };
+    let roles = RoleSet::new(&sessions, scenario);
+    let error = walk(&plan, &roles)
+        .await
+        .expect_err("a reviser hop must re-enter a validator before the next reviewer or publish");
+    assert_eq!(
+        error.to_string(),
+        "repaired output must be revalidated before the next reviewer or publish"
+    );
+}
+
+#[adk_rust::tokio::test]
+async fn revised_candidate_failing_final_validation_never_publishes() {
+    let registry = RecordingRegistry::new();
+    let plan = compile_fixture(&registry).expect("review-pattern fixture must compile");
+    let sessions = RunSessionIds::allocate().expect("session ids must allocate");
+
+    // The reviewer revises, the reviser repairs, but the final validator
+    // rejects the repaired candidate: the walk must end at the fail terminal,
+    // never at publish (REVIEW-004 §2).
+    let scenario = Scenario {
+        producer: vec![text_step(CANDIDATE_V1)],
+        reviewer: vec![text_step(&review_json(ReviewVerdict::Revise, "needs work"))],
+        reviser: vec![text_step(CANDIDATE_V2)],
+        validator_results: HashMap::from([
+            ("validate".to_owned(), "pass"),
+            ("validate-final".to_owned(), "fail"),
+        ]),
+    };
+    let roles = RoleSet::new(&sessions, scenario);
+    let report = walk(&plan, &roles)
+        .await
+        .expect("revised candidate must walk to a terminal");
+    assert_eq!(
+        report.visited.last().map(String::as_str),
+        Some("fail"),
+        "a revisited candidate failing final validation must not publish"
+    );
+    assert!(
+        !report.visited.iter().any(|node| node == "publish"),
+        "a revisited candidate failing final validation must never reach publish"
+    );
+}
+
+#[adk_rust::tokio::test]
+async fn valid_revise_then_validated_pass_reaches_publish() {
+    let registry = RecordingRegistry::new();
+    let plan = compile_fixture(&registry).expect("review-pattern fixture must compile");
+    let sessions = RunSessionIds::allocate().expect("session ids must allocate");
+
+    // False-positive guard: a valid revise followed by a validator pass must
+    // still reach publish, with a validator explicitly between revise and
+    // publish (REVIEW-004 §3).
+    let scenario = Scenario {
+        producer: vec![text_step(CANDIDATE_V1)],
+        reviewer: vec![text_step(&review_json(ReviewVerdict::Revise, "needs work"))],
+        reviser: vec![text_step(CANDIDATE_V2)],
+        validator_results: HashMap::from([
+            ("validate".to_owned(), "pass"),
+            ("validate-final".to_owned(), "pass"),
+        ]),
+    };
+    let roles = RoleSet::new(&sessions, scenario);
+    let report = walk(&plan, &roles)
+        .await
+        .expect("a valid revise then validated pass must reach publish");
+    assert_eq!(
+        report.visited,
+        vec![
+            "produce",
+            "validate",
+            "review",
+            "revise",
+            "validate-final",
+            "publish"
+        ]
+    );
+}
+
+#[adk_rust::tokio::test]
 async fn producer_and_reviewer_sessions_stay_isolated() {
     let registry = RecordingRegistry::new();
     let plan = compile_fixture(&registry).expect("review-pattern fixture must compile");
@@ -938,6 +1090,21 @@ async fn malformed_scripted_review_output_fails_closed_without_panic() {
     }
 }
 
+/// Deterministic validator outcomes for the non-progress fixture after the
+/// REVIEW-004 rewire: every repair hop gets revalidated at its own validator
+/// node (validate-1..validate-23) before the next reviewer, plus the shared
+/// head `validate` and tail `validate-final` validators.
+fn non_progress_validator_results() -> HashMap<String, &'static str> {
+    let mut results = HashMap::from([
+        ("validate".to_owned(), "pass"),
+        ("validate-final".to_owned(), "pass"),
+    ]);
+    for n in 1..=23 {
+        results.insert(format!("validate-{n}"), "pass");
+    }
+    results
+}
+
 fn compile_non_progress_fixture(
     registry: &RecordingRegistry,
 ) -> Result<CompiledPlan, workflow_compiler::CompileError> {
@@ -962,10 +1129,7 @@ async fn progressing_revisions_still_reach_publish() {
             text_step(&review_json(ReviewVerdict::Pass, "finally acceptable")),
         ],
         reviser: vec![text_step(CANDIDATE_V2), text_step("candidate draft v3")],
-        validator_results: HashMap::from([
-            ("validate".to_owned(), "pass"),
-            ("validate-final".to_owned(), "pass"),
-        ]),
+        validator_results: non_progress_validator_results(),
     };
     let roles = RoleSet::new(&sessions, scenario);
     let mut detector = NonProgressDetector::default();
@@ -1004,10 +1168,7 @@ async fn non_progress_loop_abstains_within_run_bounds() {
         producer: vec![text_step(CANDIDATE_V1)],
         reviewer: reviewer_steps,
         reviser: reviser_steps,
-        validator_results: HashMap::from([
-            ("validate".to_owned(), "pass"),
-            ("validate-final".to_owned(), "pass"),
-        ]),
+        validator_results: non_progress_validator_results(),
     };
     let roles = RoleSet::new(&sessions, scenario);
     let mut detector = NonProgressDetector::default();
