@@ -135,7 +135,7 @@ pub fn decode_structured_tool_output<T>(
     max_output_bytes: usize,
 ) -> Result<ToolEnvelope<T>, StructuredOutputError>
 where
-    T: DeserializeOwned + Serialize,
+    T: DeserializeOwned + Serialize + schemars::JsonSchema,
 {
     if bytes.len() > max_output_bytes {
         return Err(StructuredOutputError::OutputTooLarge);
@@ -150,6 +150,18 @@ where
         .map_err(|_| StructuredOutputError::TrailingBytes)?;
 
     let raw_payload = document.get("payload").cloned();
+    if document.get("status").and_then(Value::as_str) == Some("success") {
+        let raw_payload = raw_payload
+            .as_ref()
+            .ok_or(StructuredOutputError::InvalidJson)?;
+        let schema = closed_payload_schema::<T>()?;
+        let validator =
+            jsonschema::validator_for(&schema).map_err(|_| StructuredOutputError::InvalidJson)?;
+        if !validator.is_valid(raw_payload) {
+            return Err(StructuredOutputError::InvalidJson);
+        }
+    }
+
     let envelope: ToolEnvelope<T> =
         serde_json::from_value(document).map_err(|_| StructuredOutputError::InvalidJson)?;
     if let ToolEnvelope::Success { payload, .. } = &envelope {
@@ -164,6 +176,104 @@ where
     }
 
     Ok(envelope)
+}
+
+fn closed_payload_schema<T>() -> Result<Value, StructuredOutputError>
+where
+    T: schemars::JsonSchema,
+{
+    let mut schema = serde_json::to_value(
+        schemars::generate::SchemaSettings::draft2020_12()
+            .for_deserialize()
+            .with(|settings| settings.inline_subschemas = true)
+            .into_generator()
+            .into_root_schema_for::<T>(),
+    )
+    .map_err(|_| StructuredOutputError::InvalidJson)?;
+    if !close_schema(&mut schema) {
+        return Err(StructuredOutputError::InvalidJson);
+    }
+    Ok(schema)
+}
+
+fn close_schema(schema: &mut Value) -> bool {
+    match schema {
+        Value::Bool(open) => !*open,
+        Value::Object(object) => {
+            if object.contains_key("$ref") {
+                return false;
+            }
+            if !object.keys().any(|key| {
+                ![
+                    "$schema",
+                    "$id",
+                    "$anchor",
+                    "$comment",
+                    "title",
+                    "description",
+                    "default",
+                    "examples",
+                    "deprecated",
+                    "readOnly",
+                    "writeOnly",
+                ]
+                .contains(&key.as_str())
+            }) {
+                return false;
+            }
+            let is_object = object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "object")
+                || object
+                    .get("type")
+                    .and_then(Value::as_array)
+                    .is_some_and(|types| types.iter().any(|kind| kind.as_str() == Some("object")));
+            if is_object
+                || object.contains_key("properties")
+                || object.contains_key("additionalProperties")
+                || object.contains_key("patternProperties")
+                || object.contains_key("unevaluatedProperties")
+            {
+                object.insert("additionalProperties".to_owned(), false.into());
+                object.insert("unevaluatedProperties".to_owned(), false.into());
+                object.remove("patternProperties");
+            }
+
+            for key in ["properties", "$defs", "definitions", "dependentSchemas"] {
+                if let Some(Value::Object(children)) = object.get_mut(key) {
+                    if !children.values_mut().all(close_schema) {
+                        return false;
+                    }
+                }
+            }
+            for key in [
+                "items",
+                "contains",
+                "propertyNames",
+                "not",
+                "if",
+                "then",
+                "else",
+            ] {
+                if let Some(child) = object.get_mut(key) {
+                    if !close_schema(child) {
+                        return false;
+                    }
+                }
+            }
+            for key in ["prefixItems", "allOf", "anyOf", "oneOf"] {
+                if let Some(Value::Array(children)) = object.get_mut(key) {
+                    if !children.iter_mut().all(close_schema) {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        Value::Array(children) => children.iter_mut().all(close_schema),
+        Value::Null | Value::Number(_) | Value::String(_) => true,
+    }
 }
 
 /// A validated, non-executable description of a typed tool.
@@ -430,13 +540,13 @@ mod tests {
 
     const MAX_OUTPUT_BYTES: usize = 512;
 
-    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     struct Payload {
         value: String,
     }
 
-    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
     struct LoosePayload {
         value: String,
     }
@@ -456,6 +566,17 @@ mod tests {
         let document = br#"{"status":"success","payload":{"value":"ok","hostile":"payload"},"provenance":{"tool_id":"registry.tool","tool_version":"1.2.3"}}"#;
 
         let error = decode_structured_tool_output::<LoosePayload>(document, MAX_OUTPUT_BYTES)
+            .expect_err("unknown payload fields must fail closed");
+        assert_eq!(error, StructuredOutputError::InvalidJson);
+        assert_eq!(error.to_string(), "structured tool output is invalid");
+        assert!(!error.to_string().contains("payload"));
+    }
+
+    #[test]
+    fn unknown_payload_fields_fail_closed_for_json_value() {
+        let document = br#"{"status":"success","payload":{"value":"ok","hostile":"payload"},"provenance":{"tool_id":"registry.tool","tool_version":"1.2.3"}}"#;
+
+        let error = decode_structured_tool_output::<Value>(document, MAX_OUTPUT_BYTES)
             .expect_err("unknown payload fields must fail closed");
         assert_eq!(error, StructuredOutputError::InvalidJson);
         assert_eq!(error.to_string(), "structured tool output is invalid");
