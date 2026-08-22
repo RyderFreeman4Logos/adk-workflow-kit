@@ -662,6 +662,56 @@ mod tests {
         assert!(!rendered.contains("{\"payload\":\"secret\"}"));
     }
 
+    fn assert_invalid_network_destination_decode(
+        payload: serde_json::Value,
+        forbidden_markers: &[&str],
+    ) {
+        let direct_error =
+            serde_json::from_value::<NetworkDestination>(payload.clone()).unwrap_err();
+        let direct_rendered = format!("{direct_error} {direct_error:?}");
+        for marker in forbidden_markers {
+            assert!(!direct_rendered.contains(marker));
+        }
+
+        let nested_payload = serde_json::json!({
+            "allowed_tenants": ["tenant"],
+            "allowed_roles": ["role"],
+            "max_classification": "restricted",
+            "network_profile": "brokered_allowlist",
+            "brokered_destinations": [payload],
+            "capabilities": ["network"]
+        });
+        let nested_error = serde_json::from_value::<PolicyLayer>(nested_payload).unwrap_err();
+        let nested_rendered = format!("{nested_error} {nested_error:?}");
+        for marker in forbidden_markers {
+            assert!(!nested_rendered.contains(marker));
+        }
+    }
+
+    #[test]
+    fn deserialized_network_destination_rejects_empty_host_direct_and_nested() {
+        assert_invalid_network_destination_decode(
+            serde_json::json!({"host": "", "port": 443}),
+            &["\"host\":\"\""],
+        );
+    }
+
+    #[test]
+    fn deserialized_network_destination_rejects_wildcard_host_direct_and_nested() {
+        assert_invalid_network_destination_decode(
+            serde_json::json!({"host": "SECRET_*_HOST", "port": 443}),
+            &["SECRET_*_HOST"],
+        );
+    }
+
+    #[test]
+    fn deserialized_network_destination_rejects_zero_port_direct_and_nested() {
+        assert_invalid_network_destination_decode(
+            serde_json::json!({"host": "SECRET_ZERO_HOST", "port": 0}),
+            &["SECRET_ZERO_HOST"],
+        );
+    }
+
     #[test]
     fn brokered_destination_outside_allowlist_is_denied() {
         let subject = PolicySubject::new("tenant", "role", Classification::Public).unwrap();

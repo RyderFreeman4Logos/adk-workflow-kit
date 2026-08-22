@@ -163,11 +163,28 @@ impl fmt::Debug for PolicySubject {
 }
 
 /// An exact network destination tuple.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkDestination {
     host: String,
     port: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkDestinationFields {
+    host: String,
+    port: u16,
+}
+
+impl<'de> Deserialize<'de> for NetworkDestination {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let fields = NetworkDestinationFields::deserialize(deserializer)?;
+        Self::new(fields.host, fields.port).map_err(D::Error::custom)
+    }
 }
 
 impl NetworkDestination {
