@@ -3,6 +3,7 @@
 mod artifact;
 mod bubblewrap;
 mod controller;
+mod pure_transform;
 mod session;
 mod tool;
 mod workdir;
@@ -17,6 +18,9 @@ pub use bubblewrap::{
 };
 pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
+};
+pub use pure_transform::{
+    PureTransformBackend, PureTransformError, PureTransformRequest, PureTransformRequestError,
 };
 pub use session::{
     RunSessionIds, SessionId, SessionIdentityError, SessionIdentityErrorKind, SessionRole,
