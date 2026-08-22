@@ -551,12 +551,20 @@ pub fn verify_sandbox_capabilities(
 mod tests {
     use super::*;
 
+    fn tenant(value: &str) -> TenantId {
+        TenantId::new(value).unwrap()
+    }
+
+    fn role(value: &str) -> RoleToken {
+        RoleToken::new(value).unwrap()
+    }
+
     #[test]
     fn network_profile_is_required_for_network_capability() {
         let subject = PolicySubject::new("tenant", "role", Classification::Public).unwrap();
         let layer = PolicyLayer::new(
-            ["tenant"],
-            ["role"],
+            [tenant("tenant")],
+            [role("role")],
             Classification::Restricted,
             NetworkProfile::None,
             [],
@@ -577,8 +585,8 @@ mod tests {
         let subject =
             PolicySubject::new("SECRET_TENANT", "SECRET_ROLE", Classification::Public).unwrap();
         let layer = PolicyLayer::new(
-            ["other-tenant"],
-            ["SECRET_ROLE"],
+            [tenant("other-tenant")],
+            [role("SECRET_ROLE")],
             Classification::Restricted,
             NetworkProfile::LoopbackOnly,
             [],
@@ -601,8 +609,8 @@ mod tests {
     fn classification_cannot_downgrade_without_validator() {
         let subject = PolicySubject::new("tenant", "role", Classification::Confidential).unwrap();
         let layer = PolicyLayer::new(
-            ["tenant"],
-            ["role"],
+            [tenant("tenant")],
+            [role("role")],
             Classification::Public,
             NetworkProfile::LoopbackOnly,
             [],
@@ -637,8 +645,8 @@ mod tests {
         let subject =
             PolicySubject::new("TENANT_SECRET", "ROLE_SECRET", Classification::Public).unwrap();
         let layer = PolicyLayer::new(
-            ["other-tenant"],
-            ["ROLE_SECRET"],
+            [tenant("other-tenant")],
+            [role("ROLE_SECRET")],
             Classification::Restricted,
             NetworkProfile::LoopbackOnly,
             [],
@@ -660,8 +668,8 @@ mod tests {
         let allowed = NetworkDestination::new("allowed.example", 443).unwrap();
         let outside = NetworkDestination::new("outside.example", 443).unwrap();
         let layer = PolicyLayer::new(
-            ["tenant"],
-            ["role"],
+            [tenant("tenant")],
+            [role("role")],
             Classification::Restricted,
             NetworkProfile::BrokeredAllowlist,
             [allowed],
@@ -681,16 +689,16 @@ mod tests {
         let allowed = NetworkDestination::new("allowed.example", 443).unwrap();
         let capabilities = PolicyCapabilities::new([SandboxCapability::Network]);
         let full_layer = PolicyLayer::new(
-            ["tenant"],
-            ["role"],
+            [tenant("tenant")],
+            [role("role")],
             Classification::Restricted,
             NetworkProfile::Full,
             [],
             capabilities.clone(),
         );
         let brokered_layer = PolicyLayer::new(
-            ["tenant"],
-            ["role"],
+            [tenant("tenant")],
+            [role("role")],
             Classification::Restricted,
             NetworkProfile::BrokeredAllowlist,
             [allowed.clone()],
@@ -707,5 +715,39 @@ mod tests {
             NetworkProfile::BrokeredAllowlist
         );
         assert_ne!(effective.network_profile(), NetworkProfile::Full);
+    }
+
+    #[test]
+    fn incompatible_network_profiles_fail_closed() {
+        let subject = PolicySubject::new("tenant", "role", Classification::Public).unwrap();
+        let destination = NetworkDestination::new("broker.example", 443).unwrap();
+        let capabilities = PolicyCapabilities::new([SandboxCapability::Network]);
+        let loopback_layer = PolicyLayer::new(
+            [tenant("tenant")],
+            [role("role")],
+            Classification::Restricted,
+            NetworkProfile::LoopbackOnly,
+            [],
+            capabilities.clone(),
+        );
+        let brokered_layer = PolicyLayer::new(
+            [tenant("tenant")],
+            [role("role")],
+            Classification::Restricted,
+            NetworkProfile::BrokeredAllowlist,
+            [destination.clone()],
+            capabilities,
+        );
+        let requested = RequestedCapabilities::new([SandboxCapability::Network])
+            .with_network_destination(destination);
+
+        let denial =
+            evaluate_context_policy(&subject, &requested, &[loopback_layer, brokered_layer])
+                .unwrap_err();
+
+        assert_eq!(
+            denial.kind(),
+            ContextPolicyDeniedKind::NetworkProfileRequired
+        );
     }
 }

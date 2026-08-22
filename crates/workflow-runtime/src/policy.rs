@@ -8,6 +8,11 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::{collections::HashSet, fmt};
 
 /// A validated non-empty tenant identifier.
+///
+/// ```compile_fail
+/// use workflow_runtime::TenantId;
+/// let _: TenantId = String::new().into();
+/// ```
 #[derive(Clone, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct TenantId(String);
@@ -38,18 +43,6 @@ impl<'de> Deserialize<'de> for TenantId {
     }
 }
 
-impl From<String> for TenantId {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl<'a> From<&'a str> for TenantId {
-    fn from(value: &'a str) -> Self {
-        Self(value.to_owned())
-    }
-}
-
 impl fmt::Debug for TenantId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("TenantId(<redacted>)")
@@ -57,6 +50,11 @@ impl fmt::Debug for TenantId {
 }
 
 /// A validated non-empty authorization role token.
+///
+/// ```compile_fail
+/// use workflow_runtime::RoleToken;
+/// let _: RoleToken = "".into();
+/// ```
 #[derive(Clone, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct RoleToken(String);
@@ -84,18 +82,6 @@ impl<'de> Deserialize<'de> for RoleToken {
         D: Deserializer<'de>,
     {
         Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
-    }
-}
-
-impl From<String> for RoleToken {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl<'a> From<&'a str> for RoleToken {
-    fn from(value: &'a str) -> Self {
-        Self(value.to_owned())
     }
 }
 
@@ -235,18 +221,6 @@ pub enum NetworkProfile {
     Full,
 }
 
-impl NetworkProfile {
-    fn rank(self) -> u8 {
-        match self {
-            Self::None => 0,
-            Self::LoopbackOnly => 1,
-            Self::ServiceAlias => 2,
-            Self::BrokeredAllowlist => 3,
-            Self::Full => 4,
-        }
-    }
-}
-
 /// One contextual grant layered over POLICY-001 capabilities.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -261,21 +235,17 @@ pub struct PolicyLayer {
 
 impl PolicyLayer {
     /// Creates one grant layer from its allowlists and capability grant.
-    pub fn new<T, R>(
-        allowed_tenants: impl IntoIterator<Item = T>,
-        allowed_roles: impl IntoIterator<Item = R>,
+    pub fn new(
+        allowed_tenants: impl IntoIterator<Item = TenantId>,
+        allowed_roles: impl IntoIterator<Item = RoleToken>,
         max_classification: Classification,
         network_profile: NetworkProfile,
         brokered_destinations: impl IntoIterator<Item = NetworkDestination>,
         capabilities: PolicyCapabilities,
-    ) -> Self
-    where
-        T: Into<TenantId>,
-        R: Into<RoleToken>,
-    {
+    ) -> Self {
         Self {
-            allowed_tenants: allowed_tenants.into_iter().map(Into::into).collect(),
-            allowed_roles: allowed_roles.into_iter().map(Into::into).collect(),
+            allowed_tenants: allowed_tenants.into_iter().collect(),
+            allowed_roles: allowed_roles.into_iter().collect(),
             max_classification,
             network_profile,
             brokered_destinations: brokered_destinations.into_iter().collect(),
@@ -512,11 +482,20 @@ fn context_capability_denial(denied: CapabilityPolicyDenied) -> ContextPolicyDen
 fn intersect_network_policy(
     policy_layers: &[PolicyLayer],
 ) -> (NetworkProfile, Vec<NetworkDestination>) {
-    let profile = policy_layers
-        .iter()
-        .map(|layer| layer.network_profile)
-        .min_by_key(|profile| profile.rank())
-        .unwrap_or(NetworkProfile::None);
+    let mut profile = None;
+    for layer in policy_layers {
+        let layer_profile = layer.network_profile;
+        match profile {
+            None => profile = Some(layer_profile),
+            Some(NetworkProfile::Full) => profile = Some(layer_profile),
+            Some(current) if layer_profile == NetworkProfile::Full => {
+                profile = Some(current);
+            }
+            Some(current) if current == layer_profile => profile = Some(current),
+            Some(_) => return (NetworkProfile::None, Vec::new()),
+        }
+    }
+    let profile = profile.unwrap_or(NetworkProfile::None);
 
     if profile != NetworkProfile::BrokeredAllowlist {
         return (profile, Vec::new());
