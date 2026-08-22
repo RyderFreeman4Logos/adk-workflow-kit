@@ -135,7 +135,7 @@ pub fn decode_structured_tool_output<T>(
     max_output_bytes: usize,
 ) -> Result<ToolEnvelope<T>, StructuredOutputError>
 where
-    T: DeserializeOwned,
+    T: DeserializeOwned + Serialize,
 {
     if bytes.len() > max_output_bytes {
         return Err(StructuredOutputError::OutputTooLarge);
@@ -143,11 +143,26 @@ where
     std::str::from_utf8(bytes).map_err(|_| StructuredOutputError::InvalidUtf8)?;
 
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let envelope = ToolEnvelope::deserialize(&mut deserializer)
-        .map_err(|_| StructuredOutputError::InvalidJson)?;
+    let document =
+        Value::deserialize(&mut deserializer).map_err(|_| StructuredOutputError::InvalidJson)?;
     deserializer
         .end()
         .map_err(|_| StructuredOutputError::TrailingBytes)?;
+
+    let raw_payload = document.get("payload").cloned();
+    let envelope: ToolEnvelope<T> =
+        serde_json::from_value(document).map_err(|_| StructuredOutputError::InvalidJson)?;
+    if let ToolEnvelope::Success { payload, .. } = &envelope {
+        let raw_payload = raw_payload
+            .as_ref()
+            .ok_or(StructuredOutputError::InvalidJson)?;
+        let serialized_payload =
+            serde_json::to_value(payload).map_err(|_| StructuredOutputError::InvalidJson)?;
+        if raw_payload != &serialized_payload {
+            return Err(StructuredOutputError::InvalidJson);
+        }
+    }
+
     Ok(envelope)
 }
 
@@ -415,9 +430,14 @@ mod tests {
 
     const MAX_OUTPUT_BYTES: usize = 512;
 
-    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     struct Payload {
+        value: String,
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+    struct LoosePayload {
         value: String,
     }
 
@@ -429,6 +449,17 @@ mod tests {
             decode_structured_tool_output::<Payload>(VALID_JSON, MAX_OUTPUT_BYTES),
             Ok(ToolEnvelope::Success { .. })
         ));
+    }
+
+    #[test]
+    fn unknown_payload_fields_fail_closed_without_payload_opt_in() {
+        let document = br#"{"status":"success","payload":{"value":"ok","hostile":"payload"},"provenance":{"tool_id":"registry.tool","tool_version":"1.2.3"}}"#;
+
+        let error = decode_structured_tool_output::<LoosePayload>(document, MAX_OUTPUT_BYTES)
+            .expect_err("unknown payload fields must fail closed");
+        assert_eq!(error, StructuredOutputError::InvalidJson);
+        assert_eq!(error.to_string(), "structured tool output is invalid");
+        assert!(!error.to_string().contains("payload"));
     }
 
     #[test]
