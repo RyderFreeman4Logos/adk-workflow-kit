@@ -21,10 +21,9 @@ use workflow_runtime::{
 static NEXT_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// The capability classes this bwrap backend genuinely enforces.
-const LINUX_CAPABILITIES: [SandboxCapability; 4] = [
+const LINUX_CAPABILITIES: [SandboxCapability; 3] = [
     SandboxCapability::FilesystemRead,
     SandboxCapability::FilesystemWrite,
-    SandboxCapability::Network,
     SandboxCapability::ProcessSpawn,
 ];
 
@@ -81,6 +80,54 @@ impl Fixture {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessIdentity {
+    pid: u32,
+    start_time: u64,
+}
+
+fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat
+        .split_once(") ")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let start_time = fields.get(19)?.parse().ok()?;
+    Some(ProcessIdentity { pid, start_time })
+}
+
+fn read_pid_witness(path: &Path) -> ProcessIdentity {
+    let witness = fs::read_to_string(path).expect("sandbox must leave a pid witness");
+    let mut fields = witness.split_whitespace();
+    let pid = fields
+        .next()
+        .expect("pid witness must contain a pid")
+        .parse()
+        .expect("pid witness PID must be numeric");
+    let start_time = fields
+        .next()
+        .expect("pid witness must contain a start time")
+        .parse()
+        .expect("pid witness start time must be numeric");
+    ProcessIdentity { pid, start_time }
+}
+
+fn process_identity_is_alive(identity: ProcessIdentity) -> bool {
+    let Some(current) = read_process_identity(identity.pid) else {
+        return false;
+    };
+    if current.start_time != identity.start_time {
+        return false;
+    }
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(identity.pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn backend() -> LinuxBubblewrapBackend {
     LinuxBubblewrapBackend::new(BackendCapabilities::new(LINUX_CAPABILITIES))
 }
@@ -128,7 +175,7 @@ fn check01_cannot_read_undeclared_host_file() {
 
     let req = request(
         &fixture.workdir,
-        "cat /host-secret.txt",
+        &format!("cat {}", secret.display()),
         &[SandboxCapability::ProcessSpawn],
     );
     let receipt = backend()
@@ -203,15 +250,22 @@ fn check04_cannot_use_network_when_denied() {
 }
 
 #[test]
-fn check05_can_reach_only_approved_destination_when_allowlisted() {
-    // With network denied the approved destination set is empty, so nothing
-    // reaches the network: name resolution for any host fails closed.
-    let receipt = run("getent hosts example.com");
-    assert!(
-        !receipt.exit_success()
-            || !String::from_utf8_lossy(receipt.stdout()).contains("example.com"),
-        "no approved destination may be reachable under default network-none"
+fn check05_network_requests_fail_closed_as_backend_selection_fails() {
+    let fixture = Fixture::new();
+    let req = request(
+        &fixture.workdir,
+        "getent hosts example.com",
+        &[SandboxCapability::Network],
     );
+    let error = backend()
+        .execute(&req)
+        .expect_err("network requests must fail closed until an allowlist exists");
+    match error {
+        BubblewrapError::Capabilities(unsatisfied) => {
+            assert!(unsatisfied.missing().contains(&SandboxCapability::Network));
+        }
+        other => panic!("expected capability failure, got {other:?}"),
+    }
 }
 
 #[test]
@@ -260,7 +314,7 @@ fn check08_time_limit_terminates_the_full_process_tree() {
     let fixture = Fixture::new();
     let req = request(
         &fixture.workdir,
-        "sleep 60",
+        "echo \"$$ $(awk '{print $22}' /proc/$$/stat)\" > /work/pid; sleep 60",
         &[SandboxCapability::ProcessSpawn],
     )
     .with_wall_time(300);
@@ -276,23 +330,22 @@ fn check08_time_limit_terminates_the_full_process_tree() {
         elapsed < Duration::from_secs(20),
         "sandbox must be killed promptly"
     );
-    assert!(!sleep_survivors(), "no sandboxed sleep may survive");
-}
-
-fn sleep_survivors() -> bool {
-    let out = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("ps -eo pid,args | grep '[s]leep 60' || true")
-        .output()
-        .expect("host ps must run");
-    !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+    let identity = read_pid_witness(&fixture.workdir.work_dir().join("pid"));
+    assert!(
+        !process_identity_is_alive(identity),
+        "sandbox process group member must not survive: {identity:?}"
+    );
 }
 
 #[test]
-fn check09_memory_and_pid_limits_fail_closed_as_backend_selection_fails() {
+fn check09_resource_limits_fail_closed_as_backend_selection_fails() {
     let backend = LinuxBubblewrapBackend::new(BackendCapabilities::new(LINUX_CAPABILITIES));
 
-    for capability in [SandboxCapability::Memory, SandboxCapability::MaximumPids] {
+    for capability in [
+        SandboxCapability::Memory,
+        SandboxCapability::MaximumPids,
+        SandboxCapability::OutputBytes,
+    ] {
         let fixture = Fixture::new();
         let req = request(&fixture.workdir, "true", &[capability]);
         let error: BubblewrapError = match backend.execute(&req) {
@@ -311,30 +364,21 @@ fn check09_memory_and_pid_limits_fail_closed_as_backend_selection_fails() {
 #[test]
 fn check10_cancellation_leaves_no_surviving_process() {
     // Timeout-driven cancellation uses the same kill path as explicit
-    // cancellation; assert a sentinel PID is gone after the kill.
+    // cancellation; require a PID/start-time witness before checking liveness.
     let fixture = Fixture::new();
     let req = request(
         &fixture.workdir,
-        "echo $$ > /work/pid; sleep 60",
+        "echo \"$$ $(awk '{print $22}' /proc/$$/stat)\" > /work/pid; sleep 60",
         &[SandboxCapability::ProcessSpawn],
     )
     .with_wall_time(300);
     let _ = backend().execute(&req);
 
-    let saved = fixture.workdir.work_dir().join("pid");
-    if let Ok(pid_text) = fs::read_to_string(&saved) {
-        let pid: u32 = pid_text.trim().parse().expect("pid must be numeric");
-        let gone = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("kill -0 {pid} 2>/dev/null"))
-            .status()
-            .expect("kill -0 must run");
-        // 0 => signal was delivered (still alive); 1 => no such process.
-        assert!(
-            !gone.success(),
-            "cancelled sandbox process {pid} must not survive"
-        );
-    }
+    let identity = read_pid_witness(&fixture.workdir.work_dir().join("pid"));
+    assert!(
+        !process_identity_is_alive(identity),
+        "cancelled sandbox process must not survive: {identity:?}"
+    );
 }
 
 #[test]
@@ -347,10 +391,11 @@ fn check11_symlink_escape_is_blocked() {
     // bound roots; resolving it must not expose the host file.
     symlink(&secret, fixture.workdir.work_dir().join("esc")).expect("escape symlink created");
 
-    let receipt = run("cat /work/esc");
+    let receipt = run_in(&fixture.workdir, "cat /work/esc");
+    assert!(!receipt.exit_success(), "symlink escape must fail closed");
     assert!(
         !String::from_utf8_lossy(receipt.stdout()).contains("escape-secret"),
-        "symlink escape must be blocked"
+        "symlink escape must not expose the host secret"
     );
 }
 

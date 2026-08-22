@@ -5,20 +5,22 @@
 //! actually launches a `bwrap` process. The backend binds the caller's
 //! [`RunWorkdir`] roots: `input/`, `package/`, `skills/`, `refs/` read-only and
 //! `work/`, `out/`, `tmp/` read-write, with the host network namespace
-//! unshared by default (network none unless requested-and-granted).
+//! unshared by default. Network requests fail closed until a destination
+//! allowlist can be enforced.
 
 use std::{
     collections::BTreeMap,
     fmt,
-    io::Read,
+    io::{self, Read},
     path::Component,
     process::{Command, ExitStatus, Stdio},
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use crate::{
     verify_sandbox_capabilities, BackendCapabilities, RequestedCapabilities, RunWorkdir,
-    SandboxCapability, UnsatisfiedCapabilities,
+    UnsatisfiedCapabilities,
 };
 
 /// A validated sandbox request for the Linux bubblewrap backend.
@@ -228,46 +230,106 @@ impl LinuxBubblewrapBackend {
         let mut child = command
             .spawn()
             .map_err(|source| BubblewrapError::Spawn { source })?;
+        let process_group = child.id();
+        let stdout_pipe = match child.stdout.take() {
+            Some(pipe) => pipe,
+            None => {
+                terminate_and_reap(&mut child, process_group);
+                return Err(BubblewrapError::Run {
+                    source: io::Error::other("bubblewrap stdout pipe was not captured"),
+                });
+            }
+        };
+        let stderr_pipe = match child.stderr.take() {
+            Some(pipe) => pipe,
+            None => {
+                terminate_and_reap(&mut child, process_group);
+                return Err(BubblewrapError::Run {
+                    source: io::Error::other("bubblewrap stderr pipe was not captured"),
+                });
+            }
+        };
+        let stdout_reader = spawn_pipe_reader(stdout_pipe);
+        let stderr_reader = spawn_pipe_reader(stderr_pipe);
 
-        let deadline = request.wall_time.map(|limit| Instant::now() + limit);
-        // ponytail: pipes drain only after the child exits; a command that
-        // emits more than a pipe buffer without exiting will block wrapped and
-        // only unblock on the wall-time kill. Pump pipes concurrently if a
-        // backend ever must stream unbounded output live.
-        let status = loop {
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|source| BubblewrapError::Run { source })?
-            {
-                break status;
+        let status = match request.wall_time {
+            None => match child.wait() {
+                Ok(status) => status,
+                Err(source) => {
+                    terminate_and_reap(&mut child, process_group);
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(BubblewrapError::Run { source });
+                }
+            },
+            Some(limit) => {
+                let deadline = Instant::now() + limit;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break status,
+                        Ok(None) if Instant::now() >= deadline => {
+                            terminate_and_reap(&mut child, process_group);
+                            break timed_out_status();
+                        }
+                        Ok(None) => thread::sleep(Duration::from_millis(10)),
+                        Err(source) => {
+                            terminate_and_reap(&mut child, process_group);
+                            let _ = stdout_reader.join();
+                            let _ = stderr_reader.join();
+                            return Err(BubblewrapError::Run { source });
+                        }
+                    }
+                }
             }
-            let Some(limit) = deadline else {
-                continue;
-            };
-            if Instant::now() >= limit {
-                let _ = child.kill();
-                break timed_out_status();
-            }
-            std::thread::sleep(Duration::from_millis(10));
         };
 
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut out_pipe = child.stdout.take();
-        let mut err_pipe = child.stderr.take();
-        if let Some(pipe) = out_pipe.as_mut() {
-            let _ = pipe.read_to_end(&mut stdout);
-        }
-        if let Some(pipe) = err_pipe.as_mut() {
-            let _ = pipe.read_to_end(&mut stderr);
-        }
-        let _ = child.wait();
+        let stdout = join_pipe_reader(stdout_reader)?;
+        let stderr = join_pipe_reader(stderr_reader)?;
 
         Ok(BubblewrapReceipt {
             status,
             stdout,
             stderr,
         })
+    }
+}
+
+fn spawn_pipe_reader(mut pipe: impl Read + Send + 'static) -> JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes).map(|_| bytes)
+    })
+}
+
+fn join_pipe_reader(reader: JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, BubblewrapError> {
+    let result = reader.join().map_err(|_| BubblewrapError::Run {
+        source: io::Error::other("bubblewrap output reader panicked"),
+    })?;
+    result.map_err(|source| BubblewrapError::Run { source })
+}
+
+fn terminate_and_reap(child: &mut std::process::Child, process_group: u32) {
+    let _ = kill_process_group(process_group);
+    let _ = child.wait();
+}
+
+fn kill_process_group(process_group: u32) -> io::Result<()> {
+    let process_group = i32::try_from(process_group).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "process group ID is too large")
+    })?;
+
+    unsafe extern "C" {
+        fn killpg(process_group: i32, signal: i32) -> i32;
+    }
+
+    // SAFETY: `process_group` is the PID of the child created with
+    // `process_group(0)`, so the signal is restricted to the group owned by
+    // this executor. `SIGKILL` is async-signal-safe and has no Rust callback.
+    let result = unsafe { killpg(process_group, 9) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -309,11 +371,9 @@ fn configure_bwrap(command: &mut Command, request: &BubblewrapRequest<'_>) {
         .arg("--tmpfs")
         .arg("/tmp");
 
-    // Default network none: unshare the host network namespace unless granted.
-    let network_granted = request.requested.contains(SandboxCapability::Network);
-    if !network_granted {
-        command.arg("--unshare-net");
-    }
+    // Network requests are rejected during capability preflight; every
+    // executable request therefore keeps the host network namespace private.
+    command.arg("--unshare-net");
 
     // Immutable payload roots.
     for dir in ["input", "package", "skills", "refs"] {

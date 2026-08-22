@@ -56,11 +56,39 @@ fn workdir() -> (TestBase, workflow_runtime::RunWorkdir) {
 }
 
 #[test]
+fn bubblewrap_backend_pumps_piped_output_before_the_child_exits() {
+    let backend = LinuxBubblewrapBackend::new(BackendCapabilities::new([
+        SandboxCapability::FilesystemRead,
+        SandboxCapability::FilesystemWrite,
+        SandboxCapability::ProcessSpawn,
+    ]));
+    let (_base, workdir) = workdir();
+    let request = BubblewrapRequest::new(
+        String::from("yes x | head -c 262144"),
+        &workdir,
+        BTreeMap::new(),
+        RequestedCapabilities::new([SandboxCapability::ProcessSpawn]),
+    )
+    .expect("output pump request must be valid")
+    .with_wall_time(2_000);
+
+    let receipt = backend
+        .execute(&request)
+        .expect("output pump command must execute");
+
+    assert!(
+        receipt.exit_success(),
+        "full-pipe command must not time out: {:?}",
+        String::from_utf8_lossy(receipt.stderr())
+    );
+    assert_eq!(receipt.stdout().len(), 262_144);
+}
+
+#[test]
 fn bubblewrap_backend_executes_a_bare_command() {
     let backend = LinuxBubblewrapBackend::new(BackendCapabilities::new([
         SandboxCapability::FilesystemRead,
         SandboxCapability::FilesystemWrite,
-        SandboxCapability::Network,
         SandboxCapability::ProcessSpawn,
     ]));
     let (_base, workdir) = workdir();
