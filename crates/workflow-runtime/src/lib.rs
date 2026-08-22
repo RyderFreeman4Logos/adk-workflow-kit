@@ -3,6 +3,7 @@
 mod artifact;
 mod bubblewrap;
 mod controller;
+mod policy;
 mod pure_transform;
 mod session;
 mod tool;
@@ -18,6 +19,11 @@ pub use bubblewrap::{
 };
 pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
+};
+pub use policy::{
+    evaluate_context_policy, Classification, ContextPolicyDenied, ContextPolicyDeniedKind,
+    EffectivePolicy, InvalidNetworkDestination, InvalidPolicyToken, NetworkDestination,
+    NetworkProfile, PolicyLayer, PolicySubject, RoleToken, TenantId,
 };
 pub use pure_transform::{
     PureTransformBackend, PureTransformError, PureTransformRequest, PureTransformRequestError,
@@ -314,7 +320,8 @@ impl<T, D> RunResult<T, D> {
 }
 
 /// A sandbox capability class.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SandboxCapability {
     /// Read access to declared filesystem resources.
     FilesystemRead,
@@ -372,21 +379,55 @@ impl SandboxCapability {
 }
 
 /// Capability classes required by a workflow.
-pub struct RequestedCapabilities(HashSet<SandboxCapability>);
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestedCapabilities {
+    capabilities: HashSet<SandboxCapability>,
+    network_destination: Option<NetworkDestination>,
+}
+
+impl fmt::Debug for RequestedCapabilities {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestedCapabilities")
+            .field("capabilities", &self.capabilities)
+            .field(
+                "network_destination",
+                &self.network_destination.as_ref().map(|_| "exact"),
+            )
+            .finish()
+    }
+}
 
 impl RequestedCapabilities {
     /// Collects and deduplicates required capability classes.
     pub fn new(capabilities: impl IntoIterator<Item = SandboxCapability>) -> Self {
-        Self(capabilities.into_iter().collect())
+        Self {
+            capabilities: capabilities.into_iter().collect(),
+            network_destination: None,
+        }
+    }
+
+    /// Attaches an exact destination to a network request.
+    pub fn with_network_destination(mut self, destination: NetworkDestination) -> Self {
+        self.network_destination = Some(destination);
+        self
     }
 
     /// Returns whether the request requires the supplied capability class.
     pub fn contains(&self, capability: SandboxCapability) -> bool {
-        self.0.contains(&capability)
+        self.capabilities.contains(&capability)
+    }
+
+    /// Returns the requested exact network destination, if any.
+    pub fn network_destination(&self) -> Option<&NetworkDestination> {
+        self.network_destination.as_ref()
     }
 }
 
 /// Capability classes allowed by one anonymous policy layer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct PolicyCapabilities(HashSet<SandboxCapability>);
 
 impl PolicyCapabilities {
@@ -397,6 +438,7 @@ impl PolicyCapabilities {
 }
 
 /// Capability classes authorized by every policy layer for one request.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectiveCapabilities(Vec<SandboxCapability>);
 
 impl EffectiveCapabilities {
@@ -446,17 +488,17 @@ pub fn intersect_policy_capabilities(
     }
 
     let mut missing = requested
-        .0
+        .capabilities
         .difference(&allowed)
         .copied()
         .collect::<Vec<_>>();
     missing.sort_unstable_by_key(SandboxCapability::as_str);
 
-    if requested.0.is_empty() || !missing.is_empty() {
+    if requested.capabilities.is_empty() || !missing.is_empty() {
         return Err(CapabilityPolicyDenied { missing });
     }
 
-    let mut effective = requested.0.iter().copied().collect::<Vec<_>>();
+    let mut effective = requested.capabilities.iter().copied().collect::<Vec<_>>();
     effective.sort_unstable_by_key(SandboxCapability::as_str);
     Ok(EffectiveCapabilities(effective))
 }
@@ -505,7 +547,7 @@ pub fn verify_sandbox_capabilities(
     backend: &BackendCapabilities,
 ) -> Result<(), UnsatisfiedCapabilities> {
     let mut missing = requested
-        .0
+        .capabilities
         .difference(&backend.0)
         .copied()
         .collect::<Vec<_>>();
@@ -515,5 +557,276 @@ pub fn verify_sandbox_capabilities(
         Ok(())
     } else {
         Err(UnsatisfiedCapabilities { missing })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tenant(value: &str) -> TenantId {
+        TenantId::new(value).unwrap()
+    }
+
+    fn role(value: &str) -> RoleToken {
+        RoleToken::new(value).unwrap()
+    }
+
+    #[test]
+    fn network_destination_debug_redacts_host_and_port_direct_and_nested() {
+        let destination = NetworkDestination::new("SENTINEL_HOST", 4242).unwrap();
+        let direct = format!("{destination:?}");
+        let requested = RequestedCapabilities::new([SandboxCapability::Network])
+            .with_network_destination(destination);
+        let nested = format!("{requested:?}");
+
+        assert!(direct.contains("NetworkDestination"));
+        assert!(nested.contains("RequestedCapabilities"));
+        assert!(!direct.contains("SENTINEL_HOST"));
+        assert!(!direct.contains("4242"));
+        assert!(!nested.contains("SENTINEL_HOST"));
+        assert!(!nested.contains("4242"));
+    }
+
+    #[test]
+    fn network_profile_is_required_for_network_capability() {
+        let subject = PolicySubject::new("tenant", "role", Classification::Public).unwrap();
+        let layer = PolicyLayer::new(
+            [tenant("tenant")],
+            [role("role")],
+            Classification::Restricted,
+            NetworkProfile::None,
+            [],
+            PolicyCapabilities::new([SandboxCapability::Network]),
+        );
+        let requested = RequestedCapabilities::new([SandboxCapability::Network]);
+
+        let denial = evaluate_context_policy(&subject, &requested, &[layer]).unwrap_err();
+
+        assert_eq!(
+            denial.kind(),
+            ContextPolicyDeniedKind::NetworkProfileRequired
+        );
+    }
+
+    #[test]
+    fn cross_tenant_access_is_denied_without_echo() {
+        let subject =
+            PolicySubject::new("SECRET_TENANT", "SECRET_ROLE", Classification::Public).unwrap();
+        let layer = PolicyLayer::new(
+            [tenant("other-tenant")],
+            [role("SECRET_ROLE")],
+            Classification::Restricted,
+            NetworkProfile::LoopbackOnly,
+            [],
+            PolicyCapabilities::new([SandboxCapability::FilesystemRead]),
+        );
+        let requested = RequestedCapabilities::new([SandboxCapability::FilesystemRead]);
+
+        let denial = evaluate_context_policy(&subject, &requested, &[layer]).unwrap_err();
+        let display = denial.to_string();
+        let debug = format!("{denial:?}");
+
+        assert_eq!(denial.kind(), ContextPolicyDeniedKind::TenantMismatch);
+        assert!(!display.contains("SECRET_TENANT"));
+        assert!(!display.contains("SECRET_ROLE"));
+        assert!(!debug.contains("SECRET_TENANT"));
+        assert!(!debug.contains("SECRET_ROLE"));
+    }
+
+    #[test]
+    fn classification_cannot_downgrade_without_validator() {
+        let subject = PolicySubject::new("tenant", "role", Classification::Confidential).unwrap();
+        let layer = PolicyLayer::new(
+            [tenant("tenant")],
+            [role("role")],
+            Classification::Public,
+            NetworkProfile::LoopbackOnly,
+            [],
+            PolicyCapabilities::new([SandboxCapability::FilesystemRead]),
+        );
+        let requested = RequestedCapabilities::new([SandboxCapability::FilesystemRead]);
+
+        let denial = evaluate_context_policy(&subject, &requested, &[layer]).unwrap_err();
+
+        assert_eq!(denial.kind(), ContextPolicyDeniedKind::ClassificationDenied);
+    }
+
+    #[test]
+    fn unknown_policy_fields_fail_closed() {
+        let decoded = serde_json::from_str::<PolicyLayer>(
+            r#"{
+                "allowed_tenants": ["tenant"],
+                "allowed_roles": ["role"],
+                "max_classification": "restricted",
+                "network_profile": "none",
+                "brokered_destinations": [],
+                "capabilities": ["filesystem_read"],
+                "unexpected": "SECRET"
+            }"#,
+        );
+
+        assert!(decoded.is_err());
+    }
+
+    #[test]
+    fn denial_redacts_secret_and_payload_markers() {
+        let subject =
+            PolicySubject::new("TENANT_SECRET", "ROLE_SECRET", Classification::Public).unwrap();
+        let layer = PolicyLayer::new(
+            [tenant("other-tenant")],
+            [role("ROLE_SECRET")],
+            Classification::Restricted,
+            NetworkProfile::LoopbackOnly,
+            [],
+            PolicyCapabilities::new([SandboxCapability::FilesystemRead]),
+        );
+        let requested = RequestedCapabilities::new([SandboxCapability::FilesystemRead]);
+        let denial = evaluate_context_policy(&subject, &requested, &[layer]).unwrap_err();
+        let rendered = format!("{} {:?}", denial, denial);
+
+        assert_eq!(denial.kind(), ContextPolicyDeniedKind::TenantMismatch);
+        assert!(!rendered.contains("SECRET"));
+        assert!(!rendered.contains("TENANT_SECRET"));
+        assert!(!rendered.contains("{\"payload\":\"secret\"}"));
+    }
+
+    fn assert_invalid_network_destination_decode(
+        payload: serde_json::Value,
+        forbidden_markers: &[&str],
+    ) {
+        let direct_error =
+            serde_json::from_value::<NetworkDestination>(payload.clone()).unwrap_err();
+        let direct_rendered = format!("{direct_error} {direct_error:?}");
+        for marker in forbidden_markers {
+            assert!(!direct_rendered.contains(marker));
+        }
+
+        let nested_payload = serde_json::json!({
+            "allowed_tenants": ["tenant"],
+            "allowed_roles": ["role"],
+            "max_classification": "restricted",
+            "network_profile": "brokered_allowlist",
+            "brokered_destinations": [payload],
+            "capabilities": ["network"]
+        });
+        let nested_error = serde_json::from_value::<PolicyLayer>(nested_payload).unwrap_err();
+        let nested_rendered = format!("{nested_error} {nested_error:?}");
+        for marker in forbidden_markers {
+            assert!(!nested_rendered.contains(marker));
+        }
+    }
+
+    #[test]
+    fn deserialized_network_destination_rejects_empty_host_direct_and_nested() {
+        assert_invalid_network_destination_decode(
+            serde_json::json!({"host": "", "port": 443}),
+            &["\"host\":\"\""],
+        );
+    }
+
+    #[test]
+    fn deserialized_network_destination_rejects_wildcard_host_direct_and_nested() {
+        assert_invalid_network_destination_decode(
+            serde_json::json!({"host": "SECRET_*_HOST", "port": 443}),
+            &["SECRET_*_HOST"],
+        );
+    }
+
+    #[test]
+    fn deserialized_network_destination_rejects_zero_port_direct_and_nested() {
+        assert_invalid_network_destination_decode(
+            serde_json::json!({"host": "SECRET_ZERO_HOST", "port": 0}),
+            &["SECRET_ZERO_HOST"],
+        );
+    }
+
+    #[test]
+    fn brokered_destination_outside_allowlist_is_denied() {
+        let subject = PolicySubject::new("tenant", "role", Classification::Public).unwrap();
+        let allowed = NetworkDestination::new("allowed.example", 443).unwrap();
+        let outside = NetworkDestination::new("outside.example", 443).unwrap();
+        let layer = PolicyLayer::new(
+            [tenant("tenant")],
+            [role("role")],
+            Classification::Restricted,
+            NetworkProfile::BrokeredAllowlist,
+            [allowed],
+            PolicyCapabilities::new([SandboxCapability::Network]),
+        );
+        let requested = RequestedCapabilities::new([SandboxCapability::Network])
+            .with_network_destination(outside);
+
+        let denial = evaluate_context_policy(&subject, &requested, &[layer]).unwrap_err();
+
+        assert_eq!(denial.kind(), ContextPolicyDeniedKind::DestinationDenied);
+    }
+
+    #[test]
+    fn full_network_is_never_inferred() {
+        let subject = PolicySubject::new("tenant", "role", Classification::Public).unwrap();
+        let allowed = NetworkDestination::new("allowed.example", 443).unwrap();
+        let capabilities = PolicyCapabilities::new([SandboxCapability::Network]);
+        let full_layer = PolicyLayer::new(
+            [tenant("tenant")],
+            [role("role")],
+            Classification::Restricted,
+            NetworkProfile::Full,
+            [],
+            capabilities.clone(),
+        );
+        let brokered_layer = PolicyLayer::new(
+            [tenant("tenant")],
+            [role("role")],
+            Classification::Restricted,
+            NetworkProfile::BrokeredAllowlist,
+            [allowed.clone()],
+            capabilities,
+        );
+        let requested = RequestedCapabilities::new([SandboxCapability::Network])
+            .with_network_destination(allowed);
+
+        let effective =
+            evaluate_context_policy(&subject, &requested, &[full_layer, brokered_layer]).unwrap();
+
+        assert_eq!(
+            effective.network_profile(),
+            NetworkProfile::BrokeredAllowlist
+        );
+        assert_ne!(effective.network_profile(), NetworkProfile::Full);
+    }
+
+    #[test]
+    fn incompatible_network_profiles_fail_closed() {
+        let subject = PolicySubject::new("tenant", "role", Classification::Public).unwrap();
+        let destination = NetworkDestination::new("broker.example", 443).unwrap();
+        let capabilities = PolicyCapabilities::new([SandboxCapability::Network]);
+        let loopback_layer = PolicyLayer::new(
+            [tenant("tenant")],
+            [role("role")],
+            Classification::Restricted,
+            NetworkProfile::LoopbackOnly,
+            [],
+            capabilities.clone(),
+        );
+        let brokered_layer = PolicyLayer::new(
+            [tenant("tenant")],
+            [role("role")],
+            Classification::Restricted,
+            NetworkProfile::BrokeredAllowlist,
+            [destination.clone()],
+            capabilities,
+        );
+        let requested = RequestedCapabilities::new([SandboxCapability::Network])
+            .with_network_destination(destination);
+
+        let denial =
+            evaluate_context_policy(&subject, &requested, &[loopback_layer, brokered_layer])
+                .unwrap_err();
+
+        assert_eq!(
+            denial.kind(),
+            ContextPolicyDeniedKind::NetworkProfileRequired
+        );
     }
 }
