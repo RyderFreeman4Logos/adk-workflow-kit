@@ -103,6 +103,54 @@ impl ToolProvenance {
     }
 }
 
+/// A fixed, privacy-safe reason that structured tool output was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StructuredOutputError {
+    /// The output exceeded the caller-supplied byte ceiling.
+    OutputTooLarge,
+    /// The output was not valid UTF-8.
+    InvalidUtf8,
+    /// The output was not a valid tool envelope document.
+    InvalidJson,
+    /// The output contained non-whitespace bytes after its envelope.
+    TrailingBytes,
+}
+
+impl fmt::Display for StructuredOutputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::OutputTooLarge => "structured tool output exceeds the limit",
+            Self::InvalidUtf8 => "structured tool output is not valid UTF-8",
+            Self::InvalidJson => "structured tool output is invalid",
+            Self::TrailingBytes => "structured tool output has trailing bytes",
+        })
+    }
+}
+
+impl std::error::Error for StructuredOutputError {}
+
+/// Decodes one bounded, strict JSON tool envelope from output bytes.
+pub fn decode_structured_tool_output<T>(
+    bytes: &[u8],
+    max_output_bytes: usize,
+) -> Result<ToolEnvelope<T>, StructuredOutputError>
+where
+    T: DeserializeOwned,
+{
+    if bytes.len() > max_output_bytes {
+        return Err(StructuredOutputError::OutputTooLarge);
+    }
+    std::str::from_utf8(bytes).map_err(|_| StructuredOutputError::InvalidUtf8)?;
+
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let envelope = ToolEnvelope::deserialize(&mut deserializer)
+        .map_err(|_| StructuredOutputError::InvalidJson)?;
+    deserializer
+        .end()
+        .map_err(|_| StructuredOutputError::TrailingBytes)?;
+    Ok(envelope)
+}
+
 /// A validated, non-executable description of a typed tool.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ToolRegistration {
@@ -358,5 +406,69 @@ fn flag_value(
         None => Ok(false),
         Some(Value::Bool(value)) => Ok(*value),
         Some(_) => Err(ToolRegistrationError::InvalidFlags),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAX_OUTPUT_BYTES: usize = 512;
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct Payload {
+        value: String,
+    }
+
+    const VALID_JSON: &[u8] = br#"{"status":"success","payload":{"value":"ok"},"provenance":{"tool_id":"registry.tool","tool_version":"1.2.3"}}"#;
+
+    #[test]
+    fn valid_structured_output_is_the_terminal_success_path() {
+        assert!(matches!(
+            decode_structured_tool_output::<Payload>(VALID_JSON, MAX_OUTPUT_BYTES),
+            Ok(ToolEnvelope::Success { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_structured_output_fails_closed_without_echoing_input() {
+        let partial_json = &VALID_JSON[..VALID_JSON.len() - 1];
+        assert_eq!(
+            decode_structured_tool_output::<Payload>(partial_json, MAX_OUTPUT_BYTES),
+            Err(StructuredOutputError::InvalidJson)
+        );
+
+        assert_eq!(
+            decode_structured_tool_output::<Payload>(b"not-json", 1),
+            Err(StructuredOutputError::OutputTooLarge)
+        );
+
+        assert_eq!(
+            decode_structured_tool_output::<Payload>(&[b'{', 0xff], MAX_OUTPUT_BYTES),
+            Err(StructuredOutputError::InvalidUtf8)
+        );
+
+        let mut trailing_bytes = VALID_JSON.to_vec();
+        trailing_bytes.extend_from_slice(b"{}");
+        assert_eq!(
+            decode_structured_tool_output::<Payload>(&trailing_bytes, MAX_OUTPUT_BYTES),
+            Err(StructuredOutputError::TrailingBytes)
+        );
+
+        for document in [
+            br#"{"status":"success","payload":{"value":"ok"},"provenance":{"tool_id":"registry.tool","tool_version":"1.2.3"},"hostile":"payload"}"#
+                .as_slice(),
+            br#"{"status":"success","payload":{"value":"ok","hostile":"payload"},"provenance":{"tool_id":"registry.tool","tool_version":"1.2.3"}}"#
+                .as_slice(),
+            br#"{"status":"success","payload":{"value":"ok"},"provenance":{"tool_id":"registry.tool","tool_version":"1.2.3","hostile":"payload"}}"#
+                .as_slice(),
+        ] {
+            let error = decode_structured_tool_output::<Payload>(document, MAX_OUTPUT_BYTES)
+                .expect_err("extra fields must fail closed");
+            assert_eq!(error, StructuredOutputError::InvalidJson);
+            assert_eq!(error.to_string(), "structured tool output is invalid");
+            assert!(!error.to_string().contains("payload"));
+        }
     }
 }
