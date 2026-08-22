@@ -98,18 +98,18 @@ fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
 }
 
 fn read_pid_witness(path: &Path) -> ProcessIdentity {
-    let witness = fs::read_to_string(path).expect("sandbox must leave a pid witness");
+    let witness = fs::read_to_string(path).expect("backend must leave a host pid witness");
     let mut fields = witness.split_whitespace();
     let pid = fields
         .next()
-        .expect("pid witness must contain a pid")
+        .expect("host pid witness must contain a pid")
         .parse()
-        .expect("pid witness PID must be numeric");
+        .expect("host pid witness PID must be numeric");
     let start_time = fields
         .next()
-        .expect("pid witness must contain a start time")
+        .expect("host pid witness must contain a start time")
         .parse()
-        .expect("pid witness start time must be numeric");
+        .expect("host pid witness start time must be numeric");
     ProcessIdentity { pid, start_time }
 }
 
@@ -184,6 +184,22 @@ fn check01_cannot_read_undeclared_host_file() {
 
     assert!(!receipt.exit_success());
     assert!(!String::from_utf8_lossy(receipt.stdout()).contains("undeclared-secret"));
+
+    for host_path in ["/etc/hostname", "/opt/OnlyKey/app.html"] {
+        assert!(
+            Path::new(host_path).is_file(),
+            "test host file must exist: {host_path}"
+        );
+        let receipt = run_in(&fixture.workdir, &format!("cat {host_path}"));
+        assert!(
+            !receipt.exit_success(),
+            "undeclared host file must be unreadable: {host_path}"
+        );
+        assert!(
+            receipt.stdout().is_empty(),
+            "undeclared host file must not be exposed: {host_path}"
+        );
+    }
 }
 
 #[test]
@@ -314,7 +330,7 @@ fn check08_time_limit_terminates_the_full_process_tree() {
     let fixture = Fixture::new();
     let req = request(
         &fixture.workdir,
-        "echo \"$$ $(awk '{print $22}' /proc/$$/stat)\" > /work/pid; sleep 60",
+        "sleep 60",
         &[SandboxCapability::ProcessSpawn],
     )
     .with_wall_time(300);
@@ -330,7 +346,7 @@ fn check08_time_limit_terminates_the_full_process_tree() {
         elapsed < Duration::from_secs(20),
         "sandbox must be killed promptly"
     );
-    let identity = read_pid_witness(&fixture.workdir.work_dir().join("pid"));
+    let identity = read_pid_witness(&fixture.workdir.root().join("pid"));
     assert!(
         !process_identity_is_alive(identity),
         "sandbox process group member must not survive: {identity:?}"
@@ -368,13 +384,13 @@ fn check10_cancellation_leaves_no_surviving_process() {
     let fixture = Fixture::new();
     let req = request(
         &fixture.workdir,
-        "echo \"$$ $(awk '{print $22}' /proc/$$/stat)\" > /work/pid; sleep 60",
+        "sleep 60",
         &[SandboxCapability::ProcessSpawn],
     )
     .with_wall_time(300);
     let _ = backend().execute(&req);
 
-    let identity = read_pid_witness(&fixture.workdir.work_dir().join("pid"));
+    let identity = read_pid_witness(&fixture.workdir.root().join("pid"));
     assert!(
         !process_identity_is_alive(identity),
         "cancelled sandbox process must not survive: {identity:?}"

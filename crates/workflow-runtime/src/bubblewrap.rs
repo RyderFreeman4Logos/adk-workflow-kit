@@ -10,7 +10,7 @@
 
 use std::{
     collections::BTreeMap,
-    fmt,
+    fmt, fs,
     io::{self, Read},
     path::Component,
     process::{Command, ExitStatus, Stdio},
@@ -20,7 +20,7 @@ use std::{
 
 use crate::{
     verify_sandbox_capabilities, BackendCapabilities, RequestedCapabilities, RunWorkdir,
-    UnsatisfiedCapabilities,
+    SandboxCapability, UnsatisfiedCapabilities,
 };
 
 /// A validated sandbox request for the Linux bubblewrap backend.
@@ -200,9 +200,21 @@ pub struct LinuxBubblewrapBackend {
     capabilities: BackendCapabilities,
 }
 
+const ENFORCEABLE_CAPABILITIES: [SandboxCapability; 3] = [
+    SandboxCapability::FilesystemRead,
+    SandboxCapability::FilesystemWrite,
+    SandboxCapability::ProcessSpawn,
+];
+
 impl LinuxBubblewrapBackend {
-    /// Creates a backend enforcing the supplied capability classes.
+    /// Creates a backend with only the capability classes this implementation enforces.
     pub fn new(capabilities: BackendCapabilities) -> Self {
+        let capabilities = BackendCapabilities::new(
+            capabilities
+                .0
+                .into_iter()
+                .filter(|capability| ENFORCEABLE_CAPABILITIES.contains(capability)),
+        );
         Self { capabilities }
     }
 
@@ -251,6 +263,12 @@ impl LinuxBubblewrapBackend {
         };
         let stdout_reader = spawn_pipe_reader(stdout_pipe);
         let stderr_reader = spawn_pipe_reader(stderr_pipe);
+        if let Err(source) = publish_host_pid_witness(request, process_group) {
+            terminate_and_reap(&mut child, process_group);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(BubblewrapError::Run { source });
+        }
 
         let status = match request.wall_time {
             None => match child.wait() {
@@ -292,6 +310,24 @@ impl LinuxBubblewrapBackend {
             stderr,
         })
     }
+}
+
+fn publish_host_pid_witness(request: &BubblewrapRequest<'_>, pid: u32) -> io::Result<()> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let fields = stat
+        .rsplit_once(") ")
+        .ok_or_else(|| io::Error::other("bubblewrap process stat is malformed"))?
+        .1;
+    let start_time = fields
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| io::Error::other("bubblewrap process start time is missing"))?
+        .parse::<u64>()
+        .map_err(|_| io::Error::other("bubblewrap process start time is invalid"))?;
+    fs::write(
+        request.workdir.root().join("pid"),
+        format!("{pid} {start_time}\n"),
+    )
 }
 
 fn spawn_pipe_reader(mut pipe: impl Read + Send + 'static) -> JoinHandle<io::Result<Vec<u8>>> {
@@ -347,9 +383,7 @@ fn configure_bwrap(command: &mut Command, request: &BubblewrapRequest<'_>) {
     let root = request.workdir.root();
 
     // System read-only infrastructure so the sandbox can execute commands.
-    for (host, guest) in [("/usr", "/usr"), ("/etc", "/etc"), ("/opt", "/opt")] {
-        command.arg("--ro-bind").arg(host).arg(guest);
-    }
+    command.arg("--ro-bind").arg("/usr").arg("/usr");
     for (target, guest) in [
         ("usr/bin", "/bin"),
         ("usr/sbin", "/sbin"),

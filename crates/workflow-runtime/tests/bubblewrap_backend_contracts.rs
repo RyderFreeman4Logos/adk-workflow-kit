@@ -56,6 +56,34 @@ fn workdir() -> (TestBase, workflow_runtime::RunWorkdir) {
 }
 
 #[test]
+fn bubblewrap_backend_rejects_forged_unsupported_capabilities_before_spawn() {
+    let (_base, workdir) = workdir();
+    for capability in [SandboxCapability::Network, SandboxCapability::OutputBytes] {
+        let backend = LinuxBubblewrapBackend::new(BackendCapabilities::new([
+            SandboxCapability::ProcessSpawn,
+            capability,
+        ]));
+        let request = BubblewrapRequest::new(
+            String::from("true"),
+            &workdir,
+            BTreeMap::new(),
+            RequestedCapabilities::new([capability]),
+        )
+        .expect("capability request must be valid");
+
+        let error = backend
+            .execute(&request)
+            .expect_err("forged unsupported capability must fail before spawn");
+        match error {
+            workflow_runtime::BubblewrapError::Capabilities(unsatisfied) => {
+                assert!(unsatisfied.missing().contains(&capability));
+            }
+            other => panic!("expected capability failure, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn bubblewrap_backend_pumps_piped_output_before_the_child_exits() {
     let backend = LinuxBubblewrapBackend::new(BackendCapabilities::new([
         SandboxCapability::FilesystemRead,
