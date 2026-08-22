@@ -28,7 +28,8 @@ pub use skill_resource::{
     SkillResourceRead,
 };
 pub use skill_runtime::{
-    DeclaredSkillResource, DeclaredSkillScript, SkillRuntimeLock, SkillRuntimeLockError,
+    plan_script_execution, DeclaredSkillResource, DeclaredSkillScript, ScriptDenied,
+    ScriptDeniedKind, ScriptPlan, ScriptRuntime, SkillRuntimeLock, SkillRuntimeLockError,
     SkillRuntimeManifest, SkillRuntimeManifestError,
 };
 

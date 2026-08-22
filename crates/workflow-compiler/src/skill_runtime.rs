@@ -38,6 +38,207 @@ pub struct DeclaredSkillResource {
     sha256: String,
 }
 
+/// The fixed runtime selected for a planned Skill script.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScriptRuntime {
+    /// The only runtime admitted by the v0 planner.
+    Python3,
+}
+
+/// A non-executable plan for one declared Skill script.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScriptPlan {
+    script_id: SkillId,
+    runtime: ScriptRuntime,
+    path: String,
+    input_sha256: String,
+}
+
+impl ScriptPlan {
+    /// Returns the exact declared script identifier.
+    pub fn script_id(&self) -> &SkillId {
+        &self.script_id
+    }
+
+    /// Returns the fixed runtime selected by the planner.
+    pub fn runtime(&self) -> ScriptRuntime {
+        self.runtime
+    }
+
+    /// Returns the package-relative declared script path.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns the SHA-256 identity of the accepted input JSON bytes.
+    pub fn input_sha256(&self) -> &str {
+        &self.input_sha256
+    }
+}
+
+/// A fixed privacy-safe denial category for Skill script planning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScriptDeniedKind {
+    /// The requested script identifier was not declared.
+    UnknownScript,
+    /// The declaration path is outside the script path grammar.
+    InvalidScriptPath,
+    /// The declaration runtime is outside the closed allowlist.
+    UnknownRuntime,
+    /// The input JSON is absent, oversized, malformed, or schema-invalid.
+    InvalidInput,
+    /// The runtime lock does not bind the requested declaration.
+    LockMismatch,
+    /// The planner encountered an invalid internal policy state.
+    InvalidPolicy,
+}
+
+impl fmt::Display for ScriptDeniedKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}", self)
+    }
+}
+
+/// A privacy-safe denial from the ID-only script planner.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ScriptDenied {
+    kind: ScriptDeniedKind,
+}
+
+impl ScriptDenied {
+    fn new(kind: ScriptDeniedKind) -> Self {
+        Self { kind }
+    }
+
+    /// Returns the fixed denial category without any authored payload.
+    pub fn kind(self) -> ScriptDeniedKind {
+        self.kind
+    }
+}
+
+impl fmt::Debug for ScriptDenied {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}", self.kind)
+    }
+}
+
+impl fmt::Display for ScriptDenied {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}", self.kind)
+    }
+}
+
+impl std::error::Error for ScriptDenied {}
+
+fn lock_binds_script(
+    manifest: &SkillRuntimeManifest,
+    lock: &SkillRuntimeLock,
+    script: &DeclaredSkillScript,
+) -> bool {
+    if lock.lock_version != 1
+        || lock.skill_id != manifest.skill_id.as_str()
+        || lock.skill_version != manifest.skill_version
+        || lock.scripts.len() != manifest.scripts.len()
+        || lock.resources.len() != manifest.resources.len()
+    {
+        return false;
+    }
+
+    let Some(locked_script) = lock
+        .scripts
+        .iter()
+        .find(|locked_script| locked_script.id == script.id.as_str())
+    else {
+        return false;
+    };
+    let capabilities = script
+        .capabilities
+        .iter()
+        .map(|capability| capability.as_str())
+        .collect::<Vec<_>>();
+    if locked_script.path != script.path
+        || locked_script.runtime != script.runtime
+        || locked_script.sha256 != script.sha256
+        || locked_script.input_schema != script.input_schema.as_str()
+        || locked_script.output_schema != script.output_schema.as_str()
+        || locked_script.capabilities
+            != capabilities
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect::<Vec<_>>()
+    {
+        return false;
+    }
+
+    if !manifest.resources.iter().all(|resource| {
+        lock.resources
+            .iter()
+            .find(|locked_resource| locked_resource.id == resource.id.as_str())
+            .is_some_and(|locked_resource| locked_resource.sha256 == resource.sha256)
+    }) {
+        return false;
+    }
+
+    for schema_id in [&script.input_schema, &script.output_schema] {
+        let Some(bytes) = lock.schemas.get(schema_id) else {
+            return false;
+        };
+        let Some(resource) = lock
+            .resources
+            .iter()
+            .find(|resource| resource.id == schema_id.as_str())
+        else {
+            return false;
+        };
+        if digest(bytes) != resource.sha256 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Plans one declared Skill script by ID without constructing an execution backend request.
+pub fn plan_script_execution(
+    manifest: &SkillRuntimeManifest,
+    lock: &SkillRuntimeLock,
+    script_id: &str,
+    input_json: &[u8],
+) -> Result<ScriptPlan, ScriptDenied> {
+    let Some(script) = manifest.script(script_id) else {
+        return Err(ScriptDenied::new(ScriptDeniedKind::UnknownScript));
+    };
+    if !lock_binds_script(manifest, lock, script) {
+        return Err(ScriptDenied::new(ScriptDeniedKind::LockMismatch));
+    }
+    if !is_script_path(&script.path) {
+        return Err(ScriptDenied::new(ScriptDeniedKind::InvalidScriptPath));
+    }
+    if script.runtime != "python3" {
+        return Err(ScriptDenied::new(ScriptDeniedKind::UnknownRuntime));
+    }
+    if input_json.is_empty() || input_json.len() > MAX_SCHEMA_BYTES {
+        return Err(ScriptDenied::new(ScriptDeniedKind::InvalidInput));
+    }
+    let input = serde_json::from_slice::<Value>(input_json)
+        .map_err(|_| ScriptDenied::new(ScriptDeniedKind::InvalidInput))?;
+    let Some(schema_bytes) = lock.schemas.get(&script.input_schema) else {
+        return Err(ScriptDenied::new(ScriptDeniedKind::LockMismatch));
+    };
+    let schema = serde_json::from_slice::<Value>(schema_bytes)
+        .map_err(|_| ScriptDenied::new(ScriptDeniedKind::InvalidPolicy))?;
+    let validator = jsonschema::validator_for(&schema)
+        .map_err(|_| ScriptDenied::new(ScriptDeniedKind::InvalidPolicy))?;
+    if !validator.is_valid(&input) {
+        return Err(ScriptDenied::new(ScriptDeniedKind::InvalidInput));
+    }
+    Ok(ScriptPlan {
+        script_id: script.id.clone(),
+        runtime: ScriptRuntime::Python3,
+        path: script.path.clone(),
+        input_sha256: digest(input_json),
+    })
+}
+
 /// A bounded, canonicalized v1 Skill runtime manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SkillRuntimeManifest {
@@ -246,6 +447,7 @@ pub struct SkillRuntimeLock {
     runtime_manifest_sha256: String,
     scripts: Vec<LockedScript>,
     resources: Vec<LockedResource>,
+    schemas: BTreeMap<SkillResourceId, Vec<u8>>,
 }
 
 impl SkillRuntimeLock {
@@ -290,17 +492,24 @@ impl SkillRuntimeLock {
                 return Err(SkillRuntimeLockError::DigestMismatch);
             }
         }
+        let mut schemas = BTreeMap::new();
         for script in &manifest.scripts {
             let input = match supplied_resources.get(&script.input_schema) {
                 Some(bytes) => *bytes,
                 None => return Err(SkillRuntimeLockError::InputSetMismatch),
             };
             validate_schema(input)?;
+            schemas
+                .entry(script.input_schema.clone())
+                .or_insert_with(|| input.to_vec());
             let output = match supplied_resources.get(&script.output_schema) {
                 Some(bytes) => *bytes,
                 None => return Err(SkillRuntimeLockError::InputSetMismatch),
             };
             validate_schema(output)?;
+            schemas
+                .entry(script.output_schema.clone())
+                .or_insert_with(|| output.to_vec());
         }
 
         let runtime_manifest = manifest
@@ -340,6 +549,7 @@ impl SkillRuntimeLock {
             runtime_manifest_sha256: digest(runtime_manifest.as_bytes()),
             scripts,
             resources,
+            schemas,
         })
     }
 
@@ -550,9 +760,6 @@ fn parse_scripts(
         if !paths.insert(raw.path.clone()) {
             return Err(SkillRuntimeManifestError::DuplicateScript);
         }
-        if SkillId::new(&raw.runtime).is_err() {
-            return Err(SkillRuntimeManifestError::InvalidScript);
-        }
         if !is_digest(&raw.sha256) {
             return Err(SkillRuntimeManifestError::InvalidDigest);
         }
@@ -632,6 +839,7 @@ fn is_script_path(value: &str) -> bool {
         || value.starts_with('/')
         || value.chars().any(char::is_control)
         || contains_glob_metacharacter(value)
+        || contains_script_path_metacharacter(value)
     {
         return false;
     }
@@ -653,6 +861,32 @@ fn contains_glob_metacharacter(value: &str) -> bool {
     value
         .chars()
         .any(|character| matches!(character, '*' | '?' | '[' | ']' | '{' | '}' | '!'))
+}
+
+fn contains_script_path_metacharacter(value: &str) -> bool {
+    value.chars().any(|character| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                ';' | '|'
+                    | '&'
+                    | '$'
+                    | '`'
+                    | '\''
+                    | '"'
+                    | '('
+                    | ')'
+                    | '<'
+                    | '>'
+                    | '{'
+                    | '}'
+                    | '['
+                    | ']'
+                    | '!'
+                    | '#'
+                    | '\\'
+            )
+    })
 }
 
 fn is_digest(value: &str) -> bool {
@@ -730,4 +964,149 @@ fn has_only_local_references(value: &Value) -> bool {
 
 fn digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_script_path, plan_script_execution, DeclaredSkillResource, DeclaredSkillScript,
+        ScriptDeniedKind, ScriptPlan, ScriptRuntime, SkillRuntimeLock, SkillRuntimeManifest,
+    };
+    use crate::{SkillId, SkillResourceId};
+    use sha2::{Digest, Sha256};
+
+    const SCHEMA: &[u8] = br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}"#;
+    const SKILL_MARKDOWN: &[u8] =
+        b"---\nname: valid-skill\ndescription: A bounded skill.\n---\n# Instructions\n";
+    const SCRIPT_BYTES: &[u8] = b"print('ok')\n";
+
+    fn fixture_with_runtime(runtime: &str) -> (SkillRuntimeManifest, SkillRuntimeLock) {
+        let skill_id = SkillId::new("valid-skill").expect("fixture skill ID");
+        let schema_id = SkillResourceId::new("references/schema.json").expect("fixture schema ID");
+        let script_id = SkillId::new("script").expect("fixture script ID");
+        let script_digest = digest(SCRIPT_BYTES);
+        let schema_digest = digest(SCHEMA);
+        let manifest = SkillRuntimeManifest {
+            skill_id: skill_id.clone(),
+            skill_version: "1.2.3".to_owned(),
+            scripts: vec![DeclaredSkillScript {
+                id: script_id,
+                path: "scripts/normalize.py".to_owned(),
+                runtime: runtime.to_owned(),
+                sha256: script_digest,
+                input_schema: schema_id.clone(),
+                output_schema: schema_id.clone(),
+                capabilities: Vec::new(),
+            }],
+            resources: vec![DeclaredSkillResource {
+                id: schema_id.clone(),
+                sha256: schema_digest,
+            }],
+        };
+        let lock = SkillRuntimeLock::try_from_declared_bytes(
+            &manifest,
+            SKILL_MARKDOWN,
+            [("script", SCRIPT_BYTES)],
+            [(&schema_id, SCHEMA)],
+        )
+        .expect("fixture lock");
+        (manifest, lock)
+    }
+
+    fn fixture() -> (SkillRuntimeManifest, SkillRuntimeLock) {
+        fixture_with_runtime("python3")
+    }
+
+    fn digest(bytes: &[u8]) -> String {
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn script_path_with_shell_metacharacters_is_rejected_before_execution() {
+        assert!(!is_script_path("scripts/run;rm"));
+    }
+
+    #[test]
+    fn caller_cannot_supply_path_or_command() {
+        let (manifest, lock) = fixture();
+        let denial = plan_script_execution(
+            &manifest,
+            &lock,
+            "script",
+            br#"{"value":"ok","path":"/tmp/escape","command":"rm -rf /"}"#,
+        )
+        .expect_err("undeclared path and command fields must be rejected");
+        assert_eq!(denial.kind(), ScriptDeniedKind::InvalidInput);
+    }
+
+    #[test]
+    fn lock_mismatch_denies_before_plan() {
+        let (manifest, mut lock) = fixture();
+        lock.skill_version = "9.9.9".to_owned();
+        let denial = plan_script_execution(&manifest, &lock, "script", br#"{"value":"ok"}"#)
+            .expect_err("a lock for another version must be denied");
+        assert_eq!(denial.kind(), ScriptDeniedKind::LockMismatch);
+    }
+
+    #[test]
+    fn valid_script_id_produces_non_executable_plan() {
+        let (manifest, lock) = fixture();
+        let input = br#"{"value":"ok"}"#;
+        let plan: ScriptPlan =
+            plan_script_execution(&manifest, &lock, "script", input).expect("valid plan");
+        assert_eq!(plan.script_id().as_str(), "script");
+        assert_eq!(plan.runtime(), ScriptRuntime::Python3);
+        assert_eq!(plan.path(), "scripts/normalize.py");
+        assert_eq!(plan.input_sha256(), digest(input));
+    }
+
+    #[test]
+    fn invalid_input_fails_schema_without_echo() {
+        let (manifest, lock) = fixture();
+        let denial = plan_script_execution(
+            &manifest,
+            &lock,
+            "script",
+            br#"{"value":42,"secret":"SECRET_MARKER"}"#,
+        )
+        .expect_err("schema-invalid input must be denied");
+        assert_eq!(denial.kind(), ScriptDeniedKind::InvalidInput);
+        assert!(!denial.to_string().contains("SECRET_MARKER"));
+        assert!(!format!("{denial:?}").contains("SECRET_MARKER"));
+    }
+
+    #[test]
+    fn unknown_runtime_is_rejected() {
+        let (manifest, lock) = fixture_with_runtime("ruby");
+        let denial = plan_script_execution(&manifest, &lock, "script", br#"{}"#)
+            .expect_err("unknown runtimes must be denied");
+        assert_eq!(denial.kind(), ScriptDeniedKind::UnknownRuntime);
+    }
+
+    #[test]
+    fn denial_redacts_secret_and_payload_markers() {
+        let (manifest, lock) = fixture();
+        let denial = plan_script_execution(
+            &manifest,
+            &lock,
+            "SECRET_SCRIPT_ID",
+            br#"{"value":"PAYLOAD_MARKER","secret":"SECRET_MARKER"}"#,
+        )
+        .expect_err("unknown hostile IDs must be denied");
+        assert_eq!(denial.kind(), ScriptDeniedKind::UnknownScript);
+        for rendered in [denial.to_string(), format!("{denial:?}")] {
+            assert!(!rendered.contains("SECRET_SCRIPT_ID"));
+            assert!(!rendered.contains("PAYLOAD_MARKER"));
+            assert!(!rendered.contains("SECRET_MARKER"));
+        }
+    }
+
+    #[test]
+    fn unknown_script_id_is_denied_without_backend() {
+        let (manifest, lock) = fixture();
+        let denial = plan_script_execution(&manifest, &lock, "unknown", br#"{}"#)
+            .expect_err("unknown script IDs must be denied");
+        assert_eq!(denial.kind(), ScriptDeniedKind::UnknownScript);
+        assert_eq!(denial.to_string(), "UnknownScript");
+    }
 }
