@@ -163,11 +163,20 @@ impl fmt::Debug for PolicySubject {
 }
 
 /// An exact network destination tuple.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkDestination {
     host: String,
     port: u16,
+}
+
+impl fmt::Debug for NetworkDestination {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NetworkDestination")
+            .field("kind", &"exact")
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]

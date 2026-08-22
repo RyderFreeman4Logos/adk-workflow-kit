@@ -379,11 +379,24 @@ impl SandboxCapability {
 }
 
 /// Capability classes required by a workflow.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestedCapabilities {
     capabilities: HashSet<SandboxCapability>,
     network_destination: Option<NetworkDestination>,
+}
+
+impl fmt::Debug for RequestedCapabilities {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestedCapabilities")
+            .field("capabilities", &self.capabilities)
+            .field(
+                "network_destination",
+                &self.network_destination.as_ref().map(|_| "exact"),
+            )
+            .finish()
+    }
 }
 
 impl RequestedCapabilities {
@@ -557,6 +570,22 @@ mod tests {
 
     fn role(value: &str) -> RoleToken {
         RoleToken::new(value).unwrap()
+    }
+
+    #[test]
+    fn network_destination_debug_redacts_host_and_port_direct_and_nested() {
+        let destination = NetworkDestination::new("SENTINEL_HOST", 4242).unwrap();
+        let direct = format!("{destination:?}");
+        let requested = RequestedCapabilities::new([SandboxCapability::Network])
+            .with_network_destination(destination);
+        let nested = format!("{requested:?}");
+
+        assert!(direct.contains("NetworkDestination"));
+        assert!(nested.contains("RequestedCapabilities"));
+        assert!(!direct.contains("SENTINEL_HOST"));
+        assert!(!direct.contains("4242"));
+        assert!(!nested.contains("SENTINEL_HOST"));
+        assert!(!nested.contains("4242"));
     }
 
     #[test]
