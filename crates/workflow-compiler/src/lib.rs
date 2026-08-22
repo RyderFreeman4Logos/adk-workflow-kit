@@ -10,7 +10,7 @@ mod skill_runtime;
 use std::{collections::VecDeque, fmt};
 
 use workflow_ir::{IrNode, IrNodeKind, NodeId, WorkflowIr};
-use workflow_spec::{parse_file, parse_str, SourcePath, SpecError, WorkflowSpec};
+use workflow_spec::{parse_file, parse_str, NodeKind, SourcePath, SpecError, WorkflowSpec};
 
 pub use diagnostics::{Diagnostic, DiagnosticProjectionError};
 pub use lock::{WorkflowLock, WorkflowLockError};
@@ -157,10 +157,29 @@ fn compile_with_predicates<R: PredicateRegistry>(
 }
 
 fn validated_ir(spec: &WorkflowSpec) -> Result<WorkflowIr, CompileError> {
+    validate_approval_nodes(spec)?;
     let ir = WorkflowIr::from(spec);
     validate_graph(&ir).map_err(CompileError::Graph)?;
     validate_state(&ir).map_err(CompileError::State)?;
     Ok(ir)
+}
+
+fn validate_approval_nodes(spec: &WorkflowSpec) -> Result<(), CompileError> {
+    for node in spec.nodes() {
+        let invalid_timeout = if node.kind() == NodeKind::Approval {
+            node.timeout_ms().is_none_or(|timeout_ms| timeout_ms == 0)
+        } else {
+            node.timeout_ms().is_some()
+        };
+        if invalid_timeout {
+            return Err(CompileError::Graph(
+                GraphValidationError::InvalidIdentifier {
+                    field_path: "nodes[].timeout_ms",
+                },
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Renders a validated workflow plan as deterministic Mermaid graph source.
@@ -676,7 +695,80 @@ fn first_cyclic_component(forward: &Adjacency, reverse: &Adjacency) -> Option<Ve
 
 #[cfg(test)]
 mod tests {
-    use super::{first_cyclic_component, Adjacency};
+    use super::{compile_str, first_cyclic_component, Adjacency};
+
+    #[test]
+    fn approval_node_without_timeout_is_rejected() {
+        let source = r#"
+            schema_version = 1
+
+            [workflow]
+            id = "approval"
+            version = "1"
+            entry = "await"
+
+            [[nodes]]
+            id = "await"
+            kind = "approval"
+
+            [[nodes]]
+            id = "done"
+            kind = "terminal"
+
+            [[edges]]
+            from = "await"
+            to = "done"
+        "#;
+
+        assert!(compile_str("approval.workflow.toml", source).is_err());
+    }
+
+    #[test]
+    fn approval_timeout_zero_is_rejected() {
+        let source = r#"
+            schema_version = 1
+
+            [workflow]
+            id = "approval"
+            version = "1"
+            entry = "await"
+
+            [[nodes]]
+            id = "await"
+            kind = "approval"
+            timeout_ms = 0
+
+            [[nodes]]
+            id = "done"
+            kind = "terminal"
+
+            [[edges]]
+            from = "await"
+            to = "done"
+        "#;
+
+        assert!(compile_str("approval.workflow.toml", source).is_err());
+    }
+
+    #[test]
+    fn timeout_ms_forbidden_on_non_approval_nodes() {
+        let source = r#"
+            schema_version = 1
+            edges = []
+
+            [workflow]
+            id = "approval"
+            version = "1"
+            entry = "done"
+
+            [[nodes]]
+            id = "done"
+            kind = "terminal"
+            timeout_ms = 1
+        "#;
+
+        assert!(compile_str("approval.workflow.toml", source).is_err());
+    }
 
     #[test]
     fn finds_a_deep_cycle_on_a_bounded_stack() {

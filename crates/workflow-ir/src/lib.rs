@@ -9,6 +9,8 @@ pub const CANONICAL_IR_WIRE_VERSION_V1: u16 = 1;
 pub const CANONICAL_IR_WIRE_VERSION_V2: u16 = 2;
 /// The canonical byte-wire version for IR containing a declared state section.
 pub const CANONICAL_IR_WIRE_VERSION_V3: u16 = 3;
+/// The canonical byte-wire version for IR containing approval timeouts.
+pub const CANONICAL_IR_WIRE_VERSION_V4: u16 = 4;
 
 const DOMAIN: &[u8] = b"adk-workflow-kit/workflow-ir\0";
 const IR_SCHEMA_VERSION_V1: u32 = 1;
@@ -141,6 +143,7 @@ impl From<RouteOperator> for IrRouteOperator {
 pub struct IrNode {
     id: NodeId,
     kind: IrNodeKind,
+    timeout_ms: Option<u64>,
 }
 
 impl IrNode {
@@ -152,6 +155,11 @@ impl IrNode {
     /// Returns the node kind.
     pub fn kind(&self) -> IrNodeKind {
         self.kind
+    }
+
+    /// Returns the approval timeout in milliseconds, when this is an approval node.
+    pub fn timeout_ms(&self) -> Option<u64> {
+        self.timeout_ms
     }
 }
 
@@ -374,16 +382,22 @@ impl From<&WorkflowSpec> for WorkflowIr {
         let mut nodes = spec
             .nodes()
             .iter()
-            .map(|node| IrNode {
-                id: NodeId(node.id().as_str().to_owned()),
-                kind: match node.kind() {
+            .map(|node| {
+                let kind = match node.kind() {
                     SpecNodeKind::Agent => IrNodeKind::Agent,
                     SpecNodeKind::Action => IrNodeKind::Action,
                     SpecNodeKind::Validator => IrNodeKind::Validator,
                     SpecNodeKind::Registered => IrNodeKind::Registered,
                     SpecNodeKind::Approval => IrNodeKind::Approval,
                     SpecNodeKind::Terminal => IrNodeKind::Terminal,
-                },
+                };
+                IrNode {
+                    id: NodeId(node.id().as_str().to_owned()),
+                    kind,
+                    timeout_ms: (kind == IrNodeKind::Approval)
+                        .then_some(node.timeout_ms())
+                        .flatten(),
+                }
             })
             .collect::<Vec<_>>();
         let mut edges = spec
@@ -515,7 +529,13 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
     sink.write_chunk(DOMAIN);
     write_u16(
         sink,
-        if ir.state.is_some() {
+        if ir
+            .nodes
+            .iter()
+            .any(|node| node.kind == IrNodeKind::Approval)
+        {
+            CANONICAL_IR_WIRE_VERSION_V4
+        } else if ir.state.is_some() {
             CANONICAL_IR_WIRE_VERSION_V3
         } else if ir.routes.is_empty() {
             CANONICAL_IR_WIRE_VERSION_V1
@@ -531,6 +551,15 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
     for node in &ir.nodes {
         write_frame(sink, node.id.as_str());
         sink.write_chunk(&[node.kind.tag()]);
+        if node.kind == IrNodeKind::Approval {
+            match node.timeout_ms {
+                Some(timeout_ms) => {
+                    sink.write_chunk(&[1]);
+                    write_u64(sink, timeout_ms);
+                }
+                None => sink.write_chunk(&[0]),
+            }
+        }
     }
     write_u64(sink, u64_from_usize(ir.edges.len()));
     for edge in &ir.edges {

@@ -253,7 +253,11 @@ fn every_current_semantic_ir_dimension_changes_the_lock() {
         ),
         (
             "node kind",
-            SEMANTIC_WORKFLOW.replacen("kind = \"action\"", "kind = \"approval\"", 1),
+            SEMANTIC_WORKFLOW.replacen(
+                "kind = \"action\"",
+                "kind = \"approval\"\ntimeout_ms = 1",
+                1,
+            ),
         ),
         (
             "edge origin",
@@ -298,6 +302,21 @@ fn every_current_semantic_ir_dimension_changes_the_lock() {
         assert_ne!(changed_lock.ir_hash(), original_lock.ir_hash(), "{name}");
         assert_ne!(changed_document, original_document, "{name}");
     }
+}
+
+#[test]
+fn approval_timeout_changes_canonical_ir_identity() {
+    let timeout_one = SEMANTIC_WORKFLOW.replacen(
+        "kind = \"action\"",
+        "kind = \"approval\"\ntimeout_ms = 1",
+        1,
+    );
+    let timeout_two = timeout_one.replace("timeout_ms = 1", "timeout_ms = 2");
+
+    let first = compiled_plan("approval-one.workflow.toml", &timeout_one);
+    let second = compiled_plan("approval-two.workflow.toml", &timeout_two);
+
+    assert_ne!(first.ir().canonical_hash(), second.ir().canonical_hash());
 }
 
 #[test]

@@ -280,11 +280,12 @@ impl std::str::FromStr for RouteOperator {
     }
 }
 
-/// A source-level node without variant payload fields.
+/// A source-level node with its closed kind and optional approval timeout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Node {
     id: NodeId,
     kind: NodeKind,
+    timeout_ms: Option<u64>,
 }
 
 impl Node {
@@ -296,6 +297,11 @@ impl Node {
     /// Returns the closed v1 node kind.
     pub fn kind(&self) -> NodeKind {
         self.kind
+    }
+
+    /// Returns the authored timeout in milliseconds, when present.
+    pub fn timeout_ms(&self) -> Option<u64> {
+        self.timeout_ms
     }
 }
 
@@ -536,6 +542,7 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
             .map(|node| Node {
                 id: NodeId(node.id),
                 kind: node.kind,
+                timeout_ms: node.timeout_ms,
             })
             .collect(),
         edges: raw
@@ -670,6 +677,8 @@ struct RawWorkflow {
 struct RawNode {
     id: String,
     kind: NodeKind,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
