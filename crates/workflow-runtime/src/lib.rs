@@ -1,5 +1,6 @@
 //! Cooperative run enforcement, terminal contracts, and sandbox preflight.
 
+mod approval;
 mod artifact;
 mod bubblewrap;
 mod controller;
@@ -9,6 +10,9 @@ mod session;
 mod tool;
 mod workdir;
 
+pub use approval::{
+    evaluate_approval, ApprovalDecision, ApprovalGranted, ApprovalTerminal, ApprovalTerminalKind,
+};
 pub use artifact::{
     ArtifactError, ArtifactErrorKind, ArtifactId, ArtifactPage, ArtifactStore,
     FilesystemArtifactStore, InMemoryArtifactStore, PageRequest, RetentionPolicy,
