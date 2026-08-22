@@ -3,12 +3,15 @@
 use std::fmt;
 
 use serde_json::Value;
-use wasmi::{Config, Engine, Linker, Module, Store, TypedFunc};
+use wasmi::{Config, Engine, Linker, Module, Store, StoreLimitsBuilder, TypedFunc};
 
 use crate::{
     verify_sandbox_capabilities, BackendCapabilities, RequestedCapabilities, SandboxCapability,
     UnsatisfiedCapabilities,
 };
+
+const MAX_MEMORY_PAGES: usize = 64;
+const WASM_PAGE_BYTES: usize = 64 * 1024;
 
 /// A bounded JSON transform request owned by the backend boundary.
 pub struct PureTransformRequest {
@@ -78,7 +81,13 @@ impl PureTransformBackend {
             return Err(PureTransformError::UnsupportedImports);
         }
 
-        let mut store = Store::new(&engine, ());
+        let mut store = Store::new(
+            &engine,
+            StoreLimitsBuilder::new()
+                .memory_size(MAX_MEMORY_PAGES * WASM_PAGE_BYTES)
+                .build(),
+        );
+        store.limiter(|limits| limits);
         store
             .set_fuel(Self::MAX_FUEL)
             .map_err(|_| PureTransformError::FuelConfigurationFailed)?;

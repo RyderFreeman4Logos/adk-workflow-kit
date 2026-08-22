@@ -21,6 +21,27 @@ const IMPORTING_WASM: &[u8] = &[
     0x00, // one unsupported host function import
 ];
 
+const OVERSIZED_MEMORY_WASM: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // wasm header
+    0x01, 0x08, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x02, 0x7f, 0x7f, // (i32, i32) -> (i32, i32)
+    0x03, 0x02, 0x01, 0x00, // one function using type 0
+    0x05, 0x03, 0x01, 0x00, 0x41, // 65-page memory declaration
+    0x07, 0x16, 0x02, 0x06, b'm', b'e', b'm', b'o', b'r', b'y', 0x02, 0x00, 0x09, b't', b'r', b'a',
+    b'n', b's', b'f', b'o', b'r', b'm', 0x00, 0x00, // exports memory and transform
+    0x0a, 0x08, 0x01, 0x06, 0x00, 0x20, 0x00, 0x20, 0x01, 0x0b, // return input ptr/len
+];
+
+const GROWING_MEMORY_WASM: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // wasm header
+    0x01, 0x08, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x02, 0x7f, 0x7f, // (i32, i32) -> (i32, i32)
+    0x03, 0x02, 0x01, 0x00, // one function using type 0
+    0x05, 0x03, 0x01, 0x00, 0x01, // one memory with one page
+    0x07, 0x16, 0x02, 0x06, b'm', b'e', b'm', b'o', b'r', b'y', 0x02, 0x00, 0x09, b't', b'r', b'a',
+    b'n', b's', b'f', b'o', b'r', b'm', 0x00, 0x00, // exports memory and transform
+    0x0a, 0x13, 0x01, 0x11, 0x00, 0x41, 0x40, 0x40, 0x00, 0x41, 0x7f, 0x46, 0x04, 0x40, 0x00, 0x0b,
+    0x20, 0x00, 0x20, 0x01, 0x0b, // trap if growth is refused
+];
+
 #[test]
 fn pure_transform_executes_json() {
     let request = PureTransformRequest::new(
@@ -97,6 +118,44 @@ fn pure_transform_rejects_a_missing_module() {
 
     assert!(matches!(error, PureTransformError::MissingModule));
     assert_eq!(error.to_string(), "pure transform module is missing");
+}
+
+#[test]
+fn pure_transform_rejects_oversized_declared_memory() {
+    let request = PureTransformRequest::new(
+        OVERSIZED_MEMORY_WASM,
+        json!({"value": 7}),
+        RequestedCapabilities::new(std::iter::empty::<SandboxCapability>()),
+    )
+    .expect("oversized memory request must be valid");
+    let error = PureTransformBackend::new()
+        .execute(&request)
+        .expect_err("oversized declared memory must fail closed");
+
+    assert!(matches!(error, PureTransformError::InstantiationFailed));
+    assert_eq!(
+        error.to_string(),
+        "pure transform module could not be instantiated"
+    );
+}
+
+#[test]
+fn pure_transform_rejects_guest_memory_growth() {
+    let request = PureTransformRequest::new(
+        GROWING_MEMORY_WASM,
+        json!({"value": 7}),
+        RequestedCapabilities::new(std::iter::empty::<SandboxCapability>()),
+    )
+    .expect("growing memory request must be valid");
+    let error = PureTransformBackend::new()
+        .execute(&request)
+        .expect_err("guest memory growth must fail closed");
+
+    assert!(
+        matches!(error, PureTransformError::TransformFailed),
+        "unexpected growth failure: {error:?}"
+    );
+    assert_eq!(error.to_string(), "pure transform execution failed");
 }
 
 #[test]
