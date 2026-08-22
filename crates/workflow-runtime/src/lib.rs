@@ -26,7 +26,8 @@ pub use session::{
     RunSessionIds, SessionId, SessionIdentityError, SessionIdentityErrorKind, SessionRole,
 };
 pub use tool::{
-    ToolEnvelope, ToolFailure, ToolFlags, ToolProvenance, ToolRegistration, ToolRegistrationError,
+    decode_structured_tool_output, StructuredOutputError, ToolEnvelope, ToolFailure, ToolFlags,
+    ToolProvenance, ToolRegistration, ToolRegistrationError,
 };
 pub use workdir::{
     CleanupOutcome, Materialization, RunWorkdir, WorkdirError, WorkdirErrorKind, WorkdirId,
