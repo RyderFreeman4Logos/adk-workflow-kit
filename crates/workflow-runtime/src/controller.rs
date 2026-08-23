@@ -1,6 +1,6 @@
 use std::{collections::HashMap, time::Duration};
 
-use crate::{RunContext, RunLimitKind, RunLimits, RunOutcome, RunStatus, RunTimeoutKind};
+use crate::{RunContext, RunId, RunLimitKind, RunLimits, RunOutcome, RunStatus, RunTimeoutKind};
 
 /// A fail-closed host-controller error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,6 +102,7 @@ struct ActiveToolCall {
 
 /// Synchronous cooperative enforcement for one trusted host run.
 pub struct RunController<'limits> {
+    run_id: &'limits RunId,
     limits: &'limits RunLimits,
     model_turn_count: u64,
     total_tool_call_count: u64,
@@ -117,6 +118,7 @@ impl<'limits> RunController<'limits> {
     /// Starts a controller at elapsed zero using immutable context limits.
     pub fn new(context: &'limits RunContext) -> Self {
         Self {
+            run_id: context.run_id(),
             limits: context.limits(),
             model_turn_count: 0,
             total_tool_call_count: 0,
@@ -132,6 +134,20 @@ impl<'limits> RunController<'limits> {
     /// Checks clocks and deadlines without reporting progress.
     pub fn poll(&mut self, elapsed: Duration) -> Result<(), RunTermination> {
         self.check_boundary(elapsed)
+    }
+
+    pub(crate) fn belongs_to(&self, run_id: &RunId) -> bool {
+        self.run_id == run_id
+    }
+
+    pub(crate) fn preflight_finish(&mut self, elapsed: Duration) -> Result<(), RunTermination> {
+        self.check_boundary(elapsed)?;
+        if self.active_tool_call.is_some() {
+            return Err(self.terminate(RunTerminalCause::Failed(
+                RunControlError::RunFinishWithActiveToolCall,
+            )));
+        }
+        Ok(())
     }
 
     /// Admits and charges one model turn before dispatch.
@@ -251,14 +267,23 @@ impl<'limits> RunController<'limits> {
     }
 
     /// Finishes a healthy run with no active tool call.
-    pub fn finish(&mut self, elapsed: Duration) -> Result<(), RunTermination> {
-        self.check_boundary(elapsed)?;
-        if self.active_tool_call.is_some() {
-            return Err(self.terminate(RunTerminalCause::Failed(
-                RunControlError::RunFinishWithActiveToolCall,
-            )));
-        }
-        Ok(())
+    ///
+    /// Completion consumes controller authority, so contradictory later control is impossible.
+    ///
+    /// ```compile_fail
+    /// use std::{num::NonZeroU64, time::Duration};
+    /// use workflow_runtime::{RunContext, RunController, RunId, RunLimits};
+    /// let one = NonZeroU64::new(1).unwrap();
+    /// let context = RunContext::new(
+    ///     RunId::new(String::from("one-shot")).unwrap(),
+    ///     RunLimits::new(one, one, one, one, one, one, one),
+    /// );
+    /// let mut controller = RunController::new(&context);
+    /// controller.finish(Duration::ZERO).unwrap();
+    /// let _ = controller.request_cancel(Duration::ZERO);
+    /// ```
+    pub fn finish(mut self, elapsed: Duration) -> Result<(), RunTermination> {
+        self.preflight_finish(elapsed)
     }
 
     /// Returns the number of admitted model turns.

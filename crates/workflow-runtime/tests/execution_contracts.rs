@@ -134,10 +134,10 @@ fn execution_plan_runs_fixture_and_publishes_real_artifact() {
         .count();
 
     assert_eq!(before_render, 0);
-    let mut controller = RunController::new(&run);
+    let controller = RunController::new(&run);
     let result = plan.execute(
         &run,
-        &mut controller,
+        controller,
         || std::time::Duration::ZERO,
         &workdir,
         &mut artifacts,
@@ -236,7 +236,7 @@ fn capability_denial_and_backend_failure_publish_no_artifact() {
     .expect("capability-denial plan must be valid")
     .execute(
         &run,
-        &mut RunController::new(&run),
+        RunController::new(&run),
         || std::time::Duration::ZERO,
         &workdir,
         &mut artifacts,
@@ -262,7 +262,7 @@ fn capability_denial_and_backend_failure_publish_no_artifact() {
     .expect("invalid-module bytes still have a verified digest")
     .execute(
         &run,
-        &mut RunController::new(&run),
+        RunController::new(&run),
         || std::time::Duration::ZERO,
         &workdir,
         &mut artifacts,
@@ -285,7 +285,13 @@ fn capability_denial_and_backend_failure_publish_no_artifact() {
 #[test]
 fn plan_debug_redacts_bound_module_and_input() {
     let module = b"module-poison-5ed392f1";
-    let binding = binding(module);
+    let binding = PureTransformBinding::new(
+        "workflow-id-poison-98545a85",
+        "workflow-version-poison-f015b1f4",
+        module_digest(module),
+        module,
+    )
+    .expect("fixture binding must be valid");
     let plan = PureTransformPlanV1::new(
         binding.clone(),
         json!({"input": "input-poison-6a7f4d20"}),
@@ -296,9 +302,18 @@ fn plan_debug_redacts_bound_module_and_input() {
     let binding_debug = format!("{binding:?}");
     let plan_debug = format!("{plan:?}");
     for debug in [&binding_debug, &plan_debug] {
-        assert!(!debug.contains("module-poison-5ed392f1"));
-        assert!(!debug.contains("input-poison-6a7f4d20"));
+        for poison in [
+            "workflow-id-poison-98545a85",
+            "workflow-version-poison-f015b1f4",
+            "module-poison-5ed392f1",
+            "input-poison-6a7f4d20",
+        ] {
+            assert!(!debug.contains(poison), "Debug leaked {poison}");
+        }
     }
+    assert!(binding_debug.contains("binding_id"));
+    assert!(binding_debug.contains("pure-transform"));
+    assert!(binding_debug.contains("binding_version"));
     assert!(binding_debug.contains(binding.module_digest()));
     assert!(binding_debug.contains("module_bytes"));
     assert!(plan_debug.contains(binding.module_digest()));
@@ -352,12 +367,12 @@ fn mismatched_workdir_returns_typed_failure_without_putting_artifacts() {
         RequestedCapabilities::new(std::iter::empty::<SandboxCapability>()),
     )
     .expect("fixture plan must be valid");
-    let mut controller = RunController::new(&run);
+    let controller = RunController::new(&run);
     let mut artifacts = RecordingStore { put_calls: 0 };
 
     let result = plan.execute(
         &run,
-        &mut controller,
+        controller,
         || std::time::Duration::ZERO,
         &workdir,
         &mut artifacts,
@@ -395,18 +410,18 @@ fn controller_terminal_outcomes_prevent_artifact_publication() {
 
     let cancelled_result = plan.execute(
         &run,
-        &mut cancelled,
+        cancelled,
         || std::time::Duration::ZERO,
         &workdir,
         &mut artifacts,
     );
 
-    assert!(matches!(
-        cancelled_result.outcome(),
+    match cancelled_result.outcome() {
         RunOutcome::Cancelled {
-            diagnostic: PureTransformExecutionError::Controller(RunTerminalCause::Cancelled)
-        }
-    ));
+            diagnostic: PureTransformExecutionError::ControllerTermination(termination),
+        } => assert_eq!(termination.cause(), RunTerminalCause::Cancelled),
+        other => panic!("cancelled controller must remain typed, got {other:?}"),
+    }
     assert_eq!(artifacts.put_calls, 0);
 
     let timeout_run = RunContext::new(
@@ -424,7 +439,7 @@ fn controller_terminal_outcomes_prevent_artifact_publication() {
     let mut timeout_workdir = manager
         .allocate(timeout_run.run_id())
         .expect("timeout workdir must allocate");
-    let mut timeout_controller = RunController::new(&timeout_run);
+    let timeout_controller = RunController::new(&timeout_run);
     let mut samples = [
         std::time::Duration::ZERO,
         std::time::Duration::from_millis(1),
@@ -432,7 +447,7 @@ fn controller_terminal_outcomes_prevent_artifact_publication() {
     .into_iter();
     let timeout_result = plan.execute(
         &timeout_run,
-        &mut timeout_controller,
+        timeout_controller,
         || {
             samples
                 .next()
@@ -442,15 +457,16 @@ fn controller_terminal_outcomes_prevent_artifact_publication() {
         &mut artifacts,
     );
 
-    assert!(matches!(
-        timeout_result.outcome(),
+    match timeout_result.outcome() {
         RunOutcome::TimedOut {
             timeout: RunTimeoutKind::WallTime,
-            diagnostic: PureTransformExecutionError::Controller(RunTerminalCause::TimedOut(
-                RunTimeoutKind::WallTime
-            ))
-        }
-    ));
+            diagnostic: PureTransformExecutionError::ControllerTermination(termination),
+        } => assert_eq!(
+            termination.cause(),
+            RunTerminalCause::TimedOut(RunTimeoutKind::WallTime)
+        ),
+        other => panic!("timed-out controller must remain typed, got {other:?}"),
+    }
     assert_eq!(artifacts.put_calls, 0);
     workdir.cleanup().expect("test workdir must clean up");
     timeout_workdir

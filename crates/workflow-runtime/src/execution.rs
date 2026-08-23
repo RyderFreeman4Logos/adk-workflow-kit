@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     ArtifactError, ArtifactId, ArtifactStore, PureTransformBackend, PureTransformError,
     PureTransformRequest, PureTransformRequestError, RequestedCapabilities, RunContext,
-    RunController, RunOutcome, RunResult, RunTerminalCause, RunWorkdir,
+    RunController, RunOutcome, RunResult, RunWorkdir,
 };
 
 /// The version of the deterministic pure-transform execution plan.
@@ -31,8 +31,6 @@ impl fmt::Debug for PureTransformBinding {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PureTransformBinding")
-            .field("workflow_id", &self.workflow_id)
-            .field("workflow_version", &self.workflow_version)
             .field("binding_id", &PURE_TRANSFORM_BINDING_ID)
             .field("binding_version", &PURE_TRANSFORM_BINDING_VERSION)
             .field("module_digest", &self.module_digest)
@@ -172,7 +170,7 @@ impl PureTransformPlanV1 {
     pub fn execute<S: ArtifactStore, F: FnMut() -> Duration>(
         &self,
         context: &RunContext,
-        controller: &mut RunController<'_>,
+        mut controller: RunController<'_>,
         mut elapsed: F,
         workdir: &RunWorkdir,
         artifacts: &mut S,
@@ -180,8 +178,11 @@ impl PureTransformPlanV1 {
         if context.run_id() != workdir.run_id() {
             return failed(context, PureTransformExecutionError::WorkdirRunMismatch);
         }
+        if !controller.belongs_to(context.run_id()) {
+            return failed(context, PureTransformExecutionError::ControllerRunMismatch);
+        }
 
-        if let Err(termination) = controller.poll(elapsed()) {
+        if let Err(termination) = controller.preflight_finish(elapsed()) {
             return terminal_failure(context, termination);
         }
 
@@ -225,7 +226,9 @@ fn terminal_failure(
     let cause = termination.cause();
     RunResult::new(
         context.run_id().clone(),
-        cause.into_outcome(PureTransformExecutionError::Controller(cause)),
+        cause.into_outcome(PureTransformExecutionError::ControllerTermination(
+            termination,
+        )),
     )
 }
 
@@ -298,8 +301,10 @@ impl From<PureTransformRequestError> for PureTransformPlanError {
 pub enum PureTransformExecutionError {
     /// The workdir belongs to a different run context.
     WorkdirRunMismatch,
-    /// The existing controller rejected a run boundary.
-    Controller(RunTerminalCause),
+    /// The controller belongs to a different run context.
+    ControllerRunMismatch,
+    /// The existing controller rejected a run boundary with one-shot cleanup.
+    ControllerTermination(crate::RunTermination),
     /// The bounded request could not be reconstructed.
     Request(PureTransformRequestError),
     /// The existing pure-transform backend rejected or failed the module.
@@ -316,9 +321,15 @@ impl fmt::Display for PureTransformExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WorkdirRunMismatch => formatter.write_str("run context and workdir do not match"),
-            Self::Controller(cause) => {
-                write!(formatter, "run controller rejected execution: {cause:?}")
+            Self::ControllerRunMismatch => {
+                formatter.write_str("run context and controller do not match")
             }
+            Self::ControllerTermination(termination) => write!(
+                formatter,
+                "run controller rejected execution: {:?}",
+                termination.cause()
+            ),
+
             Self::Request(error) => fmt::Display::fmt(error, formatter),
             Self::Backend(error) => fmt::Display::fmt(error, formatter),
             Self::OutputSerialization => {
@@ -338,5 +349,294 @@ impl std::error::Error for PureTransformExecutionError {
             Self::Artifact(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        num::NonZeroU64,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::{
+        pure_transform::{backend_executions, reset_backend_executions},
+        ArtifactPage, InMemoryArtifactStore, PageRequest, RetentionPolicy, RunControlError, RunId,
+        RunLimits, RunTerminalCause, RunTimeoutKind, SandboxCapability, WorkdirManager,
+    };
+
+    const IDENTITY_WASM: &[u8] = include_bytes!("../tests/fixtures/pure_transform_identity.wasm");
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "workflow-runtime-execution-unit-{}-{}",
+                std::process::id(),
+                NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).expect("test root must be unique");
+            Self(root)
+        }
+
+        fn manager(&self) -> WorkdirManager {
+            let base = self.0.join("workdirs");
+            fs::create_dir(&base).expect("workdir base must be created");
+            WorkdirManager::new(base).expect("workdir base must be trusted")
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct CountingStore {
+        inner: InMemoryArtifactStore,
+        puts: usize,
+    }
+
+    impl CountingStore {
+        fn new() -> Self {
+            let limit = NonZeroU64::new(64 * 1024).expect("positive limit");
+            Self {
+                inner: InMemoryArtifactStore::new(limit, limit),
+                puts: 0,
+            }
+        }
+    }
+
+    impl ArtifactStore for CountingStore {
+        fn put(&mut self, bytes: &[u8]) -> Result<ArtifactId, ArtifactError> {
+            self.puts += 1;
+            self.inner.put(bytes)
+        }
+
+        fn read_page(
+            &self,
+            id: &ArtifactId,
+            request: PageRequest,
+        ) -> Result<ArtifactPage, ArtifactError> {
+            self.inner.read_page(id, request)
+        }
+
+        fn set_retention(
+            &mut self,
+            id: &ArtifactId,
+            policy: RetentionPolicy,
+        ) -> Result<(), ArtifactError> {
+            self.inner.set_retention(id, policy)
+        }
+
+        fn retention(&self, id: &ArtifactId) -> Result<RetentionPolicy, ArtifactError> {
+            self.inner.retention(id)
+        }
+    }
+
+    fn run(id: &str, wall_ms: u64) -> RunContext {
+        let one = NonZeroU64::new(1).expect("positive limit");
+        let relaxed = NonZeroU64::new(1_000).expect("positive limit");
+        RunContext::new(
+            RunId::new(String::from(id)).expect("test run ID must be valid"),
+            RunLimits::new(
+                one,
+                one,
+                one,
+                NonZeroU64::new(wall_ms).expect("positive wall limit"),
+                relaxed,
+                relaxed,
+                NonZeroU64::new(64 * 1024).expect("positive output limit"),
+            ),
+        )
+    }
+
+    fn plan(module: &[u8]) -> PureTransformPlanV1 {
+        PureTransformPlanV1::new(
+            PureTransformBinding::new("workflow", "1", digest(module), module)
+                .expect("test binding must be valid"),
+            json!({"value": 7}),
+            RequestedCapabilities::new(std::iter::empty::<SandboxCapability>()),
+        )
+        .expect("test plan must be valid")
+    }
+
+    #[test]
+    fn controller_context_mismatch_is_rejected_before_sampling_backend_and_put() {
+        for (context_id, context_wall, controller_id, controller_wall) in [
+            ("strict-context", 1, "loose-controller", 1_000),
+            ("loose-context", 1_000, "strict-controller", 1),
+        ] {
+            let root = TestRoot::new();
+            let manager = root.manager();
+            let context = run(context_id, context_wall);
+            let controller_context = run(controller_id, controller_wall);
+            let mut workdir = manager
+                .allocate(context.run_id())
+                .expect("workdir must allocate");
+            let controller = RunController::new(&controller_context);
+            let mut samples = 0;
+            let mut artifacts = CountingStore::new();
+            reset_backend_executions();
+
+            let result = plan(IDENTITY_WASM).execute(
+                &context,
+                controller,
+                || {
+                    samples += 1;
+                    Duration::ZERO
+                },
+                &workdir,
+                &mut artifacts,
+            );
+
+            assert!(matches!(
+                result.outcome(),
+                RunOutcome::Failed {
+                    diagnostic: PureTransformExecutionError::ControllerRunMismatch
+                }
+            ));
+            assert_eq!(samples, 0);
+            assert_eq!(backend_executions(), 0);
+            assert_eq!(artifacts.puts, 0);
+            workdir.cleanup().expect("workdir must clean up");
+        }
+    }
+
+    #[test]
+    fn active_tool_is_rejected_before_backend_with_exact_one_shot_cleanup() {
+        let root = TestRoot::new();
+        let manager = root.manager();
+        let context = run("active-tool", 1_000);
+        let mut workdir = manager
+            .allocate(context.run_id())
+            .expect("workdir must allocate");
+        let mut controller = RunController::new(&context);
+        controller
+            .begin_tool_call(Duration::ZERO, "exact-tool", "7")
+            .expect("tool call must begin");
+        let mut artifacts = CountingStore::new();
+        reset_backend_executions();
+
+        let result = plan(IDENTITY_WASM).execute(
+            &context,
+            controller,
+            || Duration::ZERO,
+            &workdir,
+            &mut artifacts,
+        );
+
+        let termination = match result.outcome() {
+            RunOutcome::Failed {
+                diagnostic: PureTransformExecutionError::ControllerTermination(termination),
+            } => termination,
+            other => panic!("active tool must return its termination, got {other:?}"),
+        };
+        assert_eq!(
+            termination.cause(),
+            RunTerminalCause::Failed(RunControlError::RunFinishWithActiveToolCall)
+        );
+        let cleanup = termination.cleanup().expect("cleanup must be recoverable");
+        assert_eq!(cleanup.exact_tool_id(), "exact-tool");
+        assert_eq!(cleanup.exact_version(), "7");
+        assert_eq!(backend_executions(), 0);
+        assert_eq!(artifacts.puts, 0);
+        workdir.cleanup().expect("workdir must clean up");
+    }
+
+    #[test]
+    fn render_never_enters_backend_for_valid_or_invalid_module() {
+        for module in [IDENTITY_WASM, b"digest-valid but invalid wasm".as_slice()] {
+            reset_backend_executions();
+            assert!(plan(module).render().contains("execution=not_started"));
+            assert_eq!(backend_executions(), 0);
+        }
+    }
+
+    #[test]
+    fn controller_pre_gates_skip_backend_while_post_timeout_records_one_call() {
+        let root = TestRoot::new();
+        let manager = root.manager();
+        let transform = plan(IDENTITY_WASM);
+        let mut artifacts = CountingStore::new();
+
+        let cancelled_run = run("cancelled", 1_000);
+        let mut cancelled_workdir = manager
+            .allocate(cancelled_run.run_id())
+            .expect("workdir must allocate");
+        let mut cancelled = RunController::new(&cancelled_run);
+        let _ = cancelled.request_cancel(Duration::ZERO);
+        reset_backend_executions();
+        let cancelled_result = transform.execute(
+            &cancelled_run,
+            cancelled,
+            || Duration::ZERO,
+            &cancelled_workdir,
+            &mut artifacts,
+        );
+        assert!(matches!(
+            cancelled_result.outcome(),
+            RunOutcome::Cancelled { .. }
+        ));
+        assert_eq!(backend_executions(), 0);
+        assert_eq!(artifacts.puts, 0);
+
+        let timed_out_run = run("pre-timeout", 1);
+        let mut timed_out_workdir = manager
+            .allocate(timed_out_run.run_id())
+            .expect("workdir must allocate");
+        let timed_out = RunController::new(&timed_out_run);
+        reset_backend_executions();
+        let timed_out_result = transform.execute(
+            &timed_out_run,
+            timed_out,
+            || Duration::from_millis(1),
+            &timed_out_workdir,
+            &mut artifacts,
+        );
+        assert!(matches!(
+            timed_out_result.outcome(),
+            RunOutcome::TimedOut {
+                timeout: RunTimeoutKind::WallTime,
+                ..
+            }
+        ));
+        assert_eq!(backend_executions(), 0);
+        assert_eq!(artifacts.puts, 0);
+
+        let post_run = run("post-timeout", 1);
+        let mut post_workdir = manager
+            .allocate(post_run.run_id())
+            .expect("workdir must allocate");
+        let post = RunController::new(&post_run);
+        let mut elapsed = [Duration::ZERO, Duration::from_millis(1)].into_iter();
+        reset_backend_executions();
+        let post_result = transform.execute(
+            &post_run,
+            post,
+            || elapsed.next().expect("two controller samples are expected"),
+            &post_workdir,
+            &mut artifacts,
+        );
+        assert!(matches!(
+            post_result.outcome(),
+            RunOutcome::TimedOut {
+                timeout: RunTimeoutKind::WallTime,
+                ..
+            }
+        ));
+        assert_eq!(backend_executions(), 1);
+        assert_eq!(artifacts.puts, 0);
+
+        cancelled_workdir.cleanup().expect("workdir must clean up");
+        timed_out_workdir.cleanup().expect("workdir must clean up");
+        post_workdir.cleanup().expect("workdir must clean up");
     }
 }
