@@ -24,7 +24,8 @@ pub use skill::{
     SkillIdError, SkillManifest, SkillManifestError,
 };
 pub use skill_evidence::{
-    SkillEvidenceError, SkillEvidenceKind, SkillEvidencePackage, SkillPlanningStage,
+    SkillEvidence, SkillEvidenceError, SkillEvidenceKind, SkillEvidencePackage, SkillPlanningStage,
+    SkillPromotion,
 };
 pub use skill_resource::{
     ActivatedSkillResources, SkillResourceError, SkillResourceId, SkillResourceIdError,

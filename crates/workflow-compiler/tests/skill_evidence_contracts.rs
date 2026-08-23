@@ -3,13 +3,16 @@ use std::{num::NonZeroU64, path::Path};
 use sha2::{Digest, Sha256};
 use workflow_compiler::{
     activate_skill, RegistryCategory, RegistryEntry, RegistryNotFound, SkillActivationReceipt,
-    SkillEvidenceKind, SkillEvidencePackage, SkillId, SkillManifest, SkillPlanningStage,
-    SkillRegistry, SkillResourceId, SkillRuntimeLock, SkillRuntimeManifest,
+    SkillEvidence, SkillEvidenceKind, SkillEvidencePackage, SkillId, SkillManifest,
+    SkillPlanningStage, SkillPromotion, SkillRegistry, SkillResourceId, SkillRuntimeLock,
+    SkillRuntimeManifest,
 };
 use workflow_runtime::{ArtifactId, ArtifactStore, InMemoryArtifactStore};
 
 struct TestSkillRegistry {
     manifest: SkillManifest,
+    id: String,
+    version: String,
 }
 
 impl SkillRegistry for TestSkillRegistry {
@@ -20,16 +23,14 @@ impl SkillRegistry for TestSkillRegistry {
         id: &str,
         version: &str,
     ) -> Result<RegistryEntry<'_, Self::Implementation>, RegistryNotFound> {
-        if (id, version) == ("valid-skill", "1.2.3") {
-            Ok(RegistryEntry::new(&self.manifest, "valid-skill", "1.2.3"))
+        if (id, version) == (self.id.as_str(), self.version.as_str()) {
+            Ok(RegistryEntry::new(&self.manifest, &self.id, &self.version))
         } else {
             Err(RegistryNotFound::new(RegistryCategory::Skill, id, version))
         }
     }
 }
 
-const SKILL_MARKDOWN: &[u8] =
-    b"---\nname: valid-skill\ndescription: A bounded skill.\n---\n# Instructions\n";
 const SCHEMA: &[u8] =
     br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#;
 const SCRIPT_BYTES: &[u8] = b"print('ok')\n";
@@ -39,16 +40,26 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn fixture() -> (SkillId, SkillRuntimeLock) {
-    let skill_id = SkillId::new("valid-skill").expect("fixture Skill ID");
-    let manifest = SkillManifest::parse(Path::new("valid-skill"), SKILL_MARKDOWN)
+    fixture_for("valid-skill")
+}
+
+fn fixture_for(skill_name: &str) -> (SkillId, SkillRuntimeLock) {
+    let skill_id = SkillId::new(skill_name).expect("fixture Skill ID");
+    let skill_markdown =
+        format!("---\nname: {skill_name}\ndescription: A bounded skill.\n---\n# Instructions\n");
+    let manifest = SkillManifest::parse(Path::new(skill_name), skill_markdown.as_bytes())
         .expect("fixture Skill manifest");
-    let registry = TestSkillRegistry { manifest };
+    let registry = TestSkillRegistry {
+        manifest,
+        id: skill_name.to_owned(),
+        version: "1.2.3".to_owned(),
+    };
     let receipt: SkillActivationReceipt<'_> =
         activate_skill(&registry, &skill_id, "1.2.3").expect("fixture activation");
     let schema_id = SkillResourceId::new("references/schema.json").expect("fixture schema ID");
     let script_id = SkillId::new("script").expect("fixture script ID");
     let runtime_manifest = format!(
-        "schema_version = 1\n\n[skill]\nid = \"valid-skill\"\nversion = \"1.2.3\"\n\n[[scripts]]\nid = \"script\"\npath = \"scripts/normalize.py\"\nruntime = \"python3\"\nsha256 = \"{}\"\ninput_schema = \"references/schema.json\"\noutput_schema = \"references/schema.json\"\ncapabilities = []\n\n[[resources]]\nid = \"references/schema.json\"\nsha256 = \"{}\"\n",
+        "schema_version = 1\n\n[skill]\nid = \"{skill_name}\"\nversion = \"1.2.3\"\n\n[[scripts]]\nid = \"script\"\npath = \"scripts/normalize.py\"\nruntime = \"python3\"\nsha256 = \"{}\"\ninput_schema = \"references/schema.json\"\noutput_schema = \"references/schema.json\"\ncapabilities = []\n\n[[resources]]\nid = \"references/schema.json\"\nsha256 = \"{}\"\n",
         digest(SCRIPT_BYTES),
         digest(SCHEMA)
     );
@@ -57,7 +68,7 @@ fn fixture() -> (SkillId, SkillRuntimeLock) {
             .expect("fixture runtime manifest");
     let lock = SkillRuntimeLock::try_from_declared_bytes(
         &runtime_manifest,
-        SKILL_MARKDOWN,
+        skill_markdown.as_bytes(),
         [(script_id.as_str(), SCRIPT_BYTES)],
         [(&schema_id, SCHEMA)],
     )
@@ -119,6 +130,7 @@ fn redacted_evidence_fixture_validates() {
     assert_eq!(package.skill_version(), "1.2.3");
     assert_eq!(package.scope_ref(), "scope:tenant-a");
     assert_eq!(package.evidence().len(), 1);
+    let _: &[SkillEvidence] = package.evidence();
     assert_eq!(
         package.evidence()[0].kind(),
         SkillEvidenceKind::SuccessfulRun
@@ -129,6 +141,7 @@ fn redacted_evidence_fixture_validates() {
         Some("run-1")
     );
     assert_eq!(package.promotion().stage(), SkillPlanningStage::Candidate);
+    let _: &SkillPromotion = package.promotion();
     assert_eq!(package.promotion().owner_ref(), "owner:team-a");
     assert_eq!(package.promotion().review_refs()[0], "review:one");
     let rendered = format!("{package:?}");
@@ -331,6 +344,35 @@ fn owner_review_run_and_artifact_refs_fail_closed() {
 }
 
 #[test]
+fn run_refs_use_the_conservative_opaque_grammar() {
+    let (skill_id, runtime_lock) = fixture();
+    let artifact = artifact();
+    let document = valid_document(&runtime_lock, &artifact);
+
+    for run_ref in [
+        "/tmp/demo".to_owned(),
+        "rm -rf".to_owned(),
+        "run ref".to_owned(),
+        "run\nref".to_owned(),
+        "payload".repeat(64),
+    ] {
+        let mut hostile: serde_json::Value =
+            serde_json::from_str(&document).expect("valid fixture JSON");
+        hostile["evidence"][0]["run_ref"] = serde_json::Value::String(run_ref);
+        let hostile = serde_json::to_vec(&hostile).expect("run fixture JSON");
+        let error = SkillEvidencePackage::parse(
+            &hostile,
+            &skill_id,
+            "1.2.3",
+            &runtime_lock,
+            std::slice::from_ref(&artifact),
+        )
+        .expect_err("run references must remain bounded opaque identifiers");
+        assert_eq!(error, workflow_compiler::SkillEvidenceError::InvalidRunRef);
+    }
+}
+
+#[test]
 fn skill_and_runtime_lock_identity_must_match() {
     let (skill_id, runtime_lock) = fixture();
     let artifact = artifact();
@@ -373,6 +415,28 @@ fn skill_and_runtime_lock_identity_must_match() {
 }
 
 #[test]
+fn split_skill_and_runtime_lock_identities_fail_closed() {
+    let (skill_a, _) = fixture();
+    let (_, lock_b) = fixture_for("other-skill");
+    let artifact = artifact();
+    let document = valid_document(&lock_b, &artifact);
+
+    let error = SkillEvidencePackage::parse(
+        document.as_bytes(),
+        &skill_a,
+        "1.2.3",
+        &lock_b,
+        std::slice::from_ref(&artifact),
+    )
+    .expect_err("a Skill A package must not accept Skill B runtime digests");
+
+    assert_eq!(
+        error,
+        workflow_compiler::SkillEvidenceError::SkillIdentityMismatch
+    );
+}
+
+#[test]
 fn scope_refs_use_a_conservative_opaque_grammar() {
     let (skill_id, runtime_lock) = fixture();
     let artifact = artifact();
@@ -393,6 +457,82 @@ fn scope_refs_use_a_conservative_opaque_grammar() {
         error,
         workflow_compiler::SkillEvidenceError::InvalidScopeRef
     );
+}
+
+#[test]
+fn opaque_refs_reject_traversal_and_reserved_segments_everywhere() {
+    let (skill_id, runtime_lock) = fixture();
+    let artifact = artifact();
+    let document = valid_document(&runtime_lock, &artifact);
+
+    for value in [
+        ".",
+        "..",
+        "scope:..",
+        "GLOBAL",
+        "scope:DEFAULT",
+        "scope.global",
+    ] {
+        let mut scope: serde_json::Value =
+            serde_json::from_str(&document).expect("valid fixture JSON");
+        scope["scope_ref"] = serde_json::Value::String(value.to_owned());
+        let scope = serde_json::to_vec(&scope).expect("scope fixture JSON");
+        assert_eq!(
+            SkillEvidencePackage::parse(
+                &scope,
+                &skill_id,
+                "1.2.3",
+                &runtime_lock,
+                std::slice::from_ref(&artifact),
+            ),
+            Err(workflow_compiler::SkillEvidenceError::InvalidScopeRef)
+        );
+
+        let mut owner: serde_json::Value =
+            serde_json::from_str(&document).expect("valid fixture JSON");
+        owner["promotion"]["owner_ref"] = serde_json::Value::String(value.to_owned());
+        let owner = serde_json::to_vec(&owner).expect("owner fixture JSON");
+        assert_eq!(
+            SkillEvidencePackage::parse(
+                &owner,
+                &skill_id,
+                "1.2.3",
+                &runtime_lock,
+                std::slice::from_ref(&artifact),
+            ),
+            Err(workflow_compiler::SkillEvidenceError::InvalidOwnerRef)
+        );
+
+        let mut review: serde_json::Value =
+            serde_json::from_str(&document).expect("valid fixture JSON");
+        review["promotion"]["review_refs"][0] = serde_json::Value::String(value.to_owned());
+        let review = serde_json::to_vec(&review).expect("review fixture JSON");
+        assert_eq!(
+            SkillEvidencePackage::parse(
+                &review,
+                &skill_id,
+                "1.2.3",
+                &runtime_lock,
+                std::slice::from_ref(&artifact),
+            ),
+            Err(workflow_compiler::SkillEvidenceError::InvalidReviewRef)
+        );
+
+        let mut run: serde_json::Value =
+            serde_json::from_str(&document).expect("valid fixture JSON");
+        run["evidence"][0]["run_ref"] = serde_json::Value::String(value.to_owned());
+        let run = serde_json::to_vec(&run).expect("run fixture JSON");
+        assert_eq!(
+            SkillEvidencePackage::parse(
+                &run,
+                &skill_id,
+                "1.2.3",
+                &runtime_lock,
+                std::slice::from_ref(&artifact),
+            ),
+            Err(workflow_compiler::SkillEvidenceError::InvalidRunRef)
+        );
+    }
 }
 
 #[test]

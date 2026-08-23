@@ -169,7 +169,10 @@ impl SkillEvidencePackage {
 
         let skill_id =
             SkillId::new(&raw.skill.id).map_err(|_| SkillEvidenceError::InvalidSkillId)?;
-        if skill_id != *expected_skill_id || raw.skill.version != expected_skill_version {
+        if skill_id != *expected_skill_id
+            || raw.skill.version != expected_skill_version
+            || !runtime_lock.matches_skill(&skill_id, &raw.skill.version)
+        {
             return Err(SkillEvidenceError::SkillIdentityMismatch);
         }
         if raw.runtime.skill_markdown_sha256 != runtime_lock.skill_markdown_sha256()
@@ -189,7 +192,12 @@ impl SkillEvidencePackage {
                     .ok_or(SkillEvidenceError::UnknownArtifactRef)?;
                 let run_ref = raw
                     .run_ref
-                    .map(|run| RunId::new(run).map_err(|_| SkillEvidenceError::InvalidRunRef))
+                    .map(|run| {
+                        if !is_valid_opaque_ref(&run) {
+                            return Err(SkillEvidenceError::InvalidRunRef);
+                        }
+                        RunId::new(run).map_err(|_| SkillEvidenceError::InvalidRunRef)
+                    })
                     .transpose()?;
                 Ok(SkillEvidence {
                     kind,
@@ -363,11 +371,14 @@ struct RawPromotion {
 fn is_valid_opaque_ref(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_REF_BYTES
-        && value != "global"
-        && value != "default"
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b':' | b'_' | b'-'))
+        && value.split(['.', ':']).all(|segment| {
+            !segment.is_empty()
+                && !segment.eq_ignore_ascii_case("global")
+                && !segment.eq_ignore_ascii_case("default")
+        })
 }
 
 fn map_json_error(error: serde_json::Error) -> SkillEvidenceError {
