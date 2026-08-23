@@ -19,12 +19,26 @@ pub const PURE_TRANSFORM_BINDING_ID: &str = "pure-transform";
 pub const PURE_TRANSFORM_BINDING_VERSION: &str = "1";
 
 /// A verified immutable binding between one workflow identity and WASM bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PureTransformBinding {
     workflow_id: String,
     workflow_version: String,
     module_digest: String,
     module: Vec<u8>,
+}
+
+impl fmt::Debug for PureTransformBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PureTransformBinding")
+            .field("workflow_id", &self.workflow_id)
+            .field("workflow_version", &self.workflow_version)
+            .field("binding_id", &PURE_TRANSFORM_BINDING_ID)
+            .field("binding_version", &PURE_TRANSFORM_BINDING_VERSION)
+            .field("module_digest", &self.module_digest)
+            .field("module_bytes", &self.module.len())
+            .finish()
+    }
 }
 
 impl PureTransformBinding {
@@ -91,13 +105,25 @@ impl PureTransformBinding {
 }
 
 /// A deterministic, versioned plan for one pure-transform request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PureTransformPlanV1 {
     binding: PureTransformBinding,
     input: Value,
     requested: RequestedCapabilities,
     input_digest: String,
     input_bytes: usize,
+}
+
+impl fmt::Debug for PureTransformPlanV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PureTransformPlanV1")
+            .field("version", &PURE_TRANSFORM_PLAN_VERSION_V1)
+            .field("binding", &self.binding)
+            .field("input_digest", &self.input_digest)
+            .field("input_bytes", &self.input_bytes)
+            .finish()
+    }
 }
 
 impl PureTransformPlanV1 {
@@ -143,9 +169,11 @@ impl PureTransformPlanV1 {
     }
 
     /// Executes the bounded transform and publishes its non-empty JSON output.
-    pub fn execute<S: ArtifactStore>(
+    pub fn execute<S: ArtifactStore, F: FnMut() -> Duration>(
         &self,
         context: &RunContext,
+        controller: &mut RunController<'_>,
+        mut elapsed: F,
         workdir: &RunWorkdir,
         artifacts: &mut S,
     ) -> RunResult<ArtifactId, PureTransformExecutionError> {
@@ -153,8 +181,7 @@ impl PureTransformPlanV1 {
             return failed(context, PureTransformExecutionError::WorkdirRunMismatch);
         }
 
-        let mut controller = RunController::new(context);
-        if let Err(termination) = controller.poll(Duration::ZERO) {
+        if let Err(termination) = controller.poll(elapsed()) {
             return terminal_failure(context, termination);
         }
 
@@ -175,7 +202,7 @@ impl PureTransformPlanV1 {
             Ok(_) => return failed(context, PureTransformExecutionError::EmptyOutput),
             Err(_) => return failed(context, PureTransformExecutionError::OutputSerialization),
         };
-        if let Err(termination) = controller.finish(Duration::ZERO) {
+        if let Err(termination) = controller.finish(elapsed()) {
             return terminal_failure(context, termination);
         }
 

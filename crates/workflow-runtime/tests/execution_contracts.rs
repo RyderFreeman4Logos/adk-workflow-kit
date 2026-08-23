@@ -8,9 +8,10 @@ use std::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use workflow_runtime::{
-    ArtifactStore, FilesystemArtifactStore, PureTransformBinding, PureTransformExecutionError,
-    PureTransformPlanError, PureTransformPlanV1, RequestedCapabilities, RunContext, RunId,
-    RunLimits, RunOutcome, SandboxCapability, WorkdirManager,
+    ArtifactError, ArtifactId, ArtifactPage, ArtifactStore, FilesystemArtifactStore, PageRequest,
+    PureTransformBinding, PureTransformExecutionError, PureTransformPlanError, PureTransformPlanV1,
+    RequestedCapabilities, RetentionPolicy, RunContext, RunController, RunId, RunLimits,
+    RunOutcome, RunTerminalCause, RunTimeoutKind, SandboxCapability, WorkdirManager,
 };
 
 const IDENTITY_WASM: &[u8] = include_bytes!("fixtures/pure_transform_identity.wasm");
@@ -68,6 +69,37 @@ fn context() -> RunContext {
     )
 }
 
+struct RecordingStore {
+    put_calls: usize,
+}
+
+impl ArtifactStore for RecordingStore {
+    fn put(&mut self, _bytes: &[u8]) -> Result<ArtifactId, ArtifactError> {
+        self.put_calls += 1;
+        panic!("terminal execution must not publish artifacts");
+    }
+
+    fn read_page(
+        &self,
+        _id: &ArtifactId,
+        _request: PageRequest,
+    ) -> Result<ArtifactPage, ArtifactError> {
+        unreachable!("recording store is only used for publication checks")
+    }
+
+    fn set_retention(
+        &mut self,
+        _id: &ArtifactId,
+        _policy: RetentionPolicy,
+    ) -> Result<(), ArtifactError> {
+        unreachable!("recording store is only used for publication checks")
+    }
+
+    fn retention(&self, _id: &ArtifactId) -> Result<RetentionPolicy, ArtifactError> {
+        unreachable!("recording store is only used for publication checks")
+    }
+}
+
 #[test]
 fn execution_plan_runs_fixture_and_publishes_real_artifact() {
     let root = TestRoot::new();
@@ -102,7 +134,14 @@ fn execution_plan_runs_fixture_and_publishes_real_artifact() {
         .count();
 
     assert_eq!(before_render, 0);
-    let result = plan.execute(&run, &workdir, &mut artifacts);
+    let mut controller = RunController::new(&run);
+    let result = plan.execute(
+        &run,
+        &mut controller,
+        || std::time::Duration::ZERO,
+        &workdir,
+        &mut artifacts,
+    );
     assert_eq!(
         fs::read_dir(&artifact_root)
             .expect("artifact root must be readable")
@@ -195,7 +234,13 @@ fn capability_denial_and_backend_failure_publish_no_artifact() {
         RequestedCapabilities::new([SandboxCapability::FilesystemRead]),
     )
     .expect("capability-denial plan must be valid")
-    .execute(&run, &workdir, &mut artifacts);
+    .execute(
+        &run,
+        &mut RunController::new(&run),
+        || std::time::Duration::ZERO,
+        &workdir,
+        &mut artifacts,
+    );
     assert!(matches!(
         denied.outcome(),
         RunOutcome::Failed {
@@ -215,7 +260,13 @@ fn capability_denial_and_backend_failure_publish_no_artifact() {
         RequestedCapabilities::new(std::iter::empty::<SandboxCapability>()),
     )
     .expect("invalid-module bytes still have a verified digest")
-    .execute(&run, &workdir, &mut artifacts);
+    .execute(
+        &run,
+        &mut RunController::new(&run),
+        || std::time::Duration::ZERO,
+        &workdir,
+        &mut artifacts,
+    );
     assert!(matches!(
         invalid.outcome(),
         RunOutcome::Failed {
@@ -229,4 +280,180 @@ fn capability_denial_and_backend_failure_publish_no_artifact() {
         0
     );
     workdir.cleanup().expect("test workdir must clean up");
+}
+
+#[test]
+fn plan_debug_redacts_bound_module_and_input() {
+    let module = b"module-poison-5ed392f1";
+    let binding = binding(module);
+    let plan = PureTransformPlanV1::new(
+        binding.clone(),
+        json!({"input": "input-poison-6a7f4d20"}),
+        RequestedCapabilities::new(std::iter::empty::<SandboxCapability>()),
+    )
+    .expect("verified bytes and bounded input form a plan");
+
+    let binding_debug = format!("{binding:?}");
+    let plan_debug = format!("{plan:?}");
+    for debug in [&binding_debug, &plan_debug] {
+        assert!(!debug.contains("module-poison-5ed392f1"));
+        assert!(!debug.contains("input-poison-6a7f4d20"));
+    }
+    assert!(binding_debug.contains(binding.module_digest()));
+    assert!(binding_debug.contains("module_bytes"));
+    assert!(plan_debug.contains(binding.module_digest()));
+    assert!(plan_debug.contains("input_digest"));
+    assert!(plan_debug.contains("input_bytes"));
+}
+
+#[test]
+fn render_accepts_unexecutable_binding_without_artifact_mutation() {
+    let root = TestRoot::new();
+    let artifact_root = root.path().join("artifacts");
+    let artifacts = FilesystemArtifactStore::new(
+        &artifact_root,
+        NonZeroU64::new(64 * 1024).expect("positive artifact limit"),
+        NonZeroU64::new(64 * 1024).expect("positive page limit"),
+    );
+    let before = fs::read_dir(&artifact_root)
+        .expect("artifact root must be readable")
+        .count();
+    let plan = PureTransformPlanV1::new(
+        binding(b"unexecutable-module-poison"),
+        json!({"value": 7}),
+        RequestedCapabilities::new(std::iter::empty::<SandboxCapability>()),
+    )
+    .expect("request validation deliberately does not execute the module");
+
+    assert!(plan.render().contains("execution=not_started"));
+    assert_eq!(
+        fs::read_dir(&artifact_root)
+            .expect("artifact root must be readable")
+            .count(),
+        before
+    );
+    drop(artifacts);
+}
+
+#[test]
+fn mismatched_workdir_returns_typed_failure_without_putting_artifacts() {
+    let root = TestRoot::new();
+    let workdir_base = root.path().join("workdirs");
+    fs::create_dir(&workdir_base).expect("workdir base must be created");
+    let manager = WorkdirManager::new(&workdir_base).expect("workdir base must be trusted");
+    let run = context();
+    let other_run = RunId::new(String::from("different-run")).expect("run ID must be valid");
+    let mut workdir = manager
+        .allocate(&other_run)
+        .expect("workdir for another run must allocate");
+    let plan = PureTransformPlanV1::new(
+        binding(IDENTITY_WASM),
+        json!({"value": 7}),
+        RequestedCapabilities::new(std::iter::empty::<SandboxCapability>()),
+    )
+    .expect("fixture plan must be valid");
+    let mut controller = RunController::new(&run);
+    let mut artifacts = RecordingStore { put_calls: 0 };
+
+    let result = plan.execute(
+        &run,
+        &mut controller,
+        || std::time::Duration::ZERO,
+        &workdir,
+        &mut artifacts,
+    );
+
+    assert!(matches!(
+        result.outcome(),
+        RunOutcome::Failed {
+            diagnostic: PureTransformExecutionError::WorkdirRunMismatch
+        }
+    ));
+    assert_eq!(artifacts.put_calls, 0);
+    workdir.cleanup().expect("test workdir must clean up");
+}
+
+#[test]
+fn controller_terminal_outcomes_prevent_artifact_publication() {
+    let root = TestRoot::new();
+    let workdir_base = root.path().join("workdirs");
+    fs::create_dir(&workdir_base).expect("workdir base must be created");
+    let manager = WorkdirManager::new(&workdir_base).expect("workdir base must be trusted");
+    let run = context();
+    let mut workdir = manager
+        .allocate(run.run_id())
+        .expect("workdir must allocate");
+    let plan = PureTransformPlanV1::new(
+        binding(IDENTITY_WASM),
+        json!({"value": 7}),
+        RequestedCapabilities::new(std::iter::empty::<SandboxCapability>()),
+    )
+    .expect("fixture plan must be valid");
+    let mut cancelled = RunController::new(&run);
+    let _ = cancelled.request_cancel(std::time::Duration::ZERO);
+    let mut artifacts = RecordingStore { put_calls: 0 };
+
+    let cancelled_result = plan.execute(
+        &run,
+        &mut cancelled,
+        || std::time::Duration::ZERO,
+        &workdir,
+        &mut artifacts,
+    );
+
+    assert!(matches!(
+        cancelled_result.outcome(),
+        RunOutcome::Cancelled {
+            diagnostic: PureTransformExecutionError::Controller(RunTerminalCause::Cancelled)
+        }
+    ));
+    assert_eq!(artifacts.put_calls, 0);
+
+    let timeout_run = RunContext::new(
+        RunId::new(String::from("elapsed-timeout")).expect("run ID must be valid"),
+        RunLimits::new(
+            NonZeroU64::new(1).expect("positive limit"),
+            NonZeroU64::new(1).expect("positive limit"),
+            NonZeroU64::new(1).expect("positive limit"),
+            NonZeroU64::new(1).expect("positive limit"),
+            NonZeroU64::new(1_000).expect("positive limit"),
+            NonZeroU64::new(1_000).expect("positive limit"),
+            NonZeroU64::new(64 * 1024).expect("positive limit"),
+        ),
+    );
+    let mut timeout_workdir = manager
+        .allocate(timeout_run.run_id())
+        .expect("timeout workdir must allocate");
+    let mut timeout_controller = RunController::new(&timeout_run);
+    let mut samples = [
+        std::time::Duration::ZERO,
+        std::time::Duration::from_millis(1),
+    ]
+    .into_iter();
+    let timeout_result = plan.execute(
+        &timeout_run,
+        &mut timeout_controller,
+        || {
+            samples
+                .next()
+                .expect("one elapsed sample per controller boundary")
+        },
+        &timeout_workdir,
+        &mut artifacts,
+    );
+
+    assert!(matches!(
+        timeout_result.outcome(),
+        RunOutcome::TimedOut {
+            timeout: RunTimeoutKind::WallTime,
+            diagnostic: PureTransformExecutionError::Controller(RunTerminalCause::TimedOut(
+                RunTimeoutKind::WallTime
+            ))
+        }
+    ));
+    assert_eq!(artifacts.put_calls, 0);
+    workdir.cleanup().expect("test workdir must clean up");
+    timeout_workdir
+        .cleanup()
+        .expect("timeout workdir must clean up");
 }

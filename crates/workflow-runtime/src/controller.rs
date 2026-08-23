@@ -250,8 +250,8 @@ impl<'limits> RunController<'limits> {
         self.terminate(RunTerminalCause::Cancelled)
     }
 
-    /// Consumes and finishes a healthy run with no active tool call.
-    pub fn finish(mut self, elapsed: Duration) -> Result<(), RunTermination> {
+    /// Finishes a healthy run with no active tool call.
+    pub fn finish(&mut self, elapsed: Duration) -> Result<(), RunTermination> {
         self.check_boundary(elapsed)?;
         if self.active_tool_call.is_some() {
             return Err(self.terminate(RunTerminalCause::Failed(
