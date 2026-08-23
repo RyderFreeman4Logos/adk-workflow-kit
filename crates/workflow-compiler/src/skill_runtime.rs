@@ -553,6 +553,21 @@ impl SkillRuntimeLock {
         })
     }
 
+    /// Returns whether this lock belongs to the exact declared Skill identity.
+    pub fn matches_skill(&self, skill_id: &SkillId, skill_version: &str) -> bool {
+        self.skill_id == skill_id.as_str() && self.skill_version == skill_version
+    }
+
+    /// Returns the exact locked Skill markdown digest.
+    pub fn skill_markdown_sha256(&self) -> &str {
+        &self.skill_markdown_sha256
+    }
+
+    /// Returns the exact locked runtime manifest digest.
+    pub fn runtime_manifest_sha256(&self) -> &str {
+        &self.runtime_manifest_sha256
+    }
+
     /// Serializes the exact deterministic v1 TOML lock document in memory.
     pub fn to_toml(&self) -> Result<String, SkillRuntimeLockError> {
         toml::to_string(&CanonicalLock {

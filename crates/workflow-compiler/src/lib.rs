@@ -4,6 +4,7 @@ mod diagnostics;
 mod lock;
 mod registry;
 mod skill;
+mod skill_evidence;
 mod skill_resource;
 mod skill_runtime;
 
@@ -21,6 +22,10 @@ pub use registry::{
 pub use skill::{
     activate_skill, SkillActivationError, SkillActivationReceipt, SkillDiscoveryMetadata, SkillId,
     SkillIdError, SkillManifest, SkillManifestError,
+};
+pub use skill_evidence::{
+    SkillEvidence, SkillEvidenceError, SkillEvidenceKind, SkillEvidencePackage, SkillPlanningStage,
+    SkillPromotion,
 };
 pub use skill_resource::{
     ActivatedSkillResources, SkillResourceError, SkillResourceId, SkillResourceIdError,
