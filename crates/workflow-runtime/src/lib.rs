@@ -4,6 +4,7 @@ mod approval;
 mod artifact;
 mod bubblewrap;
 mod controller;
+mod execution;
 mod policy;
 mod pure_transform;
 mod session;
@@ -23,6 +24,10 @@ pub use bubblewrap::{
 };
 pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
+};
+pub use execution::{
+    PureTransformBinding, PureTransformExecutionError, PureTransformPlanError, PureTransformPlanV1,
+    PURE_TRANSFORM_BINDING_ID, PURE_TRANSFORM_BINDING_VERSION, PURE_TRANSFORM_PLAN_VERSION_V1,
 };
 pub use policy::{
     evaluate_context_policy, Classification, ContextPolicyDenied, ContextPolicyDeniedKind,
