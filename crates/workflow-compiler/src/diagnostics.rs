@@ -43,6 +43,28 @@ impl Diagnostic {
         }
     }
 
+    /// Returns the fixed diagnostic for unsupported `workflowctl run` input.
+    pub fn run_unsupported_input() -> Self {
+        Self {
+            diagnostic_version: DIAGNOSTIC_VERSION,
+            code: "workflow.run.unsupported_input",
+            message: "workflow run input is not supported",
+            location: None,
+            details: DiagnosticDetails::Empty {},
+        }
+    }
+
+    /// Returns the fixed diagnostic for a failed `workflowctl run` execution.
+    pub fn run_failed() -> Self {
+        Self {
+            diagnostic_version: DIAGNOSTIC_VERSION,
+            code: "workflow.run.failed",
+            message: "workflow run failed",
+            location: None,
+            details: DiagnosticDetails::Empty {},
+        }
+    }
+
     /// Returns the stable machine-readable diagnostic code.
     pub fn code(&self) -> &'static str {
         self.code
