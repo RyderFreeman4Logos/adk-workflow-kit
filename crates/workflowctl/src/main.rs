@@ -1,9 +1,12 @@
-use std::{ffi::OsString, io::Write, num::NonZeroU64, process::exit, time::Instant};
+use std::{ffi::OsString, io::Write, num::NonZeroU64, path::Path, process::exit, time::Instant};
 
 use clap::{Arg, ArgAction, Command};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use workflow_compiler::{compile_file, render_mermaid, Diagnostic, WorkflowLock};
+use workflow_compiler::{
+    compile_file, render_mermaid, Diagnostic, SkillManifest, SkillResourceId, SkillRuntimeLock,
+    SkillRuntimeManifest, WorkflowLock,
+};
 use workflow_runtime::{
     FilesystemArtifactStore, PureTransformBinding, PureTransformPlanV1, PureTransformRequest,
     RequestedCapabilities, RunContext, RunController, RunId, RunLimits, RunOutcome,
@@ -11,7 +14,7 @@ use workflow_runtime::{
 };
 use workflow_spec::{read_bounded_regular_file, SourcePath};
 
-const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
+const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}";
 
 fn command() -> Command {
@@ -64,6 +67,25 @@ fn command() -> Command {
                     .required(true)
                     .help("Workflow source file"),
             ),
+        )
+        .subcommand(
+            Command::new("skill")
+                .subcommand(
+                    Command::new("lint").arg(
+                        Arg::new("path")
+                            .value_name("PATH")
+                            .required(true)
+                            .help("Skill directory"),
+                    ),
+                )
+                .subcommand(
+                    Command::new("test").arg(
+                        Arg::new("path")
+                            .value_name("PATH")
+                            .required(true)
+                            .help("Skill directory"),
+                    ),
+                ),
         )
         .subcommand(
             Command::new("run")
@@ -144,6 +166,80 @@ fn write_stdout(output: &str, json: bool) {
         .is_err()
     {
         exit_diagnostic(Diagnostic::stdout_write_failed(), json);
+    }
+}
+
+const MAX_SKILL_FILE_BYTES: usize = 65_536;
+
+#[derive(Clone, Copy)]
+enum SkillValidationFailure {
+    Manifest,
+    Script,
+}
+
+fn read_skill_file(
+    root: &Path,
+    relative_path: &str,
+    failure: SkillValidationFailure,
+) -> Result<Vec<u8>, SkillValidationFailure> {
+    let path = root.join(relative_path);
+    read_bounded_regular_file(&SourcePath::from(path.as_path()), MAX_SKILL_FILE_BYTES)
+        .map_err(|_| failure)
+}
+
+fn validate_skill_manifest(
+    root: &Path,
+) -> Result<(Vec<u8>, SkillManifest), SkillValidationFailure> {
+    let markdown = read_skill_file(root, "SKILL.md", SkillValidationFailure::Manifest)?;
+    let manifest =
+        SkillManifest::parse(root, &markdown).map_err(|_| SkillValidationFailure::Manifest)?;
+    Ok((markdown, manifest))
+}
+
+fn lint_skill(root: &Path) -> Result<(), SkillValidationFailure> {
+    let _ = validate_skill_manifest(root)?;
+    Ok(())
+}
+
+fn test_skill(root: &Path) -> Result<(), SkillValidationFailure> {
+    let (markdown, manifest) = validate_skill_manifest(root)?;
+    let runtime_bytes =
+        read_skill_file(root, "skill.runtime.toml", SkillValidationFailure::Manifest)?;
+    let runtime = SkillRuntimeManifest::parse(&runtime_bytes)
+        .map_err(|_| SkillValidationFailure::Manifest)?;
+    let skill_metadata = manifest.discovery_metadata();
+    if runtime.skill_id() != skill_metadata.id() {
+        return Err(SkillValidationFailure::Manifest);
+    }
+
+    let mut scripts = Vec::with_capacity(runtime.scripts().len());
+    for script in runtime.scripts() {
+        if script.runtime() != "python3" {
+            return Err(SkillValidationFailure::Script);
+        }
+        let bytes = read_skill_file(root, script.path(), SkillValidationFailure::Script)?;
+        scripts.push((script.id().as_str().to_owned(), bytes));
+    }
+
+    let mut resources = Vec::<(SkillResourceId, Vec<u8>)>::with_capacity(runtime.resources().len());
+    for resource in runtime.resources() {
+        let bytes = read_skill_file(root, resource.id().as_str(), SkillValidationFailure::Script)?;
+        resources.push((resource.id().clone(), bytes));
+    }
+
+    let script_bytes = scripts
+        .iter()
+        .map(|(id, bytes)| (id.as_str(), bytes.as_slice()));
+    let resource_bytes = resources.iter().map(|(id, bytes)| (id, bytes.as_slice()));
+    SkillRuntimeLock::try_from_declared_bytes(&runtime, &markdown, script_bytes, resource_bytes)
+        .map_err(|_| SkillValidationFailure::Script)?;
+    Ok(())
+}
+
+fn skill_diagnostic(failure: SkillValidationFailure) -> Diagnostic {
+    match failure {
+        SkillValidationFailure::Manifest => Diagnostic::skill_manifest_invalid(),
+        SkillValidationFailure::Script => Diagnostic::skill_script_invalid(),
     }
 }
 
@@ -323,6 +419,27 @@ fn main() {
                 }
             }
         }
+        Some(("skill", skill)) => match skill.subcommand() {
+            Some(("lint", subcommand)) => {
+                let Some(path) = subcommand.get_one::<String>("path") else {
+                    exit_invalid_arguments(json);
+                };
+                match lint_skill(Path::new(path)) {
+                    Ok(()) => write_stdout("valid\n", json),
+                    Err(failure) => exit_diagnostic(skill_diagnostic(failure), json),
+                }
+            }
+            Some(("test", subcommand)) => {
+                let Some(path) = subcommand.get_one::<String>("path") else {
+                    exit_invalid_arguments(json);
+                };
+                match test_skill(Path::new(path)) {
+                    Ok(()) => write_stdout("passed\n", json),
+                    Err(failure) => exit_diagnostic(skill_diagnostic(failure), json),
+                }
+            }
+            _ => exit_invalid_arguments(json),
+        },
         Some(("explain-run", subcommand)) => {
             let Some(path) = subcommand.get_one::<String>("path") else {
                 exit_invalid_arguments(json);
@@ -406,5 +523,20 @@ fn main() {
             }
         }
         _ => exit_invalid_arguments(json),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command;
+
+    #[test]
+    fn skill_lint_and_test_commands_are_declared() {
+        assert!(command()
+            .try_get_matches_from(["workflowctl", "skill", "lint", "skill-dir"])
+            .is_ok());
+        assert!(command()
+            .try_get_matches_from(["workflowctl", "skill", "test", "skill-dir"])
+            .is_ok());
     }
 }

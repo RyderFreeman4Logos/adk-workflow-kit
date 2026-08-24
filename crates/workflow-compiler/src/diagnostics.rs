@@ -65,6 +65,28 @@ impl Diagnostic {
         }
     }
 
+    /// Returns the fixed diagnostic for an invalid Skill manifest.
+    pub fn skill_manifest_invalid() -> Self {
+        Self {
+            diagnostic_version: DIAGNOSTIC_VERSION,
+            code: "skill.cli.invalid_manifest",
+            message: "Skill manifest validation failed",
+            location: None,
+            details: DiagnosticDetails::Empty {},
+        }
+    }
+
+    /// Returns the fixed diagnostic for an invalid Skill script or resource.
+    pub fn skill_script_invalid() -> Self {
+        Self {
+            diagnostic_version: DIAGNOSTIC_VERSION,
+            code: "skill.cli.invalid_script",
+            message: "Skill script validation failed",
+            location: None,
+            details: DiagnosticDetails::Empty {},
+        }
+    }
+
     /// Returns the stable machine-readable diagnostic code.
     pub fn code(&self) -> &'static str {
         self.code

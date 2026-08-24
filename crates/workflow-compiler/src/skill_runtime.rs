@@ -31,11 +31,35 @@ pub struct DeclaredSkillScript {
     capabilities: Vec<SandboxCapability>,
 }
 
+impl DeclaredSkillScript {
+    /// Returns the declared script identifier.
+    pub fn id(&self) -> &SkillId {
+        &self.id
+    }
+
+    /// Returns the package-relative script path.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns the declared script runtime.
+    pub fn runtime(&self) -> &str {
+        &self.runtime
+    }
+}
+
 /// A validated non-executable resource declaration from `skill.runtime.toml`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeclaredSkillResource {
     id: SkillResourceId,
     sha256: String,
+}
+
+impl DeclaredSkillResource {
+    /// Returns the declared resource identifier.
+    pub fn id(&self) -> &SkillResourceId {
+        &self.id
+    }
 }
 
 /// The fixed runtime selected for a planned Skill script.
@@ -249,11 +273,8 @@ pub struct SkillRuntimeManifest {
 }
 
 impl SkillRuntimeManifest {
-    /// Parses a v1 runtime declaration for one exact activated Skill without execution.
-    pub fn parse_for_activation(
-        activation: &SkillActivationReceipt<'_>,
-        bytes: &[u8],
-    ) -> Result<Self, SkillRuntimeManifestError> {
+    /// Parses a bounded v1 runtime declaration without executing any script.
+    pub fn parse(bytes: &[u8]) -> Result<Self, SkillRuntimeManifestError> {
         if bytes.is_empty() {
             return Err(SkillRuntimeManifestError::Empty);
         }
@@ -272,9 +293,6 @@ impl SkillRuntimeManifest {
             .map_err(|_| SkillRuntimeManifestError::InvalidSkillIdentifier)?;
         if !is_valid_version(&raw.skill.version) {
             return Err(SkillRuntimeManifestError::InvalidSkillVersion);
-        }
-        if skill_id != *activation.id() || raw.skill.version != activation.version() {
-            return Err(SkillRuntimeManifestError::ActivationMismatch);
         }
         if raw.scripts.len() > MAX_SCRIPTS {
             return Err(SkillRuntimeManifestError::TooManyScripts);
@@ -299,6 +317,18 @@ impl SkillRuntimeManifest {
             scripts,
             resources,
         })
+    }
+
+    /// Parses a v1 runtime declaration for one exact activated Skill without execution.
+    pub fn parse_for_activation(
+        activation: &SkillActivationReceipt<'_>,
+        bytes: &[u8],
+    ) -> Result<Self, SkillRuntimeManifestError> {
+        let manifest = Self::parse(bytes)?;
+        if manifest.skill_id != *activation.id() || manifest.skill_version != activation.version() {
+            return Err(SkillRuntimeManifestError::ActivationMismatch);
+        }
+        Ok(manifest)
     }
 
     /// Returns the exact activated Skill identifier.
