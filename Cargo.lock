@@ -1995,14 +1995,14 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workflow-adk"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adk-rust",
 ]
 
 [[package]]
 name = "workflow-compiler"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "jsonschema 0.45.1",
  "serde",
@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "workflow-ir"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "sha2",
  "workflow-spec",
@@ -2025,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "workflow-review"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "schemars",
  "serde",
@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "workflow-runtime"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "jsonschema 0.45.1",
  "schemars",
@@ -2048,7 +2048,7 @@ dependencies = [
 
 [[package]]
 name = "workflow-spec"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_path_to_error",
@@ -2058,7 +2058,7 @@ dependencies = [
 
 [[package]]
 name = "workflow-testkit"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adk-rust",
  "serde",
@@ -2073,7 +2073,7 @@ dependencies = [
 
 [[package]]
 name = "workflowctl"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "serde_json",

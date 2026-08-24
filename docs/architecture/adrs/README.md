@@ -24,5 +24,6 @@ The following decisions accept the proposed initial set in [planning-pack 18](..
 | [ADR-0018](ADR-0018.md) | R | No hidden chain-of-thought persistence |
 | [ADR-0019](ADR-0019.md) | S | Explicit incomplete and abstained terminal states |
 | [ADR-0020](ADR-0020.md) | T | Visual editing is deferred, interchange is preserved |
+| [ADR-0021](ADR-0021.md) | #49 | Multi-reviewer disagreement defers by default |
 
 The [architecture boundary](../BOUNDARY.md) makes the ADK/domain separation explicit. ADR-0014 is accepted without conflict: the existing GOV-002 baseline records the exact `adk-rust =1.0.0` pin, selected features, committed lockfile policy, and MSRV 1.94.0.

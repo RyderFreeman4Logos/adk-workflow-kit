@@ -1,6 +1,8 @@
 //! Typed review verdicts and defects, as a type-only serde/schemars wire model.
 //!
 //! REVIEW-001: smallest durable public contract for typed review results.
+//! REVIEW-005: deterministic multi-reviewer disagreement policy that reuses
+//! those verdicts (Refs #49).
 //! Terminal run semantics (abstained/incomplete/failed) stay on
 //! [`workflow_runtime::RunOutcome`]; this crate carries reviewer judgment only.
 
@@ -189,6 +191,70 @@ impl ReviewResult {
     }
 }
 
+/// The resolved disposition of a multi-reviewer disagreement policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewDisposition {
+    /// Every reviewer accepted the candidate.
+    Accept,
+    /// The candidate is not accepted yet: reviewers blocked or disagreed.
+    Defer,
+}
+
+/// One reviewer's verdict bound to the subject identity it judged.
+///
+/// `Debug` redacts the subject bytes: hostile subject text or secrets never
+/// enter diagnostics (STATE-001 redaction contract).
+#[derive(Clone, Eq, PartialEq)]
+pub struct ReviewVote {
+    subject: String,
+    verdict: ReviewVerdict,
+}
+
+impl ReviewVote {
+    /// Binds a reviewer verdict to the reviewed subject's opaque identity.
+    pub fn new(subject: String, verdict: ReviewVerdict) -> Self {
+        Self { subject, verdict }
+    }
+
+    /// Returns the reviewed subject's identity.
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    /// Returns the reviewer's verdict.
+    pub fn verdict(&self) -> ReviewVerdict {
+        self.verdict
+    }
+}
+
+impl std::fmt::Debug for ReviewVote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReviewVote")
+            .field("subject", &"<redacted>")
+            .field("verdict", &self.verdict)
+            .finish()
+    }
+}
+
+/// Deterministic multi-reviewer disagreement policy (REVIEW-005, Refs #49).
+///
+/// Fail-closed default: a candidate is accepted only when every reviewer
+/// verdict is [`ReviewVerdict::Pass`] for the same subject; any blocking
+/// verdict, abstention, or disagreement defers.
+pub fn resolve_disposition(votes: &[ReviewVote]) -> Result<ReviewDisposition, ReviewError> {
+    let Some(first) = votes.first() else {
+        return Err(ReviewError::EmptyReviewerSet);
+    };
+    if votes.iter().any(|vote| vote.subject != first.subject) {
+        return Err(ReviewError::MixedSubjectIdentity);
+    }
+    if votes.iter().all(|vote| vote.verdict == ReviewVerdict::Pass) {
+        Ok(ReviewDisposition::Accept)
+    } else {
+        Ok(ReviewDisposition::Defer)
+    }
+}
+
 /// Fail-closed errors for review result decoding and validation.
 ///
 /// Display is static text only: hostile finding text, paths, or secrets from
@@ -216,6 +282,12 @@ pub enum ReviewError {
     /// A `pass` verdict carried an `error` or `critical` defect.
     #[error("pass verdict cannot carry error or critical defects")]
     PassWithErrorOrCriticalDefects,
+    /// The disagreement policy received no reviewer verdicts.
+    #[error("disagreement policy requires at least one reviewer verdict")]
+    EmptyReviewerSet,
+    /// Reviewer verdicts referenced different subjects.
+    #[error("disagreement policy requires all verdicts for the same subject")]
+    MixedSubjectIdentity,
 }
 
 fn validate_schema_version(version: u32) -> Result<(), ReviewError> {
