@@ -250,3 +250,141 @@ fn digest(bytes: &[u8]) -> String {
 
 /// Alias using the workflow's outcome terminology.
 pub type GroundedAnswerOutcome = GroundedAnswerEnvelope;
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        compile_grounded_answer, digest, map_review_error, validate_boundary,
+        GroundedAnswerEnvelope, GroundedAnswerError, GroundedAnswerInput,
+    };
+    use crate::{ReviewError, ReviewVerdict, ReviewVote};
+
+    const CANARY_UNIT_PUBLISH_64: &str = "CANARY_UNIT_PUBLISH_64";
+    const CANARY_UNIT_ABSTAIN_64: &str = "CANARY_UNIT_ABSTAIN_64";
+    const SUBJECT: &str = "grounded-answer-unit-subject";
+
+    fn input(answer: &str, verdict: ReviewVerdict) -> GroundedAnswerInput {
+        GroundedAnswerInput::new(
+            SUBJECT.to_owned(),
+            answer.to_owned(),
+            vec![ReviewVote::new(SUBJECT.to_owned(), verdict)],
+        )
+    }
+
+    #[test]
+    fn publish_transition_returns_ack_without_diagnostic() {
+        let result =
+            match compile_grounded_answer(input(CANARY_UNIT_PUBLISH_64, ReviewVerdict::Pass)) {
+                Ok(result) => result,
+                Err(error) => panic!("publish transition failed: {error:?}"),
+            };
+
+        let acknowledgement = match &result {
+            GroundedAnswerEnvelope::Published { acknowledgement } => acknowledgement,
+            GroundedAnswerEnvelope::Abstained { .. } => {
+                panic!("publish transition must not abstain")
+            }
+        };
+        assert_eq!(acknowledgement.answer_len(), CANARY_UNIT_PUBLISH_64.len());
+        assert_eq!(
+            acknowledgement.answer_sha256(),
+            digest(CANARY_UNIT_PUBLISH_64.as_bytes())
+        );
+        assert!(result.acknowledgement().is_some());
+        assert!(result.diagnostic().is_none());
+        assert!(!format!("{result:?}").contains(CANARY_UNIT_PUBLISH_64));
+        assert!(!result.to_string().contains(CANARY_UNIT_PUBLISH_64));
+    }
+
+    #[test]
+    fn abstain_transition_returns_diagnostic_without_ack() {
+        let result =
+            match compile_grounded_answer(input(CANARY_UNIT_ABSTAIN_64, ReviewVerdict::Abstain)) {
+                Ok(result) => result,
+                Err(error) => panic!("abstain transition failed: {error:?}"),
+            };
+
+        let diagnostic = match &result {
+            GroundedAnswerEnvelope::Published { .. } => {
+                panic!("abstain transition must not publish")
+            }
+            GroundedAnswerEnvelope::Abstained { diagnostic } => diagnostic,
+        };
+        assert_eq!(
+            diagnostic.kind(),
+            super::GroundedAnswerDiagnosticKind::ReviewDeferred
+        );
+        assert_eq!(diagnostic.code(), "grounded_answer.review_deferred");
+        assert!(result.acknowledgement().is_none());
+        assert!(result.diagnostic().is_some());
+        assert!(!format!("{result:?}").contains(CANARY_UNIT_ABSTAIN_64));
+        assert!(!result.to_string().contains(CANARY_UNIT_ABSTAIN_64));
+    }
+
+    #[test]
+    fn private_boundary_validation_rejects_invalid_inputs() {
+        let cases = [
+            (
+                GroundedAnswerInput::new(
+                    String::new(),
+                    "safe answer".to_owned(),
+                    vec![ReviewVote::new(SUBJECT.to_owned(), ReviewVerdict::Pass)],
+                ),
+                GroundedAnswerError::InvalidSubject,
+            ),
+            (
+                GroundedAnswerInput::new(
+                    SUBJECT.to_owned(),
+                    String::new(),
+                    vec![ReviewVote::new(SUBJECT.to_owned(), ReviewVerdict::Pass)],
+                ),
+                GroundedAnswerError::EmptyAnswer,
+            ),
+            (
+                GroundedAnswerInput::new(
+                    SUBJECT.to_owned(),
+                    "safe\nanswer".to_owned(),
+                    vec![ReviewVote::new(SUBJECT.to_owned(), ReviewVerdict::Pass)],
+                ),
+                GroundedAnswerError::InvalidAnswer,
+            ),
+            (
+                GroundedAnswerInput::new(SUBJECT.to_owned(), "safe answer".to_owned(), Vec::new()),
+                GroundedAnswerError::MissingReview,
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(validate_boundary(&input), Err(expected));
+        }
+    }
+
+    #[test]
+    fn private_review_error_mapping_stays_fail_closed() {
+        assert_eq!(
+            map_review_error(ReviewError::EmptyReviewerSet),
+            GroundedAnswerError::MissingReview
+        );
+        assert_eq!(
+            map_review_error(ReviewError::MixedSubjectIdentity),
+            GroundedAnswerError::MixedReviewSubject
+        );
+        assert_eq!(
+            map_review_error(ReviewError::UnsupportedSchemaVersion),
+            GroundedAnswerError::ReviewResolutionFailed
+        );
+        assert_eq!(
+            map_review_error(ReviewError::PassWithErrorOrCriticalDefects),
+            GroundedAnswerError::ReviewResolutionFailed
+        );
+
+        let source = match serde_json::from_str::<serde_json::Value>("{") {
+            Ok(_) => panic!("malformed JSON must fail"),
+            Err(source) => source,
+        };
+        assert_eq!(
+            map_review_error(ReviewError::Decode { source }),
+            GroundedAnswerError::ReviewResolutionFailed
+        );
+    }
+}
