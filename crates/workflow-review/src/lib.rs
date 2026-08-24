@@ -45,7 +45,7 @@ pub enum ReviewSeverity {
 }
 
 /// One typed review defect.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewDefect {
     code: String,
@@ -109,8 +109,18 @@ impl ReviewDefect {
     }
 }
 
+impl std::fmt::Debug for ReviewDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReviewDefect")
+            .field("code", &self.code)
+            .field("severity", &self.severity)
+            .field("evidence_ref_count", &self.evidence_refs.len())
+            .finish()
+    }
+}
+
 /// A typed review result over candidate output.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewResult {
     schema_version: u32,
@@ -188,6 +198,17 @@ impl ReviewResult {
     /// Returns the reviewer confidence in the verdict.
     pub fn confidence(&self) -> f64 {
         self.confidence
+    }
+}
+
+impl std::fmt::Debug for ReviewResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReviewResult")
+            .field("schema_version", &self.schema_version)
+            .field("verdict", &self.verdict)
+            .field("defect_count", &self.defects.len())
+            .field("confidence", &self.confidence)
+            .finish()
     }
 }
 
