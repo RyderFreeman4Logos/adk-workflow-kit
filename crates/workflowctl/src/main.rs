@@ -177,7 +177,7 @@ enum SkillValidationFailure {
     Script,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn read_skill_file(
     root: &Path,
     relative_path: &str,
@@ -701,5 +701,12 @@ mod tests {
         assert!(command()
             .try_get_matches_from(["workflowctl", "skill", "test", "skill-dir"])
             .is_ok());
+    }
+
+    #[test]
+    fn skill_file_open_helper_is_linux_only() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("#[cfg(target_os = \"linux\")]\nfn read_skill_file("));
+        assert!(!source.contains("#[cfg(unix)]\nfn read_skill_file("));
     }
 }
