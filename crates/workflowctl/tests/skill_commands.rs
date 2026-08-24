@@ -1,5 +1,8 @@
 use std::{fs, path::Path, process::Command};
 
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+
 use sha2::{Digest, Sha256};
 
 const CANARY_MANIFEST_55: &str = "CANARY_MANIFEST_55";
@@ -35,6 +38,22 @@ fn write_valid_skill(path: &Path) {
     fs::create_dir_all(path.join("scripts")).expect("create script directory");
     fs::create_dir_all(path.join("references")).expect("create references directory");
     fs::write(path.join("references/schema.json"), SCHEMA).expect("write schema");
+}
+
+fn write_runtime_manifest(path: &Path, script_digest: &str) {
+    let runtime_manifest = format!(
+        "schema_version = 1\n\n[skill]\nid = \"canary-skill-55\"\nversion = \"1.0.0\"\n\n[[scripts]]\nid = \"check\"\npath = \"scripts/check.py\"\nruntime = \"python3\"\nsha256 = \"{script_digest}\"\ninput_schema = \"references/schema.json\"\noutput_schema = \"references/schema.json\"\n\n[[resources]]\nid = \"references/schema.json\"\nsha256 = \"{}\"\n",
+        digest(SCHEMA.as_bytes()),
+    );
+    fs::write(path.join("skill.runtime.toml"), runtime_manifest).expect("write runtime manifest");
+}
+
+#[cfg(unix)]
+fn escape_target(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "workflowctl-cli-005-{name}-{}-outside",
+        std::process::id()
+    ))
 }
 
 #[test]
@@ -76,4 +95,50 @@ fn invalid_script_fails_clearly_with_typed_redacted_diagnostic() {
     assert!(!stderr.contains(CANARY_SCRIPT_55));
     assert!(output.stdout.is_empty());
     fs::remove_dir_all(path).expect("remove test skill directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn leaf_symlink_escape_is_rejected_without_echoing_target() {
+    let path = temp_skill("leaf-symlink");
+    write_valid_skill(&path);
+    let target = escape_target("leaf");
+    let script = b"print('outside')\n";
+    fs::write(&target, script).expect("write outside script");
+    write_runtime_manifest(&path, &digest(script));
+    symlink(&target, path.join("scripts/check.py")).expect("create leaf symlink");
+
+    let output = run(&["--json", "skill", "test", path.to_str().expect("utf8 path")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr.contains("skill.cli.invalid_script"));
+    assert!(!stderr.contains(target.to_str().expect("utf8 target")));
+    assert!(output.stdout.is_empty());
+    fs::remove_dir_all(path).expect("remove test skill directory");
+    fs::remove_file(target).expect("remove outside script");
+}
+
+#[cfg(unix)]
+#[test]
+fn intermediate_directory_symlink_escape_is_rejected_without_echoing_target() {
+    let path = temp_skill("intermediate-symlink");
+    write_valid_skill(&path);
+    let target = escape_target("intermediate");
+    let script = b"print('outside')\n";
+    fs::create_dir_all(&target).expect("create outside script directory");
+    fs::write(target.join("check.py"), script).expect("write outside script");
+    write_runtime_manifest(&path, &digest(script));
+    fs::remove_dir(path.join("scripts")).expect("remove in-root script directory");
+    symlink(&target, path.join("scripts")).expect("create intermediate symlink");
+
+    let output = run(&["--json", "skill", "test", path.to_str().expect("utf8 path")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr.contains("skill.cli.invalid_script"));
+    assert!(!stderr.contains(target.to_str().expect("utf8 target")));
+    assert!(output.stdout.is_empty());
+    fs::remove_dir_all(path).expect("remove test skill directory");
+    fs::remove_dir_all(target).expect("remove outside script directory");
 }

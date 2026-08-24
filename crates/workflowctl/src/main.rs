@@ -177,12 +177,94 @@ enum SkillValidationFailure {
     Script,
 }
 
+#[cfg(unix)]
 fn read_skill_file(
     root: &Path,
     relative_path: &str,
     failure: SkillValidationFailure,
 ) -> Result<Vec<u8>, SkillValidationFailure> {
-    let path = root.join(relative_path);
+    use std::{
+        ffi::{c_char, CString},
+        fs::{File, OpenOptions},
+        io::Read,
+        os::{
+            fd::{AsRawFd, FromRawFd, OwnedFd},
+            unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+        },
+        path::Component,
+    };
+
+    const O_CLOEXEC: i32 = 0o2_000_000;
+    const O_DIRECTORY: i32 = 0o200_000;
+    const O_NOFOLLOW: i32 = 0o400_000;
+
+    unsafe extern "C" {
+        fn openat(dirfd: i32, pathname: *const c_char, flags: i32, mode: u32) -> i32;
+    }
+
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW)
+        .open(root)
+        .map_err(|_| failure)?;
+    let mut directory = OwnedFd::from(root);
+    let mut components = Path::new(relative_path).components().peekable();
+
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(failure);
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| failure)?;
+        let final_component = components.peek().is_none();
+        let flags = O_CLOEXEC | O_NOFOLLOW | if final_component { 0 } else { O_DIRECTORY };
+        let fd = unsafe { openat(directory.as_raw_fd(), name.as_ptr(), flags, 0) };
+        if fd < 0 {
+            return Err(failure);
+        }
+        let opened = unsafe { OwnedFd::from_raw_fd(fd) };
+        if !final_component {
+            directory = opened;
+            continue;
+        }
+
+        let file = File::from(opened);
+        let metadata = file.metadata().map_err(|_| failure)?;
+        if !metadata.is_file() {
+            return Err(failure);
+        }
+        let mut bytes = Vec::new();
+        file.take((MAX_SKILL_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| failure)?;
+        if bytes.len() > MAX_SKILL_FILE_BYTES {
+            return Err(failure);
+        }
+        return Ok(bytes);
+    }
+
+    Err(failure)
+}
+
+#[cfg(not(unix))]
+fn read_skill_file(
+    root: &Path,
+    relative_path: &str,
+    failure: SkillValidationFailure,
+) -> Result<Vec<u8>, SkillValidationFailure> {
+    let mut path = root.to_path_buf();
+    for component in Path::new(relative_path).components() {
+        let Path::Component::Normal(name) = component else {
+            return Err(failure);
+        };
+        path.push(name);
+        if std::fs::symlink_metadata(&path)
+            .map_err(|_| failure)?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(failure);
+        }
+    }
     read_bounded_regular_file(&SourcePath::from(path.as_path()), MAX_SKILL_FILE_BYTES)
         .map_err(|_| failure)
 }
@@ -528,7 +610,88 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::command;
+    use std::{fs, path::PathBuf};
+
+    use sha2::{Digest, Sha256};
+
+    use super::{command, test_skill, validate_skill_manifest, SkillValidationFailure};
+
+    const SCHEMA: &str =
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#;
+
+    fn unit_skill_path(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "workflowctl-cli-005-unit-{name}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create unit skill directory");
+        path
+    }
+
+    fn script_digest(bytes: &[u8]) -> String {
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn invalid_manifest_fixture_maps_to_typed_diagnostic() {
+        let path = unit_skill_path("manifest");
+        let marker = "UNIT_INVALID_MANIFEST_55";
+        fs::write(path.join("SKILL.md"), marker).expect("write invalid manifest fixture");
+
+        let failure = match validate_skill_manifest(&path) {
+            Err(failure) => failure,
+            Ok(_) => panic!("invalid manifest fixture must fail"),
+        };
+        let diagnostic = super::skill_diagnostic(failure);
+        assert_eq!(diagnostic.code(), "skill.cli.invalid_manifest");
+        assert!(!serde_json::to_string(&diagnostic)
+            .expect("serialize diagnostic")
+            .contains(marker));
+        fs::remove_dir_all(path).expect("remove unit skill directory");
+    }
+
+    #[test]
+    fn invalid_script_fixture_maps_to_distinct_typed_diagnostic() {
+        let path = unit_skill_path("script");
+        let skill_id = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("unit skill directory name");
+        let script = b"UNIT_INVALID_SCRIPT_55";
+        fs::create_dir_all(path.join("scripts")).expect("create script directory");
+        fs::create_dir_all(path.join("references")).expect("create references directory");
+        fs::write(
+            path.join("SKILL.md"),
+            format!("---\nname: {skill_id}\ndescription: A unit fixture.\n---\n# Instructions\n"),
+        )
+        .expect("write valid manifest fixture");
+        fs::write(path.join("scripts/check.py"), script).expect("write invalid script fixture");
+        fs::write(path.join("references/schema.json"), SCHEMA).expect("write schema fixture");
+        fs::write(
+            path.join("skill.runtime.toml"),
+            format!(
+                "schema_version = 1\n\n[skill]\nid = \"{skill_id}\"\nversion = \"1.0.0\"\n\n[[scripts]]\nid = \"check\"\npath = \"scripts/check.py\"\nruntime = \"python3\"\nsha256 = \"sha256:{}\"\ninput_schema = \"references/schema.json\"\noutput_schema = \"references/schema.json\"\n\n[[resources]]\nid = \"references/schema.json\"\nsha256 = \"{}\"\n",
+                "0".repeat(64),
+                script_digest(SCHEMA.as_bytes()),
+            ),
+        )
+        .expect("write runtime manifest fixture");
+
+        let failure = match test_skill(&path) {
+            Err(failure @ SkillValidationFailure::Script) => failure,
+            Err(SkillValidationFailure::Manifest) => {
+                panic!("legal manifest fixture must reach script validation")
+            }
+            Ok(()) => panic!("invalid script fixture must fail"),
+        };
+        let diagnostic = super::skill_diagnostic(failure);
+        assert_eq!(diagnostic.code(), "skill.cli.invalid_script");
+        assert_ne!(diagnostic.code(), "skill.cli.invalid_manifest");
+        assert!(!serde_json::to_string(&diagnostic)
+            .expect("serialize diagnostic")
+            .contains("UNIT_INVALID_SCRIPT_55"));
+        fs::remove_dir_all(path).expect("remove unit skill directory");
+    }
 
     #[test]
     fn skill_lint_and_test_commands_are_declared() {
