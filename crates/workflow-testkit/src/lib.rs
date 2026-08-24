@@ -6,7 +6,9 @@ mod sandbox;
 
 use std::{
     collections::VecDeque,
+    fmt,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use adk_rust::{
@@ -15,6 +17,7 @@ use adk_rust::{
 };
 use serde_json::Value;
 use workflow_compiler::{RegistryCategory, RegistryEntry, RegistryNotFound, ToolRegistry};
+use workflow_runtime::{RunController, RunLimitKind, RunTerminalCause, RunTimeoutKind};
 
 pub use non_progress::{NoProgressError, NoProgressReason, NonProgressDetector};
 pub use replay::{ReplayBundle, ReplayError, ReplayErrorKind, ReplayEvent, StructuralTrace};
@@ -22,6 +25,179 @@ pub use sandbox::{
     FakeSandboxBackend, FakeSandboxReceipt, FakeSandboxRequest, FakeSandboxRequestError,
     FakeSandboxRequestErrorKind,
 };
+
+/// A deterministic completion signal injected by this testkit.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum FaultSignal {
+    /// A host-enforced time ceiling was reached.
+    Timeout(RunTimeoutKind),
+    /// A host-enforced count or byte ceiling was reached.
+    RateLimit(RunLimitKind),
+    /// A bounded output payload could not be decoded.
+    InvalidOutput,
+    /// A tool output stream crossed its byte ceiling.
+    OutputFlood {
+        /// Bytes accepted before the rejecting chunk.
+        accepted_bytes: u64,
+    },
+    /// The supplied controller or payload did not meet an injector precondition.
+    InjectionPreconditionFailed,
+}
+
+/// A privacy-safe diagnostic returned by a deterministic fault injector.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct FaultDiagnostic {
+    signal: FaultSignal,
+}
+
+impl FaultDiagnostic {
+    fn new(signal: FaultSignal) -> Self {
+        Self { signal }
+    }
+
+    /// Returns the typed fault signal without retaining injected payload bytes.
+    pub const fn signal(&self) -> FaultSignal {
+        self.signal
+    }
+}
+
+impl fmt::Display for FaultDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.signal {
+            FaultSignal::Timeout(kind) => {
+                write!(
+                    formatter,
+                    "injected fault: run timed out ({})",
+                    timeout_name(kind)
+                )
+            }
+            FaultSignal::RateLimit(kind) => {
+                write!(
+                    formatter,
+                    "injected fault: quota exhausted ({})",
+                    limit_name(kind)
+                )
+            }
+            FaultSignal::InvalidOutput => formatter.write_str("injected fault: invalid output"),
+            FaultSignal::OutputFlood { accepted_bytes } => write!(
+                formatter,
+                "injected fault: output byte ceiling rejected (accepted {accepted_bytes} bytes)"
+            ),
+            FaultSignal::InjectionPreconditionFailed => {
+                formatter.write_str("injected fault: injector precondition was not met")
+            }
+        }
+    }
+}
+
+impl fmt::Debug for FaultSignal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout(kind) => formatter.debug_tuple("Timeout").field(kind).finish(),
+            Self::RateLimit(kind) => formatter.debug_tuple("RateLimit").field(kind).finish(),
+            Self::InvalidOutput => formatter.write_str("InvalidOutput"),
+            Self::OutputFlood { accepted_bytes } => formatter
+                .debug_struct("OutputByteCeiling")
+                .field("accepted_bytes", accepted_bytes)
+                .finish(),
+            Self::InjectionPreconditionFailed => formatter.write_str("InjectionPreconditionFailed"),
+        }
+    }
+}
+
+impl fmt::Debug for FaultDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.signal {
+            FaultSignal::OutputFlood { accepted_bytes } => formatter
+                .debug_struct("FaultDiagnostic")
+                .field("code", &"output_byte_ceiling")
+                .field("accepted_bytes", &accepted_bytes)
+                .finish(),
+            signal => formatter
+                .debug_struct("FaultDiagnostic")
+                .field("signal", &signal)
+                .finish(),
+        }
+    }
+}
+
+impl std::error::Error for FaultDiagnostic {}
+
+/// Injects a timeout through the existing host controller.
+pub fn inject_timeout(
+    controller: &mut RunController<'_>,
+    elapsed: Duration,
+    expected: RunTimeoutKind,
+) -> FaultDiagnostic {
+    match controller.poll(elapsed) {
+        Err(termination) => match termination.cause() {
+            RunTerminalCause::TimedOut(kind) if kind == expected => {
+                FaultDiagnostic::new(FaultSignal::Timeout(kind))
+            }
+            _ => FaultDiagnostic::new(FaultSignal::InjectionPreconditionFailed),
+        },
+        Ok(()) => FaultDiagnostic::new(FaultSignal::InjectionPreconditionFailed),
+    }
+}
+
+/// Injects quota exhaustion through the existing host controller.
+pub fn inject_rate_limit(controller: &mut RunController<'_>, elapsed: Duration) -> FaultDiagnostic {
+    match controller.admit_model_turn(elapsed) {
+        Err(termination) => match termination.cause() {
+            RunTerminalCause::LimitExceeded(kind) => {
+                FaultDiagnostic::new(FaultSignal::RateLimit(kind))
+            }
+            _ => FaultDiagnostic::new(FaultSignal::InjectionPreconditionFailed),
+        },
+        Ok(()) => FaultDiagnostic::new(FaultSignal::InjectionPreconditionFailed),
+    }
+}
+
+/// Injects an invalid bounded JSON output without retaining its bytes.
+pub fn inject_invalid_output<T>(payload: &[u8], maximum_bytes: usize) -> FaultDiagnostic
+where
+    T: serde::de::DeserializeOwned,
+{
+    if payload.len() > maximum_bytes || serde_json::from_slice::<T>(payload).is_err() {
+        FaultDiagnostic::new(FaultSignal::InvalidOutput)
+    } else {
+        FaultDiagnostic::new(FaultSignal::InjectionPreconditionFailed)
+    }
+}
+
+/// Injects a tool-output flood through the existing host controller.
+pub fn inject_output_flood(
+    controller: &mut RunController<'_>,
+    elapsed: Duration,
+    accepted_bytes: u64,
+) -> FaultDiagnostic {
+    match controller.accept_tool_output(elapsed, u64::MAX) {
+        Err(termination) => match termination.cause() {
+            RunTerminalCause::LimitExceeded(RunLimitKind::ToolOutputBytes) => {
+                FaultDiagnostic::new(FaultSignal::OutputFlood { accepted_bytes })
+            }
+            _ => FaultDiagnostic::new(FaultSignal::InjectionPreconditionFailed),
+        },
+        Ok(()) => FaultDiagnostic::new(FaultSignal::InjectionPreconditionFailed),
+    }
+}
+
+fn timeout_name(kind: RunTimeoutKind) -> &'static str {
+    match kind {
+        RunTimeoutKind::WallTime => "wall time",
+        RunTimeoutKind::IdleTime => "idle time",
+        RunTimeoutKind::ToolTime => "tool time",
+    }
+}
+
+fn limit_name(kind: RunLimitKind) -> &'static str {
+    match kind {
+        RunLimitKind::ModelTurns => "model turns",
+        RunLimitKind::TotalToolCalls => "total tool calls",
+        RunLimitKind::ToolCallsPerTool => "tool calls per tool",
+        RunLimitKind::ToolOutputBytes => "tool output bytes",
+    }
+}
 
 type RequestPredicate = dyn Fn(&LlmRequest) -> Result<(), String> + Send + Sync;
 
