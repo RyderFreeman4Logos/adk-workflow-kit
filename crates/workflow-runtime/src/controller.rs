@@ -81,6 +81,7 @@ impl ToolCallCleanup {
 pub struct RunTermination {
     cause: RunTerminalCause,
     cleanup: Option<ToolCallCleanup>,
+    source_context: Box<RunContext>,
 }
 
 impl RunTermination {
@@ -92,6 +93,11 @@ impl RunTermination {
     /// Returns the active-tool cleanup intent, when this transition owns it.
     pub fn cleanup(&self) -> Option<&ToolCallCleanup> {
         self.cleanup.as_ref()
+    }
+
+    /// Returns the complete controller authority that produced this termination.
+    pub fn source_context(&self) -> &RunContext {
+        &self.source_context
     }
 }
 
@@ -159,6 +165,9 @@ impl<'limits> RunController<'limits> {
     /// existing finish-with-active-tool invariant carries the cleanup to the
     /// host. Returns `None` only when there is no cleanup to preserve.
     pub(crate) fn into_rejection_termination(mut self) -> Option<RunTermination> {
+        if let Some(cause) = self.terminal_cause {
+            return Some(self.termination(cause, None));
+        }
         self.active_tool_call.as_ref()?;
         Some(self.terminate(RunTerminalCause::Failed(
             RunControlError::RunFinishWithActiveToolCall,
@@ -332,10 +341,7 @@ impl<'limits> RunController<'limits> {
 
     fn check_boundary(&mut self, elapsed: Duration) -> Result<(), RunTermination> {
         if let Some(cause) = self.terminal_cause {
-            return Err(RunTermination {
-                cause,
-                cleanup: None,
-            });
+            return Err(self.termination(cause, None));
         }
         if elapsed < self.last_elapsed {
             return Err(self.terminate(RunTerminalCause::Failed(RunControlError::ClockRegressed)));
@@ -384,14 +390,23 @@ impl<'limits> RunController<'limits> {
 
     fn terminate(&mut self, cause: RunTerminalCause) -> RunTermination {
         if let Some(latched) = self.terminal_cause {
-            return RunTermination {
-                cause: latched,
-                cleanup: None,
-            };
+            return self.termination(latched, None);
         }
 
         self.terminal_cause = Some(cause);
         let cleanup = self.active_tool_call.take().map(|active| active.cleanup);
-        RunTermination { cause, cleanup }
+        self.termination(cause, cleanup)
+    }
+
+    fn termination(
+        &self,
+        cause: RunTerminalCause,
+        cleanup: Option<ToolCallCleanup>,
+    ) -> RunTermination {
+        RunTermination {
+            cause,
+            cleanup,
+            source_context: Box::new(RunContext::new(self.run_id.clone(), self.limits.clone())),
+        }
     }
 }

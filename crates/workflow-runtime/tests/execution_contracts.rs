@@ -72,6 +72,7 @@ fn context() -> RunContext {
 
 struct RecordingStore {
     inner: InMemoryArtifactStore,
+    stage_calls: usize,
     commit_calls: usize,
 }
 
@@ -80,6 +81,7 @@ impl RecordingStore {
         let limit = NonZeroU64::new(64 * 1024).expect("positive limit");
         Self {
             inner: InMemoryArtifactStore::new(limit, limit),
+            stage_calls: 0,
             commit_calls: 0,
         }
     }
@@ -87,8 +89,7 @@ impl RecordingStore {
 
 impl ArtifactStore for RecordingStore {
     fn stage(&mut self, bytes: &[u8]) -> Result<StagedArtifact, ArtifactError> {
-        // Preparation may occur before a terminal authority check, but it must
-        // never become visible: commit below is the publication sentinel.
+        self.stage_calls += 1;
         self.inner.stage(bytes)
     }
 

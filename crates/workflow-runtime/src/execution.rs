@@ -239,7 +239,16 @@ fn identity_failure(
     mismatch: PureTransformExecutionError,
 ) -> RunResult<ArtifactId, PureTransformExecutionError> {
     match controller.into_rejection_termination() {
-        Some(termination) => terminal_failure(context, termination),
+        Some(termination) => {
+            let cause = termination.cause();
+            RunResult::new(
+                context.run_id().clone(),
+                cause.into_outcome(PureTransformExecutionError::IdentityRejection {
+                    mismatch: Box::new(mismatch),
+                    termination,
+                }),
+            )
+        }
         None => failed(context, mismatch),
     }
 }
@@ -330,6 +339,13 @@ pub enum PureTransformExecutionError {
     ControllerRunMismatch,
     /// The existing controller rejected a run boundary with one-shot cleanup.
     ControllerTermination(crate::RunTermination),
+    /// An identity rejection retained both its mismatch and controller termination.
+    IdentityRejection {
+        /// The rejected workdir or controller identity.
+        mismatch: Box<Self>,
+        /// The controller's terminal cause and complete source authority.
+        termination: crate::RunTermination,
+    },
     /// The bounded request could not be reconstructed.
     Request(PureTransformRequestError),
     /// The existing pure-transform backend rejected or failed the module.
@@ -352,6 +368,14 @@ impl fmt::Display for PureTransformExecutionError {
             Self::ControllerTermination(termination) => write!(
                 formatter,
                 "run controller rejected execution: {:?}",
+                termination.cause()
+            ),
+            Self::IdentityRejection {
+                mismatch,
+                termination,
+            } => write!(
+                formatter,
+                "run identity rejected execution: {mismatch}; controller termination: {:?}",
                 termination.cause()
             ),
 
@@ -392,8 +416,8 @@ mod tests {
     use crate::{
         pure_transform::{backend_executions, reset_backend_executions},
         ArtifactPage, FilesystemArtifactStore, InMemoryArtifactStore, PageRequest, RetentionPolicy,
-        RunControlError, RunId, RunLimits, RunTerminalCause, RunTimeoutKind, SandboxCapability,
-        StagedArtifact, WorkdirManager,
+        RunControlError, RunId, RunLimits, RunStatus, RunTerminalCause, RunTimeoutKind,
+        SandboxCapability, StagedArtifact, WorkdirManager,
     };
 
     const IDENTITY_WASM: &[u8] = include_bytes!("../tests/fixtures/pure_transform_identity.wasm");
@@ -427,6 +451,7 @@ mod tests {
 
     struct CountingStore {
         inner: InMemoryArtifactStore,
+        stages: usize,
         commits: usize,
     }
 
@@ -435,6 +460,7 @@ mod tests {
             let limit = NonZeroU64::new(64 * 1024).expect("positive limit");
             Self {
                 inner: InMemoryArtifactStore::new(limit, limit),
+                stages: 0,
                 commits: 0,
             }
         }
@@ -442,6 +468,7 @@ mod tests {
 
     impl ArtifactStore for CountingStore {
         fn stage(&mut self, bytes: &[u8]) -> Result<StagedArtifact, ArtifactError> {
+            self.stages += 1;
             self.inner.stage(bytes)
         }
 
@@ -621,16 +648,27 @@ mod tests {
 
         let termination = match result.outcome() {
             RunOutcome::Failed {
-                diagnostic: PureTransformExecutionError::ControllerTermination(termination),
-            } => termination,
+                diagnostic:
+                    PureTransformExecutionError::IdentityRejection {
+                        mismatch,
+                        termination,
+                    },
+            } => {
+                assert!(matches!(
+                    mismatch.as_ref(),
+                    PureTransformExecutionError::WorkdirRunMismatch
+                ));
+                termination
+            }
             other => panic!(
-                "workdir mismatch with an active tool must carry its termination, got {other:?}"
+                "workdir mismatch with an active tool must retain its rejection and termination, got {other:?}"
             ),
         };
         assert_eq!(
             termination.cause(),
             RunTerminalCause::Failed(RunControlError::RunFinishWithActiveToolCall)
         );
+        assert_eq!(termination.source_context(), &context);
         let cleanup = termination
             .cleanup()
             .expect("exactly one cleanup authority");
@@ -678,10 +716,20 @@ mod tests {
 
             let termination = match result.outcome() {
                 RunOutcome::Failed {
-                    diagnostic: PureTransformExecutionError::ControllerTermination(termination),
-                } => termination,
+                    diagnostic:
+                        PureTransformExecutionError::IdentityRejection {
+                            mismatch,
+                            termination,
+                        },
+                } => {
+                    assert!(matches!(
+                        mismatch.as_ref(),
+                        PureTransformExecutionError::ControllerRunMismatch
+                    ));
+                    termination
+                }
                 other => panic!(
-                    "controller mismatch with an active tool must carry its termination, got {other:?}"
+                    "controller mismatch with an active tool must retain its rejection and termination, got {other:?}"
                 ),
             };
             assert_eq!(
@@ -693,7 +741,13 @@ mod tests {
                 .expect("exactly one cleanup authority");
             assert_eq!(cleanup.exact_tool_id(), "exact-tool");
             assert_eq!(cleanup.exact_version(), "7");
+            assert_eq!(
+                termination.source_context(),
+                &controller_context,
+                "the cleanup must retain the controller's complete source authority"
+            );
             assert_eq!(backend_executions(), 0);
+            assert_eq!(artifacts.stages, 0);
             assert_eq!(artifacts.commits, 0);
             workdir.cleanup().expect("workdir must clean up");
         }
@@ -914,5 +968,178 @@ mod tests {
         cancelled_workdir.cleanup().expect("workdir must clean up");
         timed_out_workdir.cleanup().expect("workdir must clean up");
         post_workdir.cleanup().expect("workdir must clean up");
+    }
+
+    #[test]
+    fn cancelled_controller_mismatch_preserves_latched_cause_not_mismatch() {
+        // CA-4: a controller that already terminalized must surface its latched
+        // terminal cause on a later identity rejection, never a bare mismatch.
+        let root = TestRoot::new();
+        let manager = root.manager();
+        let owner = run("cancelled-owner-a", 1_000);
+        let requested = run("requested-b", 1_000);
+        let mut workdir = manager
+            .allocate(requested.run_id())
+            .expect("workdir must allocate");
+        let mut controller = RunController::new(&owner);
+        controller
+            .begin_tool_call(Duration::ZERO, "exact-tool", "7")
+            .expect("tool call must begin");
+        let first = controller.request_cancel(Duration::ZERO);
+        assert!(
+            first.cleanup().is_some(),
+            "the first terminal delivery must own the active-tool cleanup"
+        );
+        let mut artifacts = CountingStore::new();
+        reset_backend_executions();
+
+        let result = plan(IDENTITY_WASM).execute(
+            &requested,
+            controller,
+            || Duration::ZERO,
+            &workdir,
+            &mut artifacts,
+        );
+
+        assert_eq!(
+            result.status(),
+            RunStatus::Cancelled,
+            "an identity rejection must retain the controller's latched terminal cause"
+        );
+        match result.outcome() {
+            RunOutcome::Cancelled {
+                diagnostic:
+                    PureTransformExecutionError::IdentityRejection {
+                        mismatch,
+                        termination,
+                    },
+            } => {
+                assert!(matches!(
+                    mismatch.as_ref(),
+                    PureTransformExecutionError::ControllerRunMismatch
+                ));
+                assert_eq!(termination.cause(), RunTerminalCause::Cancelled);
+                assert_eq!(termination.source_context(), &owner);
+                assert!(termination.cleanup().is_none());
+            }
+            other => panic!("latched cause must retain its identity rejection, got {other:?}"),
+        }
+        assert_eq!(backend_executions(), 0);
+        assert_eq!(artifacts.stages, 0);
+        assert_eq!(artifacts.commits, 0);
+        workdir.cleanup().expect("workdir must clean up");
+    }
+
+    #[test]
+    fn both_mismatches_with_active_tool_preserve_mismatch_and_cleanup() {
+        // CA-3: workdir C + context B + active-tool controller A; the rejection
+        // must preserve the typed mismatch AND the termination, never present a
+        // bare termination that hides which identity mismatched.
+        let root = TestRoot::new();
+        let manager = root.manager();
+        let requested = run("requested-b", 1_000);
+        let third = run("workdir-c", 1_000);
+        let owner = run("controller-a", 1_000);
+        let mut workdir = manager
+            .allocate(third.run_id())
+            .expect("workdir must allocate");
+        let mut controller = RunController::new(&owner);
+        controller
+            .begin_tool_call(Duration::ZERO, "exact-tool", "7")
+            .expect("tool call must begin");
+        let mut artifacts = CountingStore::new();
+        reset_backend_executions();
+
+        let result = plan(IDENTITY_WASM).execute(
+            &requested,
+            controller,
+            || Duration::ZERO,
+            &workdir,
+            &mut artifacts,
+        );
+
+        match result.outcome() {
+            RunOutcome::Failed {
+                diagnostic:
+                    PureTransformExecutionError::IdentityRejection {
+                        mismatch,
+                        termination,
+                    },
+            } => {
+                assert!(matches!(
+                    mismatch.as_ref(),
+                    PureTransformExecutionError::WorkdirRunMismatch
+                ));
+                assert_eq!(termination.source_context(), &owner);
+                assert!(termination.cleanup().is_some());
+            }
+            other => {
+                panic!("both mismatches must retain typed rejection and termination, got {other:?}")
+            }
+        }
+        assert_eq!(result.run_id(), requested.run_id());
+        assert_eq!(backend_executions(), 0);
+        assert_eq!(artifacts.stages, 0);
+        assert_eq!(artifacts.commits, 0);
+        workdir.cleanup().expect("workdir must clean up");
+    }
+
+    #[test]
+    fn tool_deadline_with_active_tool_yields_timed_out_with_exact_one_shot_cleanup() {
+        // CA-5 pin: the post-identity preflight tool-deadline row must keep the
+        // matched context's label, exactly one cleanup, and zero backend work.
+        let root = TestRoot::new();
+        let manager = root.manager();
+        let one = NonZeroU64::new(1).expect("positive limit");
+        let context = RunContext::new(
+            RunId::new(String::from("tool-deadline-pin")).expect("run ID must be valid"),
+            RunLimits::new(
+                one,
+                one,
+                one,
+                NonZeroU64::new(100_000).expect("positive wall limit"),
+                NonZeroU64::new(100_000).expect("positive idle limit"),
+                NonZeroU64::new(100).expect("positive tool limit"),
+                NonZeroU64::new(64 * 1024).expect("positive output limit"),
+            ),
+        );
+        let mut workdir = manager
+            .allocate(context.run_id())
+            .expect("workdir must allocate");
+        let mut controller = RunController::new(&context);
+        controller
+            .begin_tool_call(Duration::ZERO, "exact-tool", "7")
+            .expect("tool call must begin");
+        let mut artifacts = CountingStore::new();
+        reset_backend_executions();
+
+        let result = plan(IDENTITY_WASM).execute(
+            &context,
+            controller,
+            || Duration::from_millis(101),
+            &workdir,
+            &mut artifacts,
+        );
+
+        let termination = match result.outcome() {
+            RunOutcome::TimedOut {
+                timeout: RunTimeoutKind::ToolTime,
+                diagnostic: PureTransformExecutionError::ControllerTermination(termination),
+            } => termination,
+            other => panic!("tool deadline must time out with its termination, got {other:?}"),
+        };
+        assert_eq!(
+            termination.cause(),
+            RunTerminalCause::TimedOut(RunTimeoutKind::ToolTime)
+        );
+        let cleanup = termination
+            .cleanup()
+            .expect("exactly one cleanup authority");
+        assert_eq!(cleanup.exact_tool_id(), "exact-tool");
+        assert_eq!(cleanup.exact_version(), "7");
+        assert_eq!(backend_executions(), 0);
+        assert_eq!(artifacts.stages, 0);
+        assert_eq!(artifacts.commits, 0);
+        workdir.cleanup().expect("workdir must clean up");
     }
 }
