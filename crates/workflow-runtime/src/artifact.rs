@@ -311,15 +311,19 @@ impl ArtifactStore for InMemoryArtifactStore {
         }
         let id = staged.id.clone();
         match staged.take_state() {
-            StagedState::Memory { bytes } if !bytes.is_empty() => {
-                self.entries.insert(
-                    id.clone(),
-                    Entry {
-                        bytes,
-                        retention: RetentionPolicy::Retain,
-                    },
-                );
-            }
+            StagedState::Memory { bytes } if !bytes.is_empty() => match self.entries.get(&id) {
+                Some(entry) if entry.bytes == bytes => {}
+                Some(_) => return Err(ArtifactError::new(ArtifactErrorKind::ContentIdCollision)),
+                None => {
+                    self.entries.insert(
+                        id.clone(),
+                        Entry {
+                            bytes,
+                            retention: RetentionPolicy::Retain,
+                        },
+                    );
+                }
+            },
             StagedState::Memory { .. } => {} // identical content already visible
             StagedState::File { .. } => unreachable!("memory stores only stage memory state"),
         }
@@ -454,7 +458,9 @@ impl ArtifactStore for FilesystemArtifactStore {
 
         // Every token owns a synced temp file, so commit can always perform
         // the atomic visibility transition.
-        let temporary = self.root.join(format!(".tmp-{}", id.as_str()));
+        let temporary = self
+            .root
+            .join(format!(".tmp-{}-{}", id.as_str(), next_capability()));
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -481,9 +487,24 @@ impl ArtifactStore for FilesystemArtifactStore {
             StagedState::File { temporary } => {
                 // Atomic visibility transition after the final authority check.
                 let final_path = self.path_for(&id);
-                if let Err(error) = fs::rename(&temporary, &final_path) {
-                    let _ = fs::remove_file(&temporary);
-                    return Err(Self::storage_error(error));
+                match fs::read(&final_path) {
+                    Ok(existing) => {
+                        let staged_bytes = fs::read(&temporary).map_err(Self::storage_error)?;
+                        let _ = fs::remove_file(&temporary);
+                        if existing != staged_bytes {
+                            return Err(ArtifactError::new(ArtifactErrorKind::ContentIdCollision));
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        if let Err(error) = fs::rename(&temporary, &final_path) {
+                            let _ = fs::remove_file(&temporary);
+                            return Err(Self::storage_error(error));
+                        }
+                    }
+                    Err(error) => {
+                        let _ = fs::remove_file(&temporary);
+                        return Err(Self::storage_error(error));
+                    }
                 }
             }
             StagedState::Memory { .. } => {} // identical content already visible

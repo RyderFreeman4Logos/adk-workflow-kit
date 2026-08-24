@@ -322,6 +322,55 @@ fn retention_is_explicit_typed_metadata_not_an_implicit_sweeper() {
 }
 
 #[test]
+fn stale_memory_stage_preserves_published_retention() {
+    let limit = nonzero(16);
+    let mut store = InMemoryArtifactStore::new(limit, limit);
+    let staged = store.stage(b"abc").expect("content must stage");
+    let id = store.put(b"abc").expect("same content must publish");
+    let expires_at = RetentionPolicy::ExpiresAt(std::time::SystemTime::UNIX_EPOCH);
+    store
+        .set_retention(&id, expires_at)
+        .expect("published content must accept explicit retention");
+
+    assert_eq!(
+        store
+            .commit(staged)
+            .expect("stale same-content stage must commit"),
+        id
+    );
+    assert_eq!(
+        store
+            .retention(&id)
+            .expect("published retention must remain readable"),
+        expires_at
+    );
+}
+
+#[test]
+fn stale_filesystem_stage_preserves_published_retention() {
+    let (_base, mut store) = new_store(16, 16);
+    let staged = store.stage(b"abc").expect("content must stage");
+    let id = store.put(b"abc").expect("same content must publish");
+    let expires_at = RetentionPolicy::ExpiresAt(std::time::SystemTime::UNIX_EPOCH);
+    store
+        .set_retention(&id, expires_at)
+        .expect("published content must accept explicit retention");
+
+    assert_eq!(
+        store
+            .commit(staged)
+            .expect("stale same-content stage must commit"),
+        id
+    );
+    assert_eq!(
+        store
+            .retention(&id)
+            .expect("published retention must remain readable"),
+        expires_at
+    );
+}
+
+#[test]
 fn staged_artifact_debug_redacts_content_and_temporary_paths() {
     let limit = nonzero(64);
     let mut memory = InMemoryArtifactStore::new(limit, limit);
