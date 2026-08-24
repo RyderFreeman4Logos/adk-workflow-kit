@@ -443,38 +443,33 @@ impl ArtifactStore for FilesystemArtifactStore {
         let id = ArtifactId(encode_hex(&Sha256::digest(bytes)));
         let final_path = self.path_for(&id);
         match fs::read(&final_path) {
-            Ok(existing) => {
-                if existing.as_slice() != bytes {
-                    return Err(ArtifactError::new(ArtifactErrorKind::ContentIdCollision));
-                }
-                Ok(StagedArtifact::new(
-                    id,
-                    StagedState::Memory { bytes: Vec::new() },
-                    self.capability,
-                ))
+            Ok(existing) if existing.as_slice() != bytes => {
+                return Err(ArtifactError::new(ArtifactErrorKind::ContentIdCollision));
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                // Fresh content: all blocking write/fsync work happens here,
-                // before any final wall-clock authority check.
-                let temporary = self.root.join(format!(".tmp-{}", id.as_str()));
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&temporary)
-                    .map_err(Self::storage_error)?;
-                if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-                    let _ = fs::remove_file(&temporary);
-                    return Err(Self::storage_error(error));
-                }
-                Ok(StagedArtifact::new(
-                    id,
-                    StagedState::File { temporary },
-                    self.capability,
-                ))
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                return Err(Self::storage_error(error));
             }
-            Err(error) => Err(Self::storage_error(error)),
+            _ => {}
         }
+
+        // Every token owns a synced temp file, so commit can always perform
+        // the atomic visibility transition.
+        let temporary = self.root.join(format!(".tmp-{}", id.as_str()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(Self::storage_error)?;
+        if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&temporary);
+            return Err(Self::storage_error(error));
+        }
+        Ok(StagedArtifact::new(
+            id,
+            StagedState::File { temporary },
+            self.capability,
+        ))
     }
 
     fn commit(&mut self, mut staged: StagedArtifact) -> Result<ArtifactId, ArtifactError> {

@@ -73,6 +73,46 @@ fn content_ids_are_sha256_of_bytes_and_deduplicate_on_disk() {
 }
 
 #[test]
+fn duplicate_stage_after_teardown_does_not_claim_unreadable_visibility() {
+    let (_base, mut store) = new_store(16, 8);
+
+    store.put(b"abc").expect("fixture content must publish");
+    let staged = store
+        .stage(b"abc")
+        .expect("identical content must stage as a duplicate");
+    store.remove_all();
+
+    assert_eq!(
+        store
+            .commit(staged)
+            .expect_err("a deleted duplicate must not commit as visible")
+            .kind(),
+        ArtifactErrorKind::NotFound
+    );
+}
+
+#[test]
+fn duplicate_stage_commits_to_readable_existing_artifact() {
+    let (_base, mut store) = new_store(16, 8);
+
+    store.put(b"abc").expect("fixture content must publish");
+    let staged = store
+        .stage(b"abc")
+        .expect("identical content must stage as a duplicate");
+    let id = store
+        .commit(staged)
+        .expect("an existing duplicate must remain readable after commit");
+
+    assert_eq!(
+        store
+            .read_page(&id, PageRequest::new(0, nonzero(8)))
+            .expect("a successful duplicate commit must be readable")
+            .bytes(),
+        b"abc"
+    );
+}
+
+#[test]
 fn atomic_put_leaves_no_temp_file_on_success() {
     let (base, mut store) = new_store(16, 8);
     store.put(b"abc").expect("content must be accepted");
