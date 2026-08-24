@@ -161,7 +161,7 @@ enum StagedState {
     /// An empty payload marks content that is already visible with identical
     /// bytes, making the commit a no-op.
     Memory { bytes: Vec<u8> },
-    /// A fully written and synced temporary file awaiting atomic rename.
+    /// A fully written and synced temporary file awaiting atomic no-replace publication.
     File { temporary: PathBuf },
 }
 
@@ -390,7 +390,7 @@ impl ArtifactStore for InMemoryArtifactStore {
 ///
 /// Each stored artifact is one file named by its lowercase hex SHA-256 ID,
 /// so hostile bytes never reach the filesystem path. Writes are atomic
-/// (temp + fsync + rename); retention is metadata kept alongside the store
+/// (temp + fsync + no-replace link); retention is metadata kept alongside the store
 /// and never triggers deletion.
 pub struct FilesystemArtifactStore {
     root: PathBuf,
@@ -483,32 +483,29 @@ impl ArtifactStore for FilesystemArtifactStore {
             return Err(ArtifactError::new(ArtifactErrorKind::ForeignStagedArtifact));
         }
         let id = staged.id.clone();
-        match staged.take_state() {
+        match staged
+            .state
+            .as_ref()
+            .expect("staged artifact state is present")
+        {
             StagedState::File { temporary } => {
-                // Atomic visibility transition after the final authority check.
                 let final_path = self.path_for(&id);
-                match fs::read(&final_path) {
-                    Ok(existing) => {
-                        let staged_bytes = fs::read(&temporary).map_err(Self::storage_error)?;
-                        let _ = fs::remove_file(&temporary);
+                match fs::hard_link(temporary, &final_path) {
+                    Ok(()) => fs::remove_file(temporary).map_err(Self::storage_error)?,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        let existing = fs::read(&final_path).map_err(Self::storage_error)?;
+                        let staged_bytes = fs::read(temporary).map_err(Self::storage_error)?;
                         if existing != staged_bytes {
                             return Err(ArtifactError::new(ArtifactErrorKind::ContentIdCollision));
                         }
+                        fs::remove_file(temporary).map_err(Self::storage_error)?;
                     }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        if let Err(error) = fs::rename(&temporary, &final_path) {
-                            let _ = fs::remove_file(&temporary);
-                            return Err(Self::storage_error(error));
-                        }
-                    }
-                    Err(error) => {
-                        let _ = fs::remove_file(&temporary);
-                        return Err(Self::storage_error(error));
-                    }
+                    Err(error) => return Err(Self::storage_error(error)),
                 }
             }
             StagedState::Memory { .. } => {} // identical content already visible
         }
+        staged.take_state();
 
         self.retention
             .entry(id.clone())

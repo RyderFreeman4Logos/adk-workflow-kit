@@ -254,6 +254,65 @@ fn uncommitted_stage_removes_its_temp_and_leaves_nothing_visible() {
 }
 
 #[test]
+fn late_path_occupant_is_not_replaced_during_commit() {
+    let (base, mut store) = new_store(16, 8);
+    let staged = store.stage(b"abc").expect("content must stage durably");
+    let final_path = base
+        .path()
+        .join("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    std::os::unix::fs::symlink(base.path().join("late-winner"), &final_path)
+        .expect("fixture must occupy the final pathname");
+
+    assert_eq!(
+        store
+            .commit(staged)
+            .expect_err("a late pathname occupant must not be replaced")
+            .kind(),
+        ArtifactErrorKind::NotFound
+    );
+    assert!(fs::symlink_metadata(&final_path)
+        .expect("the late pathname occupant must remain")
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        fs::read_dir(base.path())
+            .expect("store root must be readable")
+            .count(),
+        1,
+        "a failed commit must remove its temporary file"
+    );
+}
+
+#[test]
+fn existing_different_bytes_are_not_replaced_during_commit() {
+    let (base, mut store) = new_store(16, 8);
+    let staged = store.stage(b"abc").expect("content must stage durably");
+    let final_path = base
+        .path()
+        .join("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    fs::write(&final_path, b"late-winner").expect("fixture must publish winner bytes");
+
+    assert_eq!(
+        store
+            .commit(staged)
+            .expect_err("different winner bytes must reject the loser")
+            .kind(),
+        ArtifactErrorKind::ContentIdCollision
+    );
+    assert_eq!(
+        fs::read(&final_path).expect("winner bytes must remain readable"),
+        b"late-winner"
+    );
+    assert_eq!(
+        fs::read_dir(base.path())
+            .expect("store root must be readable")
+            .count(),
+        1,
+        "a rejected commit must remove its temporary file"
+    );
+}
+
+#[test]
 fn commit_is_the_single_atomic_visibility_transition() {
     let (base, mut store) = new_store(16, 8);
 
