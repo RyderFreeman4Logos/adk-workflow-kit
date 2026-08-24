@@ -9,6 +9,12 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod package;
+
+pub use package::{
+    validate_package, PackageArchiveEntry, PackageFile, PackageManifest, PackageValidationError,
+};
+
 /// The only supported review schema version.
 pub const REVIEW_SCHEMA_VERSION_V1: u32 = 1;
 
