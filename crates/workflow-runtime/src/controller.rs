@@ -1,6 +1,6 @@
 use std::{collections::HashMap, time::Duration};
 
-use crate::{RunContext, RunLimitKind, RunLimits, RunOutcome, RunStatus, RunTimeoutKind};
+use crate::{RunContext, RunId, RunLimitKind, RunLimits, RunOutcome, RunStatus, RunTimeoutKind};
 
 /// A fail-closed host-controller error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,6 +81,7 @@ impl ToolCallCleanup {
 pub struct RunTermination {
     cause: RunTerminalCause,
     cleanup: Option<ToolCallCleanup>,
+    source_context: Box<RunContext>,
 }
 
 impl RunTermination {
@@ -93,6 +94,11 @@ impl RunTermination {
     pub fn cleanup(&self) -> Option<&ToolCallCleanup> {
         self.cleanup.as_ref()
     }
+
+    /// Returns the complete controller authority that produced this termination.
+    pub fn source_context(&self) -> &RunContext {
+        &self.source_context
+    }
 }
 
 struct ActiveToolCall {
@@ -102,6 +108,7 @@ struct ActiveToolCall {
 
 /// Synchronous cooperative enforcement for one trusted host run.
 pub struct RunController<'limits> {
+    run_id: &'limits RunId,
     limits: &'limits RunLimits,
     model_turn_count: u64,
     total_tool_call_count: u64,
@@ -117,6 +124,7 @@ impl<'limits> RunController<'limits> {
     /// Starts a controller at elapsed zero using immutable context limits.
     pub fn new(context: &'limits RunContext) -> Self {
         Self {
+            run_id: context.run_id(),
             limits: context.limits(),
             model_turn_count: 0,
             total_tool_call_count: 0,
@@ -132,6 +140,38 @@ impl<'limits> RunController<'limits> {
     /// Checks clocks and deadlines without reporting progress.
     pub fn poll(&mut self, elapsed: Duration) -> Result<(), RunTermination> {
         self.check_boundary(elapsed)
+    }
+
+    /// Binds this controller to the full semantic context value: the exact run
+    /// identity and the complete run-limits ceilings, not a hand-picked subset.
+    pub(crate) fn belongs_to(&self, context: &RunContext) -> bool {
+        self.run_id == context.run_id() && self.limits == context.limits()
+    }
+
+    pub(crate) fn preflight_finish(&mut self, elapsed: Duration) -> Result<(), RunTermination> {
+        self.check_boundary(elapsed)?;
+        if self.active_tool_call.is_some() {
+            return Err(self.terminate(RunTerminalCause::Failed(
+                RunControlError::RunFinishWithActiveToolCall,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Consumes the controller after an identity rejection, preserving the
+    /// exact one-shot active-tool cleanup when a tool call is still active.
+    ///
+    /// Rejection cannot finish the run while a tool call is open, so the
+    /// existing finish-with-active-tool invariant carries the cleanup to the
+    /// host. Returns `None` only when there is no cleanup to preserve.
+    pub(crate) fn into_rejection_termination(mut self) -> Option<RunTermination> {
+        if let Some(cause) = self.terminal_cause {
+            return Some(self.termination(cause, None));
+        }
+        self.active_tool_call.as_ref()?;
+        Some(self.terminate(RunTerminalCause::Failed(
+            RunControlError::RunFinishWithActiveToolCall,
+        )))
     }
 
     /// Admits and charges one model turn before dispatch.
@@ -250,15 +290,24 @@ impl<'limits> RunController<'limits> {
         self.terminate(RunTerminalCause::Cancelled)
     }
 
-    /// Consumes and finishes a healthy run with no active tool call.
+    /// Finishes a healthy run with no active tool call.
+    ///
+    /// Completion consumes controller authority, so contradictory later control is impossible.
+    ///
+    /// ```compile_fail
+    /// use std::{num::NonZeroU64, time::Duration};
+    /// use workflow_runtime::{RunContext, RunController, RunId, RunLimits};
+    /// let one = NonZeroU64::new(1).unwrap();
+    /// let context = RunContext::new(
+    ///     RunId::new(String::from("one-shot")).unwrap(),
+    ///     RunLimits::new(one, one, one, one, one, one, one),
+    /// );
+    /// let mut controller = RunController::new(&context);
+    /// controller.finish(Duration::ZERO).unwrap();
+    /// let _ = controller.request_cancel(Duration::ZERO);
+    /// ```
     pub fn finish(mut self, elapsed: Duration) -> Result<(), RunTermination> {
-        self.check_boundary(elapsed)?;
-        if self.active_tool_call.is_some() {
-            return Err(self.terminate(RunTerminalCause::Failed(
-                RunControlError::RunFinishWithActiveToolCall,
-            )));
-        }
-        Ok(())
+        self.preflight_finish(elapsed)
     }
 
     /// Returns the number of admitted model turns.
@@ -292,10 +341,7 @@ impl<'limits> RunController<'limits> {
 
     fn check_boundary(&mut self, elapsed: Duration) -> Result<(), RunTermination> {
         if let Some(cause) = self.terminal_cause {
-            return Err(RunTermination {
-                cause,
-                cleanup: None,
-            });
+            return Err(self.termination(cause, None));
         }
         if elapsed < self.last_elapsed {
             return Err(self.terminate(RunTerminalCause::Failed(RunControlError::ClockRegressed)));
@@ -344,14 +390,23 @@ impl<'limits> RunController<'limits> {
 
     fn terminate(&mut self, cause: RunTerminalCause) -> RunTermination {
         if let Some(latched) = self.terminal_cause {
-            return RunTermination {
-                cause: latched,
-                cleanup: None,
-            };
+            return self.termination(latched, None);
         }
 
         self.terminal_cause = Some(cause);
         let cleanup = self.active_tool_call.take().map(|active| active.cleanup);
-        RunTermination { cause, cleanup }
+        self.termination(cause, cleanup)
+    }
+
+    fn termination(
+        &self,
+        cause: RunTerminalCause,
+        cleanup: Option<ToolCallCleanup>,
+    ) -> RunTermination {
+        RunTermination {
+            cause,
+            cleanup,
+            source_context: Box::new(RunContext::new(self.run_id.clone(), self.limits.clone())),
+        }
     }
 }

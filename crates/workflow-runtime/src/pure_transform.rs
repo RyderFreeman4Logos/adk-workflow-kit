@@ -2,6 +2,9 @@
 
 use std::fmt;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use serde_json::Value;
 use wasmi::{Config, Engine, Linker, Module, Store, StoreLimitsBuilder, TypedFunc};
 
@@ -12,6 +15,21 @@ use crate::{
 
 const MAX_MEMORY_PAGES: usize = 64;
 const WASM_PAGE_BYTES: usize = 64 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static BACKEND_EXECUTIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_backend_executions() {
+    BACKEND_EXECUTIONS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn backend_executions() -> usize {
+    BACKEND_EXECUTIONS.get()
+}
 
 /// A bounded JSON transform request owned by the backend boundary.
 pub struct PureTransformRequest {
@@ -67,6 +85,9 @@ impl PureTransformBackend {
 
     /// Executes a module using the fixed `(ptr, len) -> (ptr, len)` JSON ABI.
     pub fn execute(&self, request: &PureTransformRequest) -> Result<Value, PureTransformError> {
+        #[cfg(test)]
+        BACKEND_EXECUTIONS.set(BACKEND_EXECUTIONS.get() + 1);
+
         verify_sandbox_capabilities(&request.requested, &self.capabilities)?;
         if request.module.is_empty() {
             return Err(PureTransformError::MissingModule);
