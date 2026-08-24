@@ -5,6 +5,7 @@ mod artifact;
 mod bubblewrap;
 mod controller;
 mod execution;
+mod observability;
 mod policy;
 mod pure_transform;
 mod session;
@@ -28,6 +29,10 @@ pub use controller::{
 pub use execution::{
     PureTransformBinding, PureTransformExecutionError, PureTransformPlanError, PureTransformPlanV1,
     PURE_TRANSFORM_BINDING_ID, PURE_TRANSFORM_BINDING_VERSION, PURE_TRANSFORM_PLAN_VERSION_V1,
+};
+pub use observability::{
+    CallLedgerRecord, EventCounts, ObservabilityError, OtelMapping, RedactedEvent,
+    SensitiveSnapshot, SensitiveSnapshotKind, REDACTION_MARKER,
 };
 pub use policy::{
     evaluate_context_policy, Classification, ContextPolicyDenied, ContextPolicyDeniedKind,
