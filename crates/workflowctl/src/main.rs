@@ -197,6 +197,7 @@ fn read_skill_file(
     const O_CLOEXEC: i32 = 0o2_000_000;
     const O_DIRECTORY: i32 = 0o200_000;
     const O_NOFOLLOW: i32 = 0o400_000;
+    const O_NONBLOCK: i32 = 0o4_000;
 
     unsafe extern "C" {
         fn openat(dirfd: i32, pathname: *const c_char, flags: i32, mode: u32) -> i32;
@@ -216,7 +217,8 @@ fn read_skill_file(
         };
         let name = CString::new(name.as_bytes()).map_err(|_| failure)?;
         let final_component = components.peek().is_none();
-        let flags = O_CLOEXEC | O_NOFOLLOW | if final_component { 0 } else { O_DIRECTORY };
+        let flags =
+            O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | if final_component { 0 } else { O_DIRECTORY };
         let fd = unsafe { openat(directory.as_raw_fd(), name.as_ptr(), flags, 0) };
         if fd < 0 {
             return Err(failure);

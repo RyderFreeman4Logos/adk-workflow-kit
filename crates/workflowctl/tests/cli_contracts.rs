@@ -450,6 +450,40 @@ kind = "agent"
     fs::remove_file(writerless_fifo).expect("writerless FIFO fixture should be removable");
 }
 
+#[cfg(unix)]
+#[test]
+fn skill_fifo_paths_fail_closed_with_typed_diagnostics_without_blocking() {
+    let root = std::env::temp_dir().join(format!(
+        "workflowctl-cli-contract-fifo-skill-{}-{}",
+        std::process::id(),
+        TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).expect("FIFO skill root should be creatable");
+    let fifo = root.join("SKILL.md");
+    let creation = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("FIFO skill fixture should be creatable");
+    assert!(creation.success(), "FIFO skill fixture creation failed");
+
+    for subcommand in ["lint", "test"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+        command.args([
+            "--json",
+            "skill",
+            subcommand,
+            root.to_str().expect("FIFO skill root should be UTF-8"),
+        ]);
+        let failure = output(&mut command);
+        assert_eq!(failure.status.code(), Some(2));
+        assert!(failure.stdout.is_empty());
+        let stderr = String::from_utf8(failure.stderr).expect("diagnostic should be UTF-8");
+        assert!(stderr.contains("\"code\":\"skill.cli.invalid_manifest\""));
+    }
+
+    fs::remove_dir_all(&root).expect("FIFO skill root should be removable");
+}
+
 #[test]
 fn hostile_and_oversized_paths_fail_before_dispatch_without_echo() {
     let hostile = OsString::from("\u{001f}");
