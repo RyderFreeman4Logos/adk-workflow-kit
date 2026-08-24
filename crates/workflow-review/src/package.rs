@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeStruct, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const PACKAGE_SCHEMA_VERSION_V1: u16 = 1;
@@ -58,11 +58,47 @@ impl PackageManifest {
 }
 
 /// One archive entry supplied at the validation boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PackageArchiveEntry<'a> {
     path: &'a str,
     bytes: &'a [u8],
     executable: bool,
+}
+
+impl std::fmt::Debug for PackageArchiveEntry<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PackageArchiveEntry")
+            .field("path", &self.path)
+            .field("length", &self.bytes.len())
+            .field("executable", &self.executable)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for PackageArchiveEntry<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "PackageArchiveEntry(path={:?}, length={}, executable={})",
+            self.path,
+            self.bytes.len(),
+            self.executable
+        )
+    }
+}
+
+impl Serialize for PackageArchiveEntry<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("PackageArchiveEntry", 3)?;
+        state.serialize_field("path", self.path)?;
+        state.serialize_field("length", &self.bytes.len())?;
+        state.serialize_field("executable", &self.executable)?;
+        state.end()
+    }
 }
 
 impl<'a> PackageArchiveEntry<'a> {
@@ -143,8 +179,17 @@ pub fn validate_package(
         }
     }
 
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
         ensure_safe_path(entry.path)?;
+        if entries[..index]
+            .iter()
+            .any(|previous| previous.path == entry.path)
+        {
+            return Err(PackageValidationError::DuplicatePath);
+        }
+    }
+
+    for entry in entries {
         if entry.executable {
             return Err(PackageValidationError::ExecutableFile);
         }

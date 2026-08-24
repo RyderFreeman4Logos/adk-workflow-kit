@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use workflow_review::{
     validate_package, PackageArchiveEntry, PackageFile, PackageManifest, PackageValidationError,
 };
@@ -13,6 +14,13 @@ fn manifest(path: &str) -> PackageManifest {
 
 fn entry<'a>(path: &'a str, bytes: &'a [u8]) -> PackageArchiveEntry<'a> {
     PackageArchiveEntry::new(path, bytes, false)
+}
+
+fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn assert_secret_redacted(error: &PackageValidationError) {
@@ -60,4 +68,37 @@ fn secret_scan_rejects_and_redacts_the_secret_canary() {
 
     assert_eq!(error, PackageValidationError::SecretDetected);
     assert_secret_redacted(&error);
+}
+
+#[test]
+fn archive_entry_diagnostics_redact_content_bytes() {
+    let archive_entry = entry("workflow.toml", CANARY_SECRET_56);
+    let rendered: Vec<String> = vec![
+        format!("{archive_entry:?}"),
+        archive_entry.to_string(),
+        serde_json::to_string(&archive_entry).unwrap(),
+    ];
+
+    for rendered in rendered {
+        assert!(
+            !rendered.contains("CANARY_SECRET_56"),
+            "leaked archive bytes: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn duplicate_archive_paths_are_rejected_before_content_acceptance() {
+    let bytes = b"workflow";
+    let manifest = PackageManifest::new(vec![PackageFile::new(
+        "workflow.toml".into(),
+        digest(bytes),
+    )]);
+    let error = validate_package(
+        &manifest,
+        &[entry("workflow.toml", bytes), entry("workflow.toml", bytes)],
+    )
+    .expect_err("duplicate archive paths must fail closed");
+
+    assert_eq!(error, PackageValidationError::DuplicatePath);
 }
