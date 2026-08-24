@@ -7,6 +7,7 @@
 
 use std::{num::NonZeroU64, time::Duration};
 
+use adk_rust::{Content, Llm, LlmRequest};
 use serde_json::Value;
 use workflow_compiler::ToolRegistry;
 use workflow_runtime::{
@@ -39,8 +40,8 @@ fn context(ceiling: [u64; 7]) -> RunContext {
 
 /// Fixture 1: a host deadline elapses and the run must terminalize as a typed
 /// timeout diagnostic with static text only.
-#[test]
-fn timeout_fixture_fails_closed_with_typed_diagnostic() {
+#[adk_rust::tokio::test]
+async fn timeout_fixture_fails_closed_with_typed_diagnostic() {
     let model = ScriptedLlm::new(Vec::new());
     assert_eq!(
         model
@@ -49,6 +50,16 @@ fn timeout_fixture_fails_closed_with_typed_diagnostic() {
         0
     );
     assert!(model
+        .generate_content(
+            LlmRequest::new(
+                "scripted-llm",
+                vec![Content::new("user").with_text("fixture")],
+            ),
+            false,
+        )
+        .await
+        .is_err());
+    assert!(!model
         .requests()
         .expect("new scripted model request ledger is available")
         .is_empty());
@@ -94,8 +105,8 @@ fn timeout_fixture_fails_closed_with_typed_diagnostic() {
 
 /// Fixture 2: model-turn quota exhaustion must fail closed as a typed
 /// rate-limit diagnostic.
-#[test]
-fn rate_limit_fixture_fails_closed_on_quota_exhaustion() {
+#[adk_rust::tokio::test]
+async fn rate_limit_fixture_fails_closed_on_quota_exhaustion() {
     let model = ScriptedLlm::new(Vec::new());
     assert_eq!(
         model
@@ -104,6 +115,16 @@ fn rate_limit_fixture_fails_closed_on_quota_exhaustion() {
         0
     );
     assert!(model
+        .generate_content(
+            LlmRequest::new(
+                "scripted-llm",
+                vec![Content::new("user").with_text("fixture")],
+            ),
+            false,
+        )
+        .await
+        .is_err());
+    assert!(!model
         .requests()
         .expect("new scripted model request ledger is available")
         .is_empty());
@@ -144,8 +165,8 @@ fn rate_limit_fixture_fails_closed_on_quota_exhaustion() {
 
 /// Fixture 3: malformed tool output must fail closed as a typed invalid-output
 /// diagnostic that never echoes the offending bytes.
-#[test]
-fn invalid_output_fixture_fails_closed_without_echoing_bytes() {
+#[adk_rust::tokio::test]
+async fn invalid_output_fixture_fails_closed_without_echoing_bytes() {
     let model = ScriptedLlm::new(Vec::new());
     assert_eq!(
         model
@@ -154,6 +175,16 @@ fn invalid_output_fixture_fails_closed_without_echoing_bytes() {
         0
     );
     assert!(model
+        .generate_content(
+            LlmRequest::new(
+                "scripted-llm",
+                vec![Content::new("user").with_text("fixture")],
+            ),
+            false,
+        )
+        .await
+        .is_err());
+    assert!(!model
         .requests()
         .expect("new scripted model request ledger is available")
         .is_empty());
@@ -189,8 +220,8 @@ fn invalid_output_fixture_fails_closed_without_echoing_bytes() {
 
 /// Fixture 4: a tool stream that crosses the byte ceiling must fail closed as
 /// a typed output-flood diagnostic carrying only the accepted byte count.
-#[test]
-fn output_flood_fixture_fails_closed_at_byte_ceiling() {
+#[adk_rust::tokio::test]
+async fn output_flood_fixture_fails_closed_at_byte_ceiling() {
     let model = ScriptedLlm::new(Vec::new());
     assert_eq!(
         model
@@ -199,6 +230,16 @@ fn output_flood_fixture_fails_closed_at_byte_ceiling() {
         0
     );
     assert!(model
+        .generate_content(
+            LlmRequest::new(
+                "scripted-llm",
+                vec![Content::new("user").with_text("fixture")],
+            ),
+            false,
+        )
+        .await
+        .is_err());
+    assert!(!model
         .requests()
         .expect("new scripted model request ledger is available")
         .is_empty());
