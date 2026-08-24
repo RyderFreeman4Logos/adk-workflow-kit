@@ -8,12 +8,13 @@
 use std::{num::NonZeroU64, time::Duration};
 
 use serde_json::Value;
+use workflow_compiler::ToolRegistry;
 use workflow_runtime::{
     RunContext, RunController, RunId, RunLimitKind, RunLimits, RunTerminalCause, RunTimeoutKind,
 };
 use workflow_testkit::{
-    inject_invalid_output, inject_output_flood, inject_rate_limit, inject_timeout, FaultDiagnostic,
-    FaultSignal,
+    inject_invalid_output, inject_output_flood, inject_rate_limit, inject_timeout, FakeTool,
+    FakeToolRegistry, FaultDiagnostic, FaultSignal, ScriptedLlm,
 };
 
 /// One relaxed 7-ceiling run limit set; individual ceilings are overridden per fixture.
@@ -40,6 +41,30 @@ fn context(ceiling: [u64; 7]) -> RunContext {
 /// timeout diagnostic with static text only.
 #[test]
 fn timeout_fixture_fails_closed_with_typed_diagnostic() {
+    let model = ScriptedLlm::new(Vec::new());
+    assert_eq!(
+        model
+            .remaining_steps()
+            .expect("new scripted model state is available"),
+        0
+    );
+    assert!(model
+        .requests()
+        .expect("new scripted model request ledger is available")
+        .is_empty());
+    let registry = FakeToolRegistry::new(
+        "fixture-tool",
+        "1",
+        FakeTool::new("fixture-tool", "fault fixture tool", Value::Null),
+    );
+    let resolved = registry
+        .resolve("fixture-tool", "1")
+        .expect("fixture tool resolves by its exact registry identity");
+    assert!(resolved
+        .implementation()
+        .calls()
+        .expect("new fake tool call ledger is available")
+        .is_empty());
     let run_context = context([10, 10, 10, 5, 100, 100, 100]);
     let mut controller = RunController::new(&run_context);
 
@@ -71,6 +96,30 @@ fn timeout_fixture_fails_closed_with_typed_diagnostic() {
 /// rate-limit diagnostic.
 #[test]
 fn rate_limit_fixture_fails_closed_on_quota_exhaustion() {
+    let model = ScriptedLlm::new(Vec::new());
+    assert_eq!(
+        model
+            .remaining_steps()
+            .expect("new scripted model state is available"),
+        0
+    );
+    assert!(model
+        .requests()
+        .expect("new scripted model request ledger is available")
+        .is_empty());
+    let registry = FakeToolRegistry::new(
+        "fixture-tool",
+        "1",
+        FakeTool::new("fixture-tool", "fault fixture tool", Value::Null),
+    );
+    let resolved = registry
+        .resolve("fixture-tool", "1")
+        .expect("fixture tool resolves by its exact registry identity");
+    assert!(resolved
+        .implementation()
+        .calls()
+        .expect("new fake tool call ledger is available")
+        .is_empty());
     let run_context = context([1, 10, 10, 100, 100, 100, 100]);
     let mut controller = RunController::new(&run_context);
     controller
@@ -97,6 +146,36 @@ fn rate_limit_fixture_fails_closed_on_quota_exhaustion() {
 /// diagnostic that never echoes the offending bytes.
 #[test]
 fn invalid_output_fixture_fails_closed_without_echoing_bytes() {
+    let model = ScriptedLlm::new(Vec::new());
+    assert_eq!(
+        model
+            .remaining_steps()
+            .expect("new scripted model state is available"),
+        0
+    );
+    assert!(model
+        .requests()
+        .expect("new scripted model request ledger is available")
+        .is_empty());
+    let registry = FakeToolRegistry::new(
+        "fixture-tool",
+        "1",
+        FakeTool::new("fixture-tool", "fault fixture tool", Value::Null),
+    );
+    let resolved = registry
+        .resolve("fixture-tool", "1")
+        .expect("fixture tool resolves by its exact registry identity");
+    assert!(resolved
+        .implementation()
+        .calls()
+        .expect("new fake tool call ledger is available")
+        .is_empty());
+    let run_context = context([10, 10, 10, 100, 100, 100, 100]);
+    let mut controller = RunController::new(&run_context);
+    controller
+        .admit_model_turn(Duration::ZERO)
+        .expect("fixture turn is admitted under the relaxed quota");
+    assert_eq!(controller.terminal_cause(), None);
     let malformed = br#"{"status":"success","payload":{"value":"SENTINEL_FLOOD_BYTES"}"#;
 
     let diagnostic: FaultDiagnostic = inject_invalid_output::<Value>(malformed, 4096);
@@ -112,6 +191,30 @@ fn invalid_output_fixture_fails_closed_without_echoing_bytes() {
 /// a typed output-flood diagnostic carrying only the accepted byte count.
 #[test]
 fn output_flood_fixture_fails_closed_at_byte_ceiling() {
+    let model = ScriptedLlm::new(Vec::new());
+    assert_eq!(
+        model
+            .remaining_steps()
+            .expect("new scripted model state is available"),
+        0
+    );
+    assert!(model
+        .requests()
+        .expect("new scripted model request ledger is available")
+        .is_empty());
+    let registry = FakeToolRegistry::new(
+        "fixture-tool",
+        "1",
+        FakeTool::new("fixture-tool", "fault fixture tool", Value::Null),
+    );
+    let resolved = registry
+        .resolve("fixture-tool", "1")
+        .expect("fixture tool resolves by its exact registry identity");
+    assert!(resolved
+        .implementation()
+        .calls()
+        .expect("new fake tool call ledger is available")
+        .is_empty());
     let run_context = context([10, 10, 10, 100, 100, 100, 3]);
     let mut controller = RunController::new(&run_context);
     controller
