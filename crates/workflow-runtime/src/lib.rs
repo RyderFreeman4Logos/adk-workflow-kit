@@ -16,7 +16,7 @@ pub use approval::{
 };
 pub use artifact::{
     ArtifactError, ArtifactErrorKind, ArtifactId, ArtifactPage, ArtifactStore,
-    FilesystemArtifactStore, InMemoryArtifactStore, PageRequest, RetentionPolicy,
+    FilesystemArtifactStore, InMemoryArtifactStore, PageRequest, RetentionPolicy, StagedArtifact,
 };
 pub use bubblewrap::{
     BubblewrapError, BubblewrapReceipt, BubblewrapRequest, BubblewrapRequestError,

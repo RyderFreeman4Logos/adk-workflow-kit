@@ -180,6 +180,76 @@ fn hostile_bytes_remain_opaque_and_missing_ids_are_not_found() {
 }
 
 #[test]
+fn uncommitted_stage_removes_its_temp_and_leaves_nothing_visible() {
+    let (base, mut store) = new_store(16, 8);
+
+    let staged = store.stage(b"abc").expect("content must stage durably");
+
+    let before_drop = fs::read_dir(base.path())
+        .expect("store root must be readable")
+        .map(|entry| entry.expect("entry must be readable").file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        before_drop.len(),
+        1,
+        "staging must prepare exactly one non-visible temporary file"
+    );
+    assert!(
+        before_drop
+            .iter()
+            .all(|name| name.to_string_lossy().starts_with('.')),
+        "a staged artifact must not be visible under its final name"
+    );
+
+    drop(staged);
+
+    assert_eq!(
+        fs::read_dir(base.path())
+            .expect("store root must be readable")
+            .count(),
+        0,
+        "dropping an uncommitted staged artifact must remove its temporary file"
+    );
+}
+
+#[test]
+fn commit_is_the_single_atomic_visibility_transition() {
+    let (base, mut store) = new_store(16, 8);
+
+    let staged = store.stage(b"abc").expect("content must stage durably");
+    let id = store
+        .commit(staged)
+        .expect("commit must publish the staged content");
+
+    let entries = fs::read_dir(base.path())
+        .expect("store root must be readable")
+        .map(|entry| entry.expect("entry must be readable").file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries.len(),
+        1,
+        "commit must leave exactly one final artifact file"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|name| name.to_string_lossy().starts_with('.')),
+        "no temporary file may remain after a successful commit"
+    );
+    assert_eq!(
+        id.as_str(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(
+        store
+            .read_page(&id, PageRequest::new(0, nonzero(8)))
+            .expect("committed content must be readable")
+            .bytes(),
+        b"abc"
+    );
+}
+
+#[test]
 fn retention_is_explicit_typed_metadata_not_an_implicit_sweeper() {
     let (_base, mut store) = new_store(16, 8);
     let id = store.put(b"abc").expect("content must be accepted");

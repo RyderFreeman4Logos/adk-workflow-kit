@@ -130,10 +130,72 @@ impl fmt::Display for ArtifactError {
 
 impl std::error::Error for ArtifactError {}
 
+/// A staged artifact whose content is prepared but not yet visible.
+///
+/// Staging performs every bounded validation and all blocking write/fsync
+/// work; committing performs only the atomic visibility transition. Dropping
+/// an uncommitted staged artifact removes any staged filesystem state, so a
+/// run rejected after preparation can never leave a partial or visible
+/// artifact behind.
+#[derive(Debug)]
+pub struct StagedArtifact {
+    id: ArtifactId,
+    state: Option<StagedState>,
+}
+
+#[derive(Debug)]
+enum StagedState {
+    /// Prepared content retained until commit inserts it into a memory store.
+    /// An empty payload marks content that is already visible with identical
+    /// bytes, making the commit a no-op.
+    Memory { bytes: Vec<u8> },
+    /// A fully written and synced temporary file awaiting atomic rename.
+    File { temporary: PathBuf },
+}
+
+impl StagedArtifact {
+    fn new(id: ArtifactId, state: StagedState) -> Self {
+        Self {
+            id,
+            state: Some(state),
+        }
+    }
+
+    fn take_state(&mut self) -> StagedState {
+        self.state
+            .take()
+            .expect("staged artifact state is present exactly once")
+    }
+}
+
+impl Drop for StagedArtifact {
+    fn drop(&mut self) {
+        if let Some(StagedState::File { temporary }) = self.state.take() {
+            let _ = fs::remove_file(temporary);
+        }
+    }
+}
+
 /// Stores and retrieves opaque artifacts with explicit retention metadata.
 pub trait ArtifactStore {
-    /// Stores `bytes` and returns their content identifier.
-    fn put(&mut self, bytes: &[u8]) -> Result<ArtifactId, ArtifactError>;
+    /// Stages `bytes` with all bounded validation and durable preparation,
+    /// without making the content visible to readers.
+    ///
+    /// A returned staged artifact owns its prepared state: dropping it without
+    /// committing removes any staged filesystem path, so a run rejected after
+    /// preparation can never leak a visible artifact.
+    fn stage(&mut self, bytes: &[u8]) -> Result<StagedArtifact, ArtifactError>;
+
+    /// Atomically commits a staged artifact, making exactly one final path
+    /// visible. The staged artifact is consumed exactly once.
+    fn commit(&mut self, staged: StagedArtifact) -> Result<ArtifactId, ArtifactError>;
+
+    /// Stores `bytes` as one stage-then-commit sequence for callers without a
+    /// separate wall-clock authority between preparation and visibility.
+    fn put(&mut self, bytes: &[u8]) -> Result<ArtifactId, ArtifactError> {
+        let staged = self.stage(bytes)?;
+        self.commit(staged)
+    }
 
     /// Reads one bounded page of an artifact.
     fn read_page(
@@ -177,7 +239,7 @@ impl InMemoryArtifactStore {
 }
 
 impl ArtifactStore for InMemoryArtifactStore {
-    fn put(&mut self, bytes: &[u8]) -> Result<ArtifactId, ArtifactError> {
+    fn stage(&mut self, bytes: &[u8]) -> Result<StagedArtifact, ArtifactError> {
         if bytes.is_empty() {
             return Err(ArtifactError::new(ArtifactErrorKind::EmptyContent));
         }
@@ -187,19 +249,36 @@ impl ArtifactStore for InMemoryArtifactStore {
 
         let id = ArtifactId(encode_hex(&Sha256::digest(bytes)));
         match self.entries.get(&id) {
-            Some(entry) if entry.bytes.as_slice() == bytes => Ok(id),
+            Some(entry) if entry.bytes.as_slice() == bytes => Ok(StagedArtifact::new(
+                id,
+                StagedState::Memory { bytes: Vec::new() },
+            )),
             Some(_) => Err(ArtifactError::new(ArtifactErrorKind::ContentIdCollision)),
-            None => {
+            None => Ok(StagedArtifact::new(
+                id,
+                StagedState::Memory {
+                    bytes: bytes.to_vec(),
+                },
+            )),
+        }
+    }
+
+    fn commit(&mut self, mut staged: StagedArtifact) -> Result<ArtifactId, ArtifactError> {
+        let id = staged.id.clone();
+        match staged.take_state() {
+            StagedState::Memory { bytes } if !bytes.is_empty() => {
                 self.entries.insert(
                     id.clone(),
                     Entry {
-                        bytes: bytes.to_vec(),
+                        bytes,
                         retention: RetentionPolicy::Retain,
                     },
                 );
-                Ok(id)
             }
+            StagedState::Memory { .. } => {} // identical content already visible
+            StagedState::File { .. } => unreachable!("memory stores only stage memory state"),
         }
+        Ok(id)
     }
 
     fn read_page(
@@ -306,7 +385,7 @@ impl FilesystemArtifactStore {
 }
 
 impl ArtifactStore for FilesystemArtifactStore {
-    fn put(&mut self, bytes: &[u8]) -> Result<ArtifactId, ArtifactError> {
+    fn stage(&mut self, bytes: &[u8]) -> Result<StagedArtifact, ArtifactError> {
         if bytes.is_empty() {
             return Err(ArtifactError::new(ArtifactErrorKind::EmptyContent));
         }
@@ -321,28 +400,43 @@ impl ArtifactStore for FilesystemArtifactStore {
                 if existing.as_slice() != bytes {
                     return Err(ArtifactError::new(ArtifactErrorKind::ContentIdCollision));
                 }
+                Ok(StagedArtifact::new(
+                    id,
+                    StagedState::Memory { bytes: Vec::new() },
+                ))
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                // Fresh content: atomic write, mirroring workdir.rs publication.
+                // Fresh content: all blocking write/fsync work happens here,
+                // before any final wall-clock authority check.
                 let temporary = self.root.join(format!(".tmp-{}", id.as_str()));
-                let result = (|| {
-                    let mut file = OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o600)
-                        .open(&temporary)
-                        .map_err(Self::storage_error)?;
-                    file.write_all(bytes).map_err(Self::storage_error)?;
-                    file.sync_all().map_err(Self::storage_error)?;
-                    drop(file);
-                    fs::rename(&temporary, &final_path).map_err(Self::storage_error)
-                })();
-                if result.is_err() {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&temporary)
+                    .map_err(Self::storage_error)?;
+                if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
                     let _ = fs::remove_file(&temporary);
+                    return Err(Self::storage_error(error));
                 }
-                result?;
+                Ok(StagedArtifact::new(id, StagedState::File { temporary }))
             }
-            Err(error) => return Err(Self::storage_error(error)),
+            Err(error) => Err(Self::storage_error(error)),
+        }
+    }
+
+    fn commit(&mut self, mut staged: StagedArtifact) -> Result<ArtifactId, ArtifactError> {
+        let id = staged.id.clone();
+        match staged.take_state() {
+            StagedState::File { temporary } => {
+                // Atomic visibility transition after the final authority check.
+                let final_path = self.path_for(&id);
+                if let Err(error) = fs::rename(&temporary, &final_path) {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(Self::storage_error(error));
+                }
+            }
+            StagedState::Memory { .. } => {} // identical content already visible
         }
 
         self.retention

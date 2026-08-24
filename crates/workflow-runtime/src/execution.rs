@@ -176,10 +176,18 @@ impl PureTransformPlanV1 {
         artifacts: &mut S,
     ) -> RunResult<ArtifactId, PureTransformExecutionError> {
         if context.run_id() != workdir.run_id() {
-            return failed(context, PureTransformExecutionError::WorkdirRunMismatch);
+            return identity_failure(
+                context,
+                controller,
+                PureTransformExecutionError::WorkdirRunMismatch,
+            );
         }
-        if !controller.belongs_to(context.run_id()) {
-            return failed(context, PureTransformExecutionError::ControllerRunMismatch);
+        if !controller.belongs_to(context) {
+            return identity_failure(
+                context,
+                controller,
+                PureTransformExecutionError::ControllerRunMismatch,
+            );
         }
 
         if let Err(termination) = controller.preflight_finish(elapsed()) {
@@ -203,11 +211,17 @@ impl PureTransformPlanV1 {
             Ok(_) => return failed(context, PureTransformExecutionError::EmptyOutput),
             Err(_) => return failed(context, PureTransformExecutionError::OutputSerialization),
         };
+        let staged = match artifacts.stage(&output) {
+            Ok(staged) => staged,
+            Err(error) => return failed(context, PureTransformExecutionError::Artifact(error)),
+        };
+        // All blocking write/fsync preparation happened during staging; the
+        // final wall-clock authority check runs before visibility.
         if let Err(termination) = controller.finish(elapsed()) {
             return terminal_failure(context, termination);
         }
 
-        match artifacts.put(&output) {
+        match artifacts.commit(staged) {
             Ok(artifact_id) => RunResult::new(
                 context.run_id().clone(),
                 RunOutcome::Completed {
@@ -216,6 +230,17 @@ impl PureTransformPlanV1 {
             ),
             Err(error) => failed(context, PureTransformExecutionError::Artifact(error)),
         }
+    }
+}
+
+fn identity_failure(
+    context: &RunContext,
+    controller: RunController<'_>,
+    mismatch: PureTransformExecutionError,
+) -> RunResult<ArtifactId, PureTransformExecutionError> {
+    match controller.into_rejection_termination() {
+        Some(termination) => terminal_failure(context, termination),
+        None => failed(context, mismatch),
     }
 }
 
@@ -366,8 +391,9 @@ mod tests {
     use super::*;
     use crate::{
         pure_transform::{backend_executions, reset_backend_executions},
-        ArtifactPage, InMemoryArtifactStore, PageRequest, RetentionPolicy, RunControlError, RunId,
-        RunLimits, RunTerminalCause, RunTimeoutKind, SandboxCapability, WorkdirManager,
+        ArtifactPage, FilesystemArtifactStore, InMemoryArtifactStore, PageRequest, RetentionPolicy,
+        RunControlError, RunId, RunLimits, RunTerminalCause, RunTimeoutKind, SandboxCapability,
+        StagedArtifact, WorkdirManager,
     };
 
     const IDENTITY_WASM: &[u8] = include_bytes!("../tests/fixtures/pure_transform_identity.wasm");
@@ -401,7 +427,7 @@ mod tests {
 
     struct CountingStore {
         inner: InMemoryArtifactStore,
-        puts: usize,
+        commits: usize,
     }
 
     impl CountingStore {
@@ -409,14 +435,23 @@ mod tests {
             let limit = NonZeroU64::new(64 * 1024).expect("positive limit");
             Self {
                 inner: InMemoryArtifactStore::new(limit, limit),
-                puts: 0,
+                commits: 0,
             }
         }
     }
 
     impl ArtifactStore for CountingStore {
+        fn stage(&mut self, bytes: &[u8]) -> Result<StagedArtifact, ArtifactError> {
+            self.inner.stage(bytes)
+        }
+
+        fn commit(&mut self, staged: StagedArtifact) -> Result<ArtifactId, ArtifactError> {
+            self.commits += 1;
+            self.inner.commit(staged)
+        }
+
         fn put(&mut self, bytes: &[u8]) -> Result<ArtifactId, ArtifactError> {
-            self.puts += 1;
+            self.commits += 1;
             self.inner.put(bytes)
         }
 
@@ -442,8 +477,11 @@ mod tests {
     }
 
     fn run(id: &str, wall_ms: u64) -> RunContext {
+        run_with_idle(id, wall_ms, 1_000)
+    }
+
+    fn run_with_idle(id: &str, wall_ms: u64, idle_ms: u64) -> RunContext {
         let one = NonZeroU64::new(1).expect("positive limit");
-        let relaxed = NonZeroU64::new(1_000).expect("positive limit");
         RunContext::new(
             RunId::new(String::from(id)).expect("test run ID must be valid"),
             RunLimits::new(
@@ -451,8 +489,8 @@ mod tests {
                 one,
                 one,
                 NonZeroU64::new(wall_ms).expect("positive wall limit"),
-                relaxed,
-                relaxed,
+                NonZeroU64::new(idle_ms).expect("positive idle limit"),
+                NonZeroU64::new(1_000).expect("positive tool limit"),
                 NonZeroU64::new(64 * 1024).expect("positive output limit"),
             ),
         )
@@ -505,9 +543,247 @@ mod tests {
             ));
             assert_eq!(samples, 0);
             assert_eq!(backend_executions(), 0);
-            assert_eq!(artifacts.puts, 0);
+            assert_eq!(artifacts.commits, 0);
             workdir.cleanup().expect("workdir must clean up");
         }
+    }
+
+    #[test]
+    fn same_run_id_with_differing_complete_limits_is_rejected_before_backend() {
+        // Wall-time and idle-time are independent complete-limit fields; both
+        // must bind controller authority to the full semantic limits value.
+        for (context_wall_ms, controller_wall_ms, context_idle_ms, controller_idle_ms) in
+            [(1, 1_000, 1_000, 1_000), (1_000, 1_000, 1, 1_000)]
+        {
+            let root = TestRoot::new();
+            let manager = root.manager();
+            let context = run_with_idle("shared-run-id", context_wall_ms, context_idle_ms);
+            let controller_context =
+                run_with_idle("shared-run-id", controller_wall_ms, controller_idle_ms);
+            let mut workdir = manager
+                .allocate(context.run_id())
+                .expect("workdir must allocate");
+            let controller = RunController::new(&controller_context);
+            let mut samples = 0;
+            let mut artifacts = CountingStore::new();
+            reset_backend_executions();
+
+            let result = plan(IDENTITY_WASM).execute(
+                &context,
+                controller,
+                || {
+                    samples += 1;
+                    Duration::ZERO
+                },
+                &workdir,
+                &mut artifacts,
+            );
+
+            assert!(
+                matches!(
+                    result.outcome(),
+                    RunOutcome::Failed {
+                        diagnostic: PureTransformExecutionError::ControllerRunMismatch
+                    }
+                ),
+                "a permissive controller must not serve a restrictive context with the same run ID"
+            );
+            assert_eq!(samples, 0);
+            assert_eq!(backend_executions(), 0);
+            assert_eq!(artifacts.commits, 0);
+            workdir.cleanup().expect("workdir must clean up");
+        }
+    }
+
+    #[test]
+    fn workdir_mismatch_with_active_tool_retains_exact_one_shot_cleanup() {
+        let root = TestRoot::new();
+        let manager = root.manager();
+        let context = run("workdir-mismatch-active", 1_000);
+        let other_run = run("workdir-other-run", 1_000);
+        let mut workdir = manager
+            .allocate(other_run.run_id())
+            .expect("workdir for another run must allocate");
+        let mut controller = RunController::new(&context);
+        controller
+            .begin_tool_call(Duration::ZERO, "exact-tool", "7")
+            .expect("tool call must begin");
+        let mut artifacts = CountingStore::new();
+        reset_backend_executions();
+
+        let result = plan(IDENTITY_WASM).execute(
+            &context,
+            controller,
+            || Duration::ZERO,
+            &workdir,
+            &mut artifacts,
+        );
+
+        let termination = match result.outcome() {
+            RunOutcome::Failed {
+                diagnostic: PureTransformExecutionError::ControllerTermination(termination),
+            } => termination,
+            other => panic!(
+                "workdir mismatch with an active tool must carry its termination, got {other:?}"
+            ),
+        };
+        assert_eq!(
+            termination.cause(),
+            RunTerminalCause::Failed(RunControlError::RunFinishWithActiveToolCall)
+        );
+        let cleanup = termination
+            .cleanup()
+            .expect("exactly one cleanup authority");
+        assert_eq!(cleanup.exact_tool_id(), "exact-tool");
+        assert_eq!(cleanup.exact_version(), "7");
+        assert_eq!(backend_executions(), 0);
+        assert_eq!(artifacts.commits, 0);
+        workdir.cleanup().expect("workdir must clean up");
+    }
+
+    #[test]
+    fn controller_mismatch_with_active_tool_retains_exact_one_shot_cleanup() {
+        // Both controller-identity mismatch flavors must preserve the cleanup:
+        // a different run ID, and the R3-F1 complete-limits mismatch.
+        for (context_id, controller_id, context_wall_ms, controller_wall_ms) in [
+            (
+                "controller-mismatch-a",
+                "controller-mismatch-b",
+                1_000,
+                1_000,
+            ),
+            ("limits-mismatch", "limits-mismatch", 1, 1_000),
+        ] {
+            let root = TestRoot::new();
+            let manager = root.manager();
+            let context = run(context_id, context_wall_ms);
+            let controller_context = run(controller_id, controller_wall_ms);
+            let mut workdir = manager
+                .allocate(context.run_id())
+                .expect("workdir must allocate");
+            let mut controller = RunController::new(&controller_context);
+            controller
+                .begin_tool_call(Duration::ZERO, "exact-tool", "7")
+                .expect("tool call must begin");
+            let mut artifacts = CountingStore::new();
+            reset_backend_executions();
+
+            let result = plan(IDENTITY_WASM).execute(
+                &context,
+                controller,
+                || Duration::ZERO,
+                &workdir,
+                &mut artifacts,
+            );
+
+            let termination = match result.outcome() {
+                RunOutcome::Failed {
+                    diagnostic: PureTransformExecutionError::ControllerTermination(termination),
+                } => termination,
+                other => panic!(
+                    "controller mismatch with an active tool must carry its termination, got {other:?}"
+                ),
+            };
+            assert_eq!(
+                termination.cause(),
+                RunTerminalCause::Failed(RunControlError::RunFinishWithActiveToolCall)
+            );
+            let cleanup = termination
+                .cleanup()
+                .expect("exactly one cleanup authority");
+            assert_eq!(cleanup.exact_tool_id(), "exact-tool");
+            assert_eq!(cleanup.exact_version(), "7");
+            assert_eq!(backend_executions(), 0);
+            assert_eq!(artifacts.commits, 0);
+            workdir.cleanup().expect("workdir must clean up");
+        }
+    }
+
+    #[test]
+    fn delayed_artifact_preparation_cannot_publish_after_wall_deadline() {
+        let root = TestRoot::new();
+        let manager = root.manager();
+        let context = run("delayed-artifact-store", 1);
+        let mut workdir = manager
+            .allocate(context.run_id())
+            .expect("workdir must allocate");
+        let clock = AtomicU64::new(0);
+
+        struct ClockStore<'a> {
+            inner: FilesystemArtifactStore,
+            clock: &'a AtomicU64,
+        }
+
+        impl ArtifactStore for ClockStore<'_> {
+            fn stage(&mut self, bytes: &[u8]) -> Result<StagedArtifact, ArtifactError> {
+                // Durable preparation advances the wall clock past the ceiling.
+                self.clock.fetch_add(1, Ordering::Relaxed);
+                self.inner.stage(bytes)
+            }
+
+            fn commit(&mut self, staged: StagedArtifact) -> Result<ArtifactId, ArtifactError> {
+                self.inner.commit(staged)
+            }
+
+            fn read_page(
+                &self,
+                id: &ArtifactId,
+                request: PageRequest,
+            ) -> Result<ArtifactPage, ArtifactError> {
+                self.inner.read_page(id, request)
+            }
+
+            fn set_retention(
+                &mut self,
+                id: &ArtifactId,
+                policy: RetentionPolicy,
+            ) -> Result<(), ArtifactError> {
+                self.inner.set_retention(id, policy)
+            }
+
+            fn retention(&self, id: &ArtifactId) -> Result<RetentionPolicy, ArtifactError> {
+                self.inner.retention(id)
+            }
+        }
+
+        let store_root = root.0.join("artifacts");
+        let mut artifacts = ClockStore {
+            inner: FilesystemArtifactStore::new(
+                &store_root,
+                NonZeroU64::new(64 * 1024).expect("positive content limit"),
+                NonZeroU64::new(64 * 1024).expect("positive page limit"),
+            ),
+            clock: &clock,
+        };
+        reset_backend_executions();
+
+        let result = plan(IDENTITY_WASM).execute(
+            &context,
+            RunController::new(&context),
+            || Duration::from_millis(clock.load(Ordering::Relaxed)),
+            &workdir,
+            &mut artifacts,
+        );
+
+        assert!(
+            matches!(
+                result.outcome(),
+                RunOutcome::TimedOut {
+                    timeout: RunTimeoutKind::WallTime,
+                    ..
+                }
+            ),
+            "artifact preparation that crosses the wall deadline must not complete"
+        );
+        assert_eq!(backend_executions(), 1);
+        assert_eq!(
+            fs::read_dir(&store_root)
+                .expect("store root must be readable")
+                .count(),
+            0,
+            "no artifact may become visible after the wall deadline"
+        );
+        workdir.cleanup().expect("workdir must clean up");
     }
 
     #[test]
@@ -547,7 +823,7 @@ mod tests {
         assert_eq!(cleanup.exact_tool_id(), "exact-tool");
         assert_eq!(cleanup.exact_version(), "7");
         assert_eq!(backend_executions(), 0);
-        assert_eq!(artifacts.puts, 0);
+        assert_eq!(artifacts.commits, 0);
         workdir.cleanup().expect("workdir must clean up");
     }
 
@@ -586,7 +862,7 @@ mod tests {
             RunOutcome::Cancelled { .. }
         ));
         assert_eq!(backend_executions(), 0);
-        assert_eq!(artifacts.puts, 0);
+        assert_eq!(artifacts.commits, 0);
 
         let timed_out_run = run("pre-timeout", 1);
         let mut timed_out_workdir = manager
@@ -609,7 +885,7 @@ mod tests {
             }
         ));
         assert_eq!(backend_executions(), 0);
-        assert_eq!(artifacts.puts, 0);
+        assert_eq!(artifacts.commits, 0);
 
         let post_run = run("post-timeout", 1);
         let mut post_workdir = manager
@@ -633,7 +909,7 @@ mod tests {
             }
         ));
         assert_eq!(backend_executions(), 1);
-        assert_eq!(artifacts.puts, 0);
+        assert_eq!(artifacts.commits, 0);
 
         cancelled_workdir.cleanup().expect("workdir must clean up");
         timed_out_workdir.cleanup().expect("workdir must clean up");

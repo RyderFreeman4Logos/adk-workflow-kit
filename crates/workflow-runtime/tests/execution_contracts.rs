@@ -8,10 +8,11 @@ use std::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use workflow_runtime::{
-    ArtifactError, ArtifactId, ArtifactPage, ArtifactStore, FilesystemArtifactStore, PageRequest,
-    PureTransformBinding, PureTransformExecutionError, PureTransformPlanError, PureTransformPlanV1,
-    RequestedCapabilities, RetentionPolicy, RunContext, RunController, RunId, RunLimits,
-    RunOutcome, RunTerminalCause, RunTimeoutKind, SandboxCapability, WorkdirManager,
+    ArtifactError, ArtifactId, ArtifactPage, ArtifactStore, FilesystemArtifactStore,
+    InMemoryArtifactStore, PageRequest, PureTransformBinding, PureTransformExecutionError,
+    PureTransformPlanError, PureTransformPlanV1, RequestedCapabilities, RetentionPolicy,
+    RunContext, RunController, RunId, RunLimits, RunOutcome, RunTerminalCause, RunTimeoutKind,
+    SandboxCapability, StagedArtifact, WorkdirManager,
 };
 
 const IDENTITY_WASM: &[u8] = include_bytes!("fixtures/pure_transform_identity.wasm");
@@ -70,12 +71,29 @@ fn context() -> RunContext {
 }
 
 struct RecordingStore {
-    put_calls: usize,
+    inner: InMemoryArtifactStore,
+    commit_calls: usize,
+}
+
+impl RecordingStore {
+    fn new() -> Self {
+        let limit = NonZeroU64::new(64 * 1024).expect("positive limit");
+        Self {
+            inner: InMemoryArtifactStore::new(limit, limit),
+            commit_calls: 0,
+        }
+    }
 }
 
 impl ArtifactStore for RecordingStore {
-    fn put(&mut self, _bytes: &[u8]) -> Result<ArtifactId, ArtifactError> {
-        self.put_calls += 1;
+    fn stage(&mut self, bytes: &[u8]) -> Result<StagedArtifact, ArtifactError> {
+        // Preparation may occur before a terminal authority check, but it must
+        // never become visible: commit below is the publication sentinel.
+        self.inner.stage(bytes)
+    }
+
+    fn commit(&mut self, _staged: StagedArtifact) -> Result<ArtifactId, ArtifactError> {
+        self.commit_calls += 1;
         panic!("terminal execution must not publish artifacts");
     }
 
@@ -368,7 +386,7 @@ fn mismatched_workdir_returns_typed_failure_without_putting_artifacts() {
     )
     .expect("fixture plan must be valid");
     let controller = RunController::new(&run);
-    let mut artifacts = RecordingStore { put_calls: 0 };
+    let mut artifacts = RecordingStore::new();
 
     let result = plan.execute(
         &run,
@@ -384,7 +402,7 @@ fn mismatched_workdir_returns_typed_failure_without_putting_artifacts() {
             diagnostic: PureTransformExecutionError::WorkdirRunMismatch
         }
     ));
-    assert_eq!(artifacts.put_calls, 0);
+    assert_eq!(artifacts.commit_calls, 0);
     workdir.cleanup().expect("test workdir must clean up");
 }
 
@@ -406,7 +424,7 @@ fn controller_terminal_outcomes_prevent_artifact_publication() {
     .expect("fixture plan must be valid");
     let mut cancelled = RunController::new(&run);
     let _ = cancelled.request_cancel(std::time::Duration::ZERO);
-    let mut artifacts = RecordingStore { put_calls: 0 };
+    let mut artifacts = RecordingStore::new();
 
     let cancelled_result = plan.execute(
         &run,
@@ -422,7 +440,7 @@ fn controller_terminal_outcomes_prevent_artifact_publication() {
         } => assert_eq!(termination.cause(), RunTerminalCause::Cancelled),
         other => panic!("cancelled controller must remain typed, got {other:?}"),
     }
-    assert_eq!(artifacts.put_calls, 0);
+    assert_eq!(artifacts.commit_calls, 0);
 
     let timeout_run = RunContext::new(
         RunId::new(String::from("elapsed-timeout")).expect("run ID must be valid"),
@@ -467,7 +485,7 @@ fn controller_terminal_outcomes_prevent_artifact_publication() {
         ),
         other => panic!("timed-out controller must remain typed, got {other:?}"),
     }
-    assert_eq!(artifacts.put_calls, 0);
+    assert_eq!(artifacts.commit_calls, 0);
     workdir.cleanup().expect("test workdir must clean up");
     timeout_workdir
         .cleanup()

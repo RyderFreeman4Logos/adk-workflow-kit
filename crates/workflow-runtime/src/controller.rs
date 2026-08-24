@@ -136,8 +136,10 @@ impl<'limits> RunController<'limits> {
         self.check_boundary(elapsed)
     }
 
-    pub(crate) fn belongs_to(&self, run_id: &RunId) -> bool {
-        self.run_id == run_id
+    /// Binds this controller to the full semantic context value: the exact run
+    /// identity and the complete run-limits ceilings, not a hand-picked subset.
+    pub(crate) fn belongs_to(&self, context: &RunContext) -> bool {
+        self.run_id == context.run_id() && self.limits == context.limits()
     }
 
     pub(crate) fn preflight_finish(&mut self, elapsed: Duration) -> Result<(), RunTermination> {
@@ -148,6 +150,19 @@ impl<'limits> RunController<'limits> {
             )));
         }
         Ok(())
+    }
+
+    /// Consumes the controller after an identity rejection, preserving the
+    /// exact one-shot active-tool cleanup when a tool call is still active.
+    ///
+    /// Rejection cannot finish the run while a tool call is open, so the
+    /// existing finish-with-active-tool invariant carries the cleanup to the
+    /// host. Returns `None` only when there is no cleanup to preserve.
+    pub(crate) fn into_rejection_termination(mut self) -> Option<RunTermination> {
+        self.active_tool_call.as_ref()?;
+        Some(self.terminate(RunTerminalCause::Failed(
+            RunControlError::RunFinishWithActiveToolCall,
+        )))
     }
 
     /// Admits and charges one model turn before dispatch.
