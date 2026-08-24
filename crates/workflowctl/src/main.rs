@@ -245,28 +245,13 @@ fn read_skill_file(
     Err(failure)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn read_skill_file(
-    root: &Path,
-    relative_path: &str,
+    _root: &Path,
+    _relative_path: &str,
     failure: SkillValidationFailure,
 ) -> Result<Vec<u8>, SkillValidationFailure> {
-    let mut path = root.to_path_buf();
-    for component in Path::new(relative_path).components() {
-        let Path::Component::Normal(name) = component else {
-            return Err(failure);
-        };
-        path.push(name);
-        if std::fs::symlink_metadata(&path)
-            .map_err(|_| failure)?
-            .file_type()
-            .is_symlink()
-        {
-            return Err(failure);
-        }
-    }
-    read_bounded_regular_file(&SourcePath::from(path.as_path()), MAX_SKILL_FILE_BYTES)
-        .map_err(|_| failure)
+    Err(failure)
 }
 
 fn validate_skill_manifest(
@@ -704,9 +689,17 @@ mod tests {
     }
 
     #[test]
-    fn skill_file_open_helper_is_linux_only() {
+    fn skill_file_open_helper_is_linux_only_and_non_linux_fails_closed() {
         let source = include_str!("main.rs");
         assert!(source.contains("#[cfg(target_os = \"linux\")]\nfn read_skill_file("));
-        assert!(!source.contains("#[cfg(unix)]\nfn read_skill_file("));
+        let non_linux = source
+            .split("#[cfg(not(target_os = \"linux\"))]\nfn read_skill_file(")
+            .nth(1)
+            .and_then(|source| source.split("\n}\n\nfn validate_skill_manifest").next())
+            .expect("non-Linux skill-file helper");
+        assert!(!source.contains("#[cfg(not(unix))]\nfn read_skill_file("));
+        assert!(!non_linux.contains("fs::read"));
+        assert!(!non_linux.contains("File::open"));
+        assert!(!non_linux.contains("join("));
     }
 }
