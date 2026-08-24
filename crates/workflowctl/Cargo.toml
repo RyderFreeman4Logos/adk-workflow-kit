@@ -8,4 +8,7 @@ license.workspace = true
 [dependencies]
 clap.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 workflow-compiler = { path = "../workflow-compiler" }
+workflow-ir = { path = "../workflow-ir" }
+workflow-runtime = { path = "../workflow-runtime" }
