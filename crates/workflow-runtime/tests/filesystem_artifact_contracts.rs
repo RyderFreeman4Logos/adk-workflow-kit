@@ -6,7 +6,8 @@ use std::{
 };
 
 use workflow_runtime::{
-    ArtifactErrorKind, ArtifactStore, FilesystemArtifactStore, PageRequest, RetentionPolicy,
+    ArtifactErrorKind, ArtifactStore, FilesystemArtifactStore, InMemoryArtifactStore, PageRequest,
+    RetentionPolicy,
 };
 
 static NEXT_BASE: AtomicU64 = AtomicU64::new(0);
@@ -277,5 +278,124 @@ fn retention_is_explicit_typed_metadata_not_an_implicit_sweeper() {
             .retention(&id)
             .expect("retention metadata must be readable"),
         expired
+    );
+}
+
+#[test]
+fn staged_artifact_debug_redacts_content_and_temporary_paths() {
+    let limit = nonzero(64);
+    let mut memory = InMemoryArtifactStore::new(limit, limit);
+    let memory_debug = format!(
+        "{:?}",
+        memory
+            .stage(b"memory-content-poison")
+            .expect("memory content must stage")
+    );
+    assert!(!memory_debug.contains("memory-content-poison"));
+    assert!(memory_debug.contains("memory"));
+    assert!(memory_debug.contains("byte_len"));
+
+    let base = TestBase::new();
+    let root = base.path().join("temporary-path-poison");
+    let mut filesystem = FilesystemArtifactStore::new(&root, limit, limit);
+    let file_debug = format!(
+        "{:?}",
+        filesystem
+            .stage(b"file-content-poison")
+            .expect("file content must stage")
+    );
+    assert!(!file_debug.contains("file-content-poison"));
+    assert!(!file_debug.contains("temporary-path-poison"));
+    assert!(file_debug.contains("file"));
+    assert!(file_debug.contains("byte_len"));
+}
+
+#[test]
+fn foreign_staged_artifacts_are_rejected_before_visibility_or_cross_root_moves() {
+    let limit = nonzero(16);
+    let mut memory_a = InMemoryArtifactStore::new(limit, limit);
+    let mut memory_b = InMemoryArtifactStore::new(nonzero(3), limit);
+    let memory_token = memory_a.stage(b"four").expect("A must stage permissively");
+    assert_eq!(
+        memory_b
+            .commit(memory_token)
+            .expect_err("B must reject A's token")
+            .kind(),
+        ArtifactErrorKind::ForeignStagedArtifact
+    );
+
+    let file_a_base = TestBase::new();
+    let file_b_base = TestBase::new();
+    let mut file_a = FilesystemArtifactStore::new(file_a_base.path(), limit, limit);
+    let mut file_b = FilesystemArtifactStore::new(file_b_base.path(), limit, limit);
+    let file_token = file_a
+        .stage(b"file-poison")
+        .expect("A must stage a temp file");
+    assert_eq!(fs::read_dir(file_a_base.path()).expect("A root").count(), 1);
+    assert_eq!(fs::read_dir(file_b_base.path()).expect("B root").count(), 0);
+    assert_eq!(
+        file_b
+            .commit(file_token)
+            .expect_err("B must not rename A's temp file")
+            .kind(),
+        ArtifactErrorKind::ForeignStagedArtifact
+    );
+    assert_eq!(fs::read_dir(file_a_base.path()).expect("A root").count(), 0);
+    assert_eq!(fs::read_dir(file_b_base.path()).expect("B root").count(), 0);
+
+    let file_token = file_a.stage(b"restage").expect("A must stage");
+    assert_eq!(
+        memory_b
+            .commit(file_token)
+            .expect_err("memory must reject a file token without panicking")
+            .kind(),
+        ArtifactErrorKind::ForeignStagedArtifact
+    );
+    assert_eq!(fs::read_dir(file_a_base.path()).expect("A root").count(), 0);
+    let restaged = file_a
+        .stage(b"restage")
+        .expect("drop must permit restaging");
+    drop(restaged);
+
+    let file_token = memory_a.stage(b"memory-poison").expect("A must stage");
+    assert_eq!(
+        file_b
+            .commit(file_token)
+            .expect_err("filesystem must not claim foreign memory visibility")
+            .kind(),
+        ArtifactErrorKind::ForeignStagedArtifact
+    );
+    assert_eq!(fs::read_dir(file_b_base.path()).expect("B root").count(), 0);
+
+    let duplicate_id = memory_a.put(b"duplicate").expect("A must publish once");
+    let duplicate = memory_a
+        .stage(b"duplicate")
+        .expect("A must mint a duplicate token");
+    let mut memory_c = InMemoryArtifactStore::new(limit, limit);
+    assert_eq!(
+        memory_c
+            .commit(duplicate)
+            .expect_err("foreign duplicate must not claim visibility")
+            .kind(),
+        ArtifactErrorKind::ForeignStagedArtifact
+    );
+    assert_eq!(
+        memory_c
+            .read_page(&duplicate_id, PageRequest::new(0, nonzero(16)))
+            .expect_err("foreign duplicate must remain absent")
+            .kind(),
+        ArtifactErrorKind::NotFound
+    );
+
+    let staged = memory_a.stage(b"same-instance").expect("A must stage");
+    let id = memory_a
+        .commit(staged)
+        .expect("owner must commit its token");
+    assert_eq!(
+        memory_a
+            .read_page(&id, PageRequest::new(0, nonzero(16)))
+            .expect("owner content must remain readable")
+            .bytes(),
+        b"same-instance"
     );
 }

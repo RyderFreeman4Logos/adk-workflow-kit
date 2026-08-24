@@ -373,7 +373,9 @@ fn map_artifact_error(kind: workflow_runtime::ArtifactError) -> SkillResourceErr
         ArtifactErrorKind::ContentTooLarge => SkillResourceError::PayloadTooLarge,
         ArtifactErrorKind::PageOutOfBounds => SkillResourceError::PageOutOfBounds,
         ArtifactErrorKind::NotFound => SkillResourceError::ResourceNotFound,
-        ArtifactErrorKind::ContentIdCollision => SkillResourceError::ContentIdentityFailure,
+        ArtifactErrorKind::ContentIdCollision | ArtifactErrorKind::ForeignStagedArtifact => {
+            SkillResourceError::ContentIdentityFailure
+        }
         ArtifactErrorKind::Io => SkillResourceError::Io,
     }
 }

@@ -6,12 +6,20 @@ use std::{
     num::NonZeroU64,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::SystemTime,
 };
 
 use sha2::{Digest, Sha256};
 
 use crate::encode_hex;
+
+static NEXT_CAPABILITY: AtomicU64 = AtomicU64::new(1);
+
+fn next_capability() -> NonZeroU64 {
+    NonZeroU64::new(NEXT_CAPABILITY.fetch_add(1, Ordering::Relaxed))
+        .expect("artifact instance capability must not wrap")
+}
 
 /// An opaque content identifier derived from stored bytes.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -96,6 +104,8 @@ pub enum ArtifactErrorKind {
     ContentIdCollision,
     /// The underlying storage failed while reading or writing content.
     Io,
+    /// A staged artifact was minted by a different storage instance.
+    ForeignStagedArtifact,
 }
 
 /// A categorized artifact failure with a privacy-safe message.
@@ -124,6 +134,9 @@ impl fmt::Display for ArtifactError {
             ArtifactErrorKind::NotFound => "artifact was not found",
             ArtifactErrorKind::ContentIdCollision => "artifact content ID collision",
             ArtifactErrorKind::Io => "storage I/O error",
+            ArtifactErrorKind::ForeignStagedArtifact => {
+                "staged artifact belongs to a different storage instance"
+            }
         })
     }
 }
@@ -137,13 +150,12 @@ impl std::error::Error for ArtifactError {}
 /// an uncommitted staged artifact removes any staged filesystem state, so a
 /// run rejected after preparation can never leave a partial or visible
 /// artifact behind.
-#[derive(Debug)]
 pub struct StagedArtifact {
     id: ArtifactId,
     state: Option<StagedState>,
+    capability: NonZeroU64,
 }
 
-#[derive(Debug)]
 enum StagedState {
     /// Prepared content retained until commit inserts it into a memory store.
     /// An empty payload marks content that is already visible with identical
@@ -154,17 +166,43 @@ enum StagedState {
 }
 
 impl StagedArtifact {
-    fn new(id: ArtifactId, state: StagedState) -> Self {
+    fn new(id: ArtifactId, state: StagedState, capability: NonZeroU64) -> Self {
         Self {
             id,
             state: Some(state),
+            capability,
         }
+    }
+
+    fn belongs_to(&self, capability: NonZeroU64) -> bool {
+        self.capability == capability
     }
 
     fn take_state(&mut self) -> StagedState {
         self.state
             .take()
             .expect("staged artifact state is present exactly once")
+    }
+}
+
+impl fmt::Debug for StagedArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (state, byte_len) = match self.state.as_ref() {
+            Some(StagedState::Memory { bytes }) => ("memory", bytes.len()),
+            Some(StagedState::File { temporary }) => (
+                "file",
+                fs::metadata(temporary)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0) as usize,
+            ),
+            None => ("consumed", 0),
+        };
+        formatter
+            .debug_struct("StagedArtifact")
+            .field("id", &self.id)
+            .field("state", &state)
+            .field("byte_len", &byte_len)
+            .finish()
     }
 }
 
@@ -225,6 +263,7 @@ pub struct InMemoryArtifactStore {
     entries: HashMap<ArtifactId, Entry>,
     max_content_bytes: NonZeroU64,
     max_page_bytes: NonZeroU64,
+    capability: NonZeroU64,
 }
 
 impl InMemoryArtifactStore {
@@ -234,6 +273,7 @@ impl InMemoryArtifactStore {
             entries: HashMap::new(),
             max_content_bytes,
             max_page_bytes,
+            capability: next_capability(),
         }
     }
 }
@@ -252,6 +292,7 @@ impl ArtifactStore for InMemoryArtifactStore {
             Some(entry) if entry.bytes.as_slice() == bytes => Ok(StagedArtifact::new(
                 id,
                 StagedState::Memory { bytes: Vec::new() },
+                self.capability,
             )),
             Some(_) => Err(ArtifactError::new(ArtifactErrorKind::ContentIdCollision)),
             None => Ok(StagedArtifact::new(
@@ -259,11 +300,15 @@ impl ArtifactStore for InMemoryArtifactStore {
                 StagedState::Memory {
                     bytes: bytes.to_vec(),
                 },
+                self.capability,
             )),
         }
     }
 
     fn commit(&mut self, mut staged: StagedArtifact) -> Result<ArtifactId, ArtifactError> {
+        if !staged.belongs_to(self.capability) {
+            return Err(ArtifactError::new(ArtifactErrorKind::ForeignStagedArtifact));
+        }
         let id = staged.id.clone();
         match staged.take_state() {
             StagedState::Memory { bytes } if !bytes.is_empty() => {
@@ -348,6 +393,7 @@ pub struct FilesystemArtifactStore {
     retention: HashMap<ArtifactId, RetentionPolicy>,
     max_content_bytes: NonZeroU64,
     max_page_bytes: NonZeroU64,
+    capability: NonZeroU64,
 }
 
 impl FilesystemArtifactStore {
@@ -363,6 +409,7 @@ impl FilesystemArtifactStore {
             retention: HashMap::new(),
             max_content_bytes,
             max_page_bytes,
+            capability: next_capability(),
         }
     }
 
@@ -403,6 +450,7 @@ impl ArtifactStore for FilesystemArtifactStore {
                 Ok(StagedArtifact::new(
                     id,
                     StagedState::Memory { bytes: Vec::new() },
+                    self.capability,
                 ))
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -419,13 +467,20 @@ impl ArtifactStore for FilesystemArtifactStore {
                     let _ = fs::remove_file(&temporary);
                     return Err(Self::storage_error(error));
                 }
-                Ok(StagedArtifact::new(id, StagedState::File { temporary }))
+                Ok(StagedArtifact::new(
+                    id,
+                    StagedState::File { temporary },
+                    self.capability,
+                ))
             }
             Err(error) => Err(Self::storage_error(error)),
         }
     }
 
     fn commit(&mut self, mut staged: StagedArtifact) -> Result<ArtifactId, ArtifactError> {
+        if !staged.belongs_to(self.capability) {
+            return Err(ArtifactError::new(ArtifactErrorKind::ForeignStagedArtifact));
+        }
         let id = staged.id.clone();
         match staged.take_state() {
             StagedState::File { temporary } => {
