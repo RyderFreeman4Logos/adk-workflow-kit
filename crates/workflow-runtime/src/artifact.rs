@@ -407,14 +407,24 @@ impl FilesystemArtifactStore {
         max_content_bytes: NonZeroU64,
         max_page_bytes: NonZeroU64,
     ) -> Self {
-        fs::create_dir_all(root.as_ref()).expect("configured store root must be created");
-        Self {
+        Self::try_new(root, max_content_bytes, max_page_bytes)
+            .expect("configured store root must be created")
+    }
+
+    /// Fallibly creates an empty store rooted at `root`, creating the directory if needed.
+    pub fn try_new(
+        root: impl AsRef<Path>,
+        max_content_bytes: NonZeroU64,
+        max_page_bytes: NonZeroU64,
+    ) -> Result<Self, ArtifactError> {
+        fs::create_dir_all(root.as_ref()).map_err(|_| ArtifactError::new(ArtifactErrorKind::Io))?;
+        Ok(Self {
             root: root.as_ref().to_path_buf(),
             retention: HashMap::new(),
             max_content_bytes,
             max_page_bytes,
             capability: next_capability(),
-        }
+        })
     }
 
     /// Removes the entire store directory; later reads become `NotFound`.

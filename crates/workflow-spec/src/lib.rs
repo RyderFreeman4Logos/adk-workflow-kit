@@ -603,6 +603,17 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<WorkflowSpec, SpecError> {
 }
 
 fn read_source_file(source: &SourcePath) -> Result<Vec<u8>, SpecError> {
+    read_bounded_regular_file(source, MAX_SOURCE_BYTES)
+}
+
+/// Reads at most `max_bytes` from a regular file without blocking on special files.
+///
+/// The read is capped at `max_bytes + 1` so oversized content is detected and
+/// rejected without unbounded allocation.
+pub fn read_bounded_regular_file(
+    source: &SourcePath,
+    max_bytes: usize,
+) -> Result<Vec<u8>, SpecError> {
     #[cfg(target_os = "linux")]
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -623,21 +634,21 @@ fn read_source_file(source: &SourcePath) -> Result<Vec<u8>, SpecError> {
             source,
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "workflow source is not a regular file",
+                "input file is not a regular file",
             ),
         ));
     }
 
     let mut bytes = Vec::new();
-    file.take((MAX_SOURCE_BYTES + 1) as u64)
+    file.take((max_bytes + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| source_read_error(source, error))?;
-    if bytes.len() > MAX_SOURCE_BYTES {
+    if bytes.len() > max_bytes {
         return Err(source_read_error(
             source,
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "workflow source exceeds the byte limit",
+                "input file exceeds the byte limit",
             ),
         ));
     }

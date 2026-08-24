@@ -5,9 +5,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use workflow_compiler::{compile_file, render_mermaid, Diagnostic, WorkflowLock};
 use workflow_runtime::{
-    FilesystemArtifactStore, PureTransformBinding, PureTransformPlanV1, RequestedCapabilities,
-    RunContext, RunController, RunId, RunLimits, RunOutcome, SandboxCapability, WorkdirManager,
+    FilesystemArtifactStore, PureTransformBinding, PureTransformPlanV1, PureTransformRequest,
+    RequestedCapabilities, RunContext, RunController, RunId, RunLimits, RunOutcome,
+    SandboxCapability, WorkdirManager,
 };
+use workflow_spec::{read_bounded_regular_file, SourcePath};
 
 const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}";
@@ -174,7 +176,10 @@ fn build_run_plan(
         }
     };
     let ir = plan.ir();
-    let module_bytes = match std::fs::read(module) {
+    let module_bytes = match read_bounded_regular_file(
+        &SourcePath::from(module),
+        PureTransformRequest::MAX_MODULE_BYTES,
+    ) {
         Ok(bytes) => bytes,
         Err(_) => return Err(Box::new(Diagnostic::run_unsupported_input())),
     };
@@ -367,11 +372,14 @@ fn main() {
                 Ok(run_workdir) => run_workdir,
                 Err(_) => exit_diagnostic(Diagnostic::run_failed(), json),
             };
-            let mut artifacts = FilesystemArtifactStore::new(
+            let mut artifacts = match FilesystemArtifactStore::try_new(
                 std::path::Path::new(workdir.as_str()).join("artifacts"),
                 NonZeroU64::new(64 * 1024).expect("positive artifact limit"),
                 NonZeroU64::new(64 * 1024).expect("positive page limit"),
-            );
+            ) {
+                Ok(store) => store,
+                Err(_) => exit_diagnostic(Diagnostic::run_failed(), json),
+            };
             let controller = RunController::new(&context);
             let started = Instant::now();
             let result = plan.execute(

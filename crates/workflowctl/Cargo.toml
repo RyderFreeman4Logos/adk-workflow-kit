@@ -12,3 +12,4 @@ sha2.workspace = true
 workflow-compiler = { path = "../workflow-compiler" }
 workflow-ir = { path = "../workflow-ir" }
 workflow-runtime = { path = "../workflow-runtime" }
+workflow-spec = { path = "../workflow-spec" }
