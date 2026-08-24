@@ -9,7 +9,14 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod grounded_answer;
 mod package;
+
+pub use grounded_answer::{
+    compile_grounded_answer, GroundedAnswerDiagnostic, GroundedAnswerDiagnosticKind,
+    GroundedAnswerEnvelope, GroundedAnswerError, GroundedAnswerInput, GroundedAnswerOutcome,
+    GroundedAnswerPublicationAck,
+};
 
 pub use package::{
     validate_package, PackageArchiveEntry, PackageFile, PackageManifest, PackageValidationError,
