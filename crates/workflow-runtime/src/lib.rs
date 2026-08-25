@@ -5,6 +5,7 @@ mod artifact;
 mod bubblewrap;
 mod controller;
 mod execution;
+mod hot_reload;
 mod observability;
 mod policy;
 mod production_profile;
@@ -31,6 +32,7 @@ pub use execution::{
     PureTransformBinding, PureTransformExecutionError, PureTransformPlanError, PureTransformPlanV1,
     PURE_TRANSFORM_BINDING_ID, PURE_TRANSFORM_BINDING_VERSION, PURE_TRANSFORM_PLAN_VERSION_V1,
 };
+pub use hot_reload::{DevelopmentHotReload, HotReloadError, HotReloadErrorKind};
 pub use observability::{
     CallLedgerRecord, EventCounts, ObservabilityError, OtelMapping, RedactedEvent,
     SensitiveSnapshot, SensitiveSnapshotKind, REDACTION_MARKER,

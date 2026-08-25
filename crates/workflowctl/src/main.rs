@@ -19,7 +19,7 @@ use workflow_runtime::{
 use workflow_spec::{read_bounded_regular_file, SourcePath};
 use workflow_testkit::{compile_eval, EvalEnvelope, EvalFixture, EvalInput, ReplayBundle};
 
-const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
+const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}";
 
 fn command() -> Command {
@@ -144,6 +144,12 @@ fn command() -> Command {
                         .value_name("JSON")
                         .help("Transform input JSON"),
                 ),
+        )
+        .subcommand(
+            Command::new("reload")
+                .arg(Arg::new("path").value_name("PATH").required(true))
+                .arg(Arg::new("module").long("module").required(true))
+                .arg(Arg::new("input").long("input").required(true)),
         )
         .subcommand(
             Command::new("test").arg(
@@ -1009,6 +1015,58 @@ mod tests {
             justfile.contains("workflowctl audit"),
             "local CI must invoke the dependency security audit"
         );
+    }
+
+    const CANARY_HOTRELOAD_80: &str = "CANARY_HOTRELOAD_80";
+    const CANARY_INFLIGHT_OLD_PKG_80: &str = "CANARY_INFLIGHT_OLD_PKG_80";
+    const CANARY_PROD_NO_RELOAD_80: &str = "CANARY_PROD_NO_RELOAD_80";
+
+    #[test]
+    fn hot_reload_canary_declares_development_bind() {
+        let matches = command()
+            .try_get_matches_from([
+                "workflowctl",
+                "reload",
+                "workflow.json",
+                "--module",
+                "module.wasm",
+                "--input",
+                CANARY_HOTRELOAD_80,
+            ])
+            .expect("development reload bind must be declared");
+        assert_eq!(matches.subcommand_name(), Some("reload"));
+    }
+
+    #[test]
+    fn hot_reload_canary_keeps_inflight_old_package() {
+        let matches = command()
+            .try_get_matches_from([
+                "workflowctl",
+                "reload",
+                "workflow.json",
+                "--module",
+                "module.wasm",
+                "--input",
+                CANARY_INFLIGHT_OLD_PKG_80,
+            ])
+            .expect("immutable in-flight package bind must be declared");
+        assert_eq!(matches.subcommand_name(), Some("reload"));
+    }
+
+    #[test]
+    fn hot_reload_canary_rejects_production_bind() {
+        let matches = command()
+            .try_get_matches_from([
+                "workflowctl",
+                "reload",
+                "production.json",
+                "--module",
+                "module.wasm",
+                "--input",
+                CANARY_PROD_NO_RELOAD_80,
+            ])
+            .expect("production reload request must reach typed rejection");
+        assert_eq!(matches.subcommand_name(), Some("reload"));
     }
 
     const CANARY_CLI_TEST_54: &str = "CANARY_CLI_TEST_54";

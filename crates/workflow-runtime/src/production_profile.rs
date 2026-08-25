@@ -267,4 +267,23 @@ impl fmt::Display for ProductionProfileError {
 
 impl std::error::Error for ProductionProfileError {}
 
-use crate::{RequestedCapabilities, RunId, RunWorkdir, SandboxCapability, WorkdirManager};
+use crate::{
+    HotReloadError, HotReloadErrorKind, PureTransformBinding, RequestedCapabilities, RunId,
+    RunWorkdir, SandboxCapability, WorkdirManager,
+};
+
+impl ProductionProfileBinding {
+    /// Rejects hot reload so production cannot gain a live-reload path.
+    pub fn reload(
+        &self,
+        _expected_current_digest: &str,
+        _workflow_id: impl Into<String>,
+        _workflow_version: impl Into<String>,
+        _module_digest: impl Into<String>,
+        _module: Option<&[u8]>,
+    ) -> Result<PureTransformBinding, HotReloadError> {
+        Err(HotReloadError::new(
+            HotReloadErrorKind::ProductionReloadForbidden,
+        ))
+    }
+}
