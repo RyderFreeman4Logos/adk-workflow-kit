@@ -131,7 +131,10 @@ impl RootlessPodmanBackend {
 
     /// Returns whether the rootless Podman executable is available.
     pub fn is_available() -> bool {
-        Command::new("podman").arg("--version").output().is_ok()
+        Command::new("podman")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
     }
 
     /// Executes a digest-pinned request with rootless isolation flags.
@@ -263,6 +266,46 @@ impl PodmanReceipt {
 mod tests {
     use super::*;
     use crate::{BackendCapabilities, RunId, SandboxCapability, WorkdirManager};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::{Mutex, OnceLock},
+    };
+
+    fn podman_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn install_podman_shim(script: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("workflow-runtime-podman-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("podman");
+        fs::write(&executable, script).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        root
+    }
+
+    fn with_podman_shim<T>(script: &str, test: impl FnOnce() -> T) -> T {
+        let _guard = podman_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = install_podman_shim(script);
+        let old_path = std::env::var_os("PATH");
+        let path = match old_path.as_ref() {
+            Some(old_path) => format!("{}:{}", root.display(), old_path.to_string_lossy()),
+            None => root.display().to_string(),
+        };
+        std::env::set_var("PATH", path);
+        let result = test();
+        match old_path {
+            Some(old_path) => std::env::set_var("PATH", old_path),
+            None => std::env::remove_var("PATH"),
+        }
+        fs::remove_dir_all(root).unwrap();
+        result
+    }
 
     #[test]
     fn digest_pinning_rejects_tagged_images() {
@@ -301,5 +344,71 @@ mod tests {
             backend.execute(&request),
             Err(PodmanError::Capabilities(_))
         ));
+    }
+
+    #[test]
+    fn public_execute_conforms_to_digest_and_isolation_contract() {
+        with_podman_shim("#!/bin/sh\nprintf '%s\\n' \"$@\"\n", || {
+            let manager = WorkdirManager::new(std::env::temp_dir()).unwrap();
+            let run_id = RunId::new("podman-conformance".to_owned()).unwrap();
+            let workdir = manager.allocate(&run_id).unwrap();
+            let mut environment = BTreeMap::new();
+            environment.insert("PODMAN_TEST_VALUE".to_owned(), "controlled".to_owned());
+            let request = PodmanRequest::new(
+                format!("alpine@sha256:{}", "b".repeat(64)),
+                "printf conformance".to_owned(),
+                &workdir,
+                environment,
+                RequestedCapabilities::new([SandboxCapability::ProcessSpawn]),
+            )
+            .unwrap();
+            let backend = RootlessPodmanBackend::new(BackendCapabilities::new([
+                SandboxCapability::ProcessSpawn,
+            ]));
+            let receipt = backend.execute(&request).unwrap();
+            assert!(receipt.exit_success());
+            let output = String::from_utf8_lossy(receipt.stdout());
+            let digest = format!("alpine@sha256:{}", "b".repeat(64));
+            for argument in [
+                "run",
+                "--rm",
+                "--pull=never",
+                "--network=none",
+                "--read-only",
+                "--userns=keep-id",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                "--workdir",
+                "/work",
+                "--volume",
+                "--env",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "--env=PODMAN_TEST_VALUE=controlled",
+            ] {
+                assert!(
+                    output.lines().any(|line| line == argument),
+                    "missing argv: {argument}"
+                );
+            }
+            assert!(output.lines().any(|line| line == digest));
+            for mount in [
+                format!("{}:/input:ro", workdir.root().join("input").display()),
+                format!("{}:/package:ro", workdir.root().join("package").display()),
+                format!("{}:/skills:ro", workdir.root().join("skills").display()),
+                format!("{}:/refs:ro", workdir.root().join("refs").display()),
+                format!("{}:/work", workdir.root().join("work").display()),
+                format!("{}:/out", workdir.root().join("out").display()),
+                format!("{}:/tmp", workdir.root().join("tmp").display()),
+            ] {
+                assert!(output.lines().any(|line| line == mount));
+            }
+        });
+    }
+
+    #[test]
+    fn failed_version_probe_is_not_available() {
+        with_podman_shim("#!/bin/sh\nexit 7\n", || {
+            assert!(!RootlessPodmanBackend::is_available());
+        });
     }
 }
