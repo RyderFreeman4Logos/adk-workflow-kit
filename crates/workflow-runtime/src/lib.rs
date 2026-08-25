@@ -8,6 +8,7 @@ mod controller;
 mod execution;
 mod hot_reload;
 mod observability;
+mod podman;
 mod policy;
 mod production_profile;
 mod pure_transform;
@@ -38,6 +39,9 @@ pub use hot_reload::{DevelopmentHotReload, HotReloadError, HotReloadErrorKind};
 pub use observability::{
     CallLedgerRecord, EventCounts, ObservabilityError, OtelMapping, RedactedEvent,
     SensitiveSnapshot, SensitiveSnapshotKind, REDACTION_MARKER,
+};
+pub use podman::{
+    PodmanError, PodmanReceipt, PodmanRequest, PodmanRequestError, RootlessPodmanBackend,
 };
 pub use policy::{
     evaluate_context_policy, Classification, ContextPolicyDenied, ContextPolicyDeniedKind,
