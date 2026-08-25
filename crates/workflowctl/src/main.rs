@@ -1,6 +1,9 @@
-use std::{ffi::OsString, io::Write, num::NonZeroU64, path::Path, process::exit, time::Instant};
+use std::{
+    ffi::OsString, fmt, io::Write, num::NonZeroU64, path::Path, process::exit, time::Instant,
+};
 
 use clap::{Arg, ArgAction, Command};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use workflow_compiler::{
@@ -13,8 +16,9 @@ use workflow_runtime::{
     SandboxCapability, WorkdirManager,
 };
 use workflow_spec::{read_bounded_regular_file, SourcePath};
+use workflow_testkit::{compile_eval, EvalEnvelope, EvalFixture, EvalInput, ReplayBundle};
 
-const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
+const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}";
 
 fn command() -> Command {
@@ -139,6 +143,30 @@ fn command() -> Command {
                         .value_name("JSON")
                         .help("Transform input JSON"),
                 ),
+        )
+        .subcommand(
+            Command::new("test").arg(
+                Arg::new("path")
+                    .value_name("PATH")
+                    .required(true)
+                    .help("Test fixture file"),
+            ),
+        )
+        .subcommand(
+            Command::new("eval").arg(
+                Arg::new("path")
+                    .value_name("PATH")
+                    .required(true)
+                    .help("Eval fixture file"),
+            ),
+        )
+        .subcommand(
+            Command::new("replay").arg(
+                Arg::new("path")
+                    .value_name("PATH")
+                    .required(true)
+                    .help("Replay bundle file"),
+            ),
         )
 }
 
@@ -382,6 +410,161 @@ fn run_limits() -> RunLimits {
     )
 }
 
+/// Distinct typed CLI dispositions for test, eval, replay, and boundary miss.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CliDisposition {
+    TestRun,
+    EvalRun,
+    ReplayRun,
+    BoundaryMiss,
+}
+
+/// Redacted acknowledgement that one CLI command ran.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct CliEnvelope {
+    disposition: CliDisposition,
+    fixture_name: String,
+    fixture_count: usize,
+    payload_len: usize,
+}
+
+impl CliEnvelope {
+    #[cfg(test)]
+    fn disposition(&self) -> CliDisposition {
+        self.disposition
+    }
+}
+
+impl fmt::Display for CliEnvelope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.disposition {
+            CliDisposition::TestRun => "test ran",
+            CliDisposition::EvalRun => "eval ran",
+            CliDisposition::ReplayRun => "replay ran",
+            CliDisposition::BoundaryMiss => "command fixture missed a typed boundary",
+        })
+    }
+}
+
+/// Typed, payload-free CLI bind failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct CliError {
+    disposition: CliDisposition,
+    code: &'static str,
+}
+
+impl CliError {
+    const TEST_BOUNDARY: Self = Self {
+        disposition: CliDisposition::BoundaryMiss,
+        code: "workflow.cli.boundary_miss",
+    };
+    const EVAL_BOUNDARY: Self = Self {
+        disposition: CliDisposition::BoundaryMiss,
+        code: "eval.boundary_miss",
+    };
+    const REPLAY_INVALID: Self = Self {
+        disposition: CliDisposition::BoundaryMiss,
+        code: "workflow.cli.replay_invalid",
+    };
+
+    #[cfg(test)]
+    fn disposition(self) -> CliDisposition {
+        self.disposition
+    }
+
+    fn diagnostic(self) -> Diagnostic {
+        match self.code {
+            "eval.boundary_miss" => Diagnostic::eval_boundary_miss(),
+            "workflow.cli.replay_invalid" => Diagnostic::replay_invalid(),
+            _ => Diagnostic::cli_boundary_miss(),
+        }
+    }
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.code {
+            "eval.boundary_miss" => "eval boundary miss",
+            "workflow.cli.replay_invalid" => "replay bundle is invalid",
+            _ => "command fixture missed a typed boundary",
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamedFixtureWire {
+    name: String,
+    payload: String,
+}
+
+fn invalid_token(value: &str) -> bool {
+    value.is_empty() || value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn bind_test(name: &str, payload: &str) -> Result<CliEnvelope, CliError> {
+    if invalid_token(name) || invalid_token(payload) {
+        return Err(CliError::TEST_BOUNDARY);
+    }
+    Ok(CliEnvelope {
+        disposition: CliDisposition::TestRun,
+        fixture_name: name.to_owned(),
+        fixture_count: 1,
+        payload_len: payload.len(),
+    })
+}
+
+fn bind_eval(name: &str, payload: &str) -> Result<CliEnvelope, CliError> {
+    let envelope = compile_eval(EvalInput::trajectory(EvalFixture::new(
+        name.to_owned(),
+        payload.to_owned(),
+    )))
+    .map_err(|_| CliError::EVAL_BOUNDARY)?;
+    match envelope {
+        EvalEnvelope::Trajectory { acknowledgement } => Ok(CliEnvelope {
+            disposition: CliDisposition::EvalRun,
+            fixture_name: acknowledgement.fixture_name().to_owned(),
+            fixture_count: acknowledgement.fixture_count(),
+            payload_len: payload.len(),
+        }),
+        EvalEnvelope::Rubric { .. } | EvalEnvelope::TrajectoryAndRubric { .. } => {
+            Err(CliError::EVAL_BOUNDARY)
+        }
+    }
+}
+
+fn bind_replay(bytes: &[u8]) -> Result<CliEnvelope, CliError> {
+    let bundle = ReplayBundle::from_json(bytes).map_err(|_| CliError::REPLAY_INVALID)?;
+    let trace = bundle.replay();
+    Ok(CliEnvelope {
+        disposition: CliDisposition::ReplayRun,
+        fixture_name: String::from("replay"),
+        fixture_count: trace.events().len(),
+        payload_len: bytes.len(),
+    })
+}
+
+fn parse_named_fixture(bytes: &[u8], miss: CliError) -> Result<(String, String), CliError> {
+    let wire: NamedFixtureWire = serde_json::from_slice(bytes).map_err(|_| miss)?;
+    Ok((wire.name, wire.payload))
+}
+
+fn read_fixture_bytes(path: &str) -> Option<Vec<u8>> {
+    read_bounded_regular_file(&SourcePath::from(path), ReplayBundle::MAX_BUNDLE_BYTES).ok()
+}
+
+fn write_command_result(envelope: &CliEnvelope, json: bool) {
+    if json {
+        match serde_json::to_string(envelope) {
+            Ok(rendered) => write_stdout(&format!("{rendered}\n"), json),
+            Err(_) => exit_diagnostic(Diagnostic::stdout_write_failed(), json),
+        }
+    } else {
+        write_stdout(&format!("{envelope}\n"), json);
+    }
+}
+
 fn main() {
     let arguments = std::env::args_os().skip(1).collect::<Vec<OsString>>();
     let json = arguments
@@ -591,6 +774,50 @@ fn main() {
                 }
             }
         }
+        Some(("test", subcommand)) => {
+            let Some(path) = subcommand.get_one::<String>("path") else {
+                exit_invalid_arguments(json);
+            };
+            let Some(bytes) = read_fixture_bytes(path) else {
+                exit_invalid_arguments(json);
+            };
+            let (name, payload) = match parse_named_fixture(&bytes, CliError::TEST_BOUNDARY) {
+                Ok(fixture) => fixture,
+                Err(error) => exit_diagnostic(error.diagnostic(), json),
+            };
+            match bind_test(&name, &payload) {
+                Ok(envelope) => write_command_result(&envelope, json),
+                Err(error) => exit_diagnostic(error.diagnostic(), json),
+            }
+        }
+        Some(("eval", subcommand)) => {
+            let Some(path) = subcommand.get_one::<String>("path") else {
+                exit_invalid_arguments(json);
+            };
+            let Some(bytes) = read_fixture_bytes(path) else {
+                exit_invalid_arguments(json);
+            };
+            let (name, payload) = match parse_named_fixture(&bytes, CliError::EVAL_BOUNDARY) {
+                Ok(fixture) => fixture,
+                Err(error) => exit_diagnostic(error.diagnostic(), json),
+            };
+            match bind_eval(&name, &payload) {
+                Ok(envelope) => write_command_result(&envelope, json),
+                Err(error) => exit_diagnostic(error.diagnostic(), json),
+            }
+        }
+        Some(("replay", subcommand)) => {
+            let Some(path) = subcommand.get_one::<String>("path") else {
+                exit_invalid_arguments(json);
+            };
+            let Some(bytes) = read_fixture_bytes(path) else {
+                exit_invalid_arguments(json);
+            };
+            match bind_replay(&bytes) {
+                Ok(envelope) => write_command_result(&envelope, json),
+                Err(error) => exit_diagnostic(error.diagnostic(), json),
+            }
+        }
         _ => exit_invalid_arguments(json),
     }
 }
@@ -601,7 +828,10 @@ mod tests {
 
     use sha2::{Digest, Sha256};
 
-    use super::{command, test_skill, validate_skill_manifest, SkillValidationFailure};
+    use super::{
+        bind_eval, bind_replay, bind_test, command, test_skill, validate_skill_manifest,
+        CliDisposition, SkillValidationFailure,
+    };
 
     const SCHEMA: &str =
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#;
@@ -688,6 +918,128 @@ mod tests {
         assert!(command()
             .try_get_matches_from(["workflowctl", "skill", "test", "skill-dir"])
             .is_ok());
+    }
+
+    #[test]
+    fn test_eval_replay_commands_are_declared() {
+        assert!(command()
+            .try_get_matches_from(["workflowctl", "test", "fixture.json"])
+            .is_ok());
+        assert!(command()
+            .try_get_matches_from(["workflowctl", "eval", "fixture.json"])
+            .is_ok());
+        assert!(command()
+            .try_get_matches_from(["workflowctl", "replay", "fixture.json"])
+            .is_ok());
+    }
+
+    #[test]
+    fn local_ci_invokes_test_eval_replay_commands() {
+        let justfile = include_str!("../../../justfile");
+        assert!(
+            justfile.contains("workflowctl test "),
+            "local CI must invoke test"
+        );
+        assert!(
+            justfile.contains("workflowctl eval "),
+            "local CI must invoke eval"
+        );
+        assert!(
+            justfile.contains("workflowctl replay "),
+            "local CI must invoke replay"
+        );
+    }
+
+    const CANARY_CLI_TEST_54: &str = "CANARY_CLI_TEST_54";
+    const CANARY_CLI_EVAL_54: &str = "CANARY_CLI_EVAL_54";
+    const CANARY_CLI_REPLAY_54: &str = "CANARY_CLI_REPLAY_54";
+    const CANARY_CLI_BOUNDARY_54: &str = "CANARY_CLI_BOUNDARY_54";
+
+    fn canary_replay_bytes(canary: &str) -> Vec<u8> {
+        let digest = format!("sha256:{:x}", Sha256::digest(canary.as_bytes()));
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "workflow_lock": {
+                "toml": "test",
+                "sha256": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+            },
+            "input_sha256": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "events": [
+                { "type": "node_started", "node_id": "node-a" },
+                {
+                    "type": "terminal",
+                    "status": "completed",
+                    "outcome_sha256": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+                }
+            ],
+            "fixtures": [
+                { "sha256": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" },
+                { "sha256": digest, "bytes": canary.as_bytes() }
+            ],
+            "artifacts": []
+        }))
+        .expect("serialize replay canary")
+    }
+
+    #[test]
+    fn canary_cli_test_54_is_typed_test_run_not_eval_or_replay() {
+        let result = bind_test("canary-cli-test-54", CANARY_CLI_TEST_54)
+            .expect("test canary must run through the platform test API");
+        assert_eq!(result.disposition(), CliDisposition::TestRun);
+        assert_ne!(result.disposition(), CliDisposition::EvalRun);
+        assert_ne!(result.disposition(), CliDisposition::ReplayRun);
+        assert!(!format!("{result:?}").contains(CANARY_CLI_TEST_54));
+        assert!(!result.to_string().contains(CANARY_CLI_TEST_54));
+        assert!(!serde_json::to_string(&result)
+            .expect("serialize test envelope")
+            .contains(CANARY_CLI_TEST_54));
+    }
+
+    #[test]
+    fn canary_cli_eval_54_is_typed_eval_run_not_test_or_replay() {
+        let result = bind_eval("canary-cli-eval-54", CANARY_CLI_EVAL_54)
+            .expect("eval canary must run through the eval bind");
+        assert_eq!(result.disposition(), CliDisposition::EvalRun);
+        assert_ne!(result.disposition(), CliDisposition::TestRun);
+        assert_ne!(result.disposition(), CliDisposition::ReplayRun);
+        assert!(!format!("{result:?}").contains(CANARY_CLI_EVAL_54));
+        assert!(!result.to_string().contains(CANARY_CLI_EVAL_54));
+        assert!(!serde_json::to_string(&result)
+            .expect("serialize eval envelope")
+            .contains(CANARY_CLI_EVAL_54));
+    }
+
+    #[test]
+    fn canary_cli_replay_54_is_typed_replay_run_not_test_or_eval() {
+        let result = bind_replay(&canary_replay_bytes(CANARY_CLI_REPLAY_54))
+            .expect("replay canary must run through the replay bind");
+        assert_eq!(result.disposition(), CliDisposition::ReplayRun);
+        assert_ne!(result.disposition(), CliDisposition::TestRun);
+        assert_ne!(result.disposition(), CliDisposition::EvalRun);
+        assert!(!format!("{result:?}").contains(CANARY_CLI_REPLAY_54));
+        assert!(!result.to_string().contains(CANARY_CLI_REPLAY_54));
+        assert!(!serde_json::to_string(&result)
+            .expect("serialize replay envelope")
+            .contains(CANARY_CLI_REPLAY_54));
+    }
+
+    #[test]
+    fn canary_cli_boundary_54_is_typed_miss_and_cannot_report_all_three_ran() {
+        let error = bind_test("", CANARY_CLI_BOUNDARY_54)
+            .expect_err("empty fixture name must miss the boundary");
+        assert_eq!(error.disposition(), CliDisposition::BoundaryMiss);
+        assert_ne!(error.disposition(), CliDisposition::TestRun);
+        assert_ne!(error.disposition(), CliDisposition::EvalRun);
+        assert_ne!(error.disposition(), CliDisposition::ReplayRun);
+        assert!(!format!("{error:?}").contains(CANARY_CLI_BOUNDARY_54));
+        assert!(!error.to_string().contains(CANARY_CLI_BOUNDARY_54));
+        let serialized = serde_json::to_string(&error).expect("serialize boundary error");
+        assert!(!serialized.contains(CANARY_CLI_BOUNDARY_54));
+        assert!(
+            !(serialized.contains("test_run")
+                && serialized.contains("eval_run")
+                && serialized.contains("replay_run"))
+        );
     }
 
     #[test]
