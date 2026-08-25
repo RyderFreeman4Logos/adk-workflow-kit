@@ -8,6 +8,7 @@ mod security_audit;
 mod skill;
 mod skill_evidence;
 mod skill_resource;
+mod skill_retrieval;
 mod skill_runtime;
 
 use std::{collections::VecDeque, fmt};
@@ -35,6 +36,10 @@ pub use skill_resource::{
     ActivatedSkillResources, SkillResourceError, SkillResourceId, SkillResourceIdError,
     SkillResourceInput, SkillResourceLimits, SkillResourceList, SkillResourceMetadata,
     SkillResourceRead,
+};
+pub use skill_retrieval::{
+    retrieve_skill_candidates, SkillCandidate, SkillCapabilitySet, SkillDeclaration,
+    SkillRetrievalDiagnostic, SkillRetrievalResult,
 };
 pub use skill_runtime::{
     plan_script_execution, DeclaredSkillResource, DeclaredSkillScript, ScriptDenied,
