@@ -332,8 +332,8 @@ fn coverage_supports_hops(input: &MultiHopInput) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_multi_hop, validate_boundary, MultiHopCoverage, MultiHopEnvelope, MultiHopError,
-        MultiHopHop, MultiHopInput,
+        compile_multi_hop, validate_boundary, MultiHopCoverage, MultiHopDiagnosticKind,
+        MultiHopEnvelope, MultiHopError, MultiHopHop, MultiHopInput,
     };
 
     const CANARY_UNIT_COMPLETE_66: &str = "CANARY_UNIT_COMPLETE_66";
@@ -409,6 +409,64 @@ mod tests {
             MultiHopEnvelope::Incomplete { .. } => {}
             MultiHopEnvelope::Complete { .. } => panic!("dropped hop must not be complete"),
             MultiHopEnvelope::Corrective { .. } => panic!("dropped hop must not be corrective"),
+        }
+    }
+
+    #[test]
+    fn complete_fixture_compiles_as_complete_not_corrective_or_incomplete() {
+        let payload = input(
+            vec![
+                hop("hop-a", CANARY_UNIT_COMPLETE_66),
+                hop("hop-b", "follow-on hop"),
+            ],
+            vec![
+                coverage("hop-a", &format!("evidence {CANARY_UNIT_COMPLETE_66}")),
+                coverage("hop-b", "evidence follow-on hop"),
+            ],
+        );
+        let result = compile_multi_hop(payload).expect("complete fixture must compile");
+
+        match result {
+            MultiHopEnvelope::Complete { acknowledgement } => {
+                assert_eq!(acknowledgement.hop_count(), 2);
+                assert_eq!(acknowledgement.covered_count(), 2);
+            }
+            MultiHopEnvelope::Corrective { .. } => {
+                panic!("complete fixture must not be corrective")
+            }
+            MultiHopEnvelope::Incomplete { .. } => {
+                panic!("complete fixture must not be incomplete")
+            }
+        }
+    }
+
+    #[test]
+    fn corrective_fixture_takes_typed_unsupported_coverage_not_complete() {
+        let payload = input(
+            vec![
+                hop("hop-a", CANARY_UNIT_CORRECTIVE_66),
+                hop("hop-b", "uncovered hop"),
+            ],
+            vec![
+                coverage("hop-a", &format!("evidence {CANARY_UNIT_CORRECTIVE_66}")),
+                coverage("hop-b", "unrelated evidence"),
+            ],
+        );
+        let result = compile_multi_hop(payload)
+            .expect("corrective fixture must compile to a typed diagnostic");
+
+        match result {
+            MultiHopEnvelope::Complete { .. } => panic!("corrective fixture must not be complete"),
+            MultiHopEnvelope::Corrective { diagnostic } => {
+                assert_eq!(
+                    diagnostic.kind(),
+                    MultiHopDiagnosticKind::UnsupportedCoverage
+                );
+                assert_eq!(diagnostic.code(), "multi_hop.unsupported_coverage");
+            }
+            MultiHopEnvelope::Incomplete { .. } => {
+                panic!("corrective fixture must not be incomplete")
+            }
         }
     }
 }
