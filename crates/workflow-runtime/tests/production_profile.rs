@@ -138,6 +138,34 @@ fn canary_workdir_isolate_82_rejects_host_tree_write_as_source_truth() {
 }
 
 #[test]
+fn workdir_validation_rejects_lexical_and_symlink_escape() {
+    let (root, workdirs) = root();
+    let outside = root.join("outside");
+    fs::create_dir(&outside).expect("outside directory");
+    let binding = ProductionProfile::new(&workdirs)
+        .expect("production profile")
+        .bind(&run_id())
+        .expect("binding");
+    std::os::unix::fs::symlink(&outside, binding.workdir().root().join("escape"))
+        .expect("escape symlink");
+
+    for path in [
+        binding
+            .workdir()
+            .root()
+            .join("..")
+            .join("outside")
+            .join("file"),
+        binding.workdir().root().join("escape").join("file"),
+    ] {
+        assert_eq!(
+            binding.validate_workdir_path(path).unwrap_err().kind(),
+            ProductionProfileErrorKind::WorkdirIsolationBreach
+        );
+    }
+}
+
+#[test]
 fn missing_production_profile_is_typed_and_never_falls_back() {
     let error = match ProductionProfileRegistry::default().select("production") {
         Ok(_) => panic!("missing production profile must fail closed"),

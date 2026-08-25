@@ -135,18 +135,47 @@ impl ProductionProfileBinding {
         path: impl AsRef<Path>,
     ) -> Result<(), ProductionProfileError> {
         let path = path.as_ref();
-        if path.starts_with(self.workdir.root())
-            && !self
-                .source_root
-                .as_ref()
-                .is_some_and(|source_root| path.starts_with(source_root))
+        if !path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            })
         {
-            Ok(())
-        } else {
             Err(ProductionProfileError::new(
                 ProductionProfileErrorKind::WorkdirIsolationBreach,
                 None,
             ))
+        } else {
+            let mut existing_prefix = path.to_path_buf();
+            while fs::symlink_metadata(&existing_prefix).is_err() {
+                if !existing_prefix.pop() {
+                    return Err(ProductionProfileError::new(
+                        ProductionProfileErrorKind::WorkdirIsolationBreach,
+                        None,
+                    ));
+                }
+            }
+            let Ok(canonical_prefix) = fs::canonicalize(existing_prefix) else {
+                return Err(ProductionProfileError::new(
+                    ProductionProfileErrorKind::WorkdirIsolationBreach,
+                    None,
+                ));
+            };
+            if canonical_prefix.starts_with(self.workdir.root())
+                && !self
+                    .source_root
+                    .as_ref()
+                    .is_some_and(|source_root| canonical_prefix.starts_with(source_root))
+            {
+                Ok(())
+            } else {
+                Err(ProductionProfileError::new(
+                    ProductionProfileErrorKind::WorkdirIsolationBreach,
+                    None,
+                ))
+            }
         }
     }
 
