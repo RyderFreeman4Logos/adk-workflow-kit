@@ -2,7 +2,46 @@
 
 ## Scope
 
-This document defines release governance only: how release candidates are prepared and proposed. Version compatibility, migration guarantees, and the v0.1 release checklist remain deferred to `RELEASE-001`.
+This document defines release governance and the v0.1 compatibility contract for release candidates. It does not publish crates, binaries, or migration guidance; those remain part of `RELEASE-003`.
+
+## Compatibility and Migration Contract
+
+v0.1 is the compatibility baseline for the documented workflow and review
+wire contracts. Every serialized contract carries an explicit schema version;
+readers must reject an unknown or unsupported version rather than silently
+reinterpret it. Boundary validation remains explicit, and failures retain
+typed diagnostic codes instead of relying on rendered error text.
+
+### Migration Guarantees
+
+- A v0.1.x reader accepts artifacts produced by the corresponding v0.1.x
+  writer without a migration step.
+- A compatible patch release does not silently change the meaning of an
+  accepted v0.1 artifact.
+- A breaking contract change requires a new schema version and an explicit,
+  separately reviewed migration path; unsupported input fails closed.
+- Migration preserves validation, boundary checks, and typed failure
+  diagnostics. It must not downgrade a failure into an accepted artifact.
+- Published release artifacts and dogfood migration instructions are out of
+  scope here and belong to `RELEASE-003`.
+
+## v0.1 Release Checklist
+
+Before proposing a v0.1 release candidate:
+
+1. Confirm the candidate is on a feature branch based on `main` and the tree
+   is clean before and after verification.
+2. Confirm `Cargo.lock` is committed and locked metadata resolves without
+   rewriting the lockfile.
+3. Run the repository's fast checks: formatting, locked workspace check,
+   locked clippy, unit tests, integration/fixture tests, and local gate tests.
+4. Verify unit and integration coverage for successful workflows, malformed
+   input, unsupported versions, explicit boundary violations, and typed
+   compiler/runtime/sandbox diagnostics.
+5. Inspect the exact `main...HEAD` diff for compatibility, migration, secret
+   handling, and documentation scope; exclude publishing and dogfood work.
+6. Record the candidate commit and its verification receipts, then require
+   the repository's exact-tree gate and review before proposing a pull request.
 
 ## Release Candidate Workflow
 
