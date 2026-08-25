@@ -63,6 +63,20 @@ Use a dedicated pull request for dependency upgrades. Run `just lock`, inspect t
 
 The repository-local `just` recipes and Lefthook hooks are the project's CI-equivalent. This repository does not claim hosted GitHub CI.
 
+## Local Signed Release and Dogfood
+
+The local release recipe creates a deterministic archive of the committed tree and signs it without publishing anything:
+
+```sh
+RELEASE_SIGNING_KEY=/path/to/test-or-local-key.pem \
+RELEASE_OUTPUT_DIR=/tmp/adk-workflow-kit-release \
+just release-local
+```
+
+The command requires the `feat/release-003-signed-release` branch to be based on the pinned `origin/main`, a clean tree, and a readable non-symlink key. It fails with typed `RELEASE_ERROR[...]` diagnostics and never prints key material. Verify the detached signature with the matching public key before dogfooding.
+
+For local dogfood, consume the committed crates with `cargo install --path crates/workflowctl --locked` or run the binary from `target/release` after the normal locked build. Keep the generated archive and signature outside the repository; this path is intentionally local and does not publish crates, binaries, tags, or releases.
+
 ## Deferred
 
 - Hosted CI, including GitHub Actions
