@@ -1,10 +1,13 @@
 use workflow_review::{
-    compile_grounded_answer, GroundedAnswerDiagnosticKind, GroundedAnswerEnvelope,
-    GroundedAnswerError, GroundedAnswerInput, ReviewVerdict, ReviewVote,
+    compile_grounded_answer, GroundedAnswerCitation, GroundedAnswerClaim,
+    GroundedAnswerDiagnosticKind, GroundedAnswerEnvelope, GroundedAnswerError, GroundedAnswerInput,
+    ReviewVerdict, ReviewVote,
 };
 
 const CANARY_PUBLISH_64: &str = "CANARY_PUBLISH_64";
 const CANARY_ABSTAIN_64: &str = "CANARY_ABSTAIN_64";
+const CANARY_UNSUPPORTED_CLAIM_65: &str = "CANARY_UNSUPPORTED_CLAIM_65";
+const CANARY_SUPPORTED_CITATION_65: &str = "CANARY_SUPPORTED_CITATION_65";
 
 fn input(answer: &str, verdict: ReviewVerdict) -> GroundedAnswerInput {
     GroundedAnswerInput::new(
@@ -13,6 +16,19 @@ fn input(answer: &str, verdict: ReviewVerdict) -> GroundedAnswerInput {
         vec![ReviewVote::new(
             String::from("grounded-answer-subject"),
             verdict,
+        )],
+    )
+}
+
+fn claimed_input(claim: &str, evidence: &str) -> GroundedAnswerInput {
+    input("grounded answer", ReviewVerdict::Pass).with_claims(
+        vec![GroundedAnswerClaim::new(
+            String::from(claim),
+            vec![String::from("citation-65")],
+        )],
+        vec![GroundedAnswerCitation::new(
+            String::from("citation-65"),
+            String::from(evidence),
         )],
     )
 }
@@ -50,6 +66,52 @@ fn canary_abstain_takes_typed_abstain_transition_without_publish_ack() {
     assert!(!serde_json::to_string(&result)
         .expect("abstain envelope must serialize")
         .contains(CANARY_ABSTAIN_64));
+}
+
+#[test]
+fn unsupported_claim_canary_abstains_without_publish() {
+    let result = compile_grounded_answer(claimed_input(
+        CANARY_UNSUPPORTED_CLAIM_65,
+        "unrelated evidence",
+    ))
+    .expect("unsupported claim must take a typed abstain path");
+
+    let diagnostic = match &result {
+        GroundedAnswerEnvelope::Published { .. } => {
+            panic!("unsupported claim must never publish")
+        }
+        GroundedAnswerEnvelope::Abstained { diagnostic } => diagnostic,
+    };
+    assert_eq!(
+        diagnostic.kind(),
+        GroundedAnswerDiagnosticKind::UnsupportedClaim
+    );
+    assert_eq!(diagnostic.code(), "grounded_answer.unsupported_claim");
+    assert!(!format!("{result:?}").contains(CANARY_UNSUPPORTED_CLAIM_65));
+    assert!(!serde_json::to_string(&result)
+        .expect("unsupported claim envelope must serialize")
+        .contains(CANARY_UNSUPPORTED_CLAIM_65));
+    assert!(!result.to_string().contains(CANARY_UNSUPPORTED_CLAIM_65));
+}
+
+#[test]
+fn supported_citation_canary_publishes_without_abstain() {
+    let result = compile_grounded_answer(claimed_input(
+        CANARY_SUPPORTED_CITATION_65,
+        "source supports CANARY_SUPPORTED_CITATION_65",
+    ))
+    .expect("supported citation must publish");
+
+    match &result {
+        GroundedAnswerEnvelope::Published { .. } => {}
+        GroundedAnswerEnvelope::Abstained { .. } => {
+            panic!("supported citation must not abstain")
+        }
+    }
+    assert!(!format!("{result:?}").contains(CANARY_SUPPORTED_CITATION_65));
+    assert!(!serde_json::to_string(&result)
+        .expect("supported claim envelope must serialize")
+        .contains(CANARY_SUPPORTED_CITATION_65));
 }
 
 #[test]
