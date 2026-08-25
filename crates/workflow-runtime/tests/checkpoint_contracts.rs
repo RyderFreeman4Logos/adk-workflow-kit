@@ -31,3 +31,12 @@ fn checkpoint_contract_preserves_run_identity_and_typed_failure() {
         .expect_err("backend failure is typed");
     assert_eq!(error.kind(), CheckpointErrorKind::Unavailable);
 }
+
+#[test]
+fn checkpoint_deserialization_rejects_empty_state() {
+    let error = serde_json::from_str::<Checkpoint>(r#"{"run_id":"checkpoint-run","state":[]}"#)
+        .expect_err("empty checkpoint state must be rejected");
+    assert!(error
+        .to_string()
+        .contains("checkpoint state must not be empty"));
+}

@@ -1,15 +1,32 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 use crate::RunId;
 
 /// One durable execution checkpoint owned by an existing run identity.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Checkpoint {
     run_id: RunId,
     state: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointFields {
+    run_id: RunId,
+    state: Vec<u8>,
+}
+
+impl<'de> Deserialize<'de> for Checkpoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let fields = CheckpointFields::deserialize(deserializer)?;
+        Self::new(fields.run_id, fields.state).map_err(D::Error::custom)
+    }
 }
 
 impl Checkpoint {

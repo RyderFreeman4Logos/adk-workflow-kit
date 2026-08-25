@@ -97,8 +97,21 @@ impl KillResumeFixture {
 
     /// Resumes a run without repeating a side effect already checkpointed.
     pub fn resume(&mut self, run_id: &RunId) -> Result<(), CheckpointError> {
-        let _ = self.backend.load(run_id)?;
+        match self.backend.load(run_id)? {
+            Some(checkpoint) if checkpoint.state() == b"done" => {}
+            Some(_) | None => self.ledger.commit(),
+        }
         Ok(())
+    }
+
+    /// Stores a checkpoint and exercises the resumed side-effect operation.
+    pub fn resume_with_checkpoint(
+        &mut self,
+        checkpoint: Checkpoint,
+    ) -> Result<(), CheckpointError> {
+        let run_id = checkpoint.run_id().clone();
+        self.backend.save(checkpoint)?;
+        self.resume(&run_id)
     }
 
     /// Returns the fixture's side-effect ledger.
