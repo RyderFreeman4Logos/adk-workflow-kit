@@ -1,7 +1,7 @@
 ---
 name: Upstream issue and PR tracking
 about: Track one relevant upstream ADK-Rust issue or pull request
-title: "GOV-006: Track upstream ADK-Rust issue or PR"
+title: "GOV-006: <upstream-repo>#<item-number>"
 labels: ""
 assignees: ""
 ---
