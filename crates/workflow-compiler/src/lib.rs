@@ -18,7 +18,7 @@ use workflow_spec::{parse_file, parse_str, NodeKind, SourcePath, SpecError, Work
 
 pub use diagnostics::{Diagnostic, DiagnosticProjectionError};
 pub use graph_builder::{GraphBuildError, GraphBuilder, RegistryBinding, RegistryIdentityDrift};
-pub use lock::{WorkflowLock, WorkflowLockError};
+pub use lock::{WorkflowLock, WorkflowLockError, WorkflowLockMigrationError};
 pub use registry::{
     ModelRegistry, NodeRegistry, PredicateRegistry, RegistryCategory, RegistryEntry,
     RegistryNotFound, SkillRegistry, ToolRegistry, ValidatorRegistry,

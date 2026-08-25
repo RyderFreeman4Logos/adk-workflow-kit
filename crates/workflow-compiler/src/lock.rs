@@ -1,6 +1,6 @@
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use workflow_ir::{IrSchemaVersion, CANONICAL_IR_WIRE_VERSION_V1};
 
 use crate::CompiledPlan;
@@ -14,6 +14,17 @@ pub struct WorkflowLock {
     workflow_id: String,
     workflow_version: String,
     ir_hash: String,
+    semantic_resource_hashes: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyWorkflowLock {
+    lock_version: u16,
+    workflow_id: String,
+    workflow_version: String,
+    ir_hash: String,
+    #[serde(default)]
     semantic_resource_hashes: Vec<String>,
 }
 
@@ -48,6 +59,39 @@ impl WorkflowLock {
             ir_hash,
             semantic_resource_hashes: Vec::new(),
         })
+    }
+
+    /// Migrates a validated legacy v0 lock to the current v1 lock schema.
+    pub fn migrate_from_toml(
+        document: &str,
+        plan: &CompiledPlan,
+    ) -> Result<Self, WorkflowLockMigrationError> {
+        let legacy: LegacyWorkflowLock =
+            toml::from_str(document).map_err(WorkflowLockMigrationError::Decode)?;
+        if legacy.lock_version != 0 {
+            return Err(WorkflowLockMigrationError::UnsupportedSourceSchema {
+                found: legacy.lock_version,
+            });
+        }
+
+        let current = Self::try_from_plan(plan).map_err(WorkflowLockMigrationError::CurrentLock)?;
+        for (field, matches) in [
+            ("workflow_id", legacy.workflow_id == current.workflow_id),
+            (
+                "workflow_version",
+                legacy.workflow_version == current.workflow_version,
+            ),
+            ("ir_hash", legacy.ir_hash == current.ir_hash),
+            (
+                "semantic_resource_hashes",
+                legacy.semantic_resource_hashes == current.semantic_resource_hashes,
+            ),
+        ] {
+            if !matches {
+                return Err(WorkflowLockMigrationError::IdentityMismatch { field });
+            }
+        }
+        Ok(current)
     }
 
     /// Returns the workflow lock schema version.
@@ -103,6 +147,25 @@ pub enum WorkflowLockError {
     Serialization(toml::ser::Error),
 }
 
+/// A typed failure while migrating a legacy workflow lock.
+#[derive(Debug)]
+pub enum WorkflowLockMigrationError {
+    /// The legacy lock document was not valid TOML or had an invalid shape.
+    Decode(toml::de::Error),
+    /// The document was not from the supported legacy schema.
+    UnsupportedSourceSchema {
+        /// The source lock schema version found in the fixture.
+        found: u16,
+    },
+    /// A legacy identity did not match the compiled workflow plan.
+    IdentityMismatch {
+        /// The stable lock field whose identity differed.
+        field: &'static str,
+    },
+    /// The current plan could not be represented by the current lock profile.
+    CurrentLock(WorkflowLockError),
+}
+
 impl fmt::Display for WorkflowLockError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -124,6 +187,36 @@ impl std::error::Error for WorkflowLockError {
         match self {
             Self::UnsupportedSemanticResources { .. } => None,
             Self::Serialization(error) => Some(error),
+        }
+    }
+}
+
+impl fmt::Display for WorkflowLockMigrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Decode(_) => formatter.write_str("workflow lock migration document is invalid"),
+            Self::UnsupportedSourceSchema { found } => {
+                write!(formatter, "unsupported workflow lock source schema {found}")
+            }
+            Self::IdentityMismatch { field } => {
+                write!(
+                    formatter,
+                    "workflow lock migration identity mismatch in {field}"
+                )
+            }
+            Self::CurrentLock(_) => {
+                formatter.write_str("current workflow lock could not be generated")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WorkflowLockMigrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decode(error) => Some(error),
+            Self::CurrentLock(error) => Some(error),
+            Self::UnsupportedSourceSchema { .. } | Self::IdentityMismatch { .. } => None,
         }
     }
 }

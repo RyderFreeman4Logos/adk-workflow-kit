@@ -454,3 +454,26 @@ to = "private-done-marker"
         assert!(!document.contains(excluded), "leaked {excluded}");
     }
 }
+
+#[test]
+fn migrates_the_old_lock_fixture_through_the_explicit_api() {
+    const OLD_LOCK_FIXTURE: &str = concat!(
+        "lock_version = 0\n",
+        "workflow_id = \"golden\"\n",
+        "workflow_version = \"1.0.0\"\n",
+        "ir_hash = \"sha256:93ccc569008faf32fd7f682cd8bfc25bcc5b22c2cbb7e533b56dd106916b39bb\"\n",
+        "semantic_resource_hashes = []\n",
+    );
+    let plan = compiled_plan("old-fixture.workflow.toml", GOLDEN_WORKFLOW);
+
+    let migrated = WorkflowLock::migrate_from_toml(OLD_LOCK_FIXTURE, &plan)
+        .expect("old lock fixture should migrate");
+
+    assert_eq!(migrated.lock_version(), 1);
+    assert_eq!(migrated.canonical_ir_wire_version(), 1);
+    assert_eq!(migrated.ir_schema_version(), 1);
+    assert_eq!(
+        migrated.ir_hash(),
+        "sha256:93ccc569008faf32fd7f682cd8bfc25bcc5b22c2cbb7e533b56dd106916b39bb"
+    );
+}
