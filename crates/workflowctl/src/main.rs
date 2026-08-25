@@ -810,14 +810,29 @@ fn main() {
                 Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
             };
             match reload_bindings(current, plan.binding()) {
-                Ok((old_run, published)) => write_stdout(
-                    &format!(
-                        "reloaded old={} new={}\n",
-                        old_run.module_digest(),
-                        published.module_digest()
-                    ),
-                    json,
-                ),
+                Ok((old_run, published)) => {
+                    let old_input: Value = match serde_json::from_str(input.as_str()) {
+                        Ok(input) => input,
+                        Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
+                    };
+                    let old_plan = match PureTransformPlanV1::new(
+                        old_run.clone(),
+                        old_input,
+                        RequestedCapabilities::new(std::iter::empty::<SandboxCapability>()),
+                    ) {
+                        Ok(plan) => plan,
+                        Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
+                    };
+                    write_stdout(
+                        &format!(
+                            "reloaded old={} new={}\n{}",
+                            old_run.module_digest(),
+                            published.module_digest(),
+                            old_plan.render()
+                        ),
+                        json,
+                    );
+                }
                 Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
             }
         }

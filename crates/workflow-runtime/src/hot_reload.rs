@@ -103,10 +103,14 @@ impl std::error::Error for HotReloadError {}
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use sha2::{Digest, Sha256};
 
     use super::{DevelopmentHotReload, HotReloadErrorKind};
-    use crate::{ProductionProfile, PureTransformBinding, RunId};
+    use crate::{
+        ProductionProfile, PureTransformBinding, PureTransformPlanV1, RequestedCapabilities, RunId,
+        SandboxCapability,
+    };
 
     fn digest(module: &[u8]) -> String {
         format!("sha256:{:x}", Sha256::digest(module))
@@ -154,19 +158,25 @@ mod tests {
             .expect_err("stale reload must fail closed");
         assert_eq!(in_flight.module_bytes(), old);
         assert_eq!(publisher.current().module_bytes(), old);
-        assert_eq!(
-            publisher
-                .reload(
-                    digest(old).as_str(),
-                    "workflow",
-                    "2",
-                    digest(new),
-                    Some(new)
-                )
-                .expect("changed package must publish")
-                .module_bytes(),
-            new
-        );
+        let replacement = publisher
+            .reload(
+                digest(old).as_str(),
+                "workflow",
+                "2",
+                digest(new),
+                Some(new),
+            )
+            .expect("changed package must publish");
+        assert_eq!(replacement.module_bytes(), new);
+        assert_eq!(in_flight.module_bytes(), old);
+        let explanation = PureTransformPlanV1::new(
+            in_flight,
+            json!({"value": 7}),
+            RequestedCapabilities::new(std::iter::empty::<SandboxCapability>()),
+        )
+        .expect("captured binding must remain explainable")
+        .render();
+        assert!(explanation.contains(&format!("module_digest={}", digest(old))));
     }
 
     #[test]

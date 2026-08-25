@@ -535,14 +535,23 @@ fn reload_dispatch_publishes_an_immutable_bind() {
 
 #[test]
 fn canary_inflight_old_pkg_80_cli_explain_names_original_package() {
+    let current_module = temporary_fixture_path("current-module");
+    fs::write(&current_module, b"CANARY_INFLIGHT_OLD_PKG_80_OLD")
+        .expect("current module must be writable");
+    let old_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(b"CANARY_INFLIGHT_OLD_PKG_80_OLD")
+    );
     let module_digest = format!(
         "sha256:{:x}",
         Sha256::digest(fs::read(IDENTITY_MODULE).unwrap())
     );
     let mut command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
     command.args([
-        "explain-run",
+        "reload",
         MINIMAL_FIXTURE,
+        "--current-module",
+        current_module.to_str().unwrap(),
         "--module",
         IDENTITY_MODULE,
         "--input",
@@ -551,5 +560,7 @@ fn canary_inflight_old_pkg_80_cli_explain_names_original_package() {
     let result = output(&mut command);
     assert!(result.status.success());
     let stdout = String::from_utf8(result.stdout).expect("explanation must be UTF-8");
-    assert!(stdout.contains(&format!("module_digest={module_digest}")));
+    assert!(stdout.contains(&format!("module_digest={old_digest}")));
+    assert!(stdout.contains(&format!("new={module_digest}")));
+    fs::remove_file(current_module).expect("current module must be removable");
 }
