@@ -2081,6 +2081,7 @@ dependencies = [
  "sha2",
  "workflow-compiler",
  "workflow-ir",
+ "workflow-review",
  "workflow-runtime",
  "workflow-spec",
  "workflow-testkit",

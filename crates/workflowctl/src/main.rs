@@ -10,6 +10,7 @@ use workflow_compiler::{
     audit_dependencies, compile_file, render_mermaid, AuditDisposition, Diagnostic, SkillManifest,
     SkillResourceId, SkillRuntimeLock, SkillRuntimeManifest, WorkflowLock,
 };
+use workflow_review::{validate_secret_free_fixture, SecretFixtureSurface};
 use workflow_runtime::{
     FilesystemArtifactStore, PureTransformBinding, PureTransformPlanV1, PureTransformRequest,
     RequestedCapabilities, RunContext, RunController, RunId, RunLimits, RunOutcome,
@@ -510,6 +511,12 @@ fn bind_test(name: &str, payload: &str) -> Result<CliEnvelope, CliError> {
     if invalid_token(name) || invalid_token(payload) {
         return Err(CliError::TEST_BOUNDARY);
     }
+    validate_secret_free_fixture(
+        SecretFixtureSurface::State,
+        "state.json",
+        payload.as_bytes(),
+    )
+    .map_err(|_| CliError::TEST_BOUNDARY)?;
     Ok(CliEnvelope {
         disposition: CliDisposition::TestRun,
         fixture_name: name.to_owned(),
@@ -519,6 +526,12 @@ fn bind_test(name: &str, payload: &str) -> Result<CliEnvelope, CliError> {
 }
 
 fn bind_eval(name: &str, payload: &str) -> Result<CliEnvelope, CliError> {
+    validate_secret_free_fixture(
+        SecretFixtureSurface::Workdir,
+        "workdir/output.txt",
+        payload.as_bytes(),
+    )
+    .map_err(|_| CliError::EVAL_BOUNDARY)?;
     let envelope = compile_eval(EvalInput::trajectory(EvalFixture::new(
         name.to_owned(),
         payload.to_owned(),
@@ -538,6 +551,8 @@ fn bind_eval(name: &str, payload: &str) -> Result<CliEnvelope, CliError> {
 }
 
 fn bind_replay(bytes: &[u8]) -> Result<CliEnvelope, CliError> {
+    validate_secret_free_fixture(SecretFixtureSurface::Trace, "trace.jsonl", bytes)
+        .map_err(|_| CliError::REPLAY_INVALID)?;
     let bundle = ReplayBundle::from_json(bytes).map_err(|_| CliError::REPLAY_INVALID)?;
     let trace = bundle.replay();
     Ok(CliEnvelope {
@@ -1025,6 +1040,34 @@ mod tests {
             "artifacts": []
         }))
         .expect("serialize replay canary")
+    }
+
+    #[test]
+    fn production_state_persistence_rejects_secret_canary() {
+        let error = bind_test("state-78", "CANARY_SECRET_PROD_STATE_78")
+            .expect_err("state persistence must reject secret canary");
+        assert_eq!(error.disposition(), CliDisposition::BoundaryMiss);
+    }
+
+    #[test]
+    fn production_workdir_persistence_rejects_secret_canary() {
+        let error = bind_eval("workdir-78", "CANARY_SECRET_PROD_WORKDIR_78")
+            .expect_err("workdir persistence must reject secret canary");
+        assert_eq!(error.disposition(), CliDisposition::BoundaryMiss);
+    }
+
+    #[test]
+    fn production_trace_persistence_rejects_secret_canary() {
+        let bytes = canary_replay_bytes("CANARY_SECRET_PROD_TRACE_78");
+        let bytes = String::from_utf8(bytes)
+            .expect("replay fixture must be JSON")
+            .replace(
+                "\"toml\":\"test\"",
+                "\"toml\":\"CANARY_SECRET_PROD_TRACE_78\"",
+            );
+        let error =
+            bind_replay(bytes.as_bytes()).expect_err("trace persistence must reject secret canary");
+        assert_eq!(error.disposition(), CliDisposition::BoundaryMiss);
     }
 
     #[test]
