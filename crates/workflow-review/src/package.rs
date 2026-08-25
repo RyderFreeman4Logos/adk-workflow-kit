@@ -138,6 +138,17 @@ pub enum PackageValidationError {
     SecretDetected,
 }
 
+/// A durable surface that must not receive secret material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecretFixtureSurface {
+    /// Serialized workflow state.
+    State,
+    /// Files written in a workflow workdir.
+    Workdir,
+    /// Serialized execution trace events.
+    Trace,
+}
+
 impl std::fmt::Display for PackageValidationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
@@ -223,6 +234,19 @@ pub fn validate_package(
     Ok(())
 }
 
+/// Rejects secret-like data before a fixture reaches a durable workflow surface.
+pub fn validate_secret_free_fixture(
+    _surface: SecretFixtureSurface,
+    path: &str,
+    bytes: &[u8],
+) -> Result<(), PackageValidationError> {
+    ensure_safe_path(path)?;
+    if contains_secret_like_data(path, bytes) {
+        return Err(PackageValidationError::SecretDetected);
+    }
+    Ok(())
+}
+
 fn ensure_safe_path(path: &str) -> Result<(), PackageValidationError> {
     if path.is_empty() || path.starts_with('/') || path.starts_with('\\') || path.contains(':') {
         return Err(PackageValidationError::PathEscape);
@@ -259,6 +283,7 @@ fn contains_secret_like_data(path: &str, bytes: &[u8]) -> bool {
     let content = String::from_utf8_lossy(bytes).to_ascii_lowercase();
     if [
         "canary_secret_56",
+        "canary_secret_",
         "password",
         "api_key",
         "private_key",
@@ -283,7 +308,10 @@ fn contains_secret_like_data(path: &str, bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_package, PackageArchiveEntry, PackageFile, PackageManifest};
+    use super::{
+        validate_package, validate_secret_free_fixture, PackageArchiveEntry, PackageFile,
+        PackageManifest, PackageValidationError, SecretFixtureSurface,
+    };
     use sha2::{Digest, Sha256};
 
     fn digest(bytes: &[u8]) -> String {
@@ -315,5 +343,41 @@ mod tests {
         );
 
         assert_eq!(result, Err(super::PackageValidationError::InvalidManifest));
+    }
+
+    #[test]
+    fn secret_bearing_state_fixture_is_rejected() {
+        assert_eq!(
+            validate_secret_free_fixture(
+                SecretFixtureSurface::State,
+                "state.json",
+                br#"{"value":"CANARY_SECRET_STATE_78"}"#,
+            ),
+            Err(PackageValidationError::SecretDetected)
+        );
+    }
+
+    #[test]
+    fn secret_bearing_workdir_fixture_is_rejected() {
+        assert_eq!(
+            validate_secret_free_fixture(
+                SecretFixtureSurface::Workdir,
+                "workdir/output.txt",
+                b"CANARY_SECRET_WORKDIR_78",
+            ),
+            Err(PackageValidationError::SecretDetected)
+        );
+    }
+
+    #[test]
+    fn secret_bearing_trace_fixture_is_rejected() {
+        assert_eq!(
+            validate_secret_free_fixture(
+                SecretFixtureSurface::Trace,
+                "trace.jsonl",
+                br#"{"event":"CANARY_SECRET_TRACE_78"}"#,
+            ),
+            Err(PackageValidationError::SecretDetected)
+        );
     }
 }

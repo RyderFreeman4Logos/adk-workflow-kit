@@ -26,7 +26,8 @@ pub use multi_hop::{
 };
 
 pub use package::{
-    validate_package, PackageArchiveEntry, PackageFile, PackageManifest, PackageValidationError,
+    validate_package, validate_secret_free_fixture, PackageArchiveEntry, PackageFile,
+    PackageManifest, PackageValidationError, SecretFixtureSurface,
 };
 
 /// The only supported review schema version.
