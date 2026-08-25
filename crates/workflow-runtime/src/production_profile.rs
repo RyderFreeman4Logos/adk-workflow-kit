@@ -1,5 +1,5 @@
 use std::{
-    fmt,
+    fmt, fs,
     path::{Path, PathBuf},
 };
 
@@ -26,7 +26,13 @@ impl ProductionProfile {
 
     /// Binds a production workdir without a source-truth path.
     pub fn bind(&self, run_id: &RunId) -> Result<ProductionProfileBinding, ProductionProfileError> {
-        self.bind_with_source(run_id, Path::new("/"))
+        let workdir = self.workdirs.allocate(run_id).map_err(|_| {
+            ProductionProfileError::new(ProductionProfileErrorKind::WorkdirIsolationBreach, None)
+        })?;
+        Ok(ProductionProfileBinding {
+            workdir,
+            source_root: None,
+        })
     }
 
     /// Binds a production workdir while retaining the source-truth boundary.
@@ -35,8 +41,17 @@ impl ProductionProfile {
         run_id: &RunId,
         source_root: impl AsRef<Path>,
     ) -> Result<ProductionProfileBinding, ProductionProfileError> {
-        let source_root = source_root.as_ref().to_path_buf();
+        let source_root = source_root.as_ref();
         if !source_root.is_absolute() {
+            return Err(ProductionProfileError::new(
+                ProductionProfileErrorKind::SourceTruthViolation,
+                None,
+            ));
+        }
+        let source_root = fs::canonicalize(source_root).map_err(|_| {
+            ProductionProfileError::new(ProductionProfileErrorKind::SourceTruthViolation, None)
+        })?;
+        if self.workdirs.base_path().starts_with(&source_root) {
             return Err(ProductionProfileError::new(
                 ProductionProfileErrorKind::SourceTruthViolation,
                 None,
@@ -47,7 +62,7 @@ impl ProductionProfile {
         })?;
         Ok(ProductionProfileBinding {
             workdir,
-            source_root,
+            source_root: Some(source_root),
         })
     }
 }
@@ -55,7 +70,7 @@ impl ProductionProfile {
 /// A successfully bound production profile.
 pub struct ProductionProfileBinding {
     workdir: RunWorkdir,
-    source_root: PathBuf,
+    source_root: Option<PathBuf>,
 }
 
 impl ProductionProfileBinding {
@@ -78,7 +93,33 @@ impl ProductionProfileBinding {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<(), ProductionProfileError> {
-        if path.as_ref().starts_with(&self.source_root) {
+        let Some(source_root) = &self.source_root else {
+            return Err(ProductionProfileError::new(
+                ProductionProfileErrorKind::SourceTruthViolation,
+                None,
+            ));
+        };
+        let path = path.as_ref();
+        if !path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            })
+        {
+            return Err(ProductionProfileError::new(
+                ProductionProfileErrorKind::SourceTruthViolation,
+                None,
+            ));
+        }
+        let Ok(canonical_path) = fs::canonicalize(path) else {
+            return Err(ProductionProfileError::new(
+                ProductionProfileErrorKind::SourceTruthViolation,
+                None,
+            ));
+        };
+        if canonical_path.starts_with(source_root) {
             Err(ProductionProfileError::new(
                 ProductionProfileErrorKind::SourceTruthViolation,
                 None,
@@ -94,7 +135,12 @@ impl ProductionProfileBinding {
         path: impl AsRef<Path>,
     ) -> Result<(), ProductionProfileError> {
         let path = path.as_ref();
-        if path.starts_with(self.workdir.root()) && !path.starts_with(&self.source_root) {
+        if path.starts_with(self.workdir.root())
+            && !self
+                .source_root
+                .as_ref()
+                .is_some_and(|source_root| path.starts_with(source_root))
+        {
             Ok(())
         } else {
             Err(ProductionProfileError::new(

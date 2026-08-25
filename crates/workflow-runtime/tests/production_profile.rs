@@ -39,6 +39,64 @@ fn canary_prod_profile_82_binds_production_workdir_without_dev_fallback() {
     assert!(binding
         .requested()
         .contains(SandboxCapability::FilesystemWrite));
+    binding
+        .validate_workdir_path(binding.workdir().out_dir())
+        .expect(CANARY_PROD_PROFILE_82);
+}
+
+#[test]
+fn source_truth_validation_rejects_relative_and_noncanonical_paths() {
+    let (root, workdirs) = root();
+    let source = root.join("source");
+    fs::create_dir(&source).expect("source root");
+    let binding = ProductionProfile::new(&workdirs)
+        .expect("production profile")
+        .bind_with_source(&run_id(), &source)
+        .expect("binding");
+
+    for path in [
+        std::path::PathBuf::from("../source/truth.txt"),
+        source.join(".").join("truth.txt"),
+    ] {
+        assert_eq!(
+            binding.validate_source_path(path).unwrap_err().kind(),
+            ProductionProfileErrorKind::SourceTruthViolation
+        );
+    }
+}
+
+#[test]
+fn binding_rejects_workdir_base_inside_source_before_allocation() {
+    let (root, _workdirs) = root();
+    let source = root.join("source");
+    fs::create_dir(&source).expect("source root");
+    let equal_profile = ProductionProfile::new(&source).expect("production profile");
+    assert_eq!(
+        match equal_profile.bind_with_source(&run_id(), &source) {
+            Ok(_) => panic!("source tree must not receive production artifacts"),
+            Err(error) => error,
+        }
+        .kind(),
+        ProductionProfileErrorKind::SourceTruthViolation
+    );
+    let nested_workdirs = source.join("workdirs");
+    fs::create_dir(&nested_workdirs).expect("nested workdir base");
+    let profile = ProductionProfile::new(&nested_workdirs).expect("production profile");
+
+    let error = match profile.bind_with_source(&run_id(), &source) {
+        Ok(_) => panic!("source tree must not receive production artifacts"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        ProductionProfileErrorKind::SourceTruthViolation
+    );
+    assert_eq!(
+        fs::read_dir(&nested_workdirs)
+            .expect("nested workdir base remains readable")
+            .count(),
+        0
+    );
 }
 
 #[test]

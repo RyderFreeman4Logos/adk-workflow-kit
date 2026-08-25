@@ -45,6 +45,10 @@ impl WorkdirManager {
         })
     }
 
+    pub(crate) fn base_path(&self) -> &Path {
+        &self.base
+    }
+
     /// Allocates a fresh root for `run_id` with no materialized inputs.
     pub fn allocate(&self, run_id: &RunId) -> Result<RunWorkdir, WorkdirError> {
         self.materialize(run_id, &Materialization::default())
