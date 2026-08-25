@@ -425,6 +425,7 @@ mod tests {
 
     const CANARY_UNIT_PUBLISH_64: &str = "CANARY_UNIT_PUBLISH_64";
     const CANARY_UNIT_ABSTAIN_64: &str = "CANARY_UNIT_ABSTAIN_64";
+    const CANARY_UNIT_SUPPORTED_CITATION_65: &str = "CANARY_UNIT_SUPPORTED_CITATION_65";
     const SUBJECT: &str = "grounded-answer-unit-subject";
 
     fn input(answer: &str, verdict: ReviewVerdict) -> GroundedAnswerInput {
@@ -520,6 +521,37 @@ mod tests {
             ),
             Err(GroundedAnswerError::InvalidCitation)
         );
+    }
+
+    #[test]
+    fn supported_citation_publishes_without_abstain_and_stays_payload_free() {
+        let claim = GroundedAnswerClaim::new(
+            CANARY_UNIT_SUPPORTED_CITATION_65.to_owned(),
+            vec!["citation-65".to_owned()],
+        );
+        let citation = GroundedAnswerCitation::new(
+            "citation-65".to_owned(),
+            format!("source supports {CANARY_UNIT_SUPPORTED_CITATION_65}"),
+        );
+        let payload =
+            input("safe answer", ReviewVerdict::Pass).with_claims(vec![claim], vec![citation]);
+        let result = compile_grounded_answer(payload).expect("supported citation must publish");
+
+        match &result {
+            GroundedAnswerEnvelope::Published { .. } => {}
+            GroundedAnswerEnvelope::Abstained { .. } => {
+                panic!("supported citation must not abstain")
+            }
+        }
+        assert!(result.acknowledgement().is_some());
+        assert!(result.diagnostic().is_none());
+        assert!(!format!("{result:?}").contains(CANARY_UNIT_SUPPORTED_CITATION_65));
+        assert!(!result
+            .to_string()
+            .contains(CANARY_UNIT_SUPPORTED_CITATION_65));
+        assert!(!serde_json::to_string(&result)
+            .expect("supported citation envelope must serialize")
+            .contains(CANARY_UNIT_SUPPORTED_CITATION_65));
     }
 
     #[test]
