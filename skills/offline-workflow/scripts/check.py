@@ -1,0 +1,1 @@
+print('offline workflow skill')
