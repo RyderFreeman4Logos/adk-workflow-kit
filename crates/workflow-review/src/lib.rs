@@ -10,12 +10,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod grounded_answer;
+mod multi_hop;
 mod package;
 
 pub use grounded_answer::{
     compile_grounded_answer, GroundedAnswerCitation, GroundedAnswerClaim, GroundedAnswerDiagnostic,
     GroundedAnswerDiagnosticKind, GroundedAnswerEnvelope, GroundedAnswerError, GroundedAnswerInput,
     GroundedAnswerOutcome, GroundedAnswerPublicationAck,
+};
+
+pub use multi_hop::{
+    compile_multi_hop, MultiHopAcknowledgement, MultiHopCoverage, MultiHopDiagnostic,
+    MultiHopDiagnosticKind, MultiHopEnvelope, MultiHopError, MultiHopHop, MultiHopInput,
+    MultiHopOutcome,
 };
 
 pub use package::{
