@@ -12,9 +12,9 @@ use workflow_compiler::{
 };
 use workflow_review::{validate_secret_free_fixture, SecretFixtureSurface};
 use workflow_runtime::{
-    FilesystemArtifactStore, PureTransformBinding, PureTransformPlanV1, PureTransformRequest,
-    RequestedCapabilities, RunContext, RunController, RunId, RunLimits, RunOutcome,
-    SandboxCapability, WorkdirManager,
+    DevelopmentHotReload, FilesystemArtifactStore, HotReloadError, PureTransformBinding,
+    PureTransformPlanV1, PureTransformRequest, RequestedCapabilities, RunContext, RunController,
+    RunId, RunLimits, RunOutcome, SandboxCapability, WorkdirManager,
 };
 use workflow_spec::{read_bounded_regular_file, SourcePath};
 use workflow_testkit::{compile_eval, EvalEnvelope, EvalFixture, EvalInput, ReplayBundle};
@@ -406,6 +406,22 @@ fn build_run_plan(
     .map_err(|_| Box::new(Diagnostic::run_unsupported_input()))
 }
 
+fn reload_bindings(
+    current: PureTransformBinding,
+    replacement: &PureTransformBinding,
+) -> Result<(PureTransformBinding, PureTransformBinding), HotReloadError> {
+    let mut publisher = DevelopmentHotReload::new(current);
+    let old_run = publisher.start_run();
+    let published = publisher.reload(
+        old_run.module_digest(),
+        replacement.workflow_id(),
+        replacement.workflow_version(),
+        replacement.module_digest(),
+        Some(replacement.module_bytes()),
+    )?;
+    Ok((old_run, published))
+}
+
 fn run_limits() -> RunLimits {
     RunLimits::new(
         NonZeroU64::new(10_000).expect("positive limit"),
@@ -754,6 +770,49 @@ fn main() {
                 Err(diagnostic) => exit_diagnostic(*diagnostic, json),
             }
         }
+        Some(("reload", subcommand)) => {
+            let Some(path) = subcommand.get_one::<String>("path") else {
+                exit_invalid_arguments(json);
+            };
+            let Some(module) = subcommand.get_one::<String>("module") else {
+                exit_invalid_arguments(json);
+            };
+            let Some(input) = subcommand.get_one::<String>("input") else {
+                exit_invalid_arguments(json);
+            };
+            let plan = match build_run_plan(path.as_str(), module.as_str(), input.as_str()) {
+                Ok(plan) => plan,
+                Err(diagnostic) => exit_diagnostic(*diagnostic, json),
+            };
+            let current_bytes = match read_bounded_regular_file(
+                &SourcePath::from(path.as_str()),
+                PureTransformRequest::MAX_MODULE_BYTES,
+            ) {
+                Ok(bytes) => bytes,
+                Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
+            };
+            let current_digest = format!("sha256:{}", hex_encode(&Sha256::digest(&current_bytes)));
+            let current = match PureTransformBinding::new(
+                plan.binding().workflow_id(),
+                plan.binding().workflow_version(),
+                current_digest,
+                current_bytes,
+            ) {
+                Ok(binding) => binding,
+                Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
+            };
+            match reload_bindings(current, plan.binding()) {
+                Ok((old_run, published)) => write_stdout(
+                    &format!(
+                        "reloaded old={} new={}\n",
+                        old_run.module_digest(),
+                        published.module_digest()
+                    ),
+                    json,
+                ),
+                Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
+            }
+        }
         Some(("run", subcommand)) => {
             let Some(path) = subcommand.get_one::<String>("path") else {
                 exit_invalid_arguments(json);
@@ -878,6 +937,7 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use sha2::{Digest, Sha256};
+    use workflow_runtime::{DevelopmentHotReload, HotReloadErrorKind, ProductionProfile, RunId};
 
     use super::{
         bind_eval, bind_replay, bind_test, command, test_skill, validate_skill_manifest,
@@ -1021,52 +1081,66 @@ mod tests {
     const CANARY_INFLIGHT_OLD_PKG_80: &str = "CANARY_INFLIGHT_OLD_PKG_80";
     const CANARY_PROD_NO_RELOAD_80: &str = "CANARY_PROD_NO_RELOAD_80";
 
+    fn canary_binding(marker: &str) -> workflow_runtime::PureTransformBinding {
+        let module = marker.as_bytes();
+        workflow_runtime::PureTransformBinding::new(
+            "workflow",
+            marker,
+            format!("sha256:{:x}", Sha256::digest(module)),
+            module,
+        )
+        .expect("canary binding must be valid")
+    }
+
     #[test]
     fn hot_reload_canary_declares_development_bind() {
-        let matches = command()
-            .try_get_matches_from([
-                "workflowctl",
-                "reload",
-                "workflow.json",
-                "--module",
-                "module.wasm",
-                "--input",
-                CANARY_HOTRELOAD_80,
-            ])
-            .expect("development reload bind must be declared");
-        assert_eq!(matches.subcommand_name(), Some("reload"));
+        let old = canary_binding(&format!("{CANARY_HOTRELOAD_80}_OLD"));
+        let new = canary_binding(&format!("{CANARY_HOTRELOAD_80}_NEW"));
+        let mut publisher = DevelopmentHotReload::new(old.clone());
+        let published = publisher
+            .reload(
+                old.module_digest(),
+                new.workflow_id(),
+                new.workflow_version(),
+                new.module_digest(),
+                Some(new.module_bytes()),
+            )
+            .expect("development reload must publish a new bind");
+        assert_eq!(published.module_digest(), new.module_digest());
     }
 
     #[test]
     fn hot_reload_canary_keeps_inflight_old_package() {
-        let matches = command()
-            .try_get_matches_from([
-                "workflowctl",
-                "reload",
-                "workflow.json",
-                "--module",
-                "module.wasm",
-                "--input",
-                CANARY_INFLIGHT_OLD_PKG_80,
-            ])
-            .expect("immutable in-flight package bind must be declared");
-        assert_eq!(matches.subcommand_name(), Some("reload"));
+        let old = canary_binding(&format!("{CANARY_INFLIGHT_OLD_PKG_80}_OLD"));
+        let new = canary_binding(&format!("{CANARY_INFLIGHT_OLD_PKG_80}_NEW"));
+        let mut publisher = DevelopmentHotReload::new(old.clone());
+        let in_flight = publisher.start_run();
+        publisher
+            .reload(
+                old.module_digest(),
+                new.workflow_id(),
+                new.workflow_version(),
+                new.module_digest(),
+                Some(new.module_bytes()),
+            )
+            .expect("reload must publish a new bind");
+        assert_eq!(in_flight.module_digest(), old.module_digest());
+        assert_eq!(in_flight.workflow_version(), old.workflow_version());
     }
 
     #[test]
     fn hot_reload_canary_rejects_production_bind() {
-        let matches = command()
-            .try_get_matches_from([
-                "workflowctl",
-                "reload",
-                "production.json",
-                "--module",
-                "module.wasm",
-                "--input",
-                CANARY_PROD_NO_RELOAD_80,
-            ])
-            .expect("production reload request must reach typed rejection");
-        assert_eq!(matches.subcommand_name(), Some("reload"));
+        let base =
+            std::env::temp_dir().join(format!("workflowctl-prod-reload-{}", std::process::id()));
+        fs::create_dir_all(&base).expect("production test base must be created");
+        let profile = ProductionProfile::new(&base).expect("production profile must bind");
+        let run_id = RunId::new(CANARY_PROD_NO_RELOAD_80.to_owned()).expect("run ID must be valid");
+        let binding = profile.bind(&run_id).expect("production bind must succeed");
+        let error = binding
+            .reload("current", "workflow", "2", "sha256:invalid", Some(b"new"))
+            .expect_err("production reload must fail closed");
+        assert_eq!(error.kind(), HotReloadErrorKind::ProductionReloadForbidden);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     const CANARY_CLI_TEST_54: &str = "CANARY_CLI_TEST_54";

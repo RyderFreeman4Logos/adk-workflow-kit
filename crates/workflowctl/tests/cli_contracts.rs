@@ -19,6 +19,10 @@ const MINIMAL_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/minimal.workflow.toml"
 );
+const IDENTITY_MODULE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/transform_identity.wasm"
+);
 
 static TEMP_FILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -495,4 +499,23 @@ fn hostile_and_oversized_paths_fail_before_dispatch_without_echo() {
     let mut oversized_command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
     oversized_command.args(["--json", "validate", oversized.as_str()]);
     assert_error(output(&mut oversized_command), JSON_ERROR);
+}
+
+#[test]
+fn reload_dispatch_publishes_an_immutable_bind() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+    command.args([
+        "reload",
+        MINIMAL_FIXTURE,
+        "--module",
+        IDENTITY_MODULE,
+        "--input",
+        r#"{"value":7}"#,
+    ]);
+    let result = output(&mut command);
+    assert!(result.status.success());
+    assert!(result.stderr.is_empty());
+    let stdout = String::from_utf8(result.stdout).expect("reload output must be UTF-8");
+    assert!(stdout.starts_with("reloaded old=sha256:"));
+    assert!(stdout.contains(" new=sha256:"));
 }
