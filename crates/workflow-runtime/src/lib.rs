@@ -7,6 +7,7 @@ mod controller;
 mod execution;
 mod observability;
 mod policy;
+mod production_profile;
 mod pure_transform;
 mod session;
 mod tool;
@@ -38,6 +39,10 @@ pub use policy::{
     evaluate_context_policy, Classification, ContextPolicyDenied, ContextPolicyDeniedKind,
     EffectivePolicy, InvalidNetworkDestination, InvalidPolicyToken, NetworkDestination,
     NetworkProfile, PolicyLayer, PolicySubject, RoleToken, TenantId,
+};
+pub use production_profile::{
+    ProductionProfile, ProductionProfileBinding, ProductionProfileError,
+    ProductionProfileErrorKind, ProductionProfileRegistry,
 };
 pub use pure_transform::{
     PureTransformBackend, PureTransformError, PureTransformRequest, PureTransformRequestError,

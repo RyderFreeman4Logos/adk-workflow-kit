@@ -1,0 +1,110 @@
+use std::{
+    fs,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use workflow_runtime::{
+    ProductionProfile, ProductionProfileErrorKind, ProductionProfileRegistry, RunId,
+    SandboxCapability,
+};
+
+static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+fn run_id() -> RunId {
+    RunId::new(String::from("production-profile-82")).expect("valid test run ID")
+}
+
+fn root() -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!(
+        "workflow-runtime-production-profile-82-{}-{}",
+        std::process::id(),
+        NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&root).expect("unique test root");
+    let workdirs = root.join("workdirs");
+    fs::create_dir(&workdirs).expect("workdir base");
+    (root, workdirs)
+}
+
+#[test]
+fn canary_prod_profile_82_binds_production_workdir_without_dev_fallback() {
+    const CANARY_PROD_PROFILE_82: &str = "CANARY_PROD_PROFILE_82";
+    let (_root, workdirs) = root();
+    let profile = ProductionProfile::new(&workdirs).expect("production profile");
+    let binding = profile.bind(&run_id()).expect(CANARY_PROD_PROFILE_82);
+    assert_eq!(binding.profile_name(), "production");
+    assert!(binding
+        .requested()
+        .contains(SandboxCapability::FilesystemRead));
+    assert!(binding
+        .requested()
+        .contains(SandboxCapability::FilesystemWrite));
+}
+
+#[test]
+fn canary_acl_intact_82_rejects_source_truth_crossing_with_typed_error() {
+    const CANARY_ACL_INTACT_82: &str = "CANARY_ACL_INTACT_82";
+    let (root, workdirs) = root();
+    let source = root.join("source");
+    fs::create_dir(&source).expect("source root");
+    let binding = ProductionProfile::new(&workdirs)
+        .expect("production profile")
+        .bind_with_source(&run_id(), &source)
+        .expect(CANARY_ACL_INTACT_82);
+    let error = binding
+        .validate_source_path(source.join("truth.txt"))
+        .expect_err(CANARY_ACL_INTACT_82);
+    assert_eq!(
+        error.kind(),
+        ProductionProfileErrorKind::SourceTruthViolation
+    );
+}
+
+#[test]
+fn canary_workdir_isolate_82_rejects_host_tree_write_as_source_truth() {
+    const CANARY_WORKDIR_ISOLATE_82: &str = "CANARY_WORKDIR_ISOLATE_82";
+    let (root, workdirs) = root();
+    let source = root.join("source");
+    fs::create_dir(&source).expect("source root");
+    let binding = ProductionProfile::new(&workdirs)
+        .expect("production profile")
+        .bind_with_source(&run_id(), &source)
+        .expect(CANARY_WORKDIR_ISOLATE_82);
+    let error = binding
+        .validate_workdir_path(source.join("host-write"))
+        .expect_err(CANARY_WORKDIR_ISOLATE_82);
+    assert_eq!(
+        error.kind(),
+        ProductionProfileErrorKind::WorkdirIsolationBreach
+    );
+}
+
+#[test]
+fn missing_production_profile_is_typed_and_never_falls_back() {
+    let error = match ProductionProfileRegistry::default().select("production") {
+        Ok(_) => panic!("missing production profile must fail closed"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        ProductionProfileErrorKind::MissingProductionProfile
+    );
+    assert!(!format!("{error:?}").contains("production-profile-82"));
+}
+
+#[test]
+fn diagnostics_do_not_render_paths_or_payloads() {
+    let (root, workdirs) = root();
+    let source = root.join("SECRET_SOURCE_PATH");
+    fs::create_dir(&source).expect("source root");
+    let binding = ProductionProfile::new(&workdirs)
+        .expect("production profile")
+        .bind_with_source(&run_id(), &source)
+        .expect("binding");
+    let error = binding
+        .validate_source_path(&source)
+        .expect_err("source truth must be rejected");
+    let rendered = format!("{error} {error:?}");
+    assert!(!rendered.contains("SECRET_SOURCE_PATH"));
+    assert!(rendered.contains("<redacted>"));
+}
