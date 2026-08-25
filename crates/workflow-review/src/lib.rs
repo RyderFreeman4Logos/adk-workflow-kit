@@ -13,9 +13,9 @@ mod grounded_answer;
 mod package;
 
 pub use grounded_answer::{
-    compile_grounded_answer, GroundedAnswerDiagnostic, GroundedAnswerDiagnosticKind,
-    GroundedAnswerEnvelope, GroundedAnswerError, GroundedAnswerInput, GroundedAnswerOutcome,
-    GroundedAnswerPublicationAck,
+    compile_grounded_answer, GroundedAnswerCitation, GroundedAnswerClaim, GroundedAnswerDiagnostic,
+    GroundedAnswerDiagnosticKind, GroundedAnswerEnvelope, GroundedAnswerError, GroundedAnswerInput,
+    GroundedAnswerOutcome, GroundedAnswerPublicationAck,
 };
 
 pub use package::{
