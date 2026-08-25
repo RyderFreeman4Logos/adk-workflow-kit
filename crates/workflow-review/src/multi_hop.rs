@@ -70,6 +70,76 @@ impl fmt::Debug for MultiHopCoverage {
     }
 }
 
+/// A hop-count budget that fail-closes instead of completing unbounded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MultiHopBudget {
+    hop_limit: usize,
+}
+
+impl MultiHopBudget {
+    /// Creates a budget that admits at most `hop_limit` hops.
+    pub fn new(hop_limit: usize) -> Self {
+        Self { hop_limit }
+    }
+
+    /// Returns the hop-count limit.
+    pub fn hop_limit(self) -> usize {
+        self.hop_limit
+    }
+}
+
+/// A typed coverage-count predicate that must hold before completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CoveragePredicate {
+    required_covered: usize,
+}
+
+impl CoveragePredicate {
+    /// Requires at least `required_covered` hops to have supporting evidence.
+    pub fn new(required_covered: usize) -> Self {
+        Self { required_covered }
+    }
+
+    /// Returns the required covered-hop count.
+    pub fn required_covered(self) -> usize {
+        self.required_covered
+    }
+}
+
+/// Attribution that binds one hop identity to a source name.
+#[derive(Clone, Eq, PartialEq)]
+pub struct MultiHopAttribution {
+    hop_id: String,
+    source: String,
+}
+
+impl MultiHopAttribution {
+    /// Creates attribution for one hop identity.
+    pub fn new(hop_id: String, source: String) -> Self {
+        Self { hop_id, source }
+    }
+
+    /// Returns the hop identity this attribution covers.
+    pub fn hop_id(&self) -> &str {
+        &self.hop_id
+    }
+
+    /// Returns the attributed source name.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+}
+
+impl fmt::Debug for MultiHopAttribution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MultiHopAttribution")
+            .field("hop_id", &self.hop_id)
+            .field("source", &"<redacted>")
+            .finish()
+    }
+}
+
 /// A bounded multi-hop candidate and its coverage fanout.
 ///
 /// Queries and evidence are retained for compilation but redacted from `Debug`.
@@ -78,6 +148,9 @@ pub struct MultiHopInput {
     subject: String,
     hops: Vec<MultiHopHop>,
     coverages: Vec<MultiHopCoverage>,
+    budget: Option<MultiHopBudget>,
+    coverage_predicate: Option<CoveragePredicate>,
+    attributions: Vec<MultiHopAttribution>,
 }
 
 impl MultiHopInput {
@@ -87,7 +160,28 @@ impl MultiHopInput {
             subject,
             hops,
             coverages,
+            budget: None,
+            coverage_predicate: None,
+            attributions: Vec::new(),
         }
+    }
+
+    /// Binds a hop-count budget that must be applied before completion.
+    pub fn with_budget(mut self, budget: MultiHopBudget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// Binds a coverage-count predicate that must be evaluated before completion.
+    pub fn with_coverage_predicate(mut self, predicate: CoveragePredicate) -> Self {
+        self.coverage_predicate = Some(predicate);
+        self
+    }
+
+    /// Binds attributed sources that the merge must retain.
+    pub fn with_attributions(mut self, attributions: Vec<MultiHopAttribution>) -> Self {
+        self.attributions = attributions;
+        self
     }
 
     /// Returns the opaque review subject identity.
@@ -104,6 +198,21 @@ impl MultiHopInput {
     pub fn coverages(&self) -> &[MultiHopCoverage] {
         &self.coverages
     }
+
+    /// Returns the hop-count budget, when bound.
+    pub fn budget(&self) -> Option<MultiHopBudget> {
+        self.budget
+    }
+
+    /// Returns the coverage-count predicate, when bound.
+    pub fn coverage_predicate(&self) -> Option<CoveragePredicate> {
+        self.coverage_predicate
+    }
+
+    /// Returns the attributed sources bound to hops.
+    pub fn attributions(&self) -> &[MultiHopAttribution] {
+        &self.attributions
+    }
 }
 
 impl fmt::Debug for MultiHopInput {
@@ -113,6 +222,8 @@ impl fmt::Debug for MultiHopInput {
             .field("subject", &"<redacted>")
             .field("hop_count", &self.hops.len())
             .field("coverage_count", &self.coverages.len())
+            .field("budget_limit", &self.budget.map(MultiHopBudget::hop_limit))
+            .field("attribution_count", &self.attributions.len())
             .finish()
     }
 }
@@ -122,6 +233,7 @@ impl fmt::Debug for MultiHopInput {
 pub struct MultiHopAcknowledgement {
     hop_count: usize,
     covered_count: usize,
+    attributed_count: usize,
 }
 
 impl MultiHopAcknowledgement {
@@ -134,6 +246,11 @@ impl MultiHopAcknowledgement {
     pub fn covered_count(&self) -> usize {
         self.covered_count
     }
+
+    /// Returns the number of hops that retained a typed attribution.
+    pub fn attributed_count(&self) -> usize {
+        self.attributed_count
+    }
 }
 
 /// A stable category for a multi-hop diagnostic.
@@ -144,6 +261,12 @@ pub enum MultiHopDiagnosticKind {
     UnsupportedCoverage,
     /// At least one hop was dropped from the coverage fanout.
     DroppedHop,
+    /// The hop count exceeds the bound budget.
+    BudgetExceeded,
+    /// The bound coverage predicate was not satisfied.
+    CoveragePredicateMiss,
+    /// At least one hop lacked a typed attribution.
+    MissingAttribution,
 }
 
 /// A typed, redacted diagnostic returned by a corrective or incomplete transition.
@@ -206,6 +329,8 @@ pub enum MultiHopError {
     InvalidHop,
     /// Coverage is empty, malformed, duplicated, or unbound.
     InvalidCoverage,
+    /// Attribution is empty, malformed, duplicated, or unbound.
+    InvalidAttribution,
 }
 
 impl fmt::Display for MultiHopError {
@@ -214,6 +339,7 @@ impl fmt::Display for MultiHopError {
             Self::InvalidSubject => "multi-hop subject is invalid",
             Self::InvalidHop => "multi-hop hop is invalid",
             Self::InvalidCoverage => "multi-hop coverage is invalid",
+            Self::InvalidAttribution => "multi-hop attribution is invalid",
         })
     }
 }
@@ -223,8 +349,9 @@ impl std::error::Error for MultiHopError {}
 /// Compiles one multi-hop candidate into a complete, corrective, or incomplete envelope.
 ///
 /// Completeness requires every hop to have matching coverage whose evidence
-/// contains the hop query. A hop with coverage that does not support its query
-/// is corrective. A hop with no coverage entry is incomplete and never complete.
+/// contains the hop query. Bound budgets, coverage predicates, and attributions
+/// are applied before completion. An over-budget corrective path stays typed
+/// corrective and never becomes an unbounded rewrite.
 pub fn compile_multi_hop(input: MultiHopInput) -> Result<MultiHopEnvelope, MultiHopError> {
     validate_boundary(&input)?;
     if has_dropped_hop(&input) {
@@ -232,6 +359,14 @@ pub fn compile_multi_hop(input: MultiHopInput) -> Result<MultiHopEnvelope, Multi
             diagnostic: MultiHopDiagnostic {
                 kind: MultiHopDiagnosticKind::DroppedHop,
                 code: "multi_hop.dropped_hop",
+            },
+        });
+    }
+    if budget_exceeded(&input) {
+        return Ok(MultiHopEnvelope::Corrective {
+            diagnostic: MultiHopDiagnostic {
+                kind: MultiHopDiagnosticKind::BudgetExceeded,
+                code: "multi_hop.budget_exceeded",
             },
         });
     }
@@ -243,10 +378,27 @@ pub fn compile_multi_hop(input: MultiHopInput) -> Result<MultiHopEnvelope, Multi
             },
         });
     }
+    if coverage_predicate_miss(&input) {
+        return Ok(MultiHopEnvelope::Corrective {
+            diagnostic: MultiHopDiagnostic {
+                kind: MultiHopDiagnosticKind::CoveragePredicateMiss,
+                code: "multi_hop.coverage_predicate_miss",
+            },
+        });
+    }
+    if missing_attribution(&input) {
+        return Ok(MultiHopEnvelope::Corrective {
+            diagnostic: MultiHopDiagnostic {
+                kind: MultiHopDiagnosticKind::MissingAttribution,
+                code: "multi_hop.missing_attribution",
+            },
+        });
+    }
     Ok(MultiHopEnvelope::Complete {
         acknowledgement: MultiHopAcknowledgement {
             hop_count: input.hops().len(),
             covered_count: input.hops().len(),
+            attributed_count: input.attributions().len(),
         },
     })
 }
@@ -309,6 +461,40 @@ fn validate_boundary(input: &MultiHopInput) -> Result<(), MultiHopError> {
     {
         return Err(MultiHopError::InvalidCoverage);
     }
+    if input.attributions().iter().any(|attribution| {
+        attribution.hop_id().is_empty()
+            || attribution
+                .hop_id()
+                .bytes()
+                .any(|byte| byte.is_ascii_control())
+            || attribution.source().is_empty()
+            || attribution
+                .source()
+                .bytes()
+                .any(|byte| byte.is_ascii_control())
+    }) {
+        return Err(MultiHopError::InvalidAttribution);
+    }
+    if input
+        .attributions()
+        .iter()
+        .enumerate()
+        .any(|(index, attribution)| {
+            input.attributions()[..index]
+                .iter()
+                .any(|previous| previous.hop_id() == attribution.hop_id())
+        })
+    {
+        return Err(MultiHopError::InvalidAttribution);
+    }
+    if input.attributions().iter().any(|attribution| {
+        !input
+            .hops()
+            .iter()
+            .any(|hop| hop.id() == attribution.hop_id())
+    }) {
+        return Err(MultiHopError::InvalidAttribution);
+    }
     Ok(())
 }
 
@@ -329,16 +515,42 @@ fn coverage_supports_hops(input: &MultiHopInput) -> bool {
     })
 }
 
+fn budget_exceeded(input: &MultiHopInput) -> bool {
+    input
+        .budget()
+        .is_some_and(|budget| input.hops().len() > budget.hop_limit())
+}
+
+fn coverage_predicate_miss(input: &MultiHopInput) -> bool {
+    input
+        .coverage_predicate()
+        .is_some_and(|predicate| input.hops().len() < predicate.required_covered())
+}
+
+fn missing_attribution(input: &MultiHopInput) -> bool {
+    !input.attributions().is_empty()
+        && input.hops().iter().any(|hop| {
+            !input
+                .attributions()
+                .iter()
+                .any(|attribution| attribution.hop_id() == hop.id())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_multi_hop, validate_boundary, MultiHopCoverage, MultiHopDiagnosticKind,
-        MultiHopEnvelope, MultiHopError, MultiHopHop, MultiHopInput,
+        compile_multi_hop, validate_boundary, CoveragePredicate, MultiHopAttribution,
+        MultiHopBudget, MultiHopCoverage, MultiHopDiagnosticKind, MultiHopEnvelope, MultiHopError,
+        MultiHopHop, MultiHopInput,
     };
 
     const CANARY_UNIT_COMPLETE_66: &str = "CANARY_UNIT_COMPLETE_66";
     const CANARY_UNIT_CORRECTIVE_66: &str = "CANARY_UNIT_CORRECTIVE_66";
     const CANARY_UNIT_INCOMPLETE_66: &str = "CANARY_UNIT_INCOMPLETE_66";
+    const CANARY_BUDGET_67: &str = "CANARY_BUDGET_67";
+    const CANARY_COVERAGE_PRED_67: &str = "CANARY_COVERAGE_PRED_67";
+    const CANARY_ATTR_MERGE_67: &str = "CANARY_ATTR_MERGE_67";
     const SUBJECT: &str = "multi-hop-unit-subject";
 
     fn hop(id: &str, query: &str) -> MultiHopHop {
@@ -468,5 +680,145 @@ mod tests {
                 panic!("corrective fixture must not be incomplete")
             }
         }
+    }
+
+    fn two_supported(canary: &str) -> MultiHopInput {
+        input(
+            vec![hop("hop-a", canary), hop("hop-b", "follow-on hop")],
+            vec![
+                coverage("hop-a", &format!("evidence {canary}")),
+                coverage("hop-b", "evidence follow-on hop"),
+            ],
+        )
+    }
+
+    #[test]
+    fn budget_canary_cannot_report_unbounded_complete() {
+        let result =
+            compile_multi_hop(two_supported(CANARY_BUDGET_67).with_budget(MultiHopBudget::new(1)))
+                .expect("budget canary must compile to a typed diagnostic");
+
+        match result {
+            MultiHopEnvelope::Corrective { diagnostic } => {
+                assert_eq!(diagnostic.kind(), MultiHopDiagnosticKind::BudgetExceeded);
+                assert_eq!(diagnostic.code(), "multi_hop.budget_exceeded");
+            }
+            MultiHopEnvelope::Complete { .. } => {
+                panic!("budget canary must not report unbounded complete")
+            }
+            MultiHopEnvelope::Incomplete { .. } => {
+                panic!("budget canary must stay typed corrective")
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_predicate_canary_is_evaluated() {
+        let result = compile_multi_hop(
+            two_supported(CANARY_COVERAGE_PRED_67)
+                .with_coverage_predicate(CoveragePredicate::new(3)),
+        )
+        .expect("coverage-predicate canary must compile to a typed diagnostic");
+
+        match result {
+            MultiHopEnvelope::Corrective { diagnostic } => {
+                assert_eq!(
+                    diagnostic.kind(),
+                    MultiHopDiagnosticKind::CoveragePredicateMiss
+                );
+                assert_eq!(diagnostic.code(), "multi_hop.coverage_predicate_miss");
+            }
+            MultiHopEnvelope::Complete { .. } => {
+                panic!("coverage predicate canary must not report complete")
+            }
+            MultiHopEnvelope::Incomplete { .. } => {
+                panic!("coverage predicate canary must stay typed corrective")
+            }
+        }
+    }
+
+    #[test]
+    fn attributed_merge_canary_keeps_typed_attribution() {
+        let payload = two_supported(CANARY_ATTR_MERGE_67).with_attributions(vec![
+            MultiHopAttribution::new("hop-a".to_owned(), CANARY_ATTR_MERGE_67.to_owned()),
+            MultiHopAttribution::new("hop-b".to_owned(), "source-b".to_owned()),
+        ]);
+        let result = compile_multi_hop(payload).expect("attributed-merge canary must compile");
+
+        match result {
+            MultiHopEnvelope::Complete { acknowledgement } => {
+                assert_eq!(acknowledgement.hop_count(), 2);
+                assert_eq!(acknowledgement.covered_count(), 2);
+                assert_eq!(acknowledgement.attributed_count(), 2);
+            }
+            MultiHopEnvelope::Corrective { .. } => {
+                panic!("attributed merge canary must not drop attribution")
+            }
+            MultiHopEnvelope::Incomplete { .. } => {
+                panic!("attributed merge canary must not be incomplete")
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_attribution_cannot_succeed() {
+        let payload =
+            two_supported(CANARY_ATTR_MERGE_67).with_attributions(vec![MultiHopAttribution::new(
+                "hop-a".to_owned(),
+                CANARY_ATTR_MERGE_67.to_owned(),
+            )]);
+        let result = compile_multi_hop(payload).expect("dropped attribution must stay typed");
+
+        match result {
+            MultiHopEnvelope::Corrective { diagnostic } => {
+                assert_eq!(
+                    diagnostic.kind(),
+                    MultiHopDiagnosticKind::MissingAttribution
+                );
+                assert_eq!(diagnostic.code(), "multi_hop.missing_attribution");
+            }
+            MultiHopEnvelope::Complete { .. } => panic!("dropped attribution must not succeed"),
+            MultiHopEnvelope::Incomplete { .. } => {
+                panic!("dropped attribution must stay typed corrective")
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_corrective_parity_cannot_report_complete() {
+        let result = compile_multi_hop(
+            input(
+                vec![
+                    hop("hop-a", CANARY_BUDGET_67),
+                    hop("hop-b", "uncovered hop"),
+                ],
+                vec![
+                    coverage("hop-a", &format!("evidence {CANARY_BUDGET_67}")),
+                    coverage("hop-b", "unrelated evidence"),
+                ],
+            )
+            .with_budget(MultiHopBudget::new(1)),
+        )
+        .expect("bounded corrective must compile to a typed diagnostic");
+
+        match result {
+            MultiHopEnvelope::Corrective { diagnostic } => {
+                assert_eq!(diagnostic.kind(), MultiHopDiagnosticKind::BudgetExceeded);
+                assert_eq!(diagnostic.code(), "multi_hop.budget_exceeded");
+            }
+            MultiHopEnvelope::Complete { .. } => {
+                panic!("bounded corrective must not report complete")
+            }
+            MultiHopEnvelope::Incomplete { .. } => {
+                panic!("bounded corrective must not become an unbounded rewrite")
+            }
+        }
+    }
+
+    #[test]
+    fn attribution_debug_redacts_source_payload() {
+        let attribution =
+            MultiHopAttribution::new("hop-a".to_owned(), CANARY_ATTR_MERGE_67.to_owned());
+        assert!(!format!("{attribution:?}").contains(CANARY_ATTR_MERGE_67));
     }
 }

@@ -20,9 +20,9 @@ pub use grounded_answer::{
 };
 
 pub use multi_hop::{
-    compile_multi_hop, MultiHopAcknowledgement, MultiHopCoverage, MultiHopDiagnostic,
-    MultiHopDiagnosticKind, MultiHopEnvelope, MultiHopError, MultiHopHop, MultiHopInput,
-    MultiHopOutcome,
+    compile_multi_hop, CoveragePredicate, MultiHopAcknowledgement, MultiHopAttribution,
+    MultiHopBudget, MultiHopCoverage, MultiHopDiagnostic, MultiHopDiagnosticKind, MultiHopEnvelope,
+    MultiHopError, MultiHopHop, MultiHopInput, MultiHopOutcome,
 };
 
 pub use package::{
