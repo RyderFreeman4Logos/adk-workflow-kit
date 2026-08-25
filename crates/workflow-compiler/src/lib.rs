@@ -3,6 +3,7 @@
 mod diagnostics;
 mod lock;
 mod registry;
+mod security_audit;
 mod skill;
 mod skill_evidence;
 mod skill_resource;
@@ -19,6 +20,7 @@ pub use registry::{
     ModelRegistry, NodeRegistry, PredicateRegistry, RegistryCategory, RegistryEntry,
     RegistryNotFound, SkillRegistry, ToolRegistry, ValidatorRegistry,
 };
+pub use security_audit::{audit_dependencies, AuditDisposition, AuditError, AuditReport};
 pub use skill::{
     activate_skill, SkillActivationError, SkillActivationReceipt, SkillDiscoveryMetadata, SkillId,
     SkillIdError, SkillManifest, SkillManifestError,

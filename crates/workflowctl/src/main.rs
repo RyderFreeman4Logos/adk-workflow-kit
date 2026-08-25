@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use workflow_compiler::{
-    compile_file, render_mermaid, Diagnostic, SkillManifest, SkillResourceId, SkillRuntimeLock,
-    SkillRuntimeManifest, WorkflowLock,
+    audit_dependencies, compile_file, render_mermaid, AuditDisposition, Diagnostic, SkillManifest,
+    SkillResourceId, SkillRuntimeLock, SkillRuntimeManifest, WorkflowLock,
 };
 use workflow_runtime::{
     FilesystemArtifactStore, PureTransformBinding, PureTransformPlanV1, PureTransformRequest,
@@ -18,7 +18,7 @@ use workflow_runtime::{
 use workflow_spec::{read_bounded_regular_file, SourcePath};
 use workflow_testkit::{compile_eval, EvalEnvelope, EvalFixture, EvalInput, ReplayBundle};
 
-const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
+const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}";
 
 fn command() -> Command {
@@ -168,6 +168,7 @@ fn command() -> Command {
                     .help("Replay bundle file"),
             ),
         )
+        .subcommand(Command::new("audit"))
 }
 
 fn exit_diagnostic(diagnostic: Diagnostic, json: bool) -> ! {
@@ -477,6 +478,8 @@ impl CliError {
         match self.code {
             "eval.boundary_miss" => Diagnostic::eval_boundary_miss(),
             "workflow.cli.replay_invalid" => Diagnostic::replay_invalid(),
+            "workflow.audit.critical" => Diagnostic::audit_critical(),
+            "workflow.audit.boundary_miss" => Diagnostic::audit_boundary_miss(),
             _ => Diagnostic::cli_boundary_miss(),
         }
     }
@@ -543,6 +546,29 @@ fn bind_replay(bytes: &[u8]) -> Result<CliEnvelope, CliError> {
         fixture_count: trace.events().len(),
         payload_len: bytes.len(),
     })
+}
+
+const AUDIT_POLICY_PATH: &str = "deny.toml";
+const AUDIT_LOCK_PATH: &str = "Cargo.lock";
+const MAX_AUDIT_FILE_BYTES: usize = 1_048_576;
+
+fn bind_audit() -> Result<String, Box<Diagnostic>> {
+    let policy = read_audit_text(AUDIT_POLICY_PATH)?;
+    let lock = read_audit_text(AUDIT_LOCK_PATH)?;
+    match audit_dependencies(&policy, &lock) {
+        Ok(report) => match report.disposition() {
+            AuditDisposition::Clean => Ok(report.to_string()),
+            AuditDisposition::Critical => Err(Box::new(Diagnostic::audit_critical())),
+            AuditDisposition::BoundaryMiss => Err(Box::new(Diagnostic::audit_boundary_miss())),
+        },
+        Err(_) => Err(Box::new(Diagnostic::audit_boundary_miss())),
+    }
+}
+
+fn read_audit_text(path: &str) -> Result<String, Box<Diagnostic>> {
+    let bytes = read_bounded_regular_file(&SourcePath::from(path), MAX_AUDIT_FILE_BYTES)
+        .map_err(|_| Box::new(Diagnostic::audit_boundary_miss()))?;
+    String::from_utf8(bytes).map_err(|_| Box::new(Diagnostic::audit_boundary_miss()))
 }
 
 fn parse_named_fixture(bytes: &[u8], miss: CliError) -> Result<(String, String), CliError> {
@@ -818,6 +844,10 @@ fn main() {
                 Err(error) => exit_diagnostic(error.diagnostic(), json),
             }
         }
+        Some(("audit", _)) => match bind_audit() {
+            Ok(output) => write_stdout(&format!("{output}\n"), json),
+            Err(diagnostic) => exit_diagnostic(*diagnostic, json),
+        },
         _ => exit_invalid_arguments(json),
     }
 }
@@ -947,6 +977,22 @@ mod tests {
         assert!(
             justfile.contains("workflowctl replay "),
             "local CI must invoke replay"
+        );
+    }
+
+    #[test]
+    fn audit_command_is_declared() {
+        assert!(command()
+            .try_get_matches_from(["workflowctl", "audit"])
+            .is_ok());
+    }
+
+    #[test]
+    fn local_ci_invokes_dependency_security_audit() {
+        let justfile = include_str!("../../../justfile");
+        assert!(
+            justfile.contains("workflowctl audit"),
+            "local CI must invoke the dependency security audit"
         );
     }
 
