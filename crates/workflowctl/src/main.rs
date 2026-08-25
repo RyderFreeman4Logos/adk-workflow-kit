@@ -19,7 +19,7 @@ use workflow_runtime::{
 use workflow_spec::{read_bounded_regular_file, SourcePath};
 use workflow_testkit::{compile_eval, EvalEnvelope, EvalFixture, EvalInput, ReplayBundle};
 
-const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --current-module <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
+const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --current-workflow <PATH> --current-module <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}";
 
 fn command() -> Command {
@@ -148,6 +148,11 @@ fn command() -> Command {
         .subcommand(
             Command::new("reload")
                 .arg(Arg::new("path").value_name("PATH").required(true))
+                .arg(
+                    Arg::new("current-workflow")
+                        .long("current-workflow")
+                        .required(true),
+                )
                 .arg(
                     Arg::new("current-module")
                         .long("current-module")
@@ -363,15 +368,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-/// Compiles the workflow and builds the bounded pure-transform execution plan.
-///
-/// Any unsupported input fails closed with a typed `workflow.run` diagnostic
-/// without executing nodes or touching artifact state.
-fn build_run_plan(
-    workflow: &str,
-    module: &str,
-    input: &str,
-) -> Result<PureTransformPlanV1, Box<Diagnostic>> {
+fn build_binding(workflow: &str, module: &str) -> Result<PureTransformBinding, Box<Diagnostic>> {
     let plan = match compile_file(workflow) {
         Ok(plan) => plan,
         Err(error) => {
@@ -389,18 +386,28 @@ fn build_run_plan(
         Ok(bytes) => bytes,
         Err(_) => return Err(Box::new(Diagnostic::run_unsupported_input())),
     };
-    let input: Value = match serde_json::from_str(input) {
-        Ok(input) => input,
-        Err(_) => return Err(Box::new(Diagnostic::run_unsupported_input())),
-    };
     let digest = format!("sha256:{}", hex_encode(&Sha256::digest(&module_bytes)));
-    let binding = match PureTransformBinding::new(
+    PureTransformBinding::new(
         ir.workflow_id().as_str(),
         ir.workflow_version(),
         digest,
         &module_bytes,
-    ) {
-        Ok(binding) => binding,
+    )
+    .map_err(|_| Box::new(Diagnostic::run_unsupported_input()))
+}
+
+/// Compiles the workflow and builds the bounded pure-transform execution plan.
+///
+/// Any unsupported input fails closed with a typed `workflow.run` diagnostic
+/// without executing nodes or touching artifact state.
+fn build_run_plan(
+    workflow: &str,
+    module: &str,
+    input: &str,
+) -> Result<PureTransformPlanV1, Box<Diagnostic>> {
+    let binding = build_binding(workflow, module)?;
+    let input: Value = match serde_json::from_str(input) {
+        Ok(input) => input,
         Err(_) => return Err(Box::new(Diagnostic::run_unsupported_input())),
     };
     PureTransformPlanV1::new(
@@ -782,6 +789,9 @@ fn main() {
             let Some(module) = subcommand.get_one::<String>("module") else {
                 exit_invalid_arguments(json);
             };
+            let Some(current_workflow) = subcommand.get_one::<String>("current-workflow") else {
+                exit_invalid_arguments(json);
+            };
             let Some(current_module) = subcommand.get_one::<String>("current-module") else {
                 exit_invalid_arguments(json);
             };
@@ -792,20 +802,7 @@ fn main() {
                 Ok(plan) => plan,
                 Err(diagnostic) => exit_diagnostic(*diagnostic, json),
             };
-            let current_bytes = match read_bounded_regular_file(
-                &SourcePath::from(current_module.as_str()),
-                PureTransformRequest::MAX_MODULE_BYTES,
-            ) {
-                Ok(bytes) => bytes,
-                Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
-            };
-            let current_digest = format!("sha256:{}", hex_encode(&Sha256::digest(&current_bytes)));
-            let current = match PureTransformBinding::new(
-                plan.binding().workflow_id(),
-                plan.binding().workflow_version(),
-                current_digest,
-                current_bytes,
-            ) {
+            let current = match build_binding(current_workflow.as_str(), current_module.as_str()) {
                 Ok(binding) => binding,
                 Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
             };

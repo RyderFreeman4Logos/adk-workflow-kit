@@ -11,7 +11,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --current-module <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
+const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --current-workflow <PATH> --current-module <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const HUMAN_ERROR: &str =
     "[workflow.cli.invalid_arguments] invalid command-line arguments location=null details={}\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}\n";
@@ -512,6 +512,8 @@ fn reload_dispatch_publishes_an_immutable_bind() {
     command.args([
         "reload",
         MINIMAL_FIXTURE,
+        "--current-workflow",
+        MINIMAL_FIXTURE,
         "--current-module",
         current_module.to_str().unwrap(),
         "--module",
@@ -550,6 +552,11 @@ fn canary_inflight_old_pkg_80_cli_explain_names_original_package() {
     command.args([
         "reload",
         MINIMAL_FIXTURE,
+        "--current-workflow",
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cli003_transform.workflow.toml"
+        ),
         "--current-module",
         current_module.to_str().unwrap(),
         "--module",
@@ -560,6 +567,8 @@ fn canary_inflight_old_pkg_80_cli_explain_names_original_package() {
     let result = output(&mut command);
     assert!(result.status.success());
     let stdout = String::from_utf8(result.stdout).expect("explanation must be UTF-8");
+    assert!(stdout.contains("workflow_id=transform.cli003"));
+    assert!(stdout.contains("workflow_version=1"));
     assert!(stdout.contains(&format!("module_digest={old_digest}")));
     assert!(stdout.contains(&format!("new={module_digest}")));
     fs::remove_file(current_module).expect("current module must be removable");
