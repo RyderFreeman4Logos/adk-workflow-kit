@@ -12,14 +12,14 @@ use workflow_compiler::{
 };
 use workflow_review::{validate_secret_free_fixture, SecretFixtureSurface};
 use workflow_runtime::{
-    FilesystemArtifactStore, PureTransformBinding, PureTransformPlanV1, PureTransformRequest,
-    RequestedCapabilities, RunContext, RunController, RunId, RunLimits, RunOutcome,
-    SandboxCapability, WorkdirManager,
+    DevelopmentHotReload, FilesystemArtifactStore, HotReloadError, PureTransformBinding,
+    PureTransformPlanV1, PureTransformRequest, RequestedCapabilities, RunContext, RunController,
+    RunId, RunLimits, RunOutcome, SandboxCapability, WorkdirManager,
 };
 use workflow_spec::{read_bounded_regular_file, SourcePath};
 use workflow_testkit::{compile_eval, EvalEnvelope, EvalFixture, EvalInput, ReplayBundle};
 
-const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
+const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --current-workflow <PATH> --current-module <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}";
 
 fn command() -> Command {
@@ -144,6 +144,22 @@ fn command() -> Command {
                         .value_name("JSON")
                         .help("Transform input JSON"),
                 ),
+        )
+        .subcommand(
+            Command::new("reload")
+                .arg(Arg::new("path").value_name("PATH").required(true))
+                .arg(
+                    Arg::new("current-workflow")
+                        .long("current-workflow")
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("current-module")
+                        .long("current-module")
+                        .required(true),
+                )
+                .arg(Arg::new("module").long("module").required(true))
+                .arg(Arg::new("input").long("input").required(true)),
         )
         .subcommand(
             Command::new("test").arg(
@@ -352,15 +368,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-/// Compiles the workflow and builds the bounded pure-transform execution plan.
-///
-/// Any unsupported input fails closed with a typed `workflow.run` diagnostic
-/// without executing nodes or touching artifact state.
-fn build_run_plan(
-    workflow: &str,
-    module: &str,
-    input: &str,
-) -> Result<PureTransformPlanV1, Box<Diagnostic>> {
+fn build_binding(workflow: &str, module: &str) -> Result<PureTransformBinding, Box<Diagnostic>> {
     let plan = match compile_file(workflow) {
         Ok(plan) => plan,
         Err(error) => {
@@ -378,18 +386,28 @@ fn build_run_plan(
         Ok(bytes) => bytes,
         Err(_) => return Err(Box::new(Diagnostic::run_unsupported_input())),
     };
-    let input: Value = match serde_json::from_str(input) {
-        Ok(input) => input,
-        Err(_) => return Err(Box::new(Diagnostic::run_unsupported_input())),
-    };
     let digest = format!("sha256:{}", hex_encode(&Sha256::digest(&module_bytes)));
-    let binding = match PureTransformBinding::new(
+    PureTransformBinding::new(
         ir.workflow_id().as_str(),
         ir.workflow_version(),
         digest,
         &module_bytes,
-    ) {
-        Ok(binding) => binding,
+    )
+    .map_err(|_| Box::new(Diagnostic::run_unsupported_input()))
+}
+
+/// Compiles the workflow and builds the bounded pure-transform execution plan.
+///
+/// Any unsupported input fails closed with a typed `workflow.run` diagnostic
+/// without executing nodes or touching artifact state.
+fn build_run_plan(
+    workflow: &str,
+    module: &str,
+    input: &str,
+) -> Result<PureTransformPlanV1, Box<Diagnostic>> {
+    let binding = build_binding(workflow, module)?;
+    let input: Value = match serde_json::from_str(input) {
+        Ok(input) => input,
         Err(_) => return Err(Box::new(Diagnostic::run_unsupported_input())),
     };
     PureTransformPlanV1::new(
@@ -398,6 +416,22 @@ fn build_run_plan(
         RequestedCapabilities::new(std::iter::empty::<SandboxCapability>()),
     )
     .map_err(|_| Box::new(Diagnostic::run_unsupported_input()))
+}
+
+fn reload_bindings(
+    current: PureTransformBinding,
+    replacement: &PureTransformBinding,
+) -> Result<(PureTransformBinding, PureTransformBinding), HotReloadError> {
+    let mut publisher = DevelopmentHotReload::new(current);
+    let old_run = publisher.start_run();
+    let published = publisher.reload(
+        old_run.module_digest(),
+        replacement.workflow_id(),
+        replacement.workflow_version(),
+        replacement.module_digest(),
+        Some(replacement.module_bytes()),
+    )?;
+    Ok((old_run, published))
 }
 
 fn run_limits() -> RunLimits {
@@ -748,6 +782,57 @@ fn main() {
                 Err(diagnostic) => exit_diagnostic(*diagnostic, json),
             }
         }
+        Some(("reload", subcommand)) => {
+            let Some(path) = subcommand.get_one::<String>("path") else {
+                exit_invalid_arguments(json);
+            };
+            let Some(module) = subcommand.get_one::<String>("module") else {
+                exit_invalid_arguments(json);
+            };
+            let Some(current_workflow) = subcommand.get_one::<String>("current-workflow") else {
+                exit_invalid_arguments(json);
+            };
+            let Some(current_module) = subcommand.get_one::<String>("current-module") else {
+                exit_invalid_arguments(json);
+            };
+            let Some(input) = subcommand.get_one::<String>("input") else {
+                exit_invalid_arguments(json);
+            };
+            let plan = match build_run_plan(path.as_str(), module.as_str(), input.as_str()) {
+                Ok(plan) => plan,
+                Err(diagnostic) => exit_diagnostic(*diagnostic, json),
+            };
+            let current = match build_binding(current_workflow.as_str(), current_module.as_str()) {
+                Ok(binding) => binding,
+                Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
+            };
+            match reload_bindings(current, plan.binding()) {
+                Ok((old_run, published)) => {
+                    let old_input: Value = match serde_json::from_str(input.as_str()) {
+                        Ok(input) => input,
+                        Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
+                    };
+                    let old_plan = match PureTransformPlanV1::new(
+                        old_run.clone(),
+                        old_input,
+                        RequestedCapabilities::new(std::iter::empty::<SandboxCapability>()),
+                    ) {
+                        Ok(plan) => plan,
+                        Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
+                    };
+                    write_stdout(
+                        &format!(
+                            "reloaded old={} new={}\n{}",
+                            old_run.module_digest(),
+                            published.module_digest(),
+                            old_plan.render()
+                        ),
+                        json,
+                    );
+                }
+                Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
+            }
+        }
         Some(("run", subcommand)) => {
             let Some(path) = subcommand.get_one::<String>("path") else {
                 exit_invalid_arguments(json);
@@ -872,6 +957,7 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use sha2::{Digest, Sha256};
+    use workflow_runtime::{DevelopmentHotReload, HotReloadErrorKind, ProductionProfile, RunId};
 
     use super::{
         bind_eval, bind_replay, bind_test, command, test_skill, validate_skill_manifest,
@@ -1009,6 +1095,72 @@ mod tests {
             justfile.contains("workflowctl audit"),
             "local CI must invoke the dependency security audit"
         );
+    }
+
+    const CANARY_HOTRELOAD_80: &str = "CANARY_HOTRELOAD_80";
+    const CANARY_INFLIGHT_OLD_PKG_80: &str = "CANARY_INFLIGHT_OLD_PKG_80";
+    const CANARY_PROD_NO_RELOAD_80: &str = "CANARY_PROD_NO_RELOAD_80";
+
+    fn canary_binding(marker: &str) -> workflow_runtime::PureTransformBinding {
+        let module = marker.as_bytes();
+        workflow_runtime::PureTransformBinding::new(
+            "workflow",
+            marker,
+            format!("sha256:{:x}", Sha256::digest(module)),
+            module,
+        )
+        .expect("canary binding must be valid")
+    }
+
+    #[test]
+    fn hot_reload_canary_declares_development_bind() {
+        let old = canary_binding(&format!("{CANARY_HOTRELOAD_80}_OLD"));
+        let new = canary_binding(&format!("{CANARY_HOTRELOAD_80}_NEW"));
+        let mut publisher = DevelopmentHotReload::new(old.clone());
+        let published = publisher
+            .reload(
+                old.module_digest(),
+                new.workflow_id(),
+                new.workflow_version(),
+                new.module_digest(),
+                Some(new.module_bytes()),
+            )
+            .expect("development reload must publish a new bind");
+        assert_eq!(published.module_digest(), new.module_digest());
+    }
+
+    #[test]
+    fn hot_reload_canary_keeps_inflight_old_package() {
+        let old = canary_binding(&format!("{CANARY_INFLIGHT_OLD_PKG_80}_OLD"));
+        let new = canary_binding(&format!("{CANARY_INFLIGHT_OLD_PKG_80}_NEW"));
+        let mut publisher = DevelopmentHotReload::new(old.clone());
+        let in_flight = publisher.start_run();
+        publisher
+            .reload(
+                old.module_digest(),
+                new.workflow_id(),
+                new.workflow_version(),
+                new.module_digest(),
+                Some(new.module_bytes()),
+            )
+            .expect("reload must publish a new bind");
+        assert_eq!(in_flight.module_digest(), old.module_digest());
+        assert_eq!(in_flight.workflow_version(), old.workflow_version());
+    }
+
+    #[test]
+    fn hot_reload_canary_rejects_production_bind() {
+        let base =
+            std::env::temp_dir().join(format!("workflowctl-prod-reload-{}", std::process::id()));
+        fs::create_dir_all(&base).expect("production test base must be created");
+        let profile = ProductionProfile::new(&base).expect("production profile must bind");
+        let run_id = RunId::new(CANARY_PROD_NO_RELOAD_80.to_owned()).expect("run ID must be valid");
+        let binding = profile.bind(&run_id).expect("production bind must succeed");
+        let error = binding
+            .reload("current", "workflow", "2", "sha256:invalid", Some(b"new"))
+            .expect_err("production reload must fail closed");
+        assert_eq!(error.kind(), HotReloadErrorKind::ProductionReloadForbidden);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     const CANARY_CLI_TEST_54: &str = "CANARY_CLI_TEST_54";

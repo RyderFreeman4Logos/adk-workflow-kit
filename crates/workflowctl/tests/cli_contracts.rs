@@ -9,7 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
+use sha2::{Digest, Sha256};
+
+const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --current-workflow <PATH> --current-module <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const HUMAN_ERROR: &str =
     "[workflow.cli.invalid_arguments] invalid command-line arguments location=null details={}\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}\n";
@@ -18,6 +20,10 @@ const SUBPROCESS_TIMEOUT_MESSAGE: &str = "workflowctl contract subprocess timed 
 const MINIMAL_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/minimal.workflow.toml"
+);
+const IDENTITY_MODULE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/transform_identity.wasm"
 );
 
 static TEMP_FILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -495,4 +501,75 @@ fn hostile_and_oversized_paths_fail_before_dispatch_without_echo() {
     let mut oversized_command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
     oversized_command.args(["--json", "validate", oversized.as_str()]);
     assert_error(output(&mut oversized_command), JSON_ERROR);
+}
+
+#[test]
+fn reload_dispatch_publishes_an_immutable_bind() {
+    let current_module = temporary_fixture_path("current-module");
+    fs::write(&current_module, b"CANARY_HOTRELOAD_80_OLD")
+        .expect("current module must be writable");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+    command.args([
+        "reload",
+        MINIMAL_FIXTURE,
+        "--current-workflow",
+        MINIMAL_FIXTURE,
+        "--current-module",
+        current_module.to_str().unwrap(),
+        "--module",
+        IDENTITY_MODULE,
+        "--input",
+        r#"{"value":7}"#,
+    ]);
+    let result = output(&mut command);
+    assert!(result.status.success());
+    assert!(result.stderr.is_empty());
+    let stdout = String::from_utf8(result.stdout).expect("reload output must be UTF-8");
+    let current_digest = format!("sha256:{:x}", Sha256::digest(b"CANARY_HOTRELOAD_80_OLD"));
+    assert!(stdout.starts_with(&format!("reloaded old={current_digest}")));
+    let module_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(fs::read(IDENTITY_MODULE).unwrap())
+    );
+    assert!(stdout.contains(&format!(" new={module_digest}")));
+    fs::remove_file(current_module).expect("current module must be removable");
+}
+
+#[test]
+fn canary_inflight_old_pkg_80_cli_explain_names_original_package() {
+    let current_module = temporary_fixture_path("current-module");
+    fs::write(&current_module, b"CANARY_INFLIGHT_OLD_PKG_80_OLD")
+        .expect("current module must be writable");
+    let old_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(b"CANARY_INFLIGHT_OLD_PKG_80_OLD")
+    );
+    let module_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(fs::read(IDENTITY_MODULE).unwrap())
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+    command.args([
+        "reload",
+        MINIMAL_FIXTURE,
+        "--current-workflow",
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cli003_transform.workflow.toml"
+        ),
+        "--current-module",
+        current_module.to_str().unwrap(),
+        "--module",
+        IDENTITY_MODULE,
+        "--input",
+        r#"{"value":7}"#,
+    ]);
+    let result = output(&mut command);
+    assert!(result.status.success());
+    let stdout = String::from_utf8(result.stdout).expect("explanation must be UTF-8");
+    assert!(stdout.contains("workflow_id=transform.cli003"));
+    assert!(stdout.contains("workflow_version=1"));
+    assert!(stdout.contains(&format!("module_digest={old_digest}")));
+    assert!(stdout.contains(&format!("new={module_digest}")));
+    fs::remove_file(current_module).expect("current module must be removable");
 }
