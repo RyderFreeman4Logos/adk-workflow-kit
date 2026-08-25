@@ -7,10 +7,10 @@ This document defines release governance and the v0.1 compatibility contract for
 ## Compatibility and Migration Contract
 
 v0.1 is the compatibility baseline for the documented workflow and review
-wire contracts. Every serialized contract carries an explicit schema version;
-readers must reject an unknown or unsupported version rather than silently
-reinterpret it. Boundary validation remains explicit, and failures retain
-typed diagnostic codes instead of relying on rendered error text.
+wire contracts. Versioned top-level persisted artifacts carry explicit schema
+versions; readers must reject an unknown or unsupported version rather than
+silently reinterpret it. Boundary validation remains explicit, and failures
+retain typed diagnostic codes instead of relying on rendered error text.
 
 ### Migration Guarantees
 
@@ -29,7 +29,7 @@ typed diagnostic codes instead of relying on rendered error text.
 
 Before proposing a v0.1 release candidate:
 
-1. Confirm the candidate is on a feature branch based on `main` and the tree
+1. Confirm the candidate is on a feature branch based on `origin/main` and the tree
    is clean before and after verification.
 2. Confirm `Cargo.lock` is committed and locked metadata resolves without
    rewriting the lockfile.
@@ -38,7 +38,7 @@ Before proposing a v0.1 release candidate:
 4. Verify unit and integration coverage for successful workflows, malformed
    input, unsupported versions, explicit boundary violations, and typed
    compiler/runtime/sandbox diagnostics.
-5. Inspect the exact `main...HEAD` diff for compatibility, migration, secret
+5. Inspect the exact `origin/main...HEAD` diff for compatibility, migration, secret
    handling, and documentation scope; exclude publishing and dogfood work.
 6. Record the candidate commit and its verification receipts, then require
    the repository's exact-tree gate and review before proposing a pull request.
@@ -50,7 +50,7 @@ Before proposing a v0.1 release candidate:
 3. Run `just pre-commit-fast` before committing.
 4. Commit the candidate and ensure the working tree is clean.
 5. Run `just quality-gates` on the clean committed candidate.
-6. Before pushing, require the exact-tree gate receipt and a passing review of `main...HEAD`.
+6. Before pushing, require the exact-tree gate receipt and a passing review of `origin/main...HEAD`.
 7. Open a pull request targeting `main`. Do not merge it automatically.
 
 ## Reproducible Dependencies
