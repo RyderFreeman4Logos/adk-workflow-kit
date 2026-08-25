@@ -120,6 +120,28 @@ impl Diagnostic {
         }
     }
 
+    /// Returns the fixed diagnostic for unresolved critical audit findings.
+    pub fn audit_critical() -> Self {
+        Self {
+            diagnostic_version: DIAGNOSTIC_VERSION,
+            code: "workflow.audit.critical",
+            message: "unresolved critical dependency findings",
+            location: None,
+            details: DiagnosticDetails::Empty {},
+        }
+    }
+
+    /// Returns the fixed diagnostic for a fail-closed audit boundary miss.
+    pub fn audit_boundary_miss() -> Self {
+        Self {
+            diagnostic_version: DIAGNOSTIC_VERSION,
+            code: "workflow.audit.boundary_miss",
+            message: "audit policy or lock fixture missed a typed boundary",
+            location: None,
+            details: DiagnosticDetails::Empty {},
+        }
+    }
+
     /// Returns the stable machine-readable diagnostic code.
     pub fn code(&self) -> &'static str {
         self.code
