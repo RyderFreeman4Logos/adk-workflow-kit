@@ -19,7 +19,7 @@ use workflow_runtime::{
 use workflow_spec::{read_bounded_regular_file, SourcePath};
 use workflow_testkit::{compile_eval, EvalEnvelope, EvalFixture, EvalInput, ReplayBundle};
 
-const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
+const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --current-module <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}";
 
 fn command() -> Command {
@@ -148,6 +148,11 @@ fn command() -> Command {
         .subcommand(
             Command::new("reload")
                 .arg(Arg::new("path").value_name("PATH").required(true))
+                .arg(
+                    Arg::new("current-module")
+                        .long("current-module")
+                        .required(true),
+                )
                 .arg(Arg::new("module").long("module").required(true))
                 .arg(Arg::new("input").long("input").required(true)),
         )
@@ -777,6 +782,9 @@ fn main() {
             let Some(module) = subcommand.get_one::<String>("module") else {
                 exit_invalid_arguments(json);
             };
+            let Some(current_module) = subcommand.get_one::<String>("current-module") else {
+                exit_invalid_arguments(json);
+            };
             let Some(input) = subcommand.get_one::<String>("input") else {
                 exit_invalid_arguments(json);
             };
@@ -785,7 +793,7 @@ fn main() {
                 Err(diagnostic) => exit_diagnostic(*diagnostic, json),
             };
             let current_bytes = match read_bounded_regular_file(
-                &SourcePath::from(path.as_str()),
+                &SourcePath::from(current_module.as_str()),
                 PureTransformRequest::MAX_MODULE_BYTES,
             ) {
                 Ok(bytes) => bytes,

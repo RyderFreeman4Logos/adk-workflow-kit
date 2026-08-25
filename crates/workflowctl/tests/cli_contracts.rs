@@ -9,7 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
+use sha2::{Digest, Sha256};
+
+const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --current-module <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const HUMAN_ERROR: &str =
     "[workflow.cli.invalid_arguments] invalid command-line arguments location=null details={}\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}\n";
@@ -503,10 +505,15 @@ fn hostile_and_oversized_paths_fail_before_dispatch_without_echo() {
 
 #[test]
 fn reload_dispatch_publishes_an_immutable_bind() {
+    let current_module = temporary_fixture_path("current-module");
+    fs::write(&current_module, b"CANARY_HOTRELOAD_80_OLD")
+        .expect("current module must be writable");
     let mut command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
     command.args([
         "reload",
         MINIMAL_FIXTURE,
+        "--current-module",
+        current_module.to_str().unwrap(),
         "--module",
         IDENTITY_MODULE,
         "--input",
@@ -516,6 +523,33 @@ fn reload_dispatch_publishes_an_immutable_bind() {
     assert!(result.status.success());
     assert!(result.stderr.is_empty());
     let stdout = String::from_utf8(result.stdout).expect("reload output must be UTF-8");
-    assert!(stdout.starts_with("reloaded old=sha256:"));
-    assert!(stdout.contains(" new=sha256:"));
+    let current_digest = format!("sha256:{:x}", Sha256::digest(b"CANARY_HOTRELOAD_80_OLD"));
+    assert!(stdout.starts_with(&format!("reloaded old={current_digest}")));
+    let module_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(fs::read(IDENTITY_MODULE).unwrap())
+    );
+    assert!(stdout.contains(&format!(" new={module_digest}")));
+    fs::remove_file(current_module).expect("current module must be removable");
+}
+
+#[test]
+fn canary_inflight_old_pkg_80_cli_explain_names_original_package() {
+    let module_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(fs::read(IDENTITY_MODULE).unwrap())
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+    command.args([
+        "explain-run",
+        MINIMAL_FIXTURE,
+        "--module",
+        IDENTITY_MODULE,
+        "--input",
+        r#"{"value":7}"#,
+    ]);
+    let result = output(&mut command);
+    assert!(result.status.success());
+    let stdout = String::from_utf8(result.stdout).expect("explanation must be UTF-8");
+    assert!(stdout.contains(&format!("module_digest={module_digest}")));
 }
