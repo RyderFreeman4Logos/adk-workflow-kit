@@ -39,6 +39,9 @@ metadata:
 test-local-gates:
     bash scripts/test-local-gates.sh
 
+test-releasing:
+    bash scripts/test-releasing.sh
+
 check-branch:
     scripts/local-gates.sh check-branch
 
