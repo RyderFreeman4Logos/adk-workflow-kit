@@ -1,9 +1,12 @@
 //! Deterministic offline ADK-Rust test doubles and exact tool registry fixtures.
 
+mod bench;
 mod eval;
 mod non_progress;
 mod replay;
 mod sandbox;
+
+pub use bench::{run_suite, BenchmarkDiagnostics, BenchmarkReport, BenchmarkSample};
 
 use std::{
     collections::VecDeque,

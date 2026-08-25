@@ -23,6 +23,9 @@ test:
     ./target/debug/workflowctl replay crates/workflowctl/tests/fixtures/cli004-replay.json
     ./target/debug/workflowctl audit
 
+bench-001:
+    {{_io}} cargo run -p workflow-testkit --bin bench-001 --locked
+
 lock:
     {{_io}} cargo generate-lockfile
 

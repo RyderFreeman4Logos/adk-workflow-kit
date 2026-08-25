@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "samples": [
+    {
+      "name": "compiler",
+      "elapsed_ns": 235950
+    },
+    {
+      "name": "runtime",
+      "elapsed_ns": 15466
+    },
+    {
+      "name": "sandbox",
+      "elapsed_ns": 25346
+    }
+  ],
+  "diagnostics": {
+    "compiler_code": "workflow.parse.invalid",
+    "runtime_code": "runtime.output.invalid",
+    "sandbox_code": "sandbox.capability.unsatisfied",
+    "rendered": "workflow parsing failed: failed to decode workflow source; structured tool output is invalid; unsatisfied sandbox capabilities: network"
+  }
+}
