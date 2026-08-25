@@ -6,9 +6,10 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use workflow_compiler::compile_str;
+use workflow_compiler::{compile_str, CompileError};
 use workflow_runtime::{
     decode_structured_tool_output, BackendCapabilities, RequestedCapabilities, SandboxCapability,
+    StructuredOutputError, UnsatisfiedCapabilities,
 };
 
 use crate::{FakeSandboxBackend, FakeSandboxRequest};
@@ -56,6 +57,29 @@ pub struct BenchmarkReport {
     pub samples: Vec<BenchmarkSample>,
     /// Typed failure evidence from each boundary.
     pub diagnostics: BenchmarkDiagnostics,
+}
+
+fn compiler_diagnostic_code(error: &CompileError) -> &'static str {
+    match error {
+        CompileError::Parse(_) => "workflow.parse.invalid",
+        CompileError::Graph(_) => "workflow.graph.invalid",
+        CompileError::State(_) => "workflow.state.invalid",
+        CompileError::PredicateRegistryRequired => "workflow.predicate.registry_required",
+        CompileError::Registry(_) => "workflow.predicate.registry_missing",
+    }
+}
+
+fn runtime_diagnostic_code(error: &StructuredOutputError) -> &'static str {
+    match error {
+        StructuredOutputError::OutputTooLarge => "runtime.output.too_large",
+        StructuredOutputError::InvalidUtf8 => "runtime.output.invalid_utf8",
+        StructuredOutputError::InvalidJson => "runtime.output.invalid",
+        StructuredOutputError::TrailingBytes => "runtime.output.trailing_bytes",
+    }
+}
+
+fn sandbox_diagnostic_code(_: &UnsatisfiedCapabilities) -> &'static str {
+    "sandbox.capability.unsatisfied"
 }
 
 impl BenchmarkReport {
@@ -120,9 +144,9 @@ pub fn run_suite() -> Result<BenchmarkReport, String> {
             },
         ],
         diagnostics: BenchmarkDiagnostics {
-            compiler_code: String::from("workflow.parse.invalid"),
-            runtime_code: String::from("runtime.output.invalid"),
-            sandbox_code: String::from("sandbox.capability.unsatisfied"),
+            compiler_code: String::from(compiler_diagnostic_code(&compiler_error)),
+            runtime_code: String::from(runtime_diagnostic_code(&runtime_error)),
+            sandbox_code: String::from(sandbox_diagnostic_code(&sandbox_error)),
             rendered: format!("{}; {}; {}", compiler_error, runtime_error, sandbox_error),
         },
     })
@@ -130,7 +154,12 @@ pub fn run_suite() -> Result<BenchmarkReport, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_suite, BenchmarkReport};
+    use super::{
+        compiler_diagnostic_code, run_suite, runtime_diagnostic_code, sandbox_diagnostic_code,
+        BenchmarkReport,
+    };
+    use workflow_compiler::compile_str;
+    use workflow_runtime::{decode_structured_tool_output, verify_sandbox_capabilities};
 
     #[test]
     fn suite_reports_compiler_runtime_and_sandbox_samples() {
@@ -150,12 +179,29 @@ mod tests {
     #[test]
     fn suite_keeps_typed_failure_diagnostics_and_boundary_checks() {
         let report = run_suite().expect("synthetic benchmark suite should run");
+        let compiler_error = compile_str("bench-001-invalid.workflow.toml", "[invalid")
+            .expect_err("synthetic invalid workflow must fail");
+        let runtime_error = decode_structured_tool_output::<String>(b"{", 1024)
+            .expect_err("synthetic invalid output must fail");
+        let sandbox_error = verify_sandbox_capabilities(
+            &workflow_runtime::RequestedCapabilities::new([
+                workflow_runtime::SandboxCapability::Network,
+            ]),
+            &workflow_runtime::BackendCapabilities::new([]),
+        )
+        .expect_err("network capability must cross the fake backend boundary");
 
-        assert_eq!(report.diagnostics.compiler_code, "workflow.parse.invalid");
-        assert_eq!(report.diagnostics.runtime_code, "runtime.output.invalid");
+        assert_eq!(
+            report.diagnostics.compiler_code,
+            compiler_diagnostic_code(&compiler_error)
+        );
+        assert_eq!(
+            report.diagnostics.runtime_code,
+            runtime_diagnostic_code(&runtime_error)
+        );
         assert_eq!(
             report.diagnostics.sandbox_code,
-            "sandbox.capability.unsatisfied"
+            sandbox_diagnostic_code(&sandbox_error)
         );
         assert!(!report.diagnostics.rendered.contains("BENCH_SECRET"));
     }
