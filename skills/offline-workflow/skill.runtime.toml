@@ -1,0 +1,17 @@
+schema_version = 1
+
+[skill]
+id = "offline-workflow"
+version = "1.0.0"
+
+[[scripts]]
+id = "check"
+path = "scripts/check.py"
+runtime = "python3"
+sha256 = "sha256:10c2ed7fa3262c1358ff2afe3c3b58046ccb6fbd5ad95aa77c5116a24b099105"
+input_schema = "references/input.json"
+output_schema = "references/input.json"
+
+[[resources]]
+id = "references/input.json"
+sha256 = "sha256:4f9b09efdd06853bfc238fa5ebc2eef2f832f66cd2a17650d8181db66512a2db"
