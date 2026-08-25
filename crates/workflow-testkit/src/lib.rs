@@ -1,5 +1,6 @@
 //! Deterministic offline ADK-Rust test doubles and exact tool registry fixtures.
 
+mod eval;
 mod non_progress;
 mod replay;
 mod sandbox;
@@ -19,6 +20,10 @@ use serde_json::Value;
 use workflow_compiler::{RegistryCategory, RegistryEntry, RegistryNotFound, ToolRegistry};
 use workflow_runtime::{RunController, RunLimitKind, RunTerminalCause, RunTimeoutKind};
 
+pub use eval::{
+    compile_eval, EvalAcknowledgement, EvalDiagnosticKind, EvalDisposition, EvalEnvelope,
+    EvalError, EvalFixture, EvalInput,
+};
 pub use non_progress::{NoProgressError, NoProgressReason, NonProgressDetector};
 pub use replay::{ReplayBundle, ReplayError, ReplayErrorKind, ReplayEvent, StructuralTrace};
 pub use sandbox::{
