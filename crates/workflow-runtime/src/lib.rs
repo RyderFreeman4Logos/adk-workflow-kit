@@ -3,6 +3,7 @@
 mod approval;
 mod artifact;
 mod bubblewrap;
+mod checkpoint;
 mod controller;
 mod execution;
 mod hot_reload;
@@ -25,6 +26,7 @@ pub use bubblewrap::{
     BubblewrapError, BubblewrapReceipt, BubblewrapRequest, BubblewrapRequestError,
     BubblewrapRequestErrorKind, LinuxBubblewrapBackend,
 };
+pub use checkpoint::{Checkpoint, CheckpointBackend, CheckpointError, CheckpointErrorKind};
 pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
 };

@@ -34,6 +34,79 @@ pub use sandbox::{
     FakeSandboxRequestErrorKind,
 };
 
+use workflow_runtime::{Checkpoint, CheckpointBackend, CheckpointError, RunId};
+
+/// A deterministic side-effect count used by kill/resume fixtures.
+#[derive(Default)]
+pub struct SideEffectLedger {
+    commits: usize,
+}
+
+impl SideEffectLedger {
+    fn commit(&mut self) {
+        self.commits += 1;
+    }
+
+    /// Returns the number of committed side effects.
+    pub fn commits(&self) -> usize {
+        self.commits
+    }
+}
+
+struct FixtureCheckpointBackend {
+    checkpoint: Option<Checkpoint>,
+}
+
+impl CheckpointBackend for FixtureCheckpointBackend {
+    fn load(&self, run_id: &RunId) -> Result<Option<Checkpoint>, CheckpointError> {
+        Ok(self
+            .checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.run_id() == run_id)
+            .cloned())
+    }
+
+    fn save(&mut self, checkpoint: Checkpoint) -> Result<(), CheckpointError> {
+        self.checkpoint = Some(checkpoint);
+        Ok(())
+    }
+}
+
+/// A kill/resume fixture that records a side effect before checkpointing it.
+pub struct KillResumeFixture {
+    backend: FixtureCheckpointBackend,
+    ledger: SideEffectLedger,
+}
+
+impl KillResumeFixture {
+    /// Creates an offline fixture with the supplied side-effect ledger.
+    pub fn new(ledger: SideEffectLedger) -> Self {
+        Self {
+            backend: FixtureCheckpointBackend { checkpoint: None },
+            ledger,
+        }
+    }
+
+    /// Simulates a killed worker after the side effect and durable checkpoint.
+    pub fn kill_after_checkpoint(&mut self, checkpoint: Checkpoint) {
+        self.ledger.commit();
+        self.backend
+            .save(checkpoint)
+            .expect("fixture checkpoint backend must save");
+    }
+
+    /// Resumes a run without repeating a side effect already checkpointed.
+    pub fn resume(&mut self, run_id: &RunId) -> Result<(), CheckpointError> {
+        let _ = self.backend.load(run_id)?;
+        Ok(())
+    }
+
+    /// Returns the fixture's side-effect ledger.
+    pub fn ledger(&self) -> &SideEffectLedger {
+        &self.ledger
+    }
+}
+
 /// A deterministic completion signal injected by this testkit.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum FaultSignal {
