@@ -257,6 +257,8 @@ mod tests {
 
     struct DriftedRegistry;
 
+    struct MissingRegistry;
+
     macro_rules! impl_drifted_registry {
         ($trait_name:ident) => {
             impl $trait_name for DriftedRegistry {
@@ -273,12 +275,35 @@ mod tests {
         };
     }
 
+    macro_rules! impl_missing_registry {
+        ($trait_name:ident, $category:expr) => {
+            impl $trait_name for MissingRegistry {
+                type Implementation = ();
+
+                fn resolve(
+                    &self,
+                    id: &str,
+                    version: &str,
+                ) -> Result<RegistryEntry<'_, Self::Implementation>, RegistryNotFound> {
+                    Err(RegistryNotFound::new($category, id, version))
+                }
+            }
+        };
+    }
+
     impl_drifted_registry!(ModelRegistry);
     impl_drifted_registry!(ToolRegistry);
     impl_drifted_registry!(NodeRegistry);
     impl_drifted_registry!(ValidatorRegistry);
     impl_drifted_registry!(PredicateRegistry);
     impl_drifted_registry!(SkillRegistry);
+
+    impl_missing_registry!(ModelRegistry, RegistryCategory::Model);
+    impl_missing_registry!(ToolRegistry, RegistryCategory::Tool);
+    impl_missing_registry!(NodeRegistry, RegistryCategory::Node);
+    impl_missing_registry!(ValidatorRegistry, RegistryCategory::Validator);
+    impl_missing_registry!(PredicateRegistry, RegistryCategory::Predicate);
+    impl_missing_registry!(SkillRegistry, RegistryCategory::Skill);
 
     fn builder(
         registry: &DriftedRegistry,
@@ -290,6 +315,20 @@ mod tests {
         DriftedRegistry,
         DriftedRegistry,
         DriftedRegistry,
+    > {
+        GraphBuilder::new(registry, registry, registry, registry, registry, registry)
+    }
+
+    fn missing_builder(
+        registry: &MissingRegistry,
+    ) -> GraphBuilder<
+        '_,
+        MissingRegistry,
+        MissingRegistry,
+        MissingRegistry,
+        MissingRegistry,
+        MissingRegistry,
+        MissingRegistry,
     > {
         GraphBuilder::new(registry, registry, registry, registry, registry, registry)
     }
@@ -354,5 +393,44 @@ yes = "end"
         );
 
         assert!(matches!(result, Err(GraphBuildError::IdentityDrift(_))));
+    }
+
+    #[test]
+    fn rejects_missing_predicate_route_registry_entry() {
+        let result = missing_builder(&MissingRegistry).build(
+            &spec(
+                r#"
+schema_version = 1
+edges = []
+[workflow]
+id = "workflow"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "end"
+kind = "terminal"
+[[routes]]
+from = "start"
+[routes.predicate]
+id = "missing-predicate"
+version = "9"
+[routes.cases]
+yes = "end"
+"#,
+            ),
+            [] as [RegistryBinding; 0],
+        );
+
+        match result {
+            Err(GraphBuildError::Registry(error)) => {
+                assert_eq!(error.category(), RegistryCategory::Predicate);
+                assert_eq!(error.id(), "missing-predicate");
+                assert_eq!(error.version(), "9");
+            }
+            other => panic!("expected missing predicate registry entry, got {other:?}"),
+        }
     }
 }
