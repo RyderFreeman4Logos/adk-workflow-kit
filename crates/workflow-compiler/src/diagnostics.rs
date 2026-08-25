@@ -87,6 +87,39 @@ impl Diagnostic {
         }
     }
 
+    /// Returns the fixed diagnostic for a fail-closed CLI fixture boundary miss.
+    pub fn cli_boundary_miss() -> Self {
+        Self {
+            diagnostic_version: DIAGNOSTIC_VERSION,
+            code: "workflow.cli.boundary_miss",
+            message: "command fixture missed a typed boundary",
+            location: None,
+            details: DiagnosticDetails::Empty {},
+        }
+    }
+
+    /// Returns the fixed diagnostic for a fail-closed eval bind boundary miss.
+    pub fn eval_boundary_miss() -> Self {
+        Self {
+            diagnostic_version: DIAGNOSTIC_VERSION,
+            code: "eval.boundary_miss",
+            message: "eval boundary miss",
+            location: None,
+            details: DiagnosticDetails::Empty {},
+        }
+    }
+
+    /// Returns the fixed diagnostic for a rejected replay document.
+    pub fn replay_invalid() -> Self {
+        Self {
+            diagnostic_version: DIAGNOSTIC_VERSION,
+            code: "workflow.cli.replay_invalid",
+            message: "replay bundle is invalid",
+            location: None,
+            details: DiagnosticDetails::Empty {},
+        }
+    }
+
     /// Returns the stable machine-readable diagnostic code.
     pub fn code(&self) -> &'static str {
         self.code

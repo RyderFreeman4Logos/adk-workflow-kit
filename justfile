@@ -18,6 +18,9 @@ clippy:
 
 test:
     {{_io}} cargo test --workspace --locked
+    ./target/debug/workflowctl test crates/workflowctl/tests/fixtures/cli004-test.json
+    ./target/debug/workflowctl eval crates/workflowctl/tests/fixtures/cli004-eval.json
+    ./target/debug/workflowctl replay crates/workflowctl/tests/fixtures/cli004-replay.json
 
 lock:
     {{_io}} cargo generate-lockfile
