@@ -42,6 +42,12 @@ test-local-gates:
 test-releasing:
     bash scripts/test-releasing.sh
 
+release-local:
+    bash scripts/local-release.sh
+
+test-release-local:
+    bash scripts/test-local-release.sh
+
 check-branch:
     scripts/local-gates.sh check-branch
 
