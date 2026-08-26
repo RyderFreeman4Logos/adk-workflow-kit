@@ -207,7 +207,7 @@ cases = { again = "a", finish = "done" }
     );
     assert_eq!(
         validate_graph(&cycle),
-        Err(GraphValidationError::Cycle {
+        Err(GraphValidationError::UnboundedCycle {
             node_ids: vec![node_id(&cycle, "a"), node_id(&cycle, "b")],
         })
     );

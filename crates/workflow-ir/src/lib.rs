@@ -1,7 +1,9 @@
 //! Canonical, source-free workflow intermediate representation.
 
 use sha2::{Digest, Sha256};
-use workflow_spec::{NodeKind as SpecNodeKind, RouteOperator, SchemaVersion, WorkflowSpec};
+use workflow_spec::{
+    NodeKind as SpecNodeKind, ResourceReference, RouteOperator, SchemaVersion, WorkflowSpec,
+};
 
 /// The canonical byte-wire version used for content identity.
 pub const CANONICAL_IR_WIRE_VERSION_V1: u16 = 1;
@@ -11,6 +13,8 @@ pub const CANONICAL_IR_WIRE_VERSION_V2: u16 = 2;
 pub const CANONICAL_IR_WIRE_VERSION_V3: u16 = 3;
 /// The canonical byte-wire version for IR containing approval timeouts.
 pub const CANONICAL_IR_WIRE_VERSION_V4: u16 = 4;
+/// The canonical byte-wire version for executable cycle metadata.
+pub const CANONICAL_IR_WIRE_VERSION_V5: u16 = 5;
 
 const DOMAIN: &[u8] = b"adk-workflow-kit/workflow-ir\0";
 const IR_SCHEMA_VERSION_V1: u32 = 1;
@@ -144,6 +148,8 @@ pub struct IrNode {
     id: NodeId,
     kind: IrNodeKind,
     timeout_ms: Option<u64>,
+    max_visits: Option<u32>,
+    idempotent: bool,
 }
 
 impl IrNode {
@@ -161,6 +167,16 @@ impl IrNode {
     pub fn timeout_ms(&self) -> Option<u64> {
         self.timeout_ms
     }
+
+    /// Returns the static visit bound used by cycle validation.
+    pub fn max_visits(&self) -> Option<u32> {
+        self.max_visits
+    }
+
+    /// Returns whether repeated execution is declared idempotent.
+    pub fn idempotent(&self) -> bool {
+        self.idempotent
+    }
 }
 
 /// A normalized directed edge record.
@@ -170,12 +186,31 @@ pub struct IrEdge {
     to: NodeId,
 }
 
+/// A normalized semantic resource reference.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct IrResource {
+    path: String,
+    sha256: String,
+}
+
+impl IrResource {
+    /// Returns the declared resource path.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+    /// Returns the declared SHA-256 digest.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
 /// A normalized registered-predicate route.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct IrPredicateRoute {
     from: NodeId,
     predicate: IrPredicateReference,
     cases: Vec<IrRouteCase>,
+    default: Option<NodeId>,
 }
 
 impl IrPredicateRoute {
@@ -192,6 +227,11 @@ impl IrPredicateRoute {
     /// Returns cases in canonical raw UTF-8 key order.
     pub fn cases(&self) -> &[IrRouteCase] {
         &self.cases
+    }
+
+    /// Returns the explicit fallback target, when declared.
+    pub fn default(&self) -> Option<&NodeId> {
+        self.default.as_ref()
     }
 }
 
@@ -322,6 +362,7 @@ pub struct WorkflowIr {
     edges: Vec<IrEdge>,
     routes: Vec<IrPredicateRoute>,
     state: Option<IrState>,
+    resources: Vec<IrResource>,
 }
 
 impl WorkflowIr {
@@ -365,11 +406,21 @@ impl WorkflowIr {
         self.state.as_ref()
     }
 
+    /// Returns semantic resources in canonical path/hash order.
+    pub fn resources(&self) -> &[IrResource] {
+        &self.resources
+    }
+
     /// Returns the SHA-256 content identity of the canonical IR wire.
     pub fn canonical_hash(&self) -> CanonicalIrHash {
         let mut hasher = Sha256::new();
         encode_canonical(self, &mut hasher);
         CanonicalIrHash(hasher.finalize().into())
+    }
+
+    /// Returns the canonical byte-wire version used for content identity.
+    pub fn canonical_wire_version(&self) -> u16 {
+        canonical_wire_version(self)
     }
 }
 
@@ -397,6 +448,8 @@ impl From<&WorkflowSpec> for WorkflowIr {
                     timeout_ms: (kind == IrNodeKind::Approval)
                         .then_some(node.timeout_ms())
                         .flatten(),
+                    max_visits: node.max_visits(),
+                    idempotent: node.idempotent(),
                 }
             })
             .collect::<Vec<_>>();
@@ -433,6 +486,10 @@ impl From<&WorkflowSpec> for WorkflowIr {
                         version: route.predicate().version().to_owned(),
                     },
                     cases,
+                    default: route
+                        .default()
+                        .cloned()
+                        .map(|id| NodeId(id.as_str().to_owned())),
                 }
             })
             .collect::<Vec<_>>();
@@ -463,8 +520,21 @@ impl From<&WorkflowSpec> for WorkflowIr {
                 .cmp(right.from.as_str().as_bytes())
                 .then(left.predicate.cmp(&right.predicate))
                 .then(left.cases.cmp(&right.cases))
+                .then(left.default.cmp(&right.default))
         });
 
+        let mut resources = spec
+            .resources()
+            .iter()
+            .chain(workflow.resources().iter())
+            .map(ir_resource)
+            .collect::<Vec<_>>();
+        resources.extend(
+            spec.nodes()
+                .iter()
+                .flat_map(|node| node.resources().iter().map(ir_resource)),
+        );
+        resources.sort();
         Self {
             schema_version,
             workflow_id: WorkflowId(workflow.id().as_str().to_owned()),
@@ -493,7 +563,15 @@ impl From<&WorkflowSpec> for WorkflowIr {
                     })
                     .collect(),
             }),
+            resources,
         }
+    }
+}
+
+fn ir_resource(resource: &ResourceReference) -> IrResource {
+    IrResource {
+        path: resource.path().to_owned(),
+        sha256: resource.sha256().to_owned(),
     }
 }
 
@@ -527,22 +605,7 @@ impl ChunkSink for Vec<u8> {
 
 fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
     sink.write_chunk(DOMAIN);
-    write_u16(
-        sink,
-        if ir
-            .nodes
-            .iter()
-            .any(|node| node.kind == IrNodeKind::Approval)
-        {
-            CANONICAL_IR_WIRE_VERSION_V4
-        } else if ir.state.is_some() {
-            CANONICAL_IR_WIRE_VERSION_V3
-        } else if ir.routes.is_empty() {
-            CANONICAL_IR_WIRE_VERSION_V1
-        } else {
-            CANONICAL_IR_WIRE_VERSION_V2
-        },
-    );
+    write_u16(sink, canonical_wire_version(ir));
     write_u32(sink, ir.schema_version.tag());
     write_frame(sink, ir.workflow_id.as_str());
     write_frame(sink, &ir.workflow_version);
@@ -560,6 +623,20 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
                 None => sink.write_chunk(&[0]),
             }
         }
+        if ir
+            .nodes
+            .iter()
+            .any(|candidate| candidate.max_visits.is_some() || candidate.idempotent)
+        {
+            match node.max_visits {
+                Some(value) => {
+                    sink.write_chunk(&[1]);
+                    write_u32(sink, value);
+                }
+                None => sink.write_chunk(&[0]),
+            }
+            sink.write_chunk(&[u8::from(node.idempotent)]);
+        }
     }
     write_u64(sink, u64_from_usize(ir.edges.len()));
     for edge in &ir.edges {
@@ -576,6 +653,19 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
             for case in &route.cases {
                 write_frame(sink, case.key());
                 write_frame(sink, case.target().as_str());
+            }
+            if ir
+                .routes
+                .iter()
+                .any(|candidate| candidate.default.is_some())
+            {
+                match &route.default {
+                    Some(target) => {
+                        sink.write_chunk(&[1]);
+                        write_frame(sink, target.as_str());
+                    }
+                    None => sink.write_chunk(&[0]),
+                }
             }
         }
     }
@@ -599,6 +689,37 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
                 None => sink.write_chunk(&[0]),
             }
         }
+    }
+    if !ir.resources.is_empty() {
+        write_u64(sink, u64_from_usize(ir.resources.len()));
+        for resource in &ir.resources {
+            write_frame(sink, &resource.path);
+            write_frame(sink, &resource.sha256);
+        }
+    }
+}
+
+fn canonical_wire_version(ir: &WorkflowIr) -> u16 {
+    if !ir.resources.is_empty()
+        || ir
+            .nodes
+            .iter()
+            .any(|node| node.max_visits.is_some() || node.idempotent)
+        || ir.routes.iter().any(|route| route.default.is_some())
+    {
+        CANONICAL_IR_WIRE_VERSION_V5
+    } else if ir
+        .nodes
+        .iter()
+        .any(|node| node.kind == IrNodeKind::Approval)
+    {
+        CANONICAL_IR_WIRE_VERSION_V4
+    } else if ir.state.is_some() {
+        CANONICAL_IR_WIRE_VERSION_V3
+    } else if ir.routes.is_empty() {
+        CANONICAL_IR_WIRE_VERSION_V1
+    } else {
+        CANONICAL_IR_WIRE_VERSION_V2
     }
 }
 

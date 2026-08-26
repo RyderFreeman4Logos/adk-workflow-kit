@@ -29,7 +29,7 @@ id = "done"
 kind = "terminal"
 "#;
 
-const STABLE_CODES: [&str; 20] = [
+const STABLE_CODES: [&str; 22] = [
     "workflow.source.read_failed",
     "workflow.source.invalid_utf8",
     "workflow.source.decode_failed",
@@ -45,6 +45,8 @@ const STABLE_CODES: [&str; 20] = [
     "workflow.graph.unreachable_node",
     "workflow.graph.no_reachable_terminal",
     "workflow.graph.cycle",
+    "workflow.graph.unbounded_cycle",
+    "workflow.graph.non_idempotent_cycle_node",
     "workflow.graph.cannot_reach_terminal",
     "workflow.registry.predicate_registry_required",
     "workflow.registry.entry_not_found",
@@ -422,8 +424,8 @@ to = "sink"
         ),
         (
             cycle,
-            "[workflow.graph.cycle] cycle location=null details={node_ids=[\"a\", \"b\"]}",
-            json!({"code": "workflow.graph.cycle", "details": {"node_ids": ["a", "b"]}}),
+            "[workflow.graph.unbounded_cycle] unbounded cycle location=null details={node_ids=[\"a\", \"b\"]}",
+            json!({"code": "workflow.graph.unbounded_cycle", "details": {"node_ids": ["a", "b"]}}),
         ),
         (
             cannot_reach_terminal,
@@ -459,6 +461,8 @@ fn diagnostic_message(diagnostic: &Diagnostic) -> &'static str {
         "workflow.graph.unreachable_node" => "unreachable node",
         "workflow.graph.no_reachable_terminal" => "no reachable terminal",
         "workflow.graph.cycle" => "cycle",
+        "workflow.graph.unbounded_cycle" => "unbounded cycle",
+        "workflow.graph.non_idempotent_cycle_node" => "non-idempotent cycle node",
         "workflow.graph.cannot_reach_terminal" => "cannot reach terminal",
         code => panic!("unexpected graph code {code}"),
     }
@@ -654,23 +658,23 @@ from = "b"
 to = "done"
 "#,
     );
-    let GraphValidationError::Cycle { node_ids } = cycle else {
-        panic!("fixture should produce a cycle error");
+    let GraphValidationError::UnboundedCycle { node_ids } = cycle else {
+        panic!("fixture should produce an unbounded cycle error");
     };
     assert_eq!(
-        Diagnostic::try_from(&GraphValidationError::Cycle {
+        Diagnostic::try_from(&GraphValidationError::UnboundedCycle {
             node_ids: Vec::new()
         }),
         Err(DiagnosticProjectionError::EmptyCycle)
     );
     assert_eq!(
-        Diagnostic::try_from(&GraphValidationError::Cycle {
+        Diagnostic::try_from(&GraphValidationError::UnboundedCycle {
             node_ids: vec![node_ids[0].clone(), node_ids[0].clone()],
         }),
         Err(DiagnosticProjectionError::DuplicateCycleMember)
     );
     assert_eq!(
-        Diagnostic::try_from(&GraphValidationError::Cycle {
+        Diagnostic::try_from(&GraphValidationError::UnboundedCycle {
             node_ids: vec![node_ids[1].clone(), node_ids[0].clone()],
         }),
         Err(DiagnosticProjectionError::UnsortedCycle)

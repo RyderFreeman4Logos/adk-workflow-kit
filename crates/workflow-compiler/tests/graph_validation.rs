@@ -414,7 +414,7 @@ to = "done"
 
     assert_eq!(
         validate_graph(&ir),
-        Err(GraphValidationError::Cycle {
+        Err(GraphValidationError::UnboundedCycle {
             node_ids: vec![node_id(&ir, "a"), node_id(&ir, "b")],
         })
     );
@@ -449,7 +449,7 @@ to = "done"
 
     assert_eq!(
         validate_graph(&ir),
-        Err(GraphValidationError::Cycle {
+        Err(GraphValidationError::UnboundedCycle {
             node_ids: vec![node_id(&ir, "loop")],
         })
     );
@@ -620,8 +620,87 @@ to = "done"
 
     assert_eq!(
         validate_graph(&ir),
-        Err(GraphValidationError::Cycle {
+        Err(GraphValidationError::UnboundedCycle {
             node_ids: vec![node_id(&ir, "a"), node_id(&ir, "b")],
+        })
+    );
+}
+
+#[test]
+fn rejects_a_later_unbounded_cycle_after_a_bounded_cycle() {
+    let ir = ir(r#"
+schema_version = 1
+
+[workflow]
+id = "later-unbounded-cycle"
+version = "1"
+entry = "entry"
+
+[[nodes]]
+id = "entry"
+kind = "agent"
+
+[[nodes]]
+id = "a"
+kind = "agent"
+max_visits = 1
+idempotent = true
+
+[[nodes]]
+id = "b"
+kind = "agent"
+max_visits = 1
+idempotent = true
+
+[[nodes]]
+id = "x"
+kind = "action"
+
+[[nodes]]
+id = "y"
+kind = "agent"
+
+[[nodes]]
+id = "done"
+kind = "terminal"
+
+[[edges]]
+from = "entry"
+to = "a"
+
+[[edges]]
+from = "entry"
+to = "x"
+
+[[edges]]
+from = "a"
+to = "b"
+
+[[edges]]
+from = "b"
+to = "a"
+
+[[edges]]
+from = "b"
+to = "done"
+
+[[edges]]
+from = "x"
+to = "y"
+
+[[edges]]
+from = "y"
+to = "x"
+
+[[edges]]
+from = "y"
+to = "done"
+"#);
+
+    assert_eq!(
+        validate_graph(&ir),
+        Err(GraphValidationError::UnboundedCycle {
+            node_ids: vec![node_id(&ir, "x"), node_id(&ir, "y")],
         })
     );
 }
@@ -668,7 +747,7 @@ to = "done"
 "#);
     assert_eq!(
         validate_graph(&looped),
-        Err(GraphValidationError::Cycle {
+        Err(GraphValidationError::UnboundedCycle {
             node_ids: vec![node_id(&looped, "done")],
         })
     );
