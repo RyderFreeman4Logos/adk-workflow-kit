@@ -5,13 +5,13 @@ use std::{
 };
 
 use workflow_compiler::{
-    activate_skill, ActivatedSkillResources, RegistryCategory, RegistryEntry, RegistryNotFound,
-    SkillId, SkillManifest, SkillRegistry, SkillResourceError, SkillResourceId,
-    SkillResourceIdError, SkillResourceInput, SkillResourceLimits,
+    ActivatedSkillResources, RegistryCategory, RegistryEntry, RegistryNotFound, SkillId,
+    SkillManifest, SkillRegistry, SkillResourceError, SkillResourceId, SkillResourceIdError,
+    SkillResourceInput, SkillResourceLimits, activate_skill,
 };
 use workflow_runtime::{
-    intersect_policy_capabilities, EffectiveCapabilities, PageRequest, PolicyCapabilities,
-    RequestedCapabilities, SandboxCapability,
+    EffectiveCapabilities, PageRequest, PolicyCapabilities, RequestedCapabilities,
+    SandboxCapability, intersect_policy_capabilities,
 };
 
 struct TestSkillRegistry {

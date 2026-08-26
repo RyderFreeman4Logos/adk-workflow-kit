@@ -631,7 +631,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use workflow_spec::parse_str;
 
-    use super::{encode_canonical, u64_from_usize, write_u64, IrNodeKind, WorkflowIr};
+    use super::{IrNodeKind, WorkflowIr, encode_canonical, u64_from_usize, write_u64};
 
     const GOLDEN: &str = r#"
 schema_version = 1

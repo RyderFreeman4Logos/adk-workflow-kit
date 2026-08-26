@@ -5,8 +5,8 @@ use std::{
 };
 
 use workflow_runtime::{
-    verify_sandbox_capabilities, BackendCapabilities, RequestedCapabilities,
-    UnsatisfiedCapabilities,
+    BackendCapabilities, RequestedCapabilities, UnsatisfiedCapabilities,
+    verify_sandbox_capabilities,
 };
 
 /// A validated sandbox request for the deterministic fake backend.

@@ -6,7 +6,7 @@
 //! text, and hostile review content never appears in diagnostics.
 
 use workflow_review::{
-    ReviewDefect, ReviewResult, ReviewSeverity, ReviewVerdict, REVIEW_SCHEMA_VERSION_V1,
+    REVIEW_SCHEMA_VERSION_V1, ReviewDefect, ReviewResult, ReviewSeverity, ReviewVerdict,
 };
 use workflow_testkit::{NoProgressReason, NonProgressDetector};
 

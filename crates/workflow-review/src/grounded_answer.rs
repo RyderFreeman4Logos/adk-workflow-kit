@@ -3,7 +3,7 @@ use std::fmt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::{resolve_disposition, ReviewDisposition, ReviewError, ReviewVote};
+use super::{ReviewDisposition, ReviewError, ReviewVote, resolve_disposition};
 
 /// One answer claim and the citation identities that must support it.
 #[derive(Clone, Eq, PartialEq)]
@@ -417,9 +417,8 @@ pub type GroundedAnswerOutcome = GroundedAnswerEnvelope;
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_grounded_answer, digest, map_review_error, validate_boundary,
         GroundedAnswerCitation, GroundedAnswerClaim, GroundedAnswerEnvelope, GroundedAnswerError,
-        GroundedAnswerInput,
+        GroundedAnswerInput, compile_grounded_answer, digest, map_review_error, validate_boundary,
     };
     use crate::{ReviewError, ReviewVerdict, ReviewVote};
 
@@ -546,12 +545,16 @@ mod tests {
         assert!(result.acknowledgement().is_some());
         assert!(result.diagnostic().is_none());
         assert!(!format!("{result:?}").contains(CANARY_UNIT_SUPPORTED_CITATION_65));
-        assert!(!result
-            .to_string()
-            .contains(CANARY_UNIT_SUPPORTED_CITATION_65));
-        assert!(!serde_json::to_string(&result)
-            .expect("supported citation envelope must serialize")
-            .contains(CANARY_UNIT_SUPPORTED_CITATION_65));
+        assert!(
+            !result
+                .to_string()
+                .contains(CANARY_UNIT_SUPPORTED_CITATION_65)
+        );
+        assert!(
+            !serde_json::to_string(&result)
+                .expect("supported citation envelope must serialize")
+                .contains(CANARY_UNIT_SUPPORTED_CITATION_65)
+        );
     }
 
     #[test]

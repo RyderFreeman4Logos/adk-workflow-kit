@@ -2,10 +2,10 @@ use std::{num::NonZeroU64, path::Path};
 
 use sha2::{Digest, Sha256};
 use workflow_compiler::{
-    activate_skill, RegistryCategory, RegistryEntry, RegistryNotFound, SkillActivationReceipt,
-    SkillEvidence, SkillEvidenceKind, SkillEvidencePackage, SkillId, SkillManifest,
-    SkillPlanningStage, SkillPromotion, SkillRegistry, SkillResourceId, SkillRuntimeLock,
-    SkillRuntimeManifest,
+    RegistryCategory, RegistryEntry, RegistryNotFound, SkillActivationReceipt, SkillEvidence,
+    SkillEvidenceKind, SkillEvidencePackage, SkillId, SkillManifest, SkillPlanningStage,
+    SkillPromotion, SkillRegistry, SkillResourceId, SkillRuntimeLock, SkillRuntimeManifest,
+    activate_skill,
 };
 use workflow_runtime::{ArtifactId, ArtifactStore, InMemoryArtifactStore};
 

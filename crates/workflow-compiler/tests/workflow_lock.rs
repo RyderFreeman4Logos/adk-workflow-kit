@@ -1,7 +1,7 @@
 use workflow_compiler::{
-    compile_str, CompileError, CompiledPlan, GraphValidationError, WorkflowLock, WorkflowLockError,
+    CompileError, CompiledPlan, GraphValidationError, WorkflowLock, WorkflowLockError, compile_str,
 };
-use workflow_ir::{IrSchemaVersion, CANONICAL_IR_WIRE_VERSION_V1};
+use workflow_ir::{CANONICAL_IR_WIRE_VERSION_V1, IrSchemaVersion};
 
 const GOLDEN_WORKFLOW: &str = r#"
 schema_version = 1
@@ -158,9 +158,11 @@ fn emits_exact_v1_golden_toml() {
         .strip_prefix("sha256:")
         .expect("IR hash should use the required prefix");
     assert_eq!(digest.len(), 64);
-    assert!(digest
-        .bytes()
-        .all(|byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    assert!(
+        digest
+            .bytes()
+            .all(|byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
 }
 
 #[test]
@@ -283,9 +285,7 @@ fn every_current_semantic_ir_dimension_changes_the_lock() {
         ),
         (
             "edge collection",
-            format!(
-                "{SEMANTIC_WORKFLOW}\n[[edges]]\nfrom = \"start\"\nto = \"right\"\n"
-            ),
+            format!("{SEMANTIC_WORKFLOW}\n[[edges]]\nfrom = \"start\"\nto = \"right\"\n"),
         ),
     ];
     let original = compiled_plan("semantic.workflow.toml", SEMANTIC_WORKFLOW);

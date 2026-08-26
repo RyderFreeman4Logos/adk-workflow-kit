@@ -17,9 +17,10 @@ fn allocator_has_no_run_id_input_and_ids_are_path_safe() {
     for role in [SessionRole::Producer, SessionRole::Reviewer] {
         let id = ids.id(role).as_str();
         assert_eq!(id.len(), 32);
-        assert!(id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert!(
+            id.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
     }
 }
 
@@ -42,8 +43,10 @@ fn identity_keys_partition_in_memory_histories() {
 
     assert_eq!(histories.get(&producer_a), Some(&vec![event.clone()]));
     for other in [&reviewer_a, &producer_b, &reviewer_b] {
-        assert!(!histories
-            .get(other)
-            .is_some_and(|history| history.contains(&event)));
+        assert!(
+            !histories
+                .get(other)
+                .is_some_and(|history| history.contains(&event))
+        );
     }
 }

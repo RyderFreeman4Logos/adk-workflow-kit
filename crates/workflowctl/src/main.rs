@@ -7,17 +7,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use workflow_compiler::{
-    audit_dependencies, compile_file, render_mermaid, AuditDisposition, Diagnostic, SkillManifest,
-    SkillResourceId, SkillRuntimeLock, SkillRuntimeManifest, WorkflowLock,
+    AuditDisposition, Diagnostic, SkillManifest, SkillResourceId, SkillRuntimeLock,
+    SkillRuntimeManifest, WorkflowLock, audit_dependencies, compile_file, render_mermaid,
 };
-use workflow_review::{validate_secret_free_fixture, SecretFixtureSurface};
+use workflow_review::{SecretFixtureSurface, validate_secret_free_fixture};
 use workflow_runtime::{
     DevelopmentHotReload, FilesystemArtifactStore, HotReloadError, PureTransformBinding,
     PureTransformPlanV1, PureTransformRequest, RequestedCapabilities, RunContext, RunController,
     RunId, RunLimits, RunOutcome, SandboxCapability, WorkdirManager,
 };
-use workflow_spec::{read_bounded_regular_file, SourcePath};
-use workflow_testkit::{compile_eval, EvalEnvelope, EvalFixture, EvalInput, ReplayBundle};
+use workflow_spec::{SourcePath, read_bounded_regular_file};
+use workflow_testkit::{EvalEnvelope, EvalFixture, EvalInput, ReplayBundle, compile_eval};
 
 const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --current-workflow <PATH> --current-module <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}";
@@ -230,7 +230,7 @@ fn read_skill_file(
     failure: SkillValidationFailure,
 ) -> Result<Vec<u8>, SkillValidationFailure> {
     use std::{
-        ffi::{c_char, CString},
+        ffi::{CString, c_char},
         fs::{File, OpenOptions},
         io::Read,
         os::{
@@ -375,7 +375,7 @@ fn build_binding(workflow: &str, module: &str) -> Result<PureTransformBinding, B
             return Err(Box::new(match Diagnostic::try_from(&error) {
                 Ok(diagnostic) => diagnostic,
                 Err(_) => Diagnostic::invalid_cli_arguments(),
-            }))
+            }));
         }
     };
     let ir = plan.ir();
@@ -960,8 +960,8 @@ mod tests {
     use workflow_runtime::{DevelopmentHotReload, HotReloadErrorKind, ProductionProfile, RunId};
 
     use super::{
-        bind_eval, bind_replay, bind_test, command, test_skill, validate_skill_manifest,
-        CliDisposition, SkillValidationFailure,
+        CliDisposition, SkillValidationFailure, bind_eval, bind_replay, bind_test, command,
+        test_skill, validate_skill_manifest,
     };
 
     const SCHEMA: &str =
@@ -992,9 +992,11 @@ mod tests {
         };
         let diagnostic = super::skill_diagnostic(failure);
         assert_eq!(diagnostic.code(), "skill.cli.invalid_manifest");
-        assert!(!serde_json::to_string(&diagnostic)
-            .expect("serialize diagnostic")
-            .contains(marker));
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .expect("serialize diagnostic")
+                .contains(marker)
+        );
         fs::remove_dir_all(path).expect("remove unit skill directory");
     }
 
@@ -1035,33 +1037,45 @@ mod tests {
         let diagnostic = super::skill_diagnostic(failure);
         assert_eq!(diagnostic.code(), "skill.cli.invalid_script");
         assert_ne!(diagnostic.code(), "skill.cli.invalid_manifest");
-        assert!(!serde_json::to_string(&diagnostic)
-            .expect("serialize diagnostic")
-            .contains("UNIT_INVALID_SCRIPT_55"));
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .expect("serialize diagnostic")
+                .contains("UNIT_INVALID_SCRIPT_55")
+        );
         fs::remove_dir_all(path).expect("remove unit skill directory");
     }
 
     #[test]
     fn skill_lint_and_test_commands_are_declared() {
-        assert!(command()
-            .try_get_matches_from(["workflowctl", "skill", "lint", "skill-dir"])
-            .is_ok());
-        assert!(command()
-            .try_get_matches_from(["workflowctl", "skill", "test", "skill-dir"])
-            .is_ok());
+        assert!(
+            command()
+                .try_get_matches_from(["workflowctl", "skill", "lint", "skill-dir"])
+                .is_ok()
+        );
+        assert!(
+            command()
+                .try_get_matches_from(["workflowctl", "skill", "test", "skill-dir"])
+                .is_ok()
+        );
     }
 
     #[test]
     fn test_eval_replay_commands_are_declared() {
-        assert!(command()
-            .try_get_matches_from(["workflowctl", "test", "fixture.json"])
-            .is_ok());
-        assert!(command()
-            .try_get_matches_from(["workflowctl", "eval", "fixture.json"])
-            .is_ok());
-        assert!(command()
-            .try_get_matches_from(["workflowctl", "replay", "fixture.json"])
-            .is_ok());
+        assert!(
+            command()
+                .try_get_matches_from(["workflowctl", "test", "fixture.json"])
+                .is_ok()
+        );
+        assert!(
+            command()
+                .try_get_matches_from(["workflowctl", "eval", "fixture.json"])
+                .is_ok()
+        );
+        assert!(
+            command()
+                .try_get_matches_from(["workflowctl", "replay", "fixture.json"])
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1083,9 +1097,11 @@ mod tests {
 
     #[test]
     fn audit_command_is_declared() {
-        assert!(command()
-            .try_get_matches_from(["workflowctl", "audit"])
-            .is_ok());
+        assert!(
+            command()
+                .try_get_matches_from(["workflowctl", "audit"])
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1231,9 +1247,11 @@ mod tests {
         assert_ne!(result.disposition(), CliDisposition::ReplayRun);
         assert!(!format!("{result:?}").contains(CANARY_CLI_TEST_54));
         assert!(!result.to_string().contains(CANARY_CLI_TEST_54));
-        assert!(!serde_json::to_string(&result)
-            .expect("serialize test envelope")
-            .contains(CANARY_CLI_TEST_54));
+        assert!(
+            !serde_json::to_string(&result)
+                .expect("serialize test envelope")
+                .contains(CANARY_CLI_TEST_54)
+        );
     }
 
     #[test]
@@ -1245,9 +1263,11 @@ mod tests {
         assert_ne!(result.disposition(), CliDisposition::ReplayRun);
         assert!(!format!("{result:?}").contains(CANARY_CLI_EVAL_54));
         assert!(!result.to_string().contains(CANARY_CLI_EVAL_54));
-        assert!(!serde_json::to_string(&result)
-            .expect("serialize eval envelope")
-            .contains(CANARY_CLI_EVAL_54));
+        assert!(
+            !serde_json::to_string(&result)
+                .expect("serialize eval envelope")
+                .contains(CANARY_CLI_EVAL_54)
+        );
     }
 
     #[test]
@@ -1259,9 +1279,11 @@ mod tests {
         assert_ne!(result.disposition(), CliDisposition::EvalRun);
         assert!(!format!("{result:?}").contains(CANARY_CLI_REPLAY_54));
         assert!(!result.to_string().contains(CANARY_CLI_REPLAY_54));
-        assert!(!serde_json::to_string(&result)
-            .expect("serialize replay envelope")
-            .contains(CANARY_CLI_REPLAY_54));
+        assert!(
+            !serde_json::to_string(&result)
+                .expect("serialize replay envelope")
+                .contains(CANARY_CLI_REPLAY_54)
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use workflow_ir::{IrSchemaVersion, CANONICAL_IR_WIRE_VERSION_V1};
+use workflow_ir::{CANONICAL_IR_WIRE_VERSION_V1, IrSchemaVersion};
 
 use crate::CompiledPlan;
 

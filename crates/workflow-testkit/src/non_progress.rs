@@ -103,13 +103,12 @@ impl NonProgressDetector {
         }
 
         let fingerprint = defect_fingerprint(review);
-        if let Some(previous) = &self.last_defect_fingerprint {
-            if !fingerprint.is_empty()
-                && same_codes(previous, &fingerprint)
-                && !severity_dropped(previous, &fingerprint)
-            {
-                return Ok(Some(NoProgressReason::RepeatedDefectSet));
-            }
+        if let Some(previous) = &self.last_defect_fingerprint
+            && !fingerprint.is_empty()
+            && same_codes(previous, &fingerprint)
+            && !severity_dropped(previous, &fingerprint)
+        {
+            return Ok(Some(NoProgressReason::RepeatedDefectSet));
         }
 
         self.penultimate_hash = self.last_hash.replace(hash);

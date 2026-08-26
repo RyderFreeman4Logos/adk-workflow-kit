@@ -14,7 +14,7 @@ mod skill_runtime;
 use std::{collections::VecDeque, fmt};
 
 use workflow_ir::{IrNode, IrNodeKind, NodeId, WorkflowIr};
-use workflow_spec::{parse_file, parse_str, NodeKind, SourcePath, SpecError, WorkflowSpec};
+use workflow_spec::{NodeKind, SourcePath, SpecError, WorkflowSpec, parse_file, parse_str};
 
 pub use diagnostics::{Diagnostic, DiagnosticProjectionError};
 pub use graph_builder::{GraphBuildError, GraphBuilder, RegistryBinding, RegistryIdentityDrift};
@@ -23,10 +23,10 @@ pub use registry::{
     ModelRegistry, NodeRegistry, PredicateRegistry, RegistryCategory, RegistryEntry,
     RegistryNotFound, SkillRegistry, ToolRegistry, ValidatorRegistry,
 };
-pub use security_audit::{audit_dependencies, AuditDisposition, AuditError, AuditReport};
+pub use security_audit::{AuditDisposition, AuditError, AuditReport, audit_dependencies};
 pub use skill::{
-    activate_skill, SkillActivationError, SkillActivationReceipt, SkillDiscoveryMetadata, SkillId,
-    SkillIdError, SkillManifest, SkillManifestError,
+    SkillActivationError, SkillActivationReceipt, SkillDiscoveryMetadata, SkillId, SkillIdError,
+    SkillManifest, SkillManifestError, activate_skill,
 };
 pub use skill_evidence::{
     SkillEvidence, SkillEvidenceError, SkillEvidenceKind, SkillEvidencePackage, SkillPlanningStage,
@@ -38,13 +38,13 @@ pub use skill_resource::{
     SkillResourceRead,
 };
 pub use skill_retrieval::{
-    retrieve_skill_candidates, SkillCandidate, SkillCapabilitySet, SkillDeclaration,
-    SkillRetrievalDiagnostic, SkillRetrievalResult,
+    SkillCandidate, SkillCapabilitySet, SkillDeclaration, SkillRetrievalDiagnostic,
+    SkillRetrievalResult, retrieve_skill_candidates,
 };
 pub use skill_runtime::{
-    plan_script_execution, DeclaredSkillResource, DeclaredSkillScript, ScriptDenied,
-    ScriptDeniedKind, ScriptPlan, ScriptRuntime, SkillRuntimeLock, SkillRuntimeLockError,
-    SkillRuntimeManifest, SkillRuntimeManifestError,
+    DeclaredSkillResource, DeclaredSkillScript, ScriptDenied, ScriptDeniedKind, ScriptPlan,
+    ScriptRuntime, SkillRuntimeLock, SkillRuntimeLockError, SkillRuntimeManifest,
+    SkillRuntimeManifestError, plan_script_execution,
 };
 
 /// A typed failure from one compiler pipeline stage.
@@ -465,12 +465,12 @@ pub fn validate_state(ir: &WorkflowIr) -> Result<(), StateValidationError> {
     }
 
     for key in state.keys() {
-        if let Some(shape) = key.handle() {
-            if !HANDLE_SHAPES.contains(&shape) {
-                return Err(StateValidationError::InvalidHandleShape {
-                    shape: shape.to_owned(),
-                });
-            }
+        if let Some(shape) = key.handle()
+            && !HANDLE_SHAPES.contains(&shape)
+        {
+            return Err(StateValidationError::InvalidHandleShape {
+                shape: shape.to_owned(),
+            });
         }
     }
 
@@ -710,7 +710,7 @@ fn first_cyclic_component(forward: &Adjacency, reverse: &Adjacency) -> Option<Ve
 
 #[cfg(test)]
 mod tests {
-    use super::{compile_str, first_cyclic_component, Adjacency};
+    use super::{Adjacency, compile_str, first_cyclic_component};
 
     #[test]
     fn approval_node_without_timeout_is_rejected() {

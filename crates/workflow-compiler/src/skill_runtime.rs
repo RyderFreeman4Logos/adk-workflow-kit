@@ -1014,8 +1014,8 @@ fn digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_script_path, plan_script_execution, DeclaredSkillResource, DeclaredSkillScript,
-        ScriptDeniedKind, ScriptPlan, ScriptRuntime, SkillRuntimeLock, SkillRuntimeManifest,
+        DeclaredSkillResource, DeclaredSkillScript, ScriptDeniedKind, ScriptPlan, ScriptRuntime,
+        SkillRuntimeLock, SkillRuntimeManifest, is_script_path, plan_script_execution,
     };
     use crate::{SkillId, SkillResourceId};
     use sha2::{Digest, Sha256};

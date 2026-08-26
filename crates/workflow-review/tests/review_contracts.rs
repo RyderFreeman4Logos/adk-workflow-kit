@@ -1,8 +1,8 @@
 use std::error::Error;
 
 use workflow_review::{
-    ReviewDefect, ReviewError, ReviewResult, ReviewSeverity, ReviewVerdict,
-    REVIEW_SCHEMA_VERSION_V1,
+    REVIEW_SCHEMA_VERSION_V1, ReviewDefect, ReviewError, ReviewResult, ReviewSeverity,
+    ReviewVerdict,
 };
 
 /// Canonical review result wire form for a revise verdict with one error defect.

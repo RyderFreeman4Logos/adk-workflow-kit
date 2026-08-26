@@ -347,21 +347,25 @@ fn one_active_tool_lifecycle_accepts_only_legal_transitions() {
 
     let context = run_context(RELAXED);
     let mut controller = RunController::new(&context);
-    assert!(expect_cause(
-        controller.accept_tool_output(Duration::ZERO, 1),
-        RunTerminalCause::Failed(RunControlError::ToolOutputWithoutActiveCall),
-    )
-    .cleanup()
-    .is_none());
+    assert!(
+        expect_cause(
+            controller.accept_tool_output(Duration::ZERO, 1),
+            RunTerminalCause::Failed(RunControlError::ToolOutputWithoutActiveCall),
+        )
+        .cleanup()
+        .is_none()
+    );
 
     let context = run_context(RELAXED);
     let mut controller = RunController::new(&context);
-    assert!(expect_cause(
-        controller.finish_tool_call(Duration::ZERO),
-        RunTerminalCause::Failed(RunControlError::ToolFinishWithoutActiveCall),
-    )
-    .cleanup()
-    .is_none());
+    assert!(
+        expect_cause(
+            controller.finish_tool_call(Duration::ZERO),
+            RunTerminalCause::Failed(RunControlError::ToolFinishWithoutActiveCall),
+        )
+        .cleanup()
+        .is_none()
+    );
 
     let context = run_context(RELAXED);
     let mut controller = RunController::new(&context);
@@ -389,12 +393,14 @@ fn cancellation_and_first_terminal_cause_are_idempotent_and_latched() {
     let repeated = controller.request_cancel(Duration::ZERO);
     assert_eq!(repeated.cause(), RunTerminalCause::Cancelled);
     assert!(repeated.cleanup().is_none());
-    assert!(expect_cause(
-        controller.admit_model_turn(elapsed(100)),
-        RunTerminalCause::Cancelled,
-    )
-    .cleanup()
-    .is_none());
+    assert!(
+        expect_cause(
+            controller.admit_model_turn(elapsed(100)),
+            RunTerminalCause::Cancelled,
+        )
+        .cleanup()
+        .is_none()
+    );
     assert_eq!(controller.model_turn_count(), 0);
 
     let context = run_context([10, 10, 10, 5, 100, 100, 100]);

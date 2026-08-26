@@ -1,10 +1,10 @@
 //! Context identity and network policy layered over POLICY-001 capabilities.
 
 use super::{
-    intersect_policy_capabilities, CapabilityPolicyDenied, EffectiveCapabilities,
-    PolicyCapabilities, RequestedCapabilities, SandboxCapability,
+    CapabilityPolicyDenied, EffectiveCapabilities, PolicyCapabilities, RequestedCapabilities,
+    SandboxCapability, intersect_policy_capabilities,
 };
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::{collections::HashSet, fmt};
 
 /// A validated non-empty tenant identifier.
@@ -474,14 +474,13 @@ pub fn evaluate_context_policy(
                 ContextPolicyDeniedKind::NetworkProfileRequired,
             ));
         }
-        if let Some(destination) = requested.network_destination() {
-            if network_profile == NetworkProfile::BrokeredAllowlist
-                && !brokered_destinations.contains(destination)
-            {
-                return Err(ContextPolicyDenied::new(
-                    ContextPolicyDeniedKind::DestinationDenied,
-                ));
-            }
+        if let Some(destination) = requested.network_destination()
+            && network_profile == NetworkProfile::BrokeredAllowlist
+            && !brokered_destinations.contains(destination)
+        {
+            return Err(ContextPolicyDenied::new(
+                ContextPolicyDeniedKind::DestinationDenied,
+            ));
         }
     }
 

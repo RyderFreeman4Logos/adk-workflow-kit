@@ -376,13 +376,12 @@ impl<'limits> RunController<'limits> {
         {
             consider(deadline, RunTimeoutKind::IdleTime);
         }
-        if let Some(active) = &self.active_tool_call {
-            if let Some(deadline) = active
+        if let Some(active) = &self.active_tool_call
+            && let Some(deadline) = active
                 .started_at
                 .checked_add(Duration::from_millis(self.limits.max_tool_time_ms().get()))
-            {
-                consider(deadline, RunTimeoutKind::ToolTime);
-            }
+        {
+            consider(deadline, RunTimeoutKind::ToolTime);
         }
 
         winner.map(|(_, kind)| kind)

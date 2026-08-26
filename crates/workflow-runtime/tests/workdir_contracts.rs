@@ -2,8 +2,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Barrier,
+        atomic::{AtomicU64, Ordering},
     },
     thread,
 };
@@ -123,9 +123,10 @@ fn successful_allocation_has_the_exact_private_layout() {
     let id = workdir.id().as_str();
 
     assert_eq!(id.len(), 32);
-    assert!(id
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    assert!(
+        id.bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
     assert_eq!(workdir.root(), base.path().join(id));
     assert_eq!(
         workdir.manifest_path(),
@@ -344,9 +345,11 @@ fn hostile_run_id_is_owned_but_never_used_for_filesystem_identity() {
         assert!(!generated_path.to_string_lossy().contains(&hostile));
     }
     let manifest = fs::read(workdir.manifest_path()).expect("manifest must be readable");
-    assert!(!manifest
-        .windows(hostile.len())
-        .any(|window| window == hostile.as_bytes()));
+    assert!(
+        !manifest
+            .windows(hostile.len())
+            .any(|window| window == hostile.as_bytes())
+    );
 
     let original_base = fixture.path().join("original-base");
     fs::rename(&base, &original_base).expect("base must be moved aside");
@@ -466,10 +469,12 @@ fn cleanup_rejects_a_replaced_directory_or_symlink() {
         fs::read(outside.join("sentinel")).expect("outside sentinel must survive"),
         b"outside"
     );
-    assert!(fs::symlink_metadata(symlink_root)
-        .expect("replacement symlink must survive")
-        .file_type()
-        .is_symlink());
+    assert!(
+        fs::symlink_metadata(symlink_root)
+            .expect("replacement symlink must survive")
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[test]

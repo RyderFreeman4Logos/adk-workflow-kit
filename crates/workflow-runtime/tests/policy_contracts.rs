@@ -1,6 +1,6 @@
 use workflow_runtime::{
-    intersect_policy_capabilities, CapabilityPolicyDenied, EffectiveCapabilities,
-    PolicyCapabilities, RequestedCapabilities, SandboxCapability,
+    CapabilityPolicyDenied, EffectiveCapabilities, PolicyCapabilities, RequestedCapabilities,
+    SandboxCapability, intersect_policy_capabilities,
 };
 
 const ALL_CAPABILITIES: [SandboxCapability; 15] = [
@@ -173,18 +173,24 @@ fn effective_capabilities_never_expand_privilege_over_a_deterministic_corpus() {
                     Ok(effective) => {
                         assert!(!effective.capabilities().is_empty());
                         assert_eq!(effective.capabilities(), expected_effective);
-                        assert!(effective
-                            .capabilities()
-                            .iter()
-                            .all(|capability| requested_capabilities.contains(capability)));
-                        assert!(effective
-                            .capabilities()
-                            .iter()
-                            .all(|capability| first_policy.contains(capability)));
-                        assert!(effective
-                            .capabilities()
-                            .iter()
-                            .all(|capability| second_policy.contains(capability)));
+                        assert!(
+                            effective
+                                .capabilities()
+                                .iter()
+                                .all(|capability| requested_capabilities.contains(capability))
+                        );
+                        assert!(
+                            effective
+                                .capabilities()
+                                .iter()
+                                .all(|capability| first_policy.contains(capability))
+                        );
+                        assert!(
+                            effective
+                                .capabilities()
+                                .iter()
+                                .all(|capability| second_policy.contains(capability))
+                        );
                     }
                     Err(denied) => {
                         let expected_missing = sorted(

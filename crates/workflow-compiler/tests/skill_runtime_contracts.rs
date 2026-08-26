@@ -2,13 +2,13 @@ use std::{fmt::Display, path::Path};
 
 use sha2::{Digest, Sha256};
 use workflow_compiler::{
-    activate_skill, DeclaredSkillResource, DeclaredSkillScript, RegistryCategory, RegistryEntry,
-    RegistryNotFound, SkillActivationReceipt, SkillId, SkillManifest, SkillRegistry,
-    SkillResourceId, SkillRuntimeLock, SkillRuntimeLockError, SkillRuntimeManifest,
-    SkillRuntimeManifestError,
+    DeclaredSkillResource, DeclaredSkillScript, RegistryCategory, RegistryEntry, RegistryNotFound,
+    SkillActivationReceipt, SkillId, SkillManifest, SkillRegistry, SkillResourceId,
+    SkillRuntimeLock, SkillRuntimeLockError, SkillRuntimeManifest, SkillRuntimeManifestError,
+    activate_skill,
 };
 use workflow_runtime::{
-    intersect_policy_capabilities, PolicyCapabilities, RequestedCapabilities, SandboxCapability,
+    PolicyCapabilities, RequestedCapabilities, SandboxCapability, intersect_policy_capabilities,
 };
 
 struct TestSkillRegistry {

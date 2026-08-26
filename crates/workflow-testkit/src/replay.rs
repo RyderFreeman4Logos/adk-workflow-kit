@@ -500,10 +500,10 @@ fn validate_payloads(bundle: &WireBundle) -> Result<(HashSet<&str>, HashSet<&str
         if !fixture_digests.insert(fixture.sha256.as_str()) {
             return Err(ReplayError::new(ReplayErrorKind::InvalidReference));
         }
-        if let Some(bytes) = &fixture.bytes {
-            if prefixed_sha256(bytes) != fixture.sha256 {
-                return Err(ReplayError::new(ReplayErrorKind::DigestMismatch));
-            }
+        if let Some(bytes) = &fixture.bytes
+            && prefixed_sha256(bytes) != fixture.sha256
+        {
+            return Err(ReplayError::new(ReplayErrorKind::DigestMismatch));
         }
     }
 
@@ -515,10 +515,10 @@ fn validate_payloads(bundle: &WireBundle) -> Result<(HashSet<&str>, HashSet<&str
         if !artifact_ids.insert(artifact.id.as_str()) {
             return Err(ReplayError::new(ReplayErrorKind::InvalidReference));
         }
-        if let Some(bytes) = &artifact.bytes {
-            if bare_sha256(bytes) != artifact.id {
-                return Err(ReplayError::new(ReplayErrorKind::DigestMismatch));
-            }
+        if let Some(bytes) = &artifact.bytes
+            && bare_sha256(bytes) != artifact.id
+        {
+            return Err(ReplayError::new(ReplayErrorKind::DigestMismatch));
         }
     }
 

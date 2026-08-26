@@ -1,4 +1,4 @@
-use workflow_compiler::{compile_str, CompileError, Diagnostic, GraphValidationError};
+use workflow_compiler::{CompileError, Diagnostic, GraphValidationError, compile_str};
 
 fn assert_standard_error<T: std::error::Error>() {}
 

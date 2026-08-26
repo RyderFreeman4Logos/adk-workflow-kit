@@ -540,9 +540,9 @@ fn missing_attribution(input: &MultiHopInput) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_multi_hop, validate_boundary, CoveragePredicate, MultiHopAttribution,
-        MultiHopBudget, MultiHopCoverage, MultiHopDiagnosticKind, MultiHopEnvelope, MultiHopError,
-        MultiHopHop, MultiHopInput,
+        CoveragePredicate, MultiHopAttribution, MultiHopBudget, MultiHopCoverage,
+        MultiHopDiagnosticKind, MultiHopEnvelope, MultiHopError, MultiHopHop, MultiHopInput,
+        compile_multi_hop, validate_boundary,
     };
 
     const CANARY_UNIT_COMPLETE_66: &str = "CANARY_UNIT_COMPLETE_66";

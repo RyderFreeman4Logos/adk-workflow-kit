@@ -14,8 +14,8 @@ use workflow_runtime::{
     RunContext, RunController, RunId, RunLimitKind, RunLimits, RunTerminalCause, RunTimeoutKind,
 };
 use workflow_testkit::{
-    inject_invalid_output, inject_output_flood, inject_rate_limit, inject_timeout, FakeTool,
-    FakeToolRegistry, FaultDiagnostic, FaultSignal, ScriptedLlm,
+    FakeTool, FakeToolRegistry, FaultDiagnostic, FaultSignal, ScriptedLlm, inject_invalid_output,
+    inject_output_flood, inject_rate_limit, inject_timeout,
 };
 
 /// One relaxed 7-ceiling run limit set; individual ceilings are overridden per fixture.
@@ -49,20 +49,24 @@ async fn timeout_fixture_fails_closed_with_typed_diagnostic() {
             .expect("new scripted model state is available"),
         0
     );
-    assert!(model
-        .generate_content(
-            LlmRequest::new(
-                "scripted-llm",
-                vec![Content::new("user").with_text("fixture")],
-            ),
-            false,
-        )
-        .await
-        .is_err());
-    assert!(!model
-        .requests()
-        .expect("new scripted model request ledger is available")
-        .is_empty());
+    assert!(
+        model
+            .generate_content(
+                LlmRequest::new(
+                    "scripted-llm",
+                    vec![Content::new("user").with_text("fixture")],
+                ),
+                false,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        !model
+            .requests()
+            .expect("new scripted model request ledger is available")
+            .is_empty()
+    );
     let registry = FakeToolRegistry::new(
         "fixture-tool",
         "1",
@@ -71,11 +75,13 @@ async fn timeout_fixture_fails_closed_with_typed_diagnostic() {
     let resolved = registry
         .resolve("fixture-tool", "1")
         .expect("fixture tool resolves by its exact registry identity");
-    assert!(resolved
-        .implementation()
-        .calls()
-        .expect("new fake tool call ledger is available")
-        .is_empty());
+    assert!(
+        resolved
+            .implementation()
+            .calls()
+            .expect("new fake tool call ledger is available")
+            .is_empty()
+    );
     let run_context = context([10, 10, 10, 5, 100, 100, 100]);
     let mut controller = RunController::new(&run_context);
 
@@ -114,20 +120,24 @@ async fn rate_limit_fixture_fails_closed_on_quota_exhaustion() {
             .expect("new scripted model state is available"),
         0
     );
-    assert!(model
-        .generate_content(
-            LlmRequest::new(
-                "scripted-llm",
-                vec![Content::new("user").with_text("fixture")],
-            ),
-            false,
-        )
-        .await
-        .is_err());
-    assert!(!model
-        .requests()
-        .expect("new scripted model request ledger is available")
-        .is_empty());
+    assert!(
+        model
+            .generate_content(
+                LlmRequest::new(
+                    "scripted-llm",
+                    vec![Content::new("user").with_text("fixture")],
+                ),
+                false,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        !model
+            .requests()
+            .expect("new scripted model request ledger is available")
+            .is_empty()
+    );
     let registry = FakeToolRegistry::new(
         "fixture-tool",
         "1",
@@ -136,11 +146,13 @@ async fn rate_limit_fixture_fails_closed_on_quota_exhaustion() {
     let resolved = registry
         .resolve("fixture-tool", "1")
         .expect("fixture tool resolves by its exact registry identity");
-    assert!(resolved
-        .implementation()
-        .calls()
-        .expect("new fake tool call ledger is available")
-        .is_empty());
+    assert!(
+        resolved
+            .implementation()
+            .calls()
+            .expect("new fake tool call ledger is available")
+            .is_empty()
+    );
     let run_context = context([1, 10, 10, 100, 100, 100, 100]);
     let mut controller = RunController::new(&run_context);
     controller
@@ -174,20 +186,24 @@ async fn invalid_output_fixture_fails_closed_without_echoing_bytes() {
             .expect("new scripted model state is available"),
         0
     );
-    assert!(model
-        .generate_content(
-            LlmRequest::new(
-                "scripted-llm",
-                vec![Content::new("user").with_text("fixture")],
-            ),
-            false,
-        )
-        .await
-        .is_err());
-    assert!(!model
-        .requests()
-        .expect("new scripted model request ledger is available")
-        .is_empty());
+    assert!(
+        model
+            .generate_content(
+                LlmRequest::new(
+                    "scripted-llm",
+                    vec![Content::new("user").with_text("fixture")],
+                ),
+                false,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        !model
+            .requests()
+            .expect("new scripted model request ledger is available")
+            .is_empty()
+    );
     let registry = FakeToolRegistry::new(
         "fixture-tool",
         "1",
@@ -196,11 +212,13 @@ async fn invalid_output_fixture_fails_closed_without_echoing_bytes() {
     let resolved = registry
         .resolve("fixture-tool", "1")
         .expect("fixture tool resolves by its exact registry identity");
-    assert!(resolved
-        .implementation()
-        .calls()
-        .expect("new fake tool call ledger is available")
-        .is_empty());
+    assert!(
+        resolved
+            .implementation()
+            .calls()
+            .expect("new fake tool call ledger is available")
+            .is_empty()
+    );
     let run_context = context([10, 10, 10, 100, 100, 100, 100]);
     let mut controller = RunController::new(&run_context);
     controller
@@ -229,20 +247,24 @@ async fn output_flood_fixture_fails_closed_at_byte_ceiling() {
             .expect("new scripted model state is available"),
         0
     );
-    assert!(model
-        .generate_content(
-            LlmRequest::new(
-                "scripted-llm",
-                vec![Content::new("user").with_text("fixture")],
-            ),
-            false,
-        )
-        .await
-        .is_err());
-    assert!(!model
-        .requests()
-        .expect("new scripted model request ledger is available")
-        .is_empty());
+    assert!(
+        model
+            .generate_content(
+                LlmRequest::new(
+                    "scripted-llm",
+                    vec![Content::new("user").with_text("fixture")],
+                ),
+                false,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        !model
+            .requests()
+            .expect("new scripted model request ledger is available")
+            .is_empty()
+    );
     let registry = FakeToolRegistry::new(
         "fixture-tool",
         "1",
@@ -251,11 +273,13 @@ async fn output_flood_fixture_fails_closed_at_byte_ceiling() {
     let resolved = registry
         .resolve("fixture-tool", "1")
         .expect("fixture tool resolves by its exact registry identity");
-    assert!(resolved
-        .implementation()
-        .calls()
-        .expect("new fake tool call ledger is available")
-        .is_empty());
+    assert!(
+        resolved
+            .implementation()
+            .calls()
+            .expect("new fake tool call ledger is available")
+            .is_empty()
+    );
     let run_context = context([10, 10, 10, 100, 100, 100, 3]);
     let mut controller = RunController::new(&run_context);
     controller

@@ -19,8 +19,8 @@ use std::{
 };
 
 use crate::{
-    verify_sandbox_capabilities, BackendCapabilities, RequestedCapabilities, RunWorkdir,
-    SandboxCapability, UnsatisfiedCapabilities,
+    BackendCapabilities, RequestedCapabilities, RunWorkdir, SandboxCapability,
+    UnsatisfiedCapabilities, verify_sandbox_capabilities,
 };
 
 /// A validated sandbox request for the Linux bubblewrap backend.

@@ -1,13 +1,13 @@
 use std::{collections::HashMap, panic::AssertUnwindSafe, sync::Arc};
 
 use adk_rust::{
+    AdkError, Agent, Artifacts, CallbackContext, Content, ErrorComponent, InvocationContext, Llm,
+    LlmRequest, LlmResponse, Part, ReadonlyContext, RunConfig, Session, State,
     agent::LlmAgentBuilder,
     async_trait,
     futures::{FutureExt, StreamExt},
-    AdkError, Agent, Artifacts, CallbackContext, Content, ErrorComponent, InvocationContext, Llm,
-    LlmRequest, LlmResponse, Part, ReadonlyContext, RunConfig, Session, State,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use workflow_compiler::{RegistryCategory, ToolRegistry};
 use workflow_testkit::{FakeTool, FakeToolRegistry, ScriptStep, ScriptedLlm};
 
@@ -268,7 +268,11 @@ async fn real_llm_agent_executes_the_scripted_tool_loop() {
                     .any(|part| {
                         matches!(
                             part,
-                            Part::FunctionResponse { function_response, id }
+                            Part::FunctionResponse {
+                                function_response,
+                                id,
+                                ..
+                            }
                                 if function_response.name == TOOL_NAME
                                     && function_response.response == expected_result
                                     && id.as_deref() == Some(CALL_ID)
