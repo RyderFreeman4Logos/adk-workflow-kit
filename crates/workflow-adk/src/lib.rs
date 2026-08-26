@@ -1,14 +1,17 @@
 //! Domain-neutral Verbatim boundary for platform-owned workflow calls.
 
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use adk_rust::graph::prelude::{AgentNode, END, GraphAgent, NodeOutput, START, State};
+use adk_rust::graph::prelude::{
+    AgentNode, END, ExecutionConfig, GraphAgent, GraphError, NodeOutput, START, State,
+};
 use adk_rust::{
     Agent, AgentCapabilities, Content, Event, EventStream, InvocationContext, async_trait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Arc;
 use workflow_compiler::{CompiledPlan, ResolvedRuntimePlan};
 use workflow_ir::IrNodeKind;
 
@@ -184,6 +187,31 @@ impl fmt::Display for TranslationError {
 }
 impl std::error::Error for TranslationError {}
 
+/// Stable failures produced while executing a translated graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdkGraphError {
+    UnknownRoute { from: String, selector: String },
+    RecursionLimit { steps: usize },
+    Failed,
+}
+
+impl fmt::Display for AdkGraphError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownRoute { from, selector } => {
+                write!(f, "unknown route from {from:?} selector {selector:?}")
+            }
+            Self::RecursionLimit { steps } => {
+                write!(f, "recursion limit exceeded: {steps} steps")
+            }
+            Self::Failed => write!(f, "graph execution failed"),
+        }
+    }
+}
+impl std::error::Error for AdkGraphError {}
+
+const IR_DEFAULT_KEY: &str = "__ir_default__";
+
 /// Explicit state input mapping owned by the adapter.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StateInputMapper;
@@ -208,18 +236,44 @@ pub struct AdkGraph {
     summary: GraphSummary,
     input: StateInputMapper,
     output: StateOutputMapper,
+    recursion_limit: usize,
+    unmatched: Arc<Mutex<Option<(String, String)>>>,
 }
 
 impl AdkGraph {
     pub async fn invoke(
         &self,
         state: State,
-        config: adk_rust::graph::prelude::ExecutionConfig,
-    ) -> Result<State, adk_rust::graph::prelude::GraphError> {
-        self.graph
-            .invoke(self.input.map(state), config)
-            .await
-            .map(|state| self.output.map(state))
+        config: ExecutionConfig,
+    ) -> Result<State, AdkGraphError> {
+        if let Ok(mut slot) = self.unmatched.lock() {
+            *slot = None;
+        }
+        let limit = self.recursion_limit.min(config.recursion_limit);
+        let config = config.with_recursion_limit(limit);
+        match self.graph.invoke(self.input.map(state), config).await {
+            Ok(state) => {
+                if let Some((from, selector)) = take_unmatched(&self.unmatched) {
+                    return Err(AdkGraphError::UnknownRoute { from, selector });
+                }
+                Ok(self.output.map(state))
+            }
+            Err(GraphError::RecursionLimitExceeded(steps)) => {
+                Err(AdkGraphError::RecursionLimit { steps })
+            }
+            Err(error) => {
+                if let Some((from, selector)) = take_unmatched(&self.unmatched) {
+                    return Err(AdkGraphError::UnknownRoute { from, selector });
+                }
+                match error {
+                    GraphError::UnknownRouteTarget(message) => Err(AdkGraphError::UnknownRoute {
+                        from: String::new(),
+                        selector: message,
+                    }),
+                    _ => Err(AdkGraphError::Failed),
+                }
+            }
+        }
     }
     pub fn summary(&self) -> &GraphSummary {
         &self.summary
@@ -292,7 +346,11 @@ impl AdkGraphTranslator {
                 });
             }
         }
-        let mut builder = GraphAgent::builder(ir.workflow_id().as_str()).channels(&["terminal"]);
+        let recursion_limit = ir_recursion_limit(ir);
+        let unmatched = Arc::new(Mutex::new(None));
+        let mut builder = GraphAgent::builder(ir.workflow_id().as_str())
+            .channels(&["terminal"])
+            .recursion_limit(recursion_limit);
         let mut terminals = Vec::new();
         let mut order = Vec::new();
         for node in ir.nodes() {
@@ -308,12 +366,26 @@ impl AdkGraphTranslator {
                 if terminal {
                     terminals.push(id.clone());
                 }
-                let node_name: &'static str = Box::leak(id.clone().into_boxed_str());
-                builder = builder.node_fn(node_name, move |_context| {
+                let max_visits = node.max_visits();
+                let visit_count = Arc::new(AtomicUsize::new(0));
+                let node_name = id.clone();
+                builder = builder.node_fn(&node_name, move |_context| {
                     let id = id.clone();
+                    let visit_count = Arc::clone(&visit_count);
                     async move {
-                        let key: &'static str = Box::leak(format!("node:{id}").into_boxed_str());
-                        let mut output = NodeOutput::new().with_update(key, json!(true));
+                        let visits = visit_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Some(max) = max_visits
+                            && visits > max as usize
+                        {
+                            return Err(GraphError::Other(format!(
+                                "visit bound {max} exceeded for {id}"
+                            )));
+                        }
+                        let key = format!("node:{id}");
+                        let visits_key = format!("visits:{id}");
+                        let mut output = NodeOutput::new()
+                            .with_update(&key, json!(true))
+                            .with_update(&visits_key, json!(visits));
                         if terminal {
                             output = output.with_update("terminal", json!(id));
                         }
@@ -340,19 +412,36 @@ impl AdkGraphTranslator {
                 .collect();
             if let Some(default) = route.default() {
                 cases.push((
-                    "default",
+                    IR_DEFAULT_KEY,
                     Box::leak(default.as_str().to_owned().into_boxed_str()) as &'static str,
                 ));
             }
             let from = route.from().as_str().to_owned();
+            let case_keys: Vec<String> = route
+                .cases()
+                .iter()
+                .map(|case| case.key().to_owned())
+                .collect();
+            let has_default = route.default().is_some();
+            let unmatched_slot = Arc::clone(&unmatched);
             builder = builder.conditional_edge(
                 route.from().as_str(),
                 move |state| {
-                    state
+                    let selected = state
                         .get(&format!("route:{from}"))
                         .and_then(|value| value.as_str())
-                        .unwrap_or("__unknown__")
-                        .to_owned()
+                        .map(str::to_owned);
+                    match selected {
+                        Some(key) if case_keys.iter().any(|known| known == &key) => key,
+                        _ if has_default => IR_DEFAULT_KEY.to_owned(),
+                        other => {
+                            let selector = other.unwrap_or_default();
+                            if let Ok(mut slot) = unmatched_slot.lock() {
+                                *slot = Some((from.clone(), selector.clone()));
+                            }
+                            selector
+                        }
+                    }
                 },
                 cases,
             );
@@ -374,6 +463,8 @@ impl AdkGraphTranslator {
             },
             input: StateInputMapper,
             output: StateOutputMapper,
+            recursion_limit,
+            unmatched,
         })
     }
 }
@@ -408,6 +499,20 @@ impl Agent for DeterministicAgent {
         event.set_content(Content::new("assistant").with_text("ok"));
         Ok(Box::pin(adk_rust::futures::stream::iter([Ok(event)])))
     }
+}
+
+fn take_unmatched(unmatched: &Mutex<Option<(String, String)>>) -> Option<(String, String)> {
+    unmatched.lock().ok().and_then(|mut slot| slot.take())
+}
+
+fn ir_recursion_limit(ir: &workflow_ir::WorkflowIr) -> usize {
+    let bound: usize = ir
+        .nodes()
+        .iter()
+        .filter_map(workflow_ir::IrNode::max_visits)
+        .map(|visits| visits as usize)
+        .sum();
+    if bound == 0 { 50 } else { bound }
 }
 
 fn valid_path(path: &str) -> bool {
