@@ -270,10 +270,12 @@ fn late_path_occupant_is_not_replaced_during_commit() {
             .kind(),
         ArtifactErrorKind::NotFound
     );
-    assert!(fs::symlink_metadata(&final_path)
-        .expect("the late pathname occupant must remain")
-        .file_type()
-        .is_symlink());
+    assert!(
+        fs::symlink_metadata(&final_path)
+            .expect("the late pathname occupant must remain")
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(
         fs::read_dir(base.path())
             .expect("store root must be readable")

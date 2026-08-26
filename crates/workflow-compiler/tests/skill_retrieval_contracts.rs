@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use workflow_compiler::{
-    retrieve_skill_candidates, RegistryCategory, RegistryEntry, RegistryNotFound,
-    SkillCapabilitySet, SkillDeclaration, SkillId, SkillManifest, SkillRegistry,
+    RegistryCategory, RegistryEntry, RegistryNotFound, SkillCapabilitySet, SkillDeclaration,
+    SkillId, SkillManifest, SkillRegistry, retrieve_skill_candidates,
 };
 
 struct TestSkillRegistry {

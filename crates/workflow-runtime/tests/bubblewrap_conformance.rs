@@ -314,7 +314,8 @@ fn run_format_host(pipeline: &str) -> usize {
 
 #[test]
 fn check07_cannot_access_injected_secrets_outside_the_declared_node() {
-    std::env::set_var("INJECTED_SECRET", "super-secret-value");
+    // SAFETY: this test owns the process-wide variable and removes it below.
+    unsafe { std::env::set_var("INJECTED_SECRET", "super-secret-value") };
     let receipt = run("echo ${INJECTED_SECRET:-}${HOST_SECRET_FILE:-}");
     // clearenv drops host environment: neither var is visible inside.
     let out = String::from_utf8_lossy(receipt.stdout());
@@ -322,7 +323,8 @@ fn check07_cannot_access_injected_secrets_outside_the_declared_node() {
         !out.contains("super-secret-value"),
         "host env must not leak"
     );
-    std::env::remove_var("INJECTED_SECRET");
+    // SAFETY: this test removes the variable it installed above.
+    unsafe { std::env::remove_var("INJECTED_SECRET") };
 }
 
 #[test]

@@ -1,8 +1,8 @@
 use std::error::Error;
 
 use workflow_runtime::{
-    verify_sandbox_capabilities, BackendCapabilities, RequestedCapabilities, SandboxCapability,
-    UnsatisfiedCapabilities,
+    BackendCapabilities, RequestedCapabilities, SandboxCapability, UnsatisfiedCapabilities,
+    verify_sandbox_capabilities,
 };
 
 #[test]
@@ -29,11 +29,13 @@ fn empty_requests_succeed_against_any_backend() {
     let requested = RequestedCapabilities::new([]);
 
     assert!(verify_sandbox_capabilities(&requested, &BackendCapabilities::new([])).is_ok());
-    assert!(verify_sandbox_capabilities(
-        &requested,
-        &BackendCapabilities::new([SandboxCapability::Network]),
-    )
-    .is_ok());
+    assert!(
+        verify_sandbox_capabilities(
+            &requested,
+            &BackendCapabilities::new([SandboxCapability::Network]),
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -159,9 +161,11 @@ fn preflight_exposes_only_success_or_typed_failure() {
         &BackendCapabilities,
     ) -> Result<(), UnsatisfiedCapabilities> = verify_sandbox_capabilities;
 
-    assert!(preflight(
-        &RequestedCapabilities::new([SandboxCapability::Network]),
-        &BackendCapabilities::new([]),
-    )
-    .is_err());
+    assert!(
+        preflight(
+            &RequestedCapabilities::new([SandboxCapability::Network]),
+            &BackendCapabilities::new([]),
+        )
+        .is_err()
+    );
 }

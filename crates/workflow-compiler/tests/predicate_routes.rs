@@ -1,9 +1,9 @@
 use std::cell::RefCell;
 
 use workflow_compiler::{
-    compile_str, compile_str_with_predicates, validate_graph, CompileError, GraphValidationError,
-    PredicateRegistry, RegistryCategory, RegistryEntry, RegistryNotFound, WorkflowLock,
-    WorkflowLockError,
+    CompileError, GraphValidationError, PredicateRegistry, RegistryCategory, RegistryEntry,
+    RegistryNotFound, WorkflowLock, WorkflowLockError, compile_str, compile_str_with_predicates,
+    validate_graph,
 };
 use workflow_ir::WorkflowIr;
 use workflow_spec::parse_str;

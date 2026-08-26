@@ -7,13 +7,13 @@ use std::{
 #[cfg(unix)]
 use std::process::Command;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use workflow_compiler::{
-    compile_file, validate_graph, CompileError, Diagnostic, DiagnosticProjectionError,
-    GraphValidationError, RegistryCategory, RegistryNotFound, WorkflowLockError,
+    CompileError, Diagnostic, DiagnosticProjectionError, GraphValidationError, RegistryCategory,
+    RegistryNotFound, WorkflowLockError, compile_file, validate_graph,
 };
 use workflow_ir::WorkflowIr;
-use workflow_spec::{parse_file, parse_str, FieldPath, SourceLocation, SourcePath, SpecError};
+use workflow_spec::{FieldPath, SourceLocation, SourcePath, SpecError, parse_file, parse_str};
 
 const MINIMAL: &str = r#"
 schema_version = 1
@@ -788,8 +788,10 @@ fn projects_workflow_lock_errors_with_exact_human_and_json_v1() {
         assert_eq!(diagnostic.to_string(), expected_human);
         assert_eq!(json_value(&diagnostic), expected_json);
         assert!(!diagnostic.to_string().contains("secret serialization"));
-        assert!(!serde_json::to_string(&diagnostic)
-            .expect("diagnostic should serialize")
-            .contains("secret serialization"));
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .expect("diagnostic should serialize")
+                .contains("secret serialization")
+        );
     }
 }

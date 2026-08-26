@@ -10,20 +10,20 @@
 use std::{collections::HashMap, fmt, panic::AssertUnwindSafe, sync::Arc};
 
 use adk_rust::{
-    agent::LlmAgentBuilder,
-    futures::{FutureExt, StreamExt},
     Agent, Artifacts, CallbackContext, Content, InvocationContext, Part, ReadonlyContext,
     RunConfig, Session, State,
+    agent::LlmAgentBuilder,
+    futures::{FutureExt, StreamExt},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use workflow_compiler::{
-    compile_str_with_predicates, CompiledPlan, PredicateRegistry, RegistryCategory, RegistryEntry,
-    RegistryNotFound,
+    CompiledPlan, PredicateRegistry, RegistryCategory, RegistryEntry, RegistryNotFound,
+    compile_str_with_predicates,
 };
 use workflow_ir::{IrNode, IrNodeKind, IrPredicateRoute, WorkflowIr};
 use workflow_review::{
-    ReviewDefect, ReviewError, ReviewResult, ReviewSeverity, ReviewVerdict,
-    REVIEW_SCHEMA_VERSION_V1,
+    REVIEW_SCHEMA_VERSION_V1, ReviewDefect, ReviewError, ReviewResult, ReviewSeverity,
+    ReviewVerdict,
 };
 use workflow_runtime::{RunSessionIds, SessionRole};
 use workflow_testkit::{NoProgressError, NonProgressDetector, ScriptStep, ScriptedLlm};
@@ -779,12 +779,14 @@ async fn reviewer_pass_cannot_waive_failed_validator() {
             .any(|node| node == "review" || node == "publish"),
         "a reviewer pass must never waive a failed deterministic validator"
     );
-    assert!(roles2
-        .reviewer
-        .llm
-        .requests()
-        .expect("reviewer script state readable")
-        .is_empty());
+    assert!(
+        roles2
+            .reviewer
+            .llm
+            .requests()
+            .expect("reviewer script state readable")
+            .is_empty()
+    );
 }
 
 #[adk_rust::tokio::test]

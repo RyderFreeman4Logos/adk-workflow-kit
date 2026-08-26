@@ -9,8 +9,8 @@ use serde_json::Value;
 use wasmi::{Config, Engine, Linker, Module, Store, StoreLimitsBuilder, TypedFunc};
 
 use crate::{
-    verify_sandbox_capabilities, BackendCapabilities, RequestedCapabilities, SandboxCapability,
-    UnsatisfiedCapabilities,
+    BackendCapabilities, RequestedCapabilities, SandboxCapability, UnsatisfiedCapabilities,
+    verify_sandbox_capabilities,
 };
 
 const MAX_MEMORY_PAGES: usize = 64;

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 const DRAFT_2020_12_SCHEMA: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -241,10 +241,10 @@ fn close_schema(schema: &mut Value) -> bool {
             }
 
             for key in ["properties", "$defs", "definitions", "dependentSchemas"] {
-                if let Some(Value::Object(children)) = object.get_mut(key) {
-                    if !children.values_mut().all(close_schema) {
-                        return false;
-                    }
+                if let Some(Value::Object(children)) = object.get_mut(key)
+                    && !children.values_mut().all(close_schema)
+                {
+                    return false;
                 }
             }
             for key in [
@@ -256,17 +256,17 @@ fn close_schema(schema: &mut Value) -> bool {
                 "then",
                 "else",
             ] {
-                if let Some(child) = object.get_mut(key) {
-                    if !close_schema(child) {
-                        return false;
-                    }
+                if let Some(child) = object.get_mut(key)
+                    && !close_schema(child)
+                {
+                    return false;
                 }
             }
             for key in ["prefixItems", "allOf", "anyOf", "oneOf"] {
-                if let Some(Value::Array(children)) = object.get_mut(key) {
-                    if !children.iter_mut().all(close_schema) {
-                        return false;
-                    }
+                if let Some(Value::Array(children)) = object.get_mut(key)
+                    && !children.iter_mut().all(close_schema)
+                {
+                    return false;
                 }
             }
             true

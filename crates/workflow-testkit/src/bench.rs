@@ -6,10 +6,10 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use workflow_compiler::{compile_str, CompileError};
+use workflow_compiler::{CompileError, compile_str};
 use workflow_runtime::{
-    decode_structured_tool_output, BackendCapabilities, RequestedCapabilities, SandboxCapability,
-    StructuredOutputError, UnsatisfiedCapabilities,
+    BackendCapabilities, RequestedCapabilities, SandboxCapability, StructuredOutputError,
+    UnsatisfiedCapabilities, decode_structured_tool_output,
 };
 
 use crate::{FakeSandboxBackend, FakeSandboxRequest};
@@ -155,8 +155,8 @@ pub fn run_suite() -> Result<BenchmarkReport, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compiler_diagnostic_code, run_suite, runtime_diagnostic_code, sandbox_diagnostic_code,
-        BenchmarkReport,
+        BenchmarkReport, compiler_diagnostic_code, run_suite, runtime_diagnostic_code,
+        sandbox_diagnostic_code,
     };
     use workflow_compiler::compile_str;
     use workflow_runtime::{decode_structured_tool_output, verify_sandbox_capabilities};
@@ -168,10 +168,12 @@ mod tests {
         assert_eq!(report.schema_version, 1);
         assert_eq!(report.samples.len(), 3);
         assert!(report.samples.iter().all(|sample| sample.elapsed_ns > 0));
-        assert!(report
-            .samples
-            .iter()
-            .any(|sample| sample.name == "compiler"));
+        assert!(
+            report
+                .samples
+                .iter()
+                .any(|sample| sample.name == "compiler")
+        );
         assert!(report.samples.iter().any(|sample| sample.name == "runtime"));
         assert!(report.samples.iter().any(|sample| sample.name == "sandbox"));
     }

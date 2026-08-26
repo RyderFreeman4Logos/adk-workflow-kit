@@ -2,7 +2,7 @@
 
 use std::{fmt, time::Duration};
 
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 /// The closed approval decision vocabulary supplied by an external human.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -120,7 +120,7 @@ pub fn evaluate_approval(
 mod tests {
     use std::time::Duration;
 
-    use super::{evaluate_approval, ApprovalDecision, ApprovalGranted};
+    use super::{ApprovalDecision, ApprovalGranted, evaluate_approval};
 
     #[test]
     fn approval_deny_is_terminal_without_echo() {

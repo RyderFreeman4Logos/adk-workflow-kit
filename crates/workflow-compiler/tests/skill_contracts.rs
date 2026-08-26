@@ -1,11 +1,11 @@
 use std::{fmt::Display, path::Path};
 
 use workflow_compiler::{
-    activate_skill, RegistryCategory, RegistryEntry, RegistryNotFound, SkillActivationError,
-    SkillId, SkillIdError, SkillManifest, SkillManifestError, SkillRegistry,
+    RegistryCategory, RegistryEntry, RegistryNotFound, SkillActivationError, SkillId, SkillIdError,
+    SkillManifest, SkillManifestError, SkillRegistry, activate_skill,
 };
 use workflow_runtime::{
-    intersect_policy_capabilities, PolicyCapabilities, RequestedCapabilities, SandboxCapability,
+    PolicyCapabilities, RequestedCapabilities, SandboxCapability, intersect_policy_capabilities,
 };
 
 struct TestSkillRegistry {
@@ -283,9 +283,11 @@ fn activation_cannot_expand_policy_001_capabilities() {
     };
     let id = valid_id();
     match activate_skill(&registry, &id, "1") {
-        Ok(receipt) => assert!(receipt
-            .instructions()
-            .contains("explicit activation receipt")),
+        Ok(receipt) => assert!(
+            receipt
+                .instructions()
+                .contains("explicit activation receipt")
+        ),
         Err(error) => panic!("skill should activate without interpreting allowed-tools: {error}"),
     }
 

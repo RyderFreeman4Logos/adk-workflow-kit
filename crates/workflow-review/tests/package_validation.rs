@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 use workflow_review::{
-    validate_package, PackageArchiveEntry, PackageFile, PackageManifest, PackageValidationError,
+    PackageArchiveEntry, PackageFile, PackageManifest, PackageValidationError, validate_package,
 };
 
 const CANARY_PATH_56: &str = "../CANARY_PATH_56";

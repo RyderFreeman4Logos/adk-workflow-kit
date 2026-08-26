@@ -11,7 +11,7 @@ use std::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::{encode_hex, RunId};
+use crate::{RunId, encode_hex};
 
 /// Allocates one owned filesystem root per run.
 ///
@@ -549,8 +549,8 @@ mod tests {
     };
 
     use super::{
-        initialize_layout, Materialization, WorkdirError, WorkdirErrorKind, WorkdirId,
-        WorkdirManager,
+        Materialization, WorkdirError, WorkdirErrorKind, WorkdirId, WorkdirManager,
+        initialize_layout,
     };
     use crate::RunId;
 

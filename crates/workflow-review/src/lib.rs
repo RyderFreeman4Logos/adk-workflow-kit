@@ -14,20 +14,20 @@ mod multi_hop;
 mod package;
 
 pub use grounded_answer::{
-    compile_grounded_answer, GroundedAnswerCitation, GroundedAnswerClaim, GroundedAnswerDiagnostic,
+    GroundedAnswerCitation, GroundedAnswerClaim, GroundedAnswerDiagnostic,
     GroundedAnswerDiagnosticKind, GroundedAnswerEnvelope, GroundedAnswerError, GroundedAnswerInput,
-    GroundedAnswerOutcome, GroundedAnswerPublicationAck,
+    GroundedAnswerOutcome, GroundedAnswerPublicationAck, compile_grounded_answer,
 };
 
 pub use multi_hop::{
-    compile_multi_hop, CoveragePredicate, MultiHopAcknowledgement, MultiHopAttribution,
-    MultiHopBudget, MultiHopCoverage, MultiHopDiagnostic, MultiHopDiagnosticKind, MultiHopEnvelope,
-    MultiHopError, MultiHopHop, MultiHopInput, MultiHopOutcome,
+    CoveragePredicate, MultiHopAcknowledgement, MultiHopAttribution, MultiHopBudget,
+    MultiHopCoverage, MultiHopDiagnostic, MultiHopDiagnosticKind, MultiHopEnvelope, MultiHopError,
+    MultiHopHop, MultiHopInput, MultiHopOutcome, compile_multi_hop,
 };
 
 pub use package::{
-    validate_package, validate_secret_free_fixture, PackageArchiveEntry, PackageFile,
-    PackageManifest, PackageValidationError, SecretFixtureSurface,
+    PackageArchiveEntry, PackageFile, PackageManifest, PackageValidationError,
+    SecretFixtureSurface, validate_package, validate_secret_free_fixture,
 };
 
 /// The only supported review schema version.

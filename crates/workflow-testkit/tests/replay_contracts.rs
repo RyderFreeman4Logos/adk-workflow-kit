@@ -1,6 +1,6 @@
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use workflow_runtime::{BackendCapabilities, RunStatus, SandboxCapability};
 use workflow_testkit::{
     FakeSandboxBackend, FakeTool, ReplayBundle, ReplayError, ReplayErrorKind, ReplayEvent,

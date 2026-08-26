@@ -5,7 +5,7 @@
 //! any blocking/fail verdict or disagreement defers.
 
 use workflow_review::{
-    resolve_disposition, ReviewDisposition, ReviewError, ReviewVerdict, ReviewVote,
+    ReviewDisposition, ReviewError, ReviewVerdict, ReviewVote, resolve_disposition,
 };
 
 fn vote(subject: &str, verdict: ReviewVerdict) -> ReviewVote {

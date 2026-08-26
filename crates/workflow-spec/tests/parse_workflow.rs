@@ -6,8 +6,8 @@ use std::{
 };
 
 use workflow_spec::{
-    parse_file, parse_str, FieldPath, NodeKind, RouteOperator, SchemaVersion, SourcePath,
-    SpecError, UnsupportedRouteOperator, WORKFLOW_SCHEMA_VERSION_V1,
+    FieldPath, NodeKind, RouteOperator, SchemaVersion, SourcePath, SpecError,
+    UnsupportedRouteOperator, WORKFLOW_SCHEMA_VERSION_V1, parse_file, parse_str,
 };
 
 const MINIMAL: &str = r#"

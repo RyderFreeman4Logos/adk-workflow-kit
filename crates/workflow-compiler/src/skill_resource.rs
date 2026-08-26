@@ -328,7 +328,7 @@ impl<'a> SkillActivationReceipt<'a> {
             let (id, bytes) = match input {
                 SkillResourceInput::File { id, bytes } => (id, bytes),
                 SkillResourceInput::Symlink { id: _, target: _ } => {
-                    return Err(SkillResourceError::SymlinkRejected)
+                    return Err(SkillResourceError::SymlinkRejected);
                 }
             };
             if bytes.is_empty() {

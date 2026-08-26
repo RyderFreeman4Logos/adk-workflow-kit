@@ -17,7 +17,7 @@ mod tool;
 mod workdir;
 
 pub use approval::{
-    evaluate_approval, ApprovalDecision, ApprovalGranted, ApprovalTerminal, ApprovalTerminalKind,
+    ApprovalDecision, ApprovalGranted, ApprovalTerminal, ApprovalTerminalKind, evaluate_approval,
 };
 pub use artifact::{
     ArtifactError, ArtifactErrorKind, ArtifactId, ArtifactPage, ArtifactStore,
@@ -32,21 +32,21 @@ pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
 };
 pub use execution::{
-    PureTransformBinding, PureTransformExecutionError, PureTransformPlanError, PureTransformPlanV1,
     PURE_TRANSFORM_BINDING_ID, PURE_TRANSFORM_BINDING_VERSION, PURE_TRANSFORM_PLAN_VERSION_V1,
+    PureTransformBinding, PureTransformExecutionError, PureTransformPlanError, PureTransformPlanV1,
 };
 pub use hot_reload::{DevelopmentHotReload, HotReloadError, HotReloadErrorKind};
 pub use observability::{
-    CallLedgerRecord, EventCounts, ObservabilityError, OtelMapping, RedactedEvent,
-    SensitiveSnapshot, SensitiveSnapshotKind, REDACTION_MARKER,
+    CallLedgerRecord, EventCounts, ObservabilityError, OtelMapping, REDACTION_MARKER,
+    RedactedEvent, SensitiveSnapshot, SensitiveSnapshotKind,
 };
 pub use podman::{
     PodmanError, PodmanReceipt, PodmanRequest, PodmanRequestError, RootlessPodmanBackend,
 };
 pub use policy::{
-    evaluate_context_policy, Classification, ContextPolicyDenied, ContextPolicyDeniedKind,
-    EffectivePolicy, InvalidNetworkDestination, InvalidPolicyToken, NetworkDestination,
-    NetworkProfile, PolicyLayer, PolicySubject, RoleToken, TenantId,
+    Classification, ContextPolicyDenied, ContextPolicyDeniedKind, EffectivePolicy,
+    InvalidNetworkDestination, InvalidPolicyToken, NetworkDestination, NetworkProfile, PolicyLayer,
+    PolicySubject, RoleToken, TenantId, evaluate_context_policy,
 };
 pub use production_profile::{
     ProductionProfile, ProductionProfileBinding, ProductionProfileError,
@@ -59,8 +59,8 @@ pub use session::{
     RunSessionIds, SessionId, SessionIdentityError, SessionIdentityErrorKind, SessionRole,
 };
 pub use tool::{
-    decode_structured_tool_output, StructuredOutputError, ToolEnvelope, ToolFailure, ToolFlags,
-    ToolProvenance, ToolRegistration, ToolRegistrationError,
+    StructuredOutputError, ToolEnvelope, ToolFailure, ToolFlags, ToolProvenance, ToolRegistration,
+    ToolRegistrationError, decode_structured_tool_output,
 };
 pub use workdir::{
     CleanupOutcome, Materialization, RunWorkdir, WorkdirError, WorkdirErrorKind, WorkdirId,
@@ -69,7 +69,7 @@ pub use workdir::{
 
 use std::{collections::HashSet, fmt, num::NonZeroU64};
 
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 fn encode_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";

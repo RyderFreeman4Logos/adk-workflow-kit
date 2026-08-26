@@ -5,7 +5,7 @@
 //! that both fixtures ran. Fixture payloads stay out of Debug/Display/serde.
 
 use workflow_testkit::{
-    compile_eval, EvalDiagnosticKind, EvalEnvelope, EvalError, EvalFixture, EvalInput,
+    EvalDiagnosticKind, EvalEnvelope, EvalError, EvalFixture, EvalInput, compile_eval,
 };
 
 const CANARY_TRAJECTORY_51: &str = "CANARY_TRAJECTORY_51";
@@ -49,9 +49,11 @@ fn canary_trajectory_runs_as_typed_trajectory_not_rubric() {
     }
     assert!(!result.to_string().contains(CANARY_TRAJECTORY_51));
     assert_payload_redacted(&result, CANARY_TRAJECTORY_51);
-    assert!(!serde_json::to_string(&result)
-        .expect("trajectory envelope must serialize")
-        .contains(CANARY_TRAJECTORY_51));
+    assert!(
+        !serde_json::to_string(&result)
+            .expect("trajectory envelope must serialize")
+            .contains(CANARY_TRAJECTORY_51)
+    );
 }
 
 #[test]
@@ -73,9 +75,11 @@ fn canary_rubric_runs_as_typed_rubric_not_trajectory() {
     }
     assert!(!result.to_string().contains(CANARY_RUBRIC_51));
     assert_payload_redacted(&result, CANARY_RUBRIC_51);
-    assert!(!serde_json::to_string(&result)
-        .expect("rubric envelope must serialize")
-        .contains(CANARY_RUBRIC_51));
+    assert!(
+        !serde_json::to_string(&result)
+            .expect("rubric envelope must serialize")
+            .contains(CANARY_RUBRIC_51)
+    );
 }
 
 #[test]
@@ -96,9 +100,11 @@ fn canary_eval_boundary_takes_typed_path_and_cannot_report_both_ran() {
     assert_eq!(error.code(), "eval.boundary_miss");
     assert!(!format!("{error}").contains(CANARY_EVAL_BOUNDARY_51));
     assert_payload_redacted(&error, CANARY_EVAL_BOUNDARY_51);
-    assert!(!serde_json::to_string(&error)
-        .expect("boundary error must serialize")
-        .contains(CANARY_EVAL_BOUNDARY_51));
+    assert!(
+        !serde_json::to_string(&error)
+            .expect("boundary error must serialize")
+            .contains(CANARY_EVAL_BOUNDARY_51)
+    );
     let _typed: EvalError = error;
 }
 

@@ -8,8 +8,8 @@ use std::{
 };
 
 use crate::{
-    verify_sandbox_capabilities, BackendCapabilities, RequestedCapabilities, RunWorkdir,
-    SandboxCapability, UnsatisfiedCapabilities,
+    BackendCapabilities, RequestedCapabilities, RunWorkdir, SandboxCapability,
+    UnsatisfiedCapabilities, verify_sandbox_capabilities,
 };
 
 /// A validated rootless OCI image execution request.
@@ -297,11 +297,18 @@ mod tests {
             Some(old_path) => format!("{}:{}", root.display(), old_path.to_string_lossy()),
             None => root.display().to_string(),
         };
-        std::env::set_var("PATH", path);
+        // SAFETY: the test lock serializes this process-wide environment update.
+        unsafe { std::env::set_var("PATH", path) };
         let result = test();
         match old_path {
-            Some(old_path) => std::env::set_var("PATH", old_path),
-            None => std::env::remove_var("PATH"),
+            Some(old_path) => {
+                // SAFETY: the test lock serializes restoration of PATH.
+                unsafe { std::env::set_var("PATH", old_path) }
+            }
+            None => {
+                // SAFETY: the test lock serializes restoration of PATH.
+                unsafe { std::env::remove_var("PATH") }
+            }
         }
         fs::remove_dir_all(root).unwrap();
         result

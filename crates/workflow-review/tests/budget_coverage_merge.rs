@@ -1,6 +1,6 @@
 use workflow_review::{
-    compile_multi_hop, CoveragePredicate, MultiHopAttribution, MultiHopBudget, MultiHopCoverage,
-    MultiHopDiagnosticKind, MultiHopEnvelope, MultiHopHop, MultiHopInput,
+    CoveragePredicate, MultiHopAttribution, MultiHopBudget, MultiHopCoverage,
+    MultiHopDiagnosticKind, MultiHopEnvelope, MultiHopHop, MultiHopInput, compile_multi_hop,
 };
 
 const CANARY_BUDGET_67: &str = "CANARY_BUDGET_67";
@@ -32,9 +32,11 @@ fn two_supported_hops(canary: &str) -> MultiHopInput {
 fn assert_payload_redacted(result: &MultiHopEnvelope, canary: &str) {
     assert!(!format!("{result:?}").contains(canary));
     assert!(!result.to_string().contains(canary));
-    assert!(!serde_json::to_string(result)
-        .expect("multi-hop envelope must serialize")
-        .contains(canary));
+    assert!(
+        !serde_json::to_string(result)
+            .expect("multi-hop envelope must serialize")
+            .contains(canary)
+    );
 }
 
 #[test]

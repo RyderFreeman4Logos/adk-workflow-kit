@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use workflow_runtime::{ToolFlags, ToolProvenance, ToolRegistration, ToolRegistrationError};
 
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -149,10 +149,12 @@ fn generates_exact_draft_2020_12_input_and_enveloped_output_schema() {
         Some(Value::Array(variants)) => {
             assert!(!variants.is_empty());
             assert!(registration.output_schema().to_string().contains("status"));
-            assert!(registration
-                .output_schema()
-                .to_string()
-                .contains("provenance"));
+            assert!(
+                registration
+                    .output_schema()
+                    .to_string()
+                    .contains("provenance")
+            );
         }
         _ => panic!("output schema must describe ToolEnvelope variants"),
     }

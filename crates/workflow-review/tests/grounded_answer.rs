@@ -1,7 +1,7 @@
 use workflow_review::{
-    compile_grounded_answer, GroundedAnswerCitation, GroundedAnswerClaim,
-    GroundedAnswerDiagnosticKind, GroundedAnswerEnvelope, GroundedAnswerError, GroundedAnswerInput,
-    ReviewVerdict, ReviewVote,
+    GroundedAnswerCitation, GroundedAnswerClaim, GroundedAnswerDiagnosticKind,
+    GroundedAnswerEnvelope, GroundedAnswerError, GroundedAnswerInput, ReviewVerdict, ReviewVote,
+    compile_grounded_answer,
 };
 
 const CANARY_PUBLISH_64: &str = "CANARY_PUBLISH_64";
@@ -44,9 +44,11 @@ fn canary_publish_takes_typed_publish_transition() {
     };
     assert_eq!(acknowledgement.answer_len(), CANARY_PUBLISH_64.len());
     assert!(!format!("{result:?}").contains(CANARY_PUBLISH_64));
-    assert!(!serde_json::to_string(&result)
-        .expect("publish envelope must serialize")
-        .contains(CANARY_PUBLISH_64));
+    assert!(
+        !serde_json::to_string(&result)
+            .expect("publish envelope must serialize")
+            .contains(CANARY_PUBLISH_64)
+    );
 }
 
 #[test]
@@ -63,9 +65,11 @@ fn canary_abstain_takes_typed_abstain_transition_without_publish_ack() {
         GroundedAnswerDiagnosticKind::ReviewDeferred
     );
     assert!(!format!("{result:?}").contains(CANARY_ABSTAIN_64));
-    assert!(!serde_json::to_string(&result)
-        .expect("abstain envelope must serialize")
-        .contains(CANARY_ABSTAIN_64));
+    assert!(
+        !serde_json::to_string(&result)
+            .expect("abstain envelope must serialize")
+            .contains(CANARY_ABSTAIN_64)
+    );
 }
 
 #[test]
@@ -88,9 +92,11 @@ fn unsupported_claim_canary_abstains_without_publish() {
     );
     assert_eq!(diagnostic.code(), "grounded_answer.unsupported_claim");
     assert!(!format!("{result:?}").contains(CANARY_UNSUPPORTED_CLAIM_65));
-    assert!(!serde_json::to_string(&result)
-        .expect("unsupported claim envelope must serialize")
-        .contains(CANARY_UNSUPPORTED_CLAIM_65));
+    assert!(
+        !serde_json::to_string(&result)
+            .expect("unsupported claim envelope must serialize")
+            .contains(CANARY_UNSUPPORTED_CLAIM_65)
+    );
     assert!(!result.to_string().contains(CANARY_UNSUPPORTED_CLAIM_65));
 }
 
@@ -109,9 +115,11 @@ fn supported_citation_canary_publishes_without_abstain() {
         }
     }
     assert!(!format!("{result:?}").contains(CANARY_SUPPORTED_CITATION_65));
-    assert!(!serde_json::to_string(&result)
-        .expect("supported claim envelope must serialize")
-        .contains(CANARY_SUPPORTED_CITATION_65));
+    assert!(
+        !serde_json::to_string(&result)
+            .expect("supported claim envelope must serialize")
+            .contains(CANARY_SUPPORTED_CITATION_65)
+    );
 }
 
 #[test]

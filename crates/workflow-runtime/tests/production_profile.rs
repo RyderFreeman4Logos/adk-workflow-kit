@@ -33,12 +33,16 @@ fn canary_prod_profile_82_binds_production_workdir_without_dev_fallback() {
     let profile = ProductionProfile::new(&workdirs).expect("production profile");
     let binding = profile.bind(&run_id()).expect(CANARY_PROD_PROFILE_82);
     assert_eq!(binding.profile_name(), "production");
-    assert!(binding
-        .requested()
-        .contains(SandboxCapability::FilesystemRead));
-    assert!(binding
-        .requested()
-        .contains(SandboxCapability::FilesystemWrite));
+    assert!(
+        binding
+            .requested()
+            .contains(SandboxCapability::FilesystemRead)
+    );
+    assert!(
+        binding
+            .requested()
+            .contains(SandboxCapability::FilesystemWrite)
+    );
     binding
         .validate_workdir_path(binding.workdir().out_dir())
         .expect(CANARY_PROD_PROFILE_82);

@@ -1,4 +1,4 @@
-use workflow_compiler::{audit_dependencies, AuditDisposition};
+use workflow_compiler::{AuditDisposition, audit_dependencies};
 
 const CANARY_AUDIT_CLEAN_70: &str = "CANARY_AUDIT_CLEAN_70";
 const CANARY_AUDIT_CRITICAL_70: &str = "CANARY_AUDIT_CRITICAL_70";
@@ -26,9 +26,11 @@ fn integration_critical_fixture_cannot_report_clean() {
     assert_eq!(result.disposition(), AuditDisposition::Critical);
     assert_ne!(result.disposition(), AuditDisposition::Clean);
     assert!(result.critical_count() > 0);
-    assert!(!result
-        .to_string()
-        .contains("no unresolved critical findings"));
+    assert!(
+        !result
+            .to_string()
+            .contains("no unresolved critical findings")
+    );
     assert!(!format!("{result:?}").contains(CANARY_AUDIT_CRITICAL_70));
 }
 

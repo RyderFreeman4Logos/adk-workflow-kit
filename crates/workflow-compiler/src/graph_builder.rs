@@ -3,9 +3,8 @@ use std::fmt;
 use workflow_spec::WorkflowSpec;
 
 use crate::{
-    validated_ir, CompileError, CompiledPlan, ModelRegistry, NodeRegistry, PredicateRegistry,
-    RegistryCategory, RegistryEntry, RegistryNotFound, SkillRegistry, ToolRegistry,
-    ValidatorRegistry,
+    CompileError, CompiledPlan, ModelRegistry, NodeRegistry, PredicateRegistry, RegistryCategory,
+    RegistryEntry, RegistryNotFound, SkillRegistry, ToolRegistry, ValidatorRegistry, validated_ir,
 };
 
 /// An exact registry identity to resolve while composing a graph.

@@ -323,9 +323,11 @@ mod tests {
         assert_ne!(result.disposition(), AuditDisposition::BoundaryMiss);
         assert!(result.critical_count() > 0);
         assert_ne!(result.to_string(), "no unresolved critical findings");
-        assert!(!result
-            .to_string()
-            .contains("no unresolved critical findings"));
+        assert!(
+            !result
+                .to_string()
+                .contains("no unresolved critical findings")
+        );
         assert_redacted(&format!("{result:?}"), CANARY_AUDIT_CRITICAL_70);
         assert_redacted(&result.to_string(), CANARY_AUDIT_CRITICAL_70);
         assert_redacted(
@@ -342,9 +344,11 @@ mod tests {
         assert_eq!(error.code(), "workflow.audit.boundary_miss");
         assert_ne!(error.kind(), AuditDisposition::Clean);
         assert_ne!(error.kind(), AuditDisposition::Critical);
-        assert!(!error
-            .to_string()
-            .contains("no unresolved critical findings"));
+        assert!(
+            !error
+                .to_string()
+                .contains("no unresolved critical findings")
+        );
         assert_redacted(&format!("{error:?}"), CANARY_AUDIT_BOUNDARY_70);
         assert_redacted(&error.to_string(), CANARY_AUDIT_BOUNDARY_70);
         assert_redacted(

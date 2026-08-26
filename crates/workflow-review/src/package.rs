@@ -1,4 +1,4 @@
-use serde::{ser::SerializeStruct, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use sha2::{Digest, Sha256};
 
 const PACKAGE_SCHEMA_VERSION_V1: u16 = 1;
@@ -309,8 +309,8 @@ fn contains_secret_like_data(path: &str, bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_package, validate_secret_free_fixture, PackageArchiveEntry, PackageFile,
-        PackageManifest, PackageValidationError, SecretFixtureSurface,
+        PackageArchiveEntry, PackageFile, PackageManifest, PackageValidationError,
+        SecretFixtureSurface, validate_package, validate_secret_free_fixture,
     };
     use sha2::{Digest, Sha256};
 
@@ -329,11 +329,13 @@ mod tests {
             digest(bytes),
         )]);
 
-        assert!(validate_package(
-            &manifest,
-            &[PackageArchiveEntry::new("workflow.toml", bytes, false)]
-        )
-        .is_ok());
+        assert!(
+            validate_package(
+                &manifest,
+                &[PackageArchiveEntry::new("workflow.toml", bytes, false)]
+            )
+            .is_ok()
+        );
     }
 
     #[test]

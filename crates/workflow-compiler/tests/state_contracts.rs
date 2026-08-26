@@ -5,7 +5,7 @@
 //! optional handle shapes. State preflight fails closed at compile time; it is
 //! purely in-memory and never walks the host filesystem or spawns processes.
 
-use workflow_compiler::{compile_str, CompileError, Diagnostic};
+use workflow_compiler::{CompileError, Diagnostic, compile_str};
 
 const STATE_FREE: &str = r#"
 schema_version = 1

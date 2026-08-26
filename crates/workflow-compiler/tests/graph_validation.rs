@@ -1,4 +1,4 @@
-use workflow_compiler::{validate_graph, GraphValidationError, MissingEdgeEndpoint};
+use workflow_compiler::{GraphValidationError, MissingEdgeEndpoint, validate_graph};
 use workflow_ir::WorkflowIr;
 use workflow_spec::parse_str;
 

@@ -1,8 +1,8 @@
 use sha2::{Digest, Sha256};
 use workflow_ir::{
-    IrNodeKind, IrRouteOperator, IrSchemaVersion, WorkflowIr, CANONICAL_IR_WIRE_VERSION_V2,
+    CANONICAL_IR_WIRE_VERSION_V2, IrNodeKind, IrRouteOperator, IrSchemaVersion, WorkflowIr,
 };
-use workflow_spec::{parse_str, RouteOperator, UnsupportedRouteOperator};
+use workflow_spec::{RouteOperator, UnsupportedRouteOperator, parse_str};
 
 const ROUTE_OPERATOR_PAIRS: [(RouteOperator, IrRouteOperator); 9] = [
     (RouteOperator::Equals, IrRouteOperator::Equals),

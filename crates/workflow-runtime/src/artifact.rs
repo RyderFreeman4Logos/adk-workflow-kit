@@ -563,7 +563,7 @@ impl ArtifactStore for FilesystemArtifactStore {
         match fs::metadata(self.path_for(id)) {
             Ok(_) => self.retention.insert(id.clone(), policy),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(ArtifactError::new(ArtifactErrorKind::NotFound))
+                return Err(ArtifactError::new(ArtifactErrorKind::NotFound));
             }
             Err(error) => return Err(Self::storage_error(error)),
         };
@@ -574,7 +574,7 @@ impl ArtifactStore for FilesystemArtifactStore {
         match fs::metadata(self.path_for(id)) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(ArtifactError::new(ArtifactErrorKind::NotFound))
+                return Err(ArtifactError::new(ArtifactErrorKind::NotFound));
             }
             Err(error) => return Err(Self::storage_error(error)),
         }

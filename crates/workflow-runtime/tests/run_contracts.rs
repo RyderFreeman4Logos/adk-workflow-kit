@@ -1,6 +1,6 @@
 use std::{error::Error, fmt::Debug, num::NonZeroU64};
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use workflow_runtime::{
     InvalidRunId, RunContext, RunId, RunLimitKind, RunLimits, RunOutcome, RunResult, RunStatus,
     RunTimeoutKind,

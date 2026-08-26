@@ -2,10 +2,10 @@
 mod tests {
     use adk_rust::graph::prelude::*;
     use adk_rust::{
-        async_trait, Agent, AgentCapabilities, Content, Event, EventStream, InvocationContext,
+        Agent, AgentCapabilities, Content, Event, EventStream, InvocationContext, async_trait,
     };
     use serde::{Deserialize, Serialize};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -195,6 +195,14 @@ mod tests {
             wire,
             json!({"schema_version": 1, "route": "pass", "event": "success"})
         );
+    }
+
+    #[test]
+    fn workspace_uses_adk_2_1_and_rust_2024_toolchain() {
+        let manifest = include_str!("../../../Cargo.toml");
+        assert!(manifest.contains("edition = \"2024\""));
+        assert!(manifest.contains("rust-version = \"1.98.0\""));
+        assert!(manifest.contains("adk-rust = { version = \"=2.1.0\""));
     }
 
     #[tokio::test]
