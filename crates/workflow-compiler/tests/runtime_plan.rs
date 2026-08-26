@@ -61,6 +61,14 @@ impl FakeRegistry {
         }
         registry
     }
+
+    fn hostile() -> Self {
+        let mut registry = Self::all();
+        for value in registry.entries.values_mut() {
+            *value = ResolvedBinding::new("«redacted:sk-id…»", "«redacted:sk-version…»");
+        }
+        registry
+    }
 }
 
 impl RuntimePlanRegistry for FakeRegistry {
@@ -123,13 +131,24 @@ fn effective_capabilities_only_narrow() {
 }
 
 #[test]
-fn projection_and_explain_output_have_no_secret_or_adk_type() {
-    let registry = FakeRegistry::all();
-    let plan = ResolvedRuntimePlan::resolve(request(), &registry).expect("resolves");
-    let serialized = serde_json::to_string(&plan).expect("serializes");
-    let explained = plan.explain();
-    for output in [serialized, explained] {
-        assert!(!output.contains("sk-live-secret"));
+fn every_projection_surface_redacts_hostile_values() {
+    let mut hostile_request = request();
+    hostile_request.set_capabilities(CapabilitySet::from(["«redacted:sk-capability…»"]));
+    let plan =
+        ResolvedRuntimePlan::resolve(hostile_request, &FakeRegistry::hostile()).expect("resolves");
+    let binding = BindingRef::new("«redacted:sk-id…»", "«redacted:sk-version…»");
+    let resolved = ResolvedBinding::new("«redacted:sk-id…»", "«redacted:sk-version…»");
+    let outputs = [
+        serde_json::to_string(&binding).expect("serializes binding"),
+        format!("{binding:?}"),
+        serde_json::to_string(&resolved).expect("serializes resolved binding"),
+        format!("{resolved:?}"),
+        serde_json::to_string(&plan).expect("serializes plan"),
+        format!("{plan:?}"),
+        plan.explain(),
+    ];
+    for output in outputs {
+        assert!(!output.contains("«redacted:sk-"));
         assert!(!output.contains("adk_"));
         assert!(output.contains("<redacted>"));
     }

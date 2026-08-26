@@ -5,7 +5,10 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize, Serializer,
+    ser::{SerializeSeq, SerializeStruct},
+};
 use sha2::{Digest, Sha256};
 use workflow_ir::WorkflowIr;
 
@@ -26,10 +29,29 @@ pub enum BindingCategory {
 }
 
 /// An opaque exact registry identity.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BindingRef {
     id: String,
     version: String,
+}
+
+impl fmt::Debug for BindingRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BindingRef")
+            .field("id", &"<redacted>")
+            .field("version", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Serialize for BindingRef {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut value = serializer.serialize_struct("BindingRef", 2)?;
+        value.serialize_field("id", "<redacted>")?;
+        value.serialize_field("version", "<redacted>")?;
+        value.end()
+    }
 }
 
 impl BindingRef {
@@ -50,10 +72,29 @@ impl BindingRef {
 }
 
 /// A successful resolution containing only the stable identity returned by a registry.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq)]
 pub struct ResolvedBinding {
     id: String,
     version: String,
+}
+
+impl fmt::Debug for ResolvedBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedBinding")
+            .field("id", &"<redacted>")
+            .field("version", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Serialize for ResolvedBinding {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut value = serializer.serialize_struct("ResolvedBinding", 2)?;
+        value.serialize_field("id", "<redacted>")?;
+        value.serialize_field("version", "<redacted>")?;
+        value.end()
+    }
 }
 
 impl ResolvedBinding {
@@ -115,8 +156,27 @@ impl RegistryResolutionError {
 }
 
 /// A sorted, duplicate-free capability projection.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Default, Deserialize, Eq, PartialEq)]
 pub struct CapabilitySet(Vec<String>);
+
+impl fmt::Debug for CapabilitySet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("CapabilitySet")
+            .field(&vec!["<redacted>"; self.0.len()])
+            .finish()
+    }
+}
+
+impl Serialize for CapabilitySet {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut values = serializer.serialize_seq(Some(self.0.len()))?;
+        for _ in &self.0 {
+            values.serialize_element("<redacted>")?;
+        }
+        values.end()
+    }
+}
 
 impl CapabilitySet {
     pub fn new(values: impl IntoIterator<Item = impl Into<String>>) -> Self {
@@ -331,8 +391,22 @@ impl ResolvedRuntimePlan {
             .unwrap_or(request.capabilities.clone());
         let fingerprint = PlanFingerprint {
             ir_hash: request.ir_hash.clone(),
-            bindings: resolved.clone(),
-            capabilities: effective_capabilities.clone(),
+            bindings: resolved
+                .iter()
+                .map(|(category, bindings)| {
+                    (
+                        *category,
+                        bindings
+                            .iter()
+                            .map(|binding| BindingFingerprint {
+                                id: binding.id.clone(),
+                                version: binding.version.clone(),
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+            capabilities: effective_capabilities.0.clone(),
         };
         let plan_hash = hash_json(&fingerprint);
         Ok(Self {
@@ -400,8 +474,14 @@ impl ResolvedRuntimePlan {
 #[derive(Serialize)]
 struct PlanFingerprint {
     ir_hash: String,
-    bindings: BTreeMap<BindingCategory, Vec<ResolvedBinding>>,
-    capabilities: CapabilitySet,
+    bindings: BTreeMap<BindingCategory, Vec<BindingFingerprint>>,
+    capabilities: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct BindingFingerprint {
+    id: String,
+    version: String,
 }
 
 fn take(
