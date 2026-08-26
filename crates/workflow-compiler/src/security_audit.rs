@@ -107,10 +107,34 @@ impl fmt::Display for AuditError {
 impl std::error::Error for AuditError {}
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AuditPolicyWire {
-    schema_version: u32,
+    schema_version: Option<u32>,
+    #[serde(default)]
     denied_crates: Vec<String>,
+    #[serde(default)]
+    licenses: Option<LicensePolicyWire>,
+    #[serde(default)]
+    bans: Option<BanPolicyWire>,
+    #[serde(default)]
+    advisories: Option<AdvisoryPolicyWire>,
+}
+
+#[derive(Deserialize)]
+struct LicensePolicyWire {
+    #[serde(default)]
+    deny: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct BanPolicyWire {
+    #[serde(default)]
+    deny: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct AdvisoryPolicyWire {
+    #[serde(default)]
+    vulnerability: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -122,6 +146,10 @@ struct CargoLockWire {
 #[derive(Deserialize)]
 struct LockPackage {
     name: String,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    advisory_severity: Option<String>,
 }
 
 /// Audits one policy fixture against one lock fixture.
@@ -137,23 +165,69 @@ pub fn audit_dependencies(policy: &str, lock: &str) -> Result<AuditReport, Audit
 
     let parsed_policy: AuditPolicyWire =
         toml::from_str(policy).map_err(|_| AuditError::boundary(policy_len, lock_len))?;
-    if parsed_policy.schema_version != 1 {
+    if parsed_policy
+        .schema_version
+        .is_some_and(|version| version != 1)
+        || (parsed_policy.schema_version.is_none()
+            && parsed_policy.licenses.is_none()
+            && parsed_policy.bans.is_none()
+            && parsed_policy.advisories.is_none())
+    {
         return Err(AuditError::boundary(policy_len, lock_len));
     }
 
     let parsed_lock: CargoLockWire =
         toml::from_str(lock).map_err(|_| AuditError::boundary(policy_len, lock_len))?;
-    let denied = parsed_policy
+    let mut denied = parsed_policy
         .denied_crates
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
+    if let Some(bans) = &parsed_policy.bans {
+        denied.extend(bans.deny.iter().map(String::as_str));
+    }
+    let denied_licenses = parsed_policy
+        .licenses
+        .as_ref()
+        .map(|licenses| {
+            licenses
+                .deny
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let advisories_enabled = parsed_policy
+        .advisories
+        .as_ref()
+        .and_then(|advisories| advisories.vulnerability.as_deref())
+        .is_some_and(|severity| severity == "deny");
     let package_count = parsed_lock.package.len();
     let critical_count = parsed_lock
         .package
         .iter()
-        .filter(|package| denied.contains(package.name.as_str()))
-        .count();
+        .map(|package| {
+            usize::from(denied.contains(package.name.as_str()))
+                + usize::from(
+                    package
+                        .license
+                        .as_deref()
+                        .is_some_and(|license| denied_licenses.contains(license)),
+                )
+                + usize::from(
+                    advisories_enabled
+                        && package
+                            .advisory_severity
+                            .as_deref()
+                            .is_some_and(|severity| {
+                                matches!(
+                                    severity.to_ascii_lowercase().as_str(),
+                                    "high" | "critical"
+                                )
+                            }),
+                )
+        })
+        .sum();
     let disposition = if critical_count == 0 {
         AuditDisposition::Clean
     } else {
@@ -242,5 +316,15 @@ mod tests {
             &serde_json::to_string(&error).expect("serialize boundary error"),
             CANARY_AUDIT_BOUNDARY_70,
         );
+    }
+
+    #[test]
+    fn cargo_deny_license_and_advisory_findings_are_critical() {
+        let policy = "[licenses]\ndeny = [\"GPL-3.0-only\"]\n[bans]\ndeny = []\n[advisories]\nvulnerability = \"deny\"\n";
+        let lock = "[[package]]\nname = \"licensed-crate\"\nlicense = \"GPL-3.0-only\"\nadvisory_severity = \"high\"\n";
+
+        let result = audit_dependencies(policy, lock).expect("valid cargo-deny fixture");
+        assert_eq!(result.disposition(), AuditDisposition::Critical);
+        assert_eq!(result.critical_count(), 2);
     }
 }

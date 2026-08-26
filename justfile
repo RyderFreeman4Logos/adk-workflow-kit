@@ -36,6 +36,9 @@ lock-check:
 metadata:
     {{_io}} cargo metadata --format-version 1 --locked
 
+dependency-audit:
+    {{_io}} cargo deny check licenses advisories
+
 test-local-gates:
     bash scripts/test-local-gates.sh
 
@@ -51,9 +54,9 @@ test-release-local:
 check-branch:
     scripts/local-gates.sh check-branch
 
-pre-commit-fast: check-branch fmt-check lock-check check clippy test-local-gates
+pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit test-local-gates
 
-_quality-gates: fmt-check check clippy test test-local-gates
+_quality-gates: fmt-check check clippy dependency-audit test test-local-gates
 
 quality-gates:
     scripts/local-gates.sh produce
