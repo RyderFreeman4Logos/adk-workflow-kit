@@ -4,6 +4,7 @@ mod diagnostics;
 mod graph_builder;
 mod lock;
 mod registry;
+mod runtime_plan;
 mod security_audit;
 mod skill;
 mod skill_evidence;
@@ -22,6 +23,11 @@ pub use lock::{WorkflowLock, WorkflowLockError, WorkflowLockMigrationError};
 pub use registry::{
     ModelRegistry, NodeRegistry, PredicateRegistry, RegistryCategory, RegistryEntry,
     RegistryNotFound, SkillRegistry, ToolRegistry, ValidatorRegistry,
+};
+pub use runtime_plan::{
+    BindingCategory, BindingRef, CapabilitySet, PlanResolutionError, PlanResolutionErrorKind,
+    RegistryResolutionError, RegistryResolutionErrorKind, ResolvedBinding, ResolvedRuntimePlan,
+    RuntimePlanRegistry, RuntimePlanRequest,
 };
 pub use security_audit::{AuditDisposition, AuditError, AuditReport, audit_dependencies};
 pub use skill::{
