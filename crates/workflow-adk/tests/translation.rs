@@ -248,6 +248,56 @@ async fn unknown_route_fails_closed_with_project_diagnostic() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_unknown_route_invokes_keep_diagnostics_isolated() {
+    let plan =
+        compile_str_with_predicates("unknown-route.workflow.toml", UNKNOWN_ROUTE, &AnyPredicate)
+            .expect("fixture compiles");
+    let graph = std::sync::Arc::new(
+        AdkGraphTranslator::new()
+            .translate(&plan)
+            .expect("translation succeeds"),
+    );
+
+    for _ in 0..100 {
+        let mut first_state = State::new();
+        first_state.insert("route:decide".to_owned(), json!("first-missing"));
+        let mut second_state = State::new();
+        second_state.insert("route:decide".to_owned(), json!("second-missing"));
+        let first_graph = std::sync::Arc::clone(&graph);
+        let second_graph = std::sync::Arc::clone(&graph);
+        let (first, second) = tokio::join!(
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                first_graph
+                    .invoke(first_state, ExecutionConfig::new("first-unknown"))
+                    .await
+            }),
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                second_graph
+                    .invoke(second_state, ExecutionConfig::new("second-unknown"))
+                    .await
+            }),
+        );
+
+        let first = first
+            .expect("first invoke task completes")
+            .expect_err("first unknown route must fail closed");
+        let second = second
+            .expect("second invoke task completes")
+            .expect_err("second unknown route must fail closed");
+        assert_eq!(
+            first.to_string(),
+            "unknown route from \"decide\" selector \"first-missing\""
+        );
+        assert_eq!(
+            second.to_string(),
+            "unknown route from \"decide\" selector \"second-missing\""
+        );
+    }
+}
+
 #[tokio::test]
 async fn conditional_plan_executes_cases_and_ir_default_fallback() {
     let plan = compile_str_with_predicates("conditional.workflow.toml", CONDITIONAL, &AnyPredicate)

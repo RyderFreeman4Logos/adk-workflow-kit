@@ -1,7 +1,8 @@
 //! Domain-neutral Verbatim boundary for platform-owned workflow calls.
 
+use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use adk_rust::graph::prelude::{
     AgentNode, END, ExecutionConfig, GraphAgent, GraphError, NodeOutput, START, State,
@@ -226,6 +227,8 @@ impl fmt::Display for AdkGraphError {
 impl std::error::Error for AdkGraphError {}
 
 const IR_DEFAULT_KEY: &str = "__ir_default__";
+const UNKNOWN_ROUTE_ERROR_PREFIX: &str = "workflow unknown route selector: ";
+const UNKNOWN_ROUTE_NODE_PREFIX: &str = "__workflow_unknown_route_";
 
 /// Explicit state input mapping owned by the adapter.
 #[derive(Clone, Copy, Debug, Default)]
@@ -260,7 +263,7 @@ pub struct AdkGraph {
     output: StateOutputMapper,
     recursion_limit: usize,
     visit_bound: Option<usize>,
-    unmatched: Arc<Mutex<Option<(String, String)>>>,
+    unknown_route_nodes: BTreeMap<String, String>,
     plan_binding: Option<PlanBinding>,
 }
 
@@ -270,9 +273,6 @@ impl AdkGraph {
         state: State,
         config: ExecutionConfig,
     ) -> Result<State, AdkGraphError> {
-        if let Ok(mut slot) = self.unmatched.lock() {
-            *slot = None;
-        }
         let mut state = self.input.map(state);
         state.retain(|key, _| !key.starts_with("visits:"));
         let limit = self.recursion_limit.min(config.recursion_limit);
@@ -287,12 +287,7 @@ impl AdkGraph {
                 );
         }
         match self.graph.invoke(state, config).await {
-            Ok(state) => {
-                if let Some((from, selector)) = take_unmatched(&self.unmatched) {
-                    return Err(AdkGraphError::UnknownRoute { from, selector });
-                }
-                Ok(self.output.map(state))
-            }
+            Ok(state) => Ok(self.output.map(state)),
             Err(GraphError::RecursionLimitExceeded(steps))
                 if self.visit_bound == Some(limit) && steps == limit =>
             {
@@ -302,8 +297,14 @@ impl AdkGraph {
                 Err(AdkGraphError::RecursionLimit { steps })
             }
             Err(error) => {
-                if let Some((from, selector)) = take_unmatched(&self.unmatched) {
-                    return Err(AdkGraphError::UnknownRoute { from, selector });
+                if let GraphError::NodeExecutionFailed { node, message } = &error
+                    && let Some(from) = self.unknown_route_nodes.get(node)
+                    && let Some(selector) = message.strip_prefix(UNKNOWN_ROUTE_ERROR_PREFIX)
+                {
+                    return Err(AdkGraphError::UnknownRoute {
+                        from: from.clone(),
+                        selector: selector.to_owned(),
+                    });
                 }
                 let visit_bound = visit_bound_from_error(&error);
                 match error {
@@ -444,12 +445,12 @@ impl AdkGraphTranslator {
         }
         let visit_bound = ir_visit_bound(ir);
         let recursion_limit = visit_bound.unwrap_or(50);
-        let unmatched = Arc::new(Mutex::new(None));
         let mut builder = GraphAgent::builder(ir.workflow_id().as_str())
             .channels(&["terminal"])
             .recursion_limit(recursion_limit);
         let mut terminals = Vec::new();
         let mut order = Vec::new();
+        let mut unknown_route_nodes = BTreeMap::new();
         for node in ir.nodes() {
             let id = node.id().as_str().to_owned();
             order.push(id.clone());
@@ -498,7 +499,45 @@ impl AdkGraphTranslator {
         for edge in ir.edges() {
             builder = builder.edge(edge.from().as_str(), edge.to().as_str());
         }
+        let mut unknown_route_index = 0;
         for route in ir.routes() {
+            let from = route.from().as_str().to_owned();
+            let case_keys: Vec<String> = route
+                .cases()
+                .iter()
+                .map(|case| case.key().to_owned())
+                .collect();
+            let has_default = route.default().is_some();
+            let unknown_route_node = if has_default {
+                None
+            } else {
+                let unknown_route_node = loop {
+                    let candidate = format!("{UNKNOWN_ROUTE_NODE_PREFIX}{unknown_route_index}");
+                    unknown_route_index += 1;
+                    if !ids.contains(candidate.as_str())
+                        && !case_keys.iter().any(|key| key == &candidate)
+                    {
+                        break candidate;
+                    }
+                };
+                let state_key = format!("route:{from}");
+                let node_name = unknown_route_node.clone();
+                builder = builder.node_fn(&node_name, move |context| {
+                    let selector = context
+                        .state
+                        .get(&state_key)
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    async move {
+                        Err(GraphError::Other(format!(
+                            "{UNKNOWN_ROUTE_ERROR_PREFIX}{selector}"
+                        )))
+                    }
+                });
+                unknown_route_nodes.insert(unknown_route_node.clone(), from.clone());
+                Some(unknown_route_node)
+            };
             let mut cases: Vec<(&'static str, &'static str)> = route
                 .cases()
                 .iter()
@@ -516,14 +555,12 @@ impl AdkGraphTranslator {
                     Box::leak(default.as_str().to_owned().into_boxed_str()) as &'static str,
                 ));
             }
-            let from = route.from().as_str().to_owned();
-            let case_keys: Vec<String> = route
-                .cases()
-                .iter()
-                .map(|case| case.key().to_owned())
-                .collect();
-            let has_default = route.default().is_some();
-            let unmatched_slot = Arc::clone(&unmatched);
+            if let Some(unknown_route_node) = &unknown_route_node {
+                cases.push((
+                    Box::leak(unknown_route_node.clone().into_boxed_str()) as &'static str,
+                    Box::leak(unknown_route_node.clone().into_boxed_str()) as &'static str,
+                ));
+            }
             builder = builder.conditional_edge(
                 route.from().as_str(),
                 move |state| {
@@ -534,13 +571,7 @@ impl AdkGraphTranslator {
                     match selected {
                         Some(key) if case_keys.iter().any(|known| known == &key) => key,
                         _ if has_default => IR_DEFAULT_KEY.to_owned(),
-                        other => {
-                            let selector = other.unwrap_or_default();
-                            if let Ok(mut slot) = unmatched_slot.lock() {
-                                *slot = Some((from.clone(), selector.clone()));
-                            }
-                            selector
-                        }
+                        _ => unknown_route_node.clone().unwrap_or_default(),
                     }
                 },
                 cases,
@@ -565,7 +596,7 @@ impl AdkGraphTranslator {
             output: StateOutputMapper,
             recursion_limit,
             visit_bound,
-            unmatched,
+            unknown_route_nodes,
             plan_binding,
         })
     }
@@ -601,10 +632,6 @@ impl Agent for DeterministicAgent {
         event.set_content(Content::new("assistant").with_text("ok"));
         Ok(Box::pin(adk_rust::futures::stream::iter([Ok(event)])))
     }
-}
-
-fn take_unmatched(unmatched: &Mutex<Option<(String, String)>>) -> Option<(String, String)> {
-    unmatched.lock().ok().and_then(|mut slot| slot.take())
 }
 
 fn visit_bound_from_error(error: &GraphError) -> Option<usize> {
