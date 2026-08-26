@@ -107,6 +107,7 @@ impl fmt::Display for AuditError {
 impl std::error::Error for AuditError {}
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AuditPolicyWire {
     schema_version: Option<u32>,
     #[serde(default)]
@@ -120,19 +121,28 @@ struct AuditPolicyWire {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LicensePolicyWire {
+    #[serde(default)]
+    allow: Option<Vec<String>>,
     #[serde(default)]
     deny: Vec<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BanPolicyWire {
     #[serde(default)]
     deny: Vec<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AdvisoryPolicyWire {
+    #[serde(default)]
+    unmaintained: Option<String>,
+    #[serde(default)]
+    yanked: Option<String>,
     #[serde(default)]
     vulnerability: Option<String>,
 }
@@ -150,6 +160,10 @@ struct LockPackage {
     license: Option<String>,
     #[serde(default)]
     advisory_severity: Option<String>,
+    #[serde(default)]
+    unmaintained: bool,
+    #[serde(default)]
+    yanked: bool,
 }
 
 /// Audits one policy fixture against one lock fixture.
@@ -197,10 +211,25 @@ pub fn audit_dependencies(policy: &str, lock: &str) -> Result<AuditReport, Audit
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
+    let allowed_licenses = parsed_policy
+        .licenses
+        .as_ref()
+        .and_then(|licenses| licenses.allow.as_ref())
+        .map(|licenses| licenses.iter().map(String::as_str).collect::<BTreeSet<_>>());
     let advisories_enabled = parsed_policy
         .advisories
         .as_ref()
         .and_then(|advisories| advisories.vulnerability.as_deref())
+        .is_some_and(|severity| severity == "deny");
+    let unmaintained_enabled = parsed_policy
+        .advisories
+        .as_ref()
+        .and_then(|advisories| advisories.unmaintained.as_deref())
+        .is_some_and(|severity| matches!(severity, "all" | "deny"));
+    let yanked_enabled = parsed_policy
+        .advisories
+        .as_ref()
+        .and_then(|advisories| advisories.yanked.as_deref())
         .is_some_and(|severity| severity == "deny");
     let package_count = parsed_lock.package.len();
     let critical_count = parsed_lock
@@ -214,6 +243,12 @@ pub fn audit_dependencies(policy: &str, lock: &str) -> Result<AuditReport, Audit
                         .as_deref()
                         .is_some_and(|license| denied_licenses.contains(license)),
                 )
+                + usize::from(allowed_licenses.as_ref().is_some_and(|allowed| {
+                    package
+                        .license
+                        .as_deref()
+                        .is_some_and(|license| !allowed.contains(license))
+                }))
                 + usize::from(
                     advisories_enabled
                         && package
@@ -226,6 +261,8 @@ pub fn audit_dependencies(policy: &str, lock: &str) -> Result<AuditReport, Audit
                                 )
                             }),
                 )
+                + usize::from(unmaintained_enabled && package.unmaintained)
+                + usize::from(yanked_enabled && package.yanked)
         })
         .sum();
     let disposition = if critical_count == 0 {
@@ -326,5 +363,33 @@ mod tests {
         let result = audit_dependencies(policy, lock).expect("valid cargo-deny fixture");
         assert_eq!(result.disposition(), AuditDisposition::Critical);
         assert_eq!(result.critical_count(), 2);
+    }
+
+    #[test]
+    fn committed_cargo_deny_shape_rejects_disallowed_license() {
+        let policy = "[licenses]\nallow = [\"MIT\"]\n[advisories]\nunmaintained = \"all\"\nyanked = \"deny\"\n";
+        let lock = "[[package]]\nname = \"gpl-crate\"\nlicense = \"GPL-3.0-only\"\n";
+
+        let result = audit_dependencies(policy, lock).expect("valid committed policy shape");
+        assert_eq!(result.disposition(), AuditDisposition::Critical);
+    }
+
+    #[test]
+    fn committed_advisory_shapes_reject_matching_findings() {
+        let policy = "[licenses]\nallow = [\"MIT\"]\n[advisories]\nunmaintained = \"all\"\nyanked = \"deny\"\n";
+        let lock = "[[package]]\nname = \"flagged-crate\"\nlicense = \"MIT\"\nunmaintained = true\nyanked = true\n";
+
+        let result = audit_dependencies(policy, lock).expect("valid committed policy shape");
+        assert_eq!(result.disposition(), AuditDisposition::Critical);
+        assert_eq!(result.critical_count(), 2);
+    }
+
+    #[test]
+    fn unknown_policy_fields_are_boundary_misses() {
+        let policy = "[licenses]\nallow = [\"MIT\"]\nunsupported = true\n";
+        let lock = "[[package]]\nname = \"ordinary-crate\"\nlicense = \"MIT\"\n";
+
+        let error = audit_dependencies(policy, lock).expect_err("unknown policy must fail closed");
+        assert_eq!(error.kind(), AuditDisposition::BoundaryMiss);
     }
 }
