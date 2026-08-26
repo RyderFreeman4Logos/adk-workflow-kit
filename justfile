@@ -32,6 +32,12 @@ m1-01-red:
 m1-01-green:
     {{_io}} cargo +1.98.0 test -p adk-2-1-ownership --locked
 
+m1-03-red:
+    {{_io}} cargo +1.98.0 test -p workflow-compiler --test runtime_plan --locked
+
+m1-03-green:
+    {{_io}} cargo +1.98.0 test -p workflow-compiler --test runtime_plan --locked
+
 lock:
     {{_io}} cargo generate-lockfile
 
