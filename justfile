@@ -11,13 +11,13 @@ fmt-check:
     {{_io}} cargo fmt --all -- --check
 
 check:
-    {{_io}} cargo check --workspace --all-targets --locked
+    {{_io}} cargo +1.98.0 check --workspace --all-targets --locked
 
 clippy:
-    {{_io}} cargo clippy --workspace --all-targets --locked -- -D warnings
+    {{_io}} cargo +1.98.0 clippy --workspace --all-targets --locked -- -D warnings
 
 test:
-    {{_io}} cargo test --workspace --locked
+    {{_io}} cargo +1.98.0 test --workspace --locked
     ./target/debug/workflowctl test crates/workflowctl/tests/fixtures/cli004-test.json
     ./target/debug/workflowctl eval crates/workflowctl/tests/fixtures/cli004-eval.json
     ./target/debug/workflowctl replay crates/workflowctl/tests/fixtures/cli004-replay.json
@@ -25,6 +25,12 @@ test:
 
 bench-001:
     {{_io}} cargo run -p workflow-testkit --bin bench-001 --locked
+
+m1-01-red:
+    {{_io}} cargo +1.98.0 test -p adk-2-1-ownership --locked
+
+m1-01-green:
+    {{_io}} cargo +1.98.0 test -p adk-2-1-ownership --locked
 
 lock:
     {{_io}} cargo generate-lockfile
