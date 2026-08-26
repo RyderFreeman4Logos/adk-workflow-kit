@@ -143,8 +143,6 @@ struct AdvisoryPolicyWire {
     unmaintained: Option<UnmaintainedAction>,
     #[serde(default)]
     yanked: Option<DenyAction>,
-    #[serde(default)]
-    vulnerability: Option<DenyAction>,
 }
 
 #[derive(Deserialize)]
@@ -230,10 +228,7 @@ pub fn audit_dependencies(policy: &str, lock: &str) -> Result<AuditReport, Audit
         .as_ref()
         .and_then(|licenses| licenses.allow.as_ref())
         .map(|licenses| licenses.iter().map(String::as_str).collect::<BTreeSet<_>>());
-    let advisories_enabled = parsed_policy
-        .advisories
-        .as_ref()
-        .is_some_and(|advisories| advisories.vulnerability.is_some());
+    let advisories_enabled = true;
     let unmaintained_enabled = parsed_policy
         .advisories
         .as_ref()
@@ -255,23 +250,14 @@ pub fn audit_dependencies(policy: &str, lock: &str) -> Result<AuditReport, Audit
                         .is_some_and(|license| denied_licenses.contains(license)),
                 )
                 + usize::from(allowed_licenses.as_ref().is_some_and(|allowed| {
-                    package
-                        .license
-                        .as_deref()
-                        .is_some_and(|license| !allowed.contains(license))
+                    package.license.as_deref().is_none_or(|license| {
+                        !allowed.contains(license)
+                            || license.contains(" OR ")
+                            || license.contains(" AND ")
+                            || license.contains(" WITH ")
+                    })
                 }))
-                + usize::from(
-                    advisories_enabled
-                        && package
-                            .advisory_severity
-                            .as_deref()
-                            .is_some_and(|severity| {
-                                matches!(
-                                    severity.to_ascii_lowercase().as_str(),
-                                    "high" | "critical"
-                                )
-                            }),
-                )
+                + usize::from(advisories_enabled && package.advisory_severity.as_deref().is_some())
                 + usize::from(unmaintained_enabled && package.unmaintained)
                 + usize::from(yanked_enabled && package.yanked)
         })
@@ -368,12 +354,51 @@ mod tests {
 
     #[test]
     fn cargo_deny_license_and_advisory_findings_are_critical() {
-        let policy = "[licenses]\ndeny = [\"GPL-3.0-only\"]\n[bans]\ndeny = []\n[advisories]\nvulnerability = \"deny\"\n";
+        let policy = "[licenses]\ndeny = [\"GPL-3.0-only\"]\n[bans]\ndeny = []\n[advisories]\nunmaintained = \"all\"\nyanked = \"deny\"\n";
         let lock = "[[package]]\nname = \"licensed-crate\"\nlicense = \"GPL-3.0-only\"\nadvisory_severity = \"high\"\n";
 
         let result = audit_dependencies(policy, lock).expect("valid cargo-deny fixture");
         assert_eq!(result.disposition(), AuditDisposition::Critical);
         assert_eq!(result.critical_count(), 2);
+    }
+
+    #[test]
+    fn allow_list_rejects_package_without_license() {
+        let policy = "[licenses]\nallow = [\"MIT\"]\n";
+        let lock = "[[package]]\nname = \"unlicensed-crate\"\n";
+
+        let result = audit_dependencies(policy, lock).expect("valid policy and lock fixture");
+        assert_eq!(result.disposition(), AuditDisposition::Critical);
+    }
+
+    #[test]
+    fn vulnerability_default_rejects_every_advisory_severity() {
+        let policy = "[advisories]\nunmaintained = \"all\"\nyanked = \"deny\"\n";
+        let lock = "[[package]]\nname = \"low-risk-crate\"\nadvisory_severity = \"low\"\n";
+
+        let result = audit_dependencies(policy, lock).expect("cargo-deny 0.19 policy is valid");
+        assert_eq!(result.disposition(), AuditDisposition::Critical);
+    }
+
+    #[test]
+    fn compound_license_is_not_clean() {
+        let policy = "[licenses]\nallow = [\"MIT\", \"Apache-2.0\"]\n";
+        let lock =
+            "[[package]]\nname = \"compound-license-crate\"\nlicense = \"MIT OR Apache-2.0\"\n";
+
+        let result = audit_dependencies(policy, lock).expect("valid policy and lock fixture");
+        assert_ne!(result.disposition(), AuditDisposition::Clean);
+    }
+
+    #[test]
+    fn diagnostics_remain_payload_free_for_advisory_fixture() {
+        let policy = "[advisories]\nunmaintained = \"all\"\nyanked = \"deny\"\n";
+        let lock = "[[package]]\nname = \"payload-crate\"\nadvisory_severity = \"critical\"\nadvisory_body = \"SECRET_ADVISORY_BODY_R3B\"\n";
+
+        let result = audit_dependencies(policy, lock).expect("valid policy and lock fixture");
+        let serialized = serde_json::to_string(&result).expect("serialize redacted report");
+        assert!(!serialized.contains("SECRET_ADVISORY_BODY_R3B"));
+        assert!(!result.to_string().contains("SECRET_ADVISORY_BODY_R3B"));
     }
 
     #[test]
@@ -396,8 +421,8 @@ mod tests {
     }
 
     #[test]
-    fn warn_vulnerability_action_is_a_boundary_miss() {
-        let policy = "[advisories]\nvulnerability = \"warn\"\n";
+    fn removed_advisory_action_is_a_boundary_miss() {
+        let policy = "[advisories]\nremoved_action = \"warn\"\n";
         let lock = "[[package]]\nname = \"vulnerable-crate\"\nadvisory_severity = \"high\"\n";
 
         let error = audit_dependencies(policy, lock).expect_err("warn must fail closed");

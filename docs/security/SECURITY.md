@@ -4,7 +4,7 @@ Security checks are deterministic, local, and fail closed. Input validation happ
 
 ## Dependency audit
 
-`audit_dependencies(policy, lock)` parses the repository's cargo-deny policy and a Cargo lock fixture. It rejects denied crates, denied licenses, and high/critical advisory fixtures. `AuditDisposition` is deliberately three-way: `Clean` means no unresolved critical findings, `Critical` means a denied package/license or high/critical advisory was found, and `BoundaryMiss` means the policy or lock input was missing or invalid. A critical result never reports clean, and a boundary miss never reports that the audit ran.
+`audit_dependencies(policy, lock)` parses the repository's cargo-deny policy and a Cargo lock fixture. An allow-list treats a missing package license as critical; compound SPDX expressions are never clean; and any advisory severity is critical because cargo-deny 0.19 enables vulnerability checking by default. `AuditDisposition` is deliberately three-way: `Clean` means no unresolved critical findings, `Critical` means a denied package/license, compound license, missing allowed license, or advisory was found, and `BoundaryMiss` means the policy or lock input was missing or invalid. A critical result never reports clean, and a boundary miss never reports that the audit ran.
 
 `AuditReport` exposes only disposition and counts. `AuditError` exposes the stable code `workflow.audit.boundary_miss` plus typed disposition; it does not serialize policy bytes, lock bytes, or advisory bodies. The in-process fixture audit does not fetch advisories; the cargo-deny gate performs the external advisory-database check and fails closed on database or policy errors.
 

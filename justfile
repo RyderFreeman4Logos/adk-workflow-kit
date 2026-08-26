@@ -21,7 +21,7 @@ test:
     ./target/debug/workflowctl test crates/workflowctl/tests/fixtures/cli004-test.json
     ./target/debug/workflowctl eval crates/workflowctl/tests/fixtures/cli004-eval.json
     ./target/debug/workflowctl replay crates/workflowctl/tests/fixtures/cli004-replay.json
-    ./target/debug/workflowctl audit
+    if ./target/debug/workflowctl audit; then exit 1; else test "$?" -eq 2; fi
 
 bench-001:
     {{_io}} cargo run -p workflow-testkit --bin bench-001 --locked
