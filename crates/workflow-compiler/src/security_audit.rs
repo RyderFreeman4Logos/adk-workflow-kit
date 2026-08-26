@@ -140,11 +140,25 @@ struct BanPolicyWire {
 #[serde(deny_unknown_fields)]
 struct AdvisoryPolicyWire {
     #[serde(default)]
-    unmaintained: Option<String>,
+    unmaintained: Option<UnmaintainedAction>,
     #[serde(default)]
-    yanked: Option<String>,
+    yanked: Option<DenyAction>,
     #[serde(default)]
-    vulnerability: Option<String>,
+    vulnerability: Option<DenyAction>,
+}
+
+#[derive(Deserialize)]
+enum UnmaintainedAction {
+    #[serde(rename = "all")]
+    All,
+    #[serde(rename = "deny")]
+    Deny,
+}
+
+#[derive(Deserialize)]
+enum DenyAction {
+    #[serde(rename = "deny")]
+    Deny,
 }
 
 #[derive(Deserialize)]
@@ -219,18 +233,15 @@ pub fn audit_dependencies(policy: &str, lock: &str) -> Result<AuditReport, Audit
     let advisories_enabled = parsed_policy
         .advisories
         .as_ref()
-        .and_then(|advisories| advisories.vulnerability.as_deref())
-        .is_some_and(|severity| severity == "deny");
+        .is_some_and(|advisories| advisories.vulnerability.is_some());
     let unmaintained_enabled = parsed_policy
         .advisories
         .as_ref()
-        .and_then(|advisories| advisories.unmaintained.as_deref())
-        .is_some_and(|severity| matches!(severity, "all" | "deny"));
+        .is_some_and(|advisories| advisories.unmaintained.is_some());
     let yanked_enabled = parsed_policy
         .advisories
         .as_ref()
-        .and_then(|advisories| advisories.yanked.as_deref())
-        .is_some_and(|severity| severity == "deny");
+        .is_some_and(|advisories| advisories.yanked.is_some());
     let package_count = parsed_lock.package.len();
     let critical_count = parsed_lock
         .package
@@ -380,6 +391,43 @@ mod tests {
         let lock = "[[package]]\nname = \"flagged-crate\"\nlicense = \"MIT\"\nunmaintained = true\nyanked = true\n";
 
         let result = audit_dependencies(policy, lock).expect("valid committed policy shape");
+        assert_eq!(result.disposition(), AuditDisposition::Critical);
+        assert_eq!(result.critical_count(), 2);
+    }
+
+    #[test]
+    fn warn_vulnerability_action_is_a_boundary_miss() {
+        let policy = "[advisories]\nvulnerability = \"warn\"\n";
+        let lock = "[[package]]\nname = \"vulnerable-crate\"\nadvisory_severity = \"high\"\n";
+
+        let error = audit_dependencies(policy, lock).expect_err("warn must fail closed");
+        assert_eq!(error.kind(), AuditDisposition::BoundaryMiss);
+    }
+
+    #[test]
+    fn warn_yanked_action_is_a_boundary_miss() {
+        let policy = "[advisories]\nyanked = \"warn\"\n";
+        let lock = "[[package]]\nname = \"yanked-crate\"\nyanked = true\n";
+
+        let error = audit_dependencies(policy, lock).expect_err("warn must fail closed");
+        assert_eq!(error.kind(), AuditDisposition::BoundaryMiss);
+    }
+
+    #[test]
+    fn unknown_advisory_action_is_a_boundary_miss() {
+        let policy = "[advisories]\nunmaintained = \"review\"\n";
+        let lock = "[[package]]\nname = \"ordinary-crate\"\n";
+
+        let error = audit_dependencies(policy, lock).expect_err("unknown action must fail closed");
+        assert_eq!(error.kind(), AuditDisposition::BoundaryMiss);
+    }
+
+    #[test]
+    fn committed_advisory_actions_still_report_matching_critical_findings() {
+        let policy = "[advisories]\nunmaintained = \"all\"\nyanked = \"deny\"\n";
+        let lock = "[[package]]\nname = \"flagged-crate\"\nunmaintained = true\nyanked = true\n";
+
+        let result = audit_dependencies(policy, lock).expect("committed actions are valid");
         assert_eq!(result.disposition(), AuditDisposition::Critical);
         assert_eq!(result.critical_count(), 2);
     }
