@@ -106,6 +106,7 @@ pub struct WorkflowSpec {
     edges: Vec<Edge>,
     routes: Vec<PredicateRoute>,
     state: Option<StateSpec>,
+    resources: Vec<ResourceReference>,
 }
 
 impl WorkflowSpec {
@@ -138,6 +139,11 @@ impl WorkflowSpec {
     pub fn state(&self) -> Option<&StateSpec> {
         self.state.as_ref()
     }
+
+    /// Returns semantic resources declared by the workflow.
+    pub fn resources(&self) -> &[ResourceReference] {
+        &self.resources
+    }
 }
 
 /// Workflow metadata from the v1 source document.
@@ -146,6 +152,23 @@ pub struct Workflow {
     id: WorkflowId,
     version: String,
     entry: NodeId,
+    resources: Vec<ResourceReference>,
+}
+
+/// An immutable path and content hash for a semantic workflow resource.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceReference {
+    path: String,
+    sha256: String,
+}
+
+impl ResourceReference {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
 }
 
 impl Workflow {
@@ -162,6 +185,11 @@ impl Workflow {
     /// Returns the configured entry node identifier.
     pub fn entry(&self) -> &NodeId {
         &self.entry
+    }
+
+    /// Returns semantic resources attached to the workflow.
+    pub fn resources(&self) -> &[ResourceReference] {
+        &self.resources
     }
 }
 
@@ -286,6 +314,9 @@ pub struct Node {
     id: NodeId,
     kind: NodeKind,
     timeout_ms: Option<u64>,
+    max_visits: Option<u32>,
+    idempotent: bool,
+    resources: Vec<ResourceReference>,
 }
 
 impl Node {
@@ -303,6 +334,21 @@ impl Node {
     pub fn timeout_ms(&self) -> Option<u64> {
         self.timeout_ms
     }
+
+    /// Returns the static visit bound used by cycle validation.
+    pub fn max_visits(&self) -> Option<u32> {
+        self.max_visits
+    }
+
+    /// Returns whether repeating this node is idempotent.
+    pub fn idempotent(&self) -> bool {
+        self.idempotent
+    }
+
+    /// Returns resources attached to this node.
+    pub fn resources(&self) -> &[ResourceReference] {
+        &self.resources
+    }
 }
 
 /// A source-level directed edge without graph validation.
@@ -318,6 +364,7 @@ pub struct PredicateRoute {
     from: NodeId,
     predicate: PredicateReference,
     cases: Vec<RouteCase>,
+    default: Option<NodeId>,
 }
 
 impl PredicateRoute {
@@ -334,6 +381,11 @@ impl PredicateRoute {
     /// Returns route cases in raw UTF-8 key order.
     pub fn cases(&self) -> &[RouteCase] {
         &self.cases
+    }
+
+    /// Returns the explicit fallback target, when declared.
+    pub fn default(&self) -> Option<&NodeId> {
+        self.default.as_ref()
     }
 }
 
@@ -535,6 +587,7 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
             id: WorkflowId(raw.workflow.id),
             version: raw.workflow.version,
             entry: NodeId(raw.workflow.entry),
+            resources: raw.workflow.resources.into_iter().map(resource).collect(),
         },
         nodes: raw
             .nodes
@@ -543,6 +596,9 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
                 id: NodeId(node.id),
                 kind: node.kind,
                 timeout_ms: node.timeout_ms,
+                max_visits: node.max_visits,
+                idempotent: node.idempotent,
+                resources: node.resources.into_iter().map(resource).collect(),
             })
             .collect(),
         edges: raw
@@ -570,6 +626,7 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
                         target: NodeId(target),
                     })
                     .collect(),
+                default: route.default.map(NodeId),
             })
             .collect(),
         state: raw.state.map(|state| StateSpec {
@@ -587,7 +644,15 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
                 })
                 .collect(),
         }),
+        resources: raw.resources.into_iter().map(resource).collect(),
     })
+}
+
+fn resource(resource: RawResource) -> ResourceReference {
+    ResourceReference {
+        path: resource.path,
+        sha256: resource.sha256,
+    }
 }
 
 /// Reads and parses a strict v1 TOML workflow without lossy path conversion.
@@ -673,6 +738,8 @@ struct RawWorkflowSpec {
     routes: Vec<RawPredicateRoute>,
     #[serde(default)]
     state: Option<RawState>,
+    #[serde(default)]
+    resources: Vec<RawResource>,
 }
 
 #[derive(Deserialize)]
@@ -681,6 +748,8 @@ struct RawWorkflow {
     id: String,
     version: String,
     entry: String,
+    #[serde(default)]
+    resources: Vec<RawResource>,
 }
 
 #[derive(Deserialize)]
@@ -690,6 +759,12 @@ struct RawNode {
     kind: NodeKind,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    max_visits: Option<u32>,
+    #[serde(default)]
+    idempotent: bool,
+    #[serde(default)]
+    resources: Vec<RawResource>,
 }
 
 #[derive(Deserialize)]
@@ -705,6 +780,15 @@ struct RawPredicateRoute {
     from: String,
     predicate: RawPredicateReference,
     cases: BTreeMap<String, String>,
+    #[serde(default)]
+    default: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawResource {
+    path: String,
+    sha256: String,
 }
 
 #[derive(Deserialize)]
