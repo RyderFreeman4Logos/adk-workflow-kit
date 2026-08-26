@@ -1,8 +1,10 @@
 use adk_rust::graph::prelude::{ExecutionConfig, State};
 use serde_json::json;
-use workflow_adk::{AdkGraphTranslator, TerminalOutcome};
+use workflow_adk::{AdkGraphTranslator, TerminalOutcome, TranslationError};
 use workflow_compiler::{
-    PredicateRegistry, RegistryEntry, RegistryNotFound, compile_str, compile_str_with_predicates,
+    BindingCategory, BindingRef, CapabilitySet, PredicateRegistry, RegistryEntry, RegistryNotFound,
+    RegistryResolutionError, ResolvedBinding, ResolvedRuntimePlan, RuntimePlanRegistry,
+    RuntimePlanRequest, compile_str, compile_str_with_predicates,
 };
 
 const SEQUENTIAL: &str = r#"
@@ -48,6 +50,36 @@ to = "loop"
 [[edges]]
 from = "loop"
 to = "done"
+"#;
+
+const BOUNDED_INVOKE: &str = r#"
+schema_version = 1
+[workflow]
+id = "bounded-invoke"
+version = "1"
+entry = "loop"
+[[nodes]]
+id = "loop"
+kind = "action"
+max_visits = 2
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "loop"
+to = "done"
+"#;
+
+const OTHER_WORKFLOW: &str = r#"
+schema_version = 1
+edges = []
+[workflow]
+id = "other"
+version = "1"
+entry = "only"
+[[nodes]]
+id = "only"
+kind = "terminal"
 "#;
 
 const CONDITIONAL: &str = r#"
@@ -102,6 +134,26 @@ impl PredicateRegistry for AnyPredicate {
         const IMPLEMENTATION: () = ();
         Ok(RegistryEntry::new(&IMPLEMENTATION, "route-pred", "1"))
     }
+}
+
+struct AnyRuntimeBinding;
+
+impl RuntimePlanRegistry for AnyRuntimeBinding {
+    fn resolve(
+        &self,
+        category: BindingCategory,
+        binding: &BindingRef,
+    ) -> Result<ResolvedBinding, RegistryResolutionError> {
+        let _ = category;
+        Ok(ResolvedBinding::new(binding.id(), binding.version()))
+    }
+}
+
+fn resolved_plan(ir: &workflow_ir::WorkflowIr, capabilities: CapabilitySet) -> ResolvedRuntimePlan {
+    let mut request = RuntimePlanRequest::from_ir(ir).with_model("fake-model", "1");
+    request.set_capabilities(capabilities.clone());
+    request.set_effective_capabilities(capabilities);
+    ResolvedRuntimePlan::resolve(request, &AnyRuntimeBinding).expect("runtime plan resolves")
 }
 
 #[tokio::test]
@@ -220,4 +272,56 @@ async fn conditional_plan_executes_cases_and_ir_default_fallback() {
         .await
         .expect("IR default is fallback, not a literal default case key");
     assert_eq!(fallback_state.get("terminal"), Some(&json!("fallback")));
+}
+
+#[tokio::test]
+async fn bounded_cycle_visit_budget_resets_for_each_invoke() {
+    let plan =
+        compile_str("bounded-invoke.workflow.toml", BOUNDED_INVOKE).expect("fixture compiles");
+    let graph = AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("translation succeeds");
+
+    for run in ["first", "second"] {
+        let state = graph
+            .invoke(State::new(), ExecutionConfig::new(run))
+            .await
+            .expect("each invoke must receive a fresh visit counter");
+        assert_eq!(state.get("visits:loop"), Some(&json!(1)));
+    }
+}
+
+#[test]
+fn resolved_plan_identity_and_capabilities_are_bound_to_graph() {
+    let compiled = compile_str("resolved.workflow.toml", SEQUENTIAL).expect("fixture compiles");
+    let first_plan = resolved_plan(compiled.ir(), CapabilitySet::from(["read"]));
+    let second_plan = resolved_plan(compiled.ir(), CapabilitySet::from(["read", "network"]));
+    let translator = AdkGraphTranslator::new();
+    let first = translator
+        .translate_resolved(&first_plan, compiled.ir())
+        .expect("first translation succeeds");
+    let second = translator
+        .translate_resolved(&second_plan, compiled.ir())
+        .expect("second translation succeeds");
+
+    assert_eq!(first.plan_hash(), Some(first_plan.plan_hash()));
+    assert_eq!(first.effective_capabilities(), vec!["read"]);
+    assert_ne!(first.plan_hash(), second.plan_hash());
+    assert_eq!(second.effective_capabilities(), vec!["network", "read"]);
+}
+
+#[test]
+fn resolved_plan_rejects_ir_hash_mismatch() {
+    let compiled = compile_str("resolved.workflow.toml", SEQUENTIAL).expect("fixture compiles");
+    let other = compile_str("other.workflow.toml", OTHER_WORKFLOW).expect("fixture compiles");
+    let plan = resolved_plan(compiled.ir(), CapabilitySet::from(["read"]));
+
+    let error = match AdkGraphTranslator::new().translate_resolved(&plan, other.ir()) {
+        Ok(_) => panic!("a plan resolved for another IR must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        TranslationError::ResolvedPlanMismatch { .. }
+    ));
 }

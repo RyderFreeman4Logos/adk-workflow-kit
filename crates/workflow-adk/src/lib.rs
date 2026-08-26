@@ -1,7 +1,6 @@
 //! Domain-neutral Verbatim boundary for platform-owned workflow calls.
 
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use adk_rust::graph::prelude::{
@@ -171,8 +170,17 @@ pub struct GraphSummary {
 /// Stable failures produced while translating a validated compiler plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranslationError {
-    UnknownTarget { from: String, target: String },
-    MissingEntry { node: String },
+    UnknownTarget {
+        from: String,
+        target: String,
+    },
+    MissingEntry {
+        node: String,
+    },
+    ResolvedPlanMismatch {
+        plan_ir_hash: String,
+        ir_hash: String,
+    },
 }
 
 impl fmt::Display for TranslationError {
@@ -182,6 +190,9 @@ impl fmt::Display for TranslationError {
                 write!(f, "graph translation rejected {from:?} to {target:?}")
             }
             Self::MissingEntry { node } => write!(f, "graph translation missing entry {node:?}"),
+            Self::ResolvedPlanMismatch { .. } => {
+                write!(f, "graph translation rejected resolved plan mismatch")
+            }
         }
     }
 }
@@ -235,6 +246,13 @@ impl StateOutputMapper {
 }
 
 /// A translated, executable ADK graph plus project-owned metadata.
+#[derive(Clone, Debug)]
+struct PlanBinding {
+    plan_hash: String,
+    resume_identity: String,
+    effective_capabilities: Vec<String>,
+}
+
 pub struct AdkGraph {
     graph: GraphAgent,
     summary: GraphSummary,
@@ -243,6 +261,7 @@ pub struct AdkGraph {
     recursion_limit: usize,
     visit_bound: Option<usize>,
     unmatched: Arc<Mutex<Option<(String, String)>>>,
+    plan_binding: Option<PlanBinding>,
 }
 
 impl AdkGraph {
@@ -254,9 +273,20 @@ impl AdkGraph {
         if let Ok(mut slot) = self.unmatched.lock() {
             *slot = None;
         }
+        let mut state = self.input.map(state);
+        state.retain(|key, _| !key.starts_with("visits:"));
         let limit = self.recursion_limit.min(config.recursion_limit);
-        let config = config.with_recursion_limit(limit);
-        match self.graph.invoke(self.input.map(state), config).await {
+        let mut config = config.with_recursion_limit(limit);
+        if let Some(binding) = &self.plan_binding {
+            config = config
+                .with_metadata("workflow.plan_hash", json!(binding.plan_hash))
+                .with_metadata("workflow.resume_identity", json!(binding.resume_identity))
+                .with_metadata(
+                    "workflow.effective_capabilities",
+                    json!(binding.effective_capabilities),
+                );
+        }
+        match self.graph.invoke(state, config).await {
             Ok(state) => {
                 if let Some((from, selector)) = take_unmatched(&self.unmatched) {
                     return Err(AdkGraphError::UnknownRoute { from, selector });
@@ -294,6 +324,25 @@ impl AdkGraph {
     pub fn node_order(&self) -> Vec<&str> {
         self.summary.node_order.iter().map(String::as_str).collect()
     }
+    pub fn plan_hash(&self) -> Option<&str> {
+        self.plan_binding
+            .as_ref()
+            .map(|binding| binding.plan_hash.as_str())
+    }
+    pub fn resume_identity(&self) -> Option<&str> {
+        self.plan_binding
+            .as_ref()
+            .map(|binding| binding.resume_identity.as_str())
+    }
+    pub fn effective_capabilities(&self) -> Vec<&str> {
+        self.plan_binding.as_ref().map_or_else(Vec::new, |binding| {
+            binding
+                .effective_capabilities
+                .iter()
+                .map(String::as_str)
+                .collect()
+        })
+    }
     pub fn terminal_outcome(&self, id: &str) -> Option<TerminalOutcome> {
         self.summary
             .terminals
@@ -313,19 +362,53 @@ impl AdkGraphTranslator {
     }
 
     pub fn translate(&self, plan: &CompiledPlan) -> Result<AdkGraph, TranslationError> {
-        self.translate_ir(plan.ir())
+        self.translate_ir(plan.ir(), None)
     }
 
     /// Translates a resolved runtime plan while keeping its canonical IR separate.
     pub fn translate_resolved(
         &self,
-        _plan: &ResolvedRuntimePlan,
+        plan: &ResolvedRuntimePlan,
         ir: &workflow_ir::WorkflowIr,
     ) -> Result<AdkGraph, TranslationError> {
-        self.translate_ir(ir)
+        let ir_hash = canonical_ir_hash(ir);
+        let Some(plan_ir_hash) = serde_json::to_value(plan).ok().and_then(|value| {
+            value
+                .get("ir_hash")
+                .and_then(|hash| hash.as_str())
+                .map(str::to_owned)
+        }) else {
+            return Err(TranslationError::ResolvedPlanMismatch {
+                plan_ir_hash: String::new(),
+                ir_hash,
+            });
+        };
+        if plan_ir_hash != ir_hash {
+            return Err(TranslationError::ResolvedPlanMismatch {
+                plan_ir_hash,
+                ir_hash,
+            });
+        }
+        self.translate_ir(
+            ir,
+            Some(PlanBinding {
+                plan_hash: plan.plan_hash().to_owned(),
+                resume_identity: plan.resume_identity().to_owned(),
+                effective_capabilities: plan
+                    .effective_capabilities()
+                    .as_slice()
+                    .iter()
+                    .map(|capability| (*capability).to_owned())
+                    .collect(),
+            }),
+        )
     }
 
-    fn translate_ir(&self, ir: &workflow_ir::WorkflowIr) -> Result<AdkGraph, TranslationError> {
+    fn translate_ir(
+        &self,
+        ir: &workflow_ir::WorkflowIr,
+        plan_binding: Option<PlanBinding>,
+    ) -> Result<AdkGraph, TranslationError> {
         let ids: std::collections::BTreeSet<&str> =
             ir.nodes().iter().map(|node| node.id().as_str()).collect();
         if !ids.contains(ir.entry_node_id().as_str()) {
@@ -381,22 +464,25 @@ impl AdkGraphTranslator {
                     terminals.push(id.clone());
                 }
                 let max_visits = node.max_visits();
-                let visit_count = Arc::new(AtomicUsize::new(0));
                 let node_name = id.clone();
-                builder = builder.node_fn(&node_name, move |_context| {
+                builder = builder.node_fn(&node_name, move |context| {
                     let id = id.clone();
-                    let visit_count = Arc::clone(&visit_count);
                     async move {
-                        let visits = visit_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        let visits_key = format!("visits:{id}");
+                        let visits = context
+                            .state
+                            .get(&visits_key)
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or_default()
+                            + 1;
                         if let Some(max) = max_visits
-                            && visits > max as usize
+                            && visits > max as u64
                         {
                             return Err(GraphError::Other(format!(
                                 "visit bound {max} exceeded for {id}"
                             )));
                         }
                         let key = format!("node:{id}");
-                        let visits_key = format!("visits:{id}");
                         let mut output = NodeOutput::new()
                             .with_update(&key, json!(true))
                             .with_update(&visits_key, json!(visits));
@@ -480,6 +566,7 @@ impl AdkGraphTranslator {
             recursion_limit,
             visit_bound,
             unmatched,
+            plan_binding,
         })
     }
 }
@@ -532,6 +619,16 @@ fn visit_bound_from_error(error: &GraphError) -> Option<usize> {
         .next()?
         .parse()
         .ok()
+}
+
+fn canonical_ir_hash(ir: &workflow_ir::WorkflowIr) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hash = String::with_capacity(ir.canonical_hash().as_bytes().len() * 2);
+    for byte in ir.canonical_hash().as_bytes() {
+        hash.push(HEX[(byte >> 4) as usize] as char);
+        hash.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    hash
 }
 
 fn ir_visit_bound(ir: &workflow_ir::WorkflowIr) -> Option<usize> {
