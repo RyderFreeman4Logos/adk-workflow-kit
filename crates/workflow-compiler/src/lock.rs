@@ -1,7 +1,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use workflow_ir::{CANONICAL_IR_WIRE_VERSION_V1, IrSchemaVersion};
+use workflow_ir::{CANONICAL_IR_WIRE_VERSION_V1, CANONICAL_IR_WIRE_VERSION_V5, IrSchemaVersion};
 
 use crate::CompiledPlan;
 
@@ -50,14 +50,22 @@ impl WorkflowLock {
 
         Ok(Self {
             lock_version: 1,
-            canonical_ir_wire_version: CANONICAL_IR_WIRE_VERSION_V1,
+            canonical_ir_wire_version: if ir.resources().is_empty() {
+                CANONICAL_IR_WIRE_VERSION_V1
+            } else {
+                CANONICAL_IR_WIRE_VERSION_V5
+            },
             ir_schema_version: match ir.schema_version() {
                 IrSchemaVersion::V1 => 1,
             },
             workflow_id: ir.workflow_id().as_str().to_owned(),
             workflow_version: ir.workflow_version().to_owned(),
             ir_hash,
-            semantic_resource_hashes: Vec::new(),
+            semantic_resource_hashes: ir
+                .resources()
+                .iter()
+                .map(|resource| resource.sha256().to_owned())
+                .collect(),
         })
     }
 

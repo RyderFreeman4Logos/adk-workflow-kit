@@ -362,6 +362,34 @@ impl TryFrom<&GraphValidationError> for Diagnostic {
                     },
                 )
             }
+            GraphValidationError::UnboundedCycle { node_ids } => {
+                if node_ids.is_empty() {
+                    return Err(DiagnosticProjectionError::EmptyCycle);
+                }
+                if node_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+                    return Err(DiagnosticProjectionError::DuplicateCycleMember);
+                }
+                if node_ids
+                    .windows(2)
+                    .any(|pair| pair[0].as_str().as_bytes() >= pair[1].as_str().as_bytes())
+                {
+                    return Err(DiagnosticProjectionError::UnsortedCycle);
+                }
+                (
+                    "workflow.graph.unbounded_cycle",
+                    "unbounded cycle",
+                    DiagnosticDetails::Cycle {
+                        node_ids: node_ids.iter().map(|id| id.as_str().to_owned()).collect(),
+                    },
+                )
+            }
+            GraphValidationError::NonIdempotentCycleNode { node_id } => (
+                "workflow.graph.non_idempotent_cycle_node",
+                "non-idempotent cycle node",
+                DiagnosticDetails::UnreachableNode {
+                    node_id: node_id.as_str().to_owned(),
+                },
+            ),
             GraphValidationError::CannotReachTerminal { node_id } => (
                 "workflow.graph.cannot_reach_terminal",
                 "cannot reach terminal",

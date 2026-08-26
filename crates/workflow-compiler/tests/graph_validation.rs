@@ -414,7 +414,7 @@ to = "done"
 
     assert_eq!(
         validate_graph(&ir),
-        Err(GraphValidationError::Cycle {
+        Err(GraphValidationError::UnboundedCycle {
             node_ids: vec![node_id(&ir, "a"), node_id(&ir, "b")],
         })
     );
@@ -449,7 +449,7 @@ to = "done"
 
     assert_eq!(
         validate_graph(&ir),
-        Err(GraphValidationError::Cycle {
+        Err(GraphValidationError::UnboundedCycle {
             node_ids: vec![node_id(&ir, "loop")],
         })
     );
@@ -620,7 +620,7 @@ to = "done"
 
     assert_eq!(
         validate_graph(&ir),
-        Err(GraphValidationError::Cycle {
+        Err(GraphValidationError::UnboundedCycle {
             node_ids: vec![node_id(&ir, "a"), node_id(&ir, "b")],
         })
     );
@@ -668,7 +668,7 @@ to = "done"
 "#);
     assert_eq!(
         validate_graph(&looped),
-        Err(GraphValidationError::Cycle {
+        Err(GraphValidationError::UnboundedCycle {
             node_ids: vec![node_id(&looped, "done")],
         })
     );

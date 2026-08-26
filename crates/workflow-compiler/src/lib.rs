@@ -320,6 +320,10 @@ pub enum GraphValidationError {
         /// The sorted member identifiers of the canonical-first cyclic SCC.
         node_ids: Vec<NodeId>,
     },
+    /// A reachable cycle has no positive visit bound.
+    UnboundedCycle { node_ids: Vec<NodeId> },
+    /// A side-effecting action in a cycle is not idempotent.
+    NonIdempotentCycleNode { node_id: NodeId },
     /// A reachable node cannot reach a terminal-kind node.
     CannotReachTerminal {
         /// The canonical-first node identifier without a terminal path.
@@ -368,12 +372,24 @@ pub fn validate_graph(ir: &WorkflowIr) -> Result<(), GraphValidationError> {
     }
 
     if let Some(component) = first_cyclic_component(&forward, &reverse) {
-        return Err(GraphValidationError::Cycle {
-            node_ids: component
-                .into_iter()
-                .map(|index| nodes[index].id().clone())
-                .collect(),
-        });
+        let node_ids = component
+            .iter()
+            .map(|&index| nodes[index].id().clone())
+            .collect::<Vec<_>>();
+        if component
+            .iter()
+            .any(|&index| nodes[index].max_visits().is_none_or(|bound| bound == 0))
+        {
+            return Err(GraphValidationError::UnboundedCycle { node_ids });
+        }
+        if let Some(&index) = component
+            .iter()
+            .find(|&&index| nodes[index].kind() == IrNodeKind::Action && !nodes[index].idempotent())
+        {
+            return Err(GraphValidationError::NonIdempotentCycleNode {
+                node_id: nodes[index].id().clone(),
+            });
+        }
     }
 
     let can_reach_terminal = reachability_from(&terminal_seeds, &reverse);
@@ -587,6 +603,13 @@ fn adjacency(
         };
         for case in route.cases() {
             let Some(to) = find_node_index(nodes, case.target()) else {
+                return Err(GraphValidationError::DanglingRoute);
+            };
+            forward[from].push(to);
+            reverse[to].push(from);
+        }
+        if let Some(target) = route.default() {
+            let Some(to) = find_node_index(nodes, target) else {
                 return Err(GraphValidationError::DanglingRoute);
             };
             forward[from].push(to);
