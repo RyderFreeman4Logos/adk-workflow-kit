@@ -371,7 +371,7 @@ pub fn validate_graph(ir: &WorkflowIr) -> Result<(), GraphValidationError> {
         return Err(GraphValidationError::NoReachableTerminal);
     }
 
-    if let Some(component) = first_cyclic_component(&forward, &reverse) {
+    for component in cyclic_components(&forward, &reverse) {
         let node_ids = component
             .iter()
             .map(|&index| nodes[index].id().clone())
@@ -676,7 +676,7 @@ fn reachability_from(starts: &[usize], adjacency: &Adjacency) -> Vec<bool> {
     reached
 }
 
-fn first_cyclic_component(forward: &Adjacency, reverse: &Adjacency) -> Option<Vec<usize>> {
+fn cyclic_components(forward: &Adjacency, reverse: &Adjacency) -> Vec<Vec<usize>> {
     let mut visited = vec![false; forward.len()];
     let mut finished = Vec::with_capacity(forward.len());
 
@@ -703,7 +703,7 @@ fn first_cyclic_component(forward: &Adjacency, reverse: &Adjacency) -> Option<Ve
     }
 
     let mut assigned = vec![false; forward.len()];
-    let mut first = None;
+    let mut components = Vec::new();
     for &start in finished.iter().rev() {
         if assigned[start] {
             continue;
@@ -725,21 +725,18 @@ fn first_cyclic_component(forward: &Adjacency, reverse: &Adjacency) -> Option<Ve
             || forward[component[0]]
                 .iter()
                 .any(|&next| next == component[0]);
-        if cyclic
-            && first
-                .as_ref()
-                .is_none_or(|current: &Vec<usize>| component[0] < current[0])
-        {
-            first = Some(component);
+        if cyclic {
+            components.push(component);
         }
     }
 
-    first
+    components.sort_unstable_by_key(|component| component[0]);
+    components
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Adjacency, compile_str, first_cyclic_component};
+    use super::{Adjacency, compile_str, cyclic_components};
 
     #[test]
     fn approval_node_without_timeout_is_rejected() {
@@ -831,8 +828,8 @@ mod tests {
 
                 // A recursive DFS cannot traverse this heap-built chain within 64 KiB.
                 assert_eq!(
-                    first_cyclic_component(&forward, &reverse),
-                    Some((0..NODES).collect())
+                    cyclic_components(&forward, &reverse),
+                    vec![(0..NODES).collect::<Vec<_>>()]
                 );
             })
             .expect("bounded-stack worker should start");
