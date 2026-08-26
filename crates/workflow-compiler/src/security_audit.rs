@@ -243,12 +243,13 @@ pub fn audit_dependencies(policy: &str, lock: &str) -> Result<AuditReport, Audit
         .iter()
         .map(|package| {
             usize::from(denied.contains(package.name.as_str()))
-                + usize::from(
-                    package
-                        .license
-                        .as_deref()
-                        .is_some_and(|license| denied_licenses.contains(license)),
-                )
+                + usize::from(package.license.as_deref().is_some_and(|license| {
+                    denied_licenses.contains(license)
+                        || (!denied_licenses.is_empty()
+                            && (license.contains(" OR ")
+                                || license.contains(" AND ")
+                                || license.contains(" WITH ")))
+                }))
                 + usize::from(allowed_licenses.as_ref().is_some_and(|allowed| {
                     package.license.as_deref().is_none_or(|license| {
                         !allowed.contains(license)
@@ -360,6 +361,20 @@ mod tests {
         let result = audit_dependencies(policy, lock).expect("valid cargo-deny fixture");
         assert_eq!(result.disposition(), AuditDisposition::Critical);
         assert_eq!(result.critical_count(), 2);
+    }
+
+    #[test]
+    fn deny_only_compound_license_with_denied_member_fails_closed() {
+        let policy = "[licenses]\ndeny = [\"GPL-3.0-only\"]\n";
+        let lock =
+            "[[package]]\nname = \"compound-license-crate\"\nlicense = \"GPL-3.0-only OR MIT\"\n";
+
+        let result = audit_dependencies(policy, lock).expect("valid deny-only policy fixture");
+        assert_ne!(result.disposition(), AuditDisposition::Clean);
+        assert!(matches!(
+            result.disposition(),
+            AuditDisposition::Critical | AuditDisposition::BoundaryMiss
+        ));
     }
 
     #[test]
