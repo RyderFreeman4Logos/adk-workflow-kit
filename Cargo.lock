@@ -2027,6 +2027,11 @@ name = "workflow-adk"
 version = "0.2.2"
 dependencies = [
  "adk-rust",
+ "serde",
+ "serde_json",
+ "tokio",
+ "workflow-compiler",
+ "workflow-ir",
 ]
 
 [[package]]

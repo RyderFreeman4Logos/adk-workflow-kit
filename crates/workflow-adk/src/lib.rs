@@ -2,6 +2,16 @@
 
 use std::fmt;
 
+use adk_rust::graph::prelude::{AgentNode, END, GraphAgent, NodeOutput, START, State};
+use adk_rust::{
+    Agent, AgentCapabilities, Content, Event, EventStream, InvocationContext, async_trait,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::sync::Arc;
+use workflow_compiler::{CompiledPlan, ResolvedRuntimePlan};
+use workflow_ir::IrNodeKind;
+
 const MAX_PATH_BYTES: usize = 256;
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const TYPE_MARKERS: &[&[u8]] = &[
@@ -139,6 +149,264 @@ impl VerbatimPlatformAdapter {
             path: request.path,
             payload_len: request.payload.len(),
         })
+    }
+}
+
+/// A project-owned terminal result; ADK execution types never cross this boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TerminalOutcome {
+    Succeeded,
+}
+
+/// A serializable description of a translated graph.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GraphSummary {
+    pub node_order: Vec<String>,
+    pub terminals: Vec<String>,
+}
+
+/// Stable failures produced while translating a validated compiler plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TranslationError {
+    UnknownTarget { from: String, target: String },
+    MissingEntry { node: String },
+}
+
+impl fmt::Display for TranslationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTarget { from, target } => {
+                write!(f, "graph translation rejected {from:?} to {target:?}")
+            }
+            Self::MissingEntry { node } => write!(f, "graph translation missing entry {node:?}"),
+        }
+    }
+}
+impl std::error::Error for TranslationError {}
+
+/// Explicit state input mapping owned by the adapter.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StateInputMapper;
+impl StateInputMapper {
+    pub fn map(&self, state: State) -> State {
+        state
+    }
+}
+
+/// Explicit state output mapping owned by the adapter.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StateOutputMapper;
+impl StateOutputMapper {
+    pub fn map(&self, state: State) -> State {
+        state
+    }
+}
+
+/// A translated, executable ADK graph plus project-owned metadata.
+pub struct AdkGraph {
+    graph: GraphAgent,
+    summary: GraphSummary,
+    input: StateInputMapper,
+    output: StateOutputMapper,
+}
+
+impl AdkGraph {
+    pub async fn invoke(
+        &self,
+        state: State,
+        config: adk_rust::graph::prelude::ExecutionConfig,
+    ) -> Result<State, adk_rust::graph::prelude::GraphError> {
+        self.graph
+            .invoke(self.input.map(state), config)
+            .await
+            .map(|state| self.output.map(state))
+    }
+    pub fn summary(&self) -> &GraphSummary {
+        &self.summary
+    }
+    pub fn node_order(&self) -> Vec<&str> {
+        self.summary.node_order.iter().map(String::as_str).collect()
+    }
+    pub fn terminal_outcome(&self, id: &str) -> Option<TerminalOutcome> {
+        self.summary
+            .terminals
+            .iter()
+            .any(|terminal| terminal == id)
+            .then_some(TerminalOutcome::Succeeded)
+    }
+}
+
+/// Translates canonical compiler output into a real in-process ADK graph.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AdkGraphTranslator;
+
+impl AdkGraphTranslator {
+    pub const fn new() -> Self {
+        Self
+    }
+
+    pub fn translate(&self, plan: &CompiledPlan) -> Result<AdkGraph, TranslationError> {
+        self.translate_ir(plan.ir())
+    }
+
+    /// Translates a resolved runtime plan while keeping its canonical IR separate.
+    pub fn translate_resolved(
+        &self,
+        _plan: &ResolvedRuntimePlan,
+        ir: &workflow_ir::WorkflowIr,
+    ) -> Result<AdkGraph, TranslationError> {
+        self.translate_ir(ir)
+    }
+
+    fn translate_ir(&self, ir: &workflow_ir::WorkflowIr) -> Result<AdkGraph, TranslationError> {
+        let ids: std::collections::BTreeSet<&str> =
+            ir.nodes().iter().map(|node| node.id().as_str()).collect();
+        if !ids.contains(ir.entry_node_id().as_str()) {
+            return Err(TranslationError::MissingEntry {
+                node: ir.entry_node_id().as_str().to_owned(),
+            });
+        }
+        for edge in ir.edges() {
+            if !ids.contains(edge.to().as_str()) {
+                return Err(TranslationError::UnknownTarget {
+                    from: edge.from().as_str().to_owned(),
+                    target: edge.to().as_str().to_owned(),
+                });
+            }
+        }
+        for route in ir.routes() {
+            for case in route.cases() {
+                if !ids.contains(case.target().as_str()) {
+                    return Err(TranslationError::UnknownTarget {
+                        from: route.from().as_str().to_owned(),
+                        target: case.target().as_str().to_owned(),
+                    });
+                }
+            }
+            if let Some(target) = route.default()
+                && !ids.contains(target.as_str())
+            {
+                return Err(TranslationError::UnknownTarget {
+                    from: route.from().as_str().to_owned(),
+                    target: target.as_str().to_owned(),
+                });
+            }
+        }
+        let mut builder = GraphAgent::builder(ir.workflow_id().as_str()).channels(&["terminal"]);
+        let mut terminals = Vec::new();
+        let mut order = Vec::new();
+        for node in ir.nodes() {
+            let id = node.id().as_str().to_owned();
+            order.push(id.clone());
+            if node.kind() == IrNodeKind::Agent {
+                let agent = DeterministicAgent::new(id.clone());
+                builder = builder.node(AgentNode::new(Arc::new(agent)).with_output_mapper(
+                    move |_| std::collections::HashMap::from([(format!("node:{id}"), json!(true))]),
+                ));
+            } else {
+                let terminal = node.kind() == IrNodeKind::Terminal;
+                if terminal {
+                    terminals.push(id.clone());
+                }
+                let node_name: &'static str = Box::leak(id.clone().into_boxed_str());
+                builder = builder.node_fn(node_name, move |_context| {
+                    let id = id.clone();
+                    async move {
+                        let key: &'static str = Box::leak(format!("node:{id}").into_boxed_str());
+                        let mut output = NodeOutput::new().with_update(key, json!(true));
+                        if terminal {
+                            output = output.with_update("terminal", json!(id));
+                        }
+                        Ok(output)
+                    }
+                });
+            }
+        }
+        builder = builder.edge(START, ir.entry_node_id().as_str());
+        for edge in ir.edges() {
+            builder = builder.edge(edge.from().as_str(), edge.to().as_str());
+        }
+        for route in ir.routes() {
+            let mut cases: Vec<(&'static str, &'static str)> = route
+                .cases()
+                .iter()
+                .map(|case| {
+                    (
+                        Box::leak(case.key().to_owned().into_boxed_str()) as &'static str,
+                        Box::leak(case.target().as_str().to_owned().into_boxed_str())
+                            as &'static str,
+                    )
+                })
+                .collect();
+            if let Some(default) = route.default() {
+                cases.push((
+                    "default",
+                    Box::leak(default.as_str().to_owned().into_boxed_str()) as &'static str,
+                ));
+            }
+            let from = route.from().as_str().to_owned();
+            builder = builder.conditional_edge(
+                route.from().as_str(),
+                move |state| {
+                    state
+                        .get(&format!("route:{from}"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("__unknown__")
+                        .to_owned()
+                },
+                cases,
+            );
+        }
+        for terminal in &terminals {
+            builder = builder.edge(terminal, END);
+        }
+        let graph = builder
+            .build()
+            .map_err(|error| TranslationError::UnknownTarget {
+                from: String::from("builder"),
+                target: error.to_string(),
+            })?;
+        Ok(AdkGraph {
+            graph,
+            summary: GraphSummary {
+                node_order: order,
+                terminals,
+            },
+            input: StateInputMapper,
+            output: StateOutputMapper,
+        })
+    }
+}
+
+struct DeterministicAgent {
+    name: String,
+}
+impl DeterministicAgent {
+    fn new(name: String) -> Self {
+        Self { name }
+    }
+}
+#[async_trait]
+impl Agent for DeterministicAgent {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        "deterministic workflow adapter agent"
+    }
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &[]
+    }
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            shared_state: true,
+            ..AgentCapabilities::default()
+        }
+    }
+    async fn run(&self, _ctx: Arc<dyn InvocationContext>) -> adk_rust::Result<EventStream> {
+        let mut event = Event::new(&self.name);
+        event.set_content(Content::new("assistant").with_text("ok"));
+        Ok(Box::pin(adk_rust::futures::stream::iter([Ok(event)])))
     }
 }
 
