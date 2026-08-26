@@ -3,13 +3,24 @@
 version = 4
 
 [[package]]
+name = "adk-2-1-ownership"
+version = "0.1.0"
+dependencies = [
+ "adk-rust 2.1.0",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "adk-agent"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be73cfc954523b114c59c00db7bbe1ade30d37ecd27af4c590127725b0c97f04"
 dependencies = [
- "adk-core",
- "adk-telemetry",
+ "adk-core 1.0.0",
+ "adk-telemetry 1.0.0",
  "async-stream",
  "async-trait",
  "chrono",
@@ -20,6 +31,28 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "adk-agent"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da8c2c4894eab69797b17850315ae27535dfa43b4dda43f7ff7c91824af18b8d"
+dependencies = [
+ "adk-core 2.1.0",
+ "adk-telemetry 2.1.0",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "jsonschema 0.47.0",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -40,12 +73,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "adk-core"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db3f16b5fbb32945b277a83d6cd3f8c37abf210052b2258d604ec5749a5bf9ee"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "adk-graph"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a65ead3ec4b864d0928ac2afbb33132b3c7d6e764e340950ee63839bfdbf42c3"
 dependencies = [
- "adk-core",
+ "adk-core 1.0.0",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "adk-graph"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bda1d11c2cfa51b2dcd5d8a024bb604e3cd7aab86970552f0cb52f991cd405a2"
+dependencies = [
+ "adk-core 2.1.0",
  "async-stream",
  "async-trait",
  "chrono",
@@ -64,7 +133,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a0408cd5152eb5dfac08f5720e914df0cc5c51f9361b0b4a7fb008cb6fa47a52"
 dependencies = [
- "adk-core",
+ "adk-core 1.0.0",
  "async-trait",
  "futures",
  "jsonschema 0.45.1",
@@ -81,8 +150,8 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f79e38948bcec656a66db7a71c2efebafb20c8f196110278b13d105e6c7eb105"
 dependencies = [
- "adk-core",
- "adk-telemetry",
+ "adk-core 1.0.0",
+ "adk-telemetry 1.0.0",
  "anyhow",
  "async-stream",
  "async-trait",
@@ -101,12 +170,12 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b571459ef1d9d216ad4308963545b333be870e2bc34765c28c38a49c3a2c4bdb"
 dependencies = [
- "adk-agent",
- "adk-core",
- "adk-graph",
+ "adk-agent 1.0.0",
+ "adk-core 1.0.0",
+ "adk-graph 1.0.0",
  "adk-guardrail",
  "adk-model",
- "adk-telemetry",
+ "adk-telemetry 1.0.0",
  "anyhow",
  "async-trait",
  "futures",
@@ -116,10 +185,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "adk-rust"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5244ddd601fb2f9a9671a2407312d8c25914b211381e6e6bf62e0b8eadba72e"
+dependencies = [
+ "adk-agent 2.1.0",
+ "adk-core 2.1.0",
+ "adk-graph 2.1.0",
+ "anyhow",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "adk-telemetry"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2d2be5505a6d41f335f4c9292070117432761714d959bef26d9780529244f0e"
+dependencies = [
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "adk-telemetry"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09592e9f3d8238e882beb2891af5dd1996aec4579df513a23d953eb0939e0f6b"
 dependencies = [
  "thiserror",
  "tracing",
@@ -500,6 +598,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fancy-regex"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1e1dacd0d2082dfcf1351c4bdd566bbe89a2b263235a2b50058f1e130a47277"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -697,6 +806,11 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "iana-time-zone"
@@ -911,6 +1025,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonschema"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "281c43ff06dcb331e9356d30e38853d559ce3d0a3f693e0b0e102667dec14fb1"
+dependencies = [
+ "ahash",
+ "bytecount",
+ "data-encoding",
+ "email_address",
+ "fancy-regex 0.18.0",
+ "fraction",
+ "getrandom 0.3.4",
+ "idna",
+ "itoa",
+ "jsonschema-regex",
+ "num-cmp",
+ "num-traits",
+ "percent-encoding",
+ "referencing 0.47.0",
+ "regex",
+ "serde",
+ "serde_json",
+ "unicode-general-category",
+ "uuid-simd",
+]
+
+[[package]]
+name = "jsonschema-regex"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee0b351864e7ffbc5db9273daf7fa1b4d5177b0946713d667ca571b83c0b4045"
+dependencies = [
+ "regex-syntax",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -969,6 +1119,12 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "micromap"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a86d3146ed3995b5913c414f6664344b9617457320782e64f0bb44afd49d74"
 
 [[package]]
 name = "mio"
@@ -1218,6 +1374,23 @@ dependencies = [
  "fluent-uri 0.4.1",
  "getrandom 0.3.4",
  "hashbrown 0.16.1",
+ "parking_lot",
+ "percent-encoding",
+ "serde_json",
+]
+
+[[package]]
+name = "referencing"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "348e860aeb0b7bd035778fd11dd9cd5290d32e4aed3b8f2274a00287a9fd362b"
+dependencies = [
+ "ahash",
+ "fluent-uri 0.4.1",
+ "getrandom 0.3.4",
+ "hashbrown 0.17.1",
+ "itoa",
+ "micromap",
  "parking_lot",
  "percent-encoding",
  "serde_json",
@@ -1997,7 +2170,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 name = "workflow-adk"
 version = "0.2.2"
 dependencies = [
- "adk-rust",
+ "adk-rust 1.0.0",
 ]
 
 [[package]]
@@ -2060,7 +2233,7 @@ dependencies = [
 name = "workflow-testkit"
 version = "0.2.2"
 dependencies = [
- "adk-rust",
+ "adk-rust 1.0.0",
  "serde",
  "serde_json",
  "sha2",

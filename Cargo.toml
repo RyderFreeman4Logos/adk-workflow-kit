@@ -9,6 +9,7 @@ members = [
     "crates/workflow-runtime",
     "crates/workflow-review",
     "crates/workflowctl",
+    "spikes/adk-2-1-ownership",
 ]
 
 [workspace.package]
