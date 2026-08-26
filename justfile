@@ -21,7 +21,7 @@ test:
     ./target/debug/workflowctl test crates/workflowctl/tests/fixtures/cli004-test.json
     ./target/debug/workflowctl eval crates/workflowctl/tests/fixtures/cli004-eval.json
     ./target/debug/workflowctl replay crates/workflowctl/tests/fixtures/cli004-replay.json
-    ./target/debug/workflowctl audit
+    if ./target/debug/workflowctl audit; then exit 1; else test "$?" -eq 2; fi
 
 bench-001:
     {{_io}} cargo run -p workflow-testkit --bin bench-001 --locked
@@ -35,6 +35,9 @@ lock-check:
 
 metadata:
     {{_io}} cargo metadata --format-version 1 --locked
+
+dependency-audit:
+    {{_io}} cargo deny check licenses advisories
 
 test-local-gates:
     bash scripts/test-local-gates.sh
@@ -51,9 +54,9 @@ test-release-local:
 check-branch:
     scripts/local-gates.sh check-branch
 
-pre-commit-fast: check-branch fmt-check lock-check check clippy test-local-gates
+pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit test-local-gates
 
-_quality-gates: fmt-check check clippy test test-local-gates
+_quality-gates: fmt-check check clippy dependency-audit test test-local-gates
 
 quality-gates:
     scripts/local-gates.sh produce

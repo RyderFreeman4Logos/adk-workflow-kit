@@ -109,8 +109,54 @@ impl std::error::Error for AuditError {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuditPolicyWire {
-    schema_version: u32,
+    schema_version: Option<u32>,
+    #[serde(default)]
     denied_crates: Vec<String>,
+    #[serde(default)]
+    licenses: Option<LicensePolicyWire>,
+    #[serde(default)]
+    bans: Option<BanPolicyWire>,
+    #[serde(default)]
+    advisories: Option<AdvisoryPolicyWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LicensePolicyWire {
+    #[serde(default)]
+    allow: Option<Vec<String>>,
+    #[serde(default)]
+    deny: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BanPolicyWire {
+    #[serde(default)]
+    deny: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdvisoryPolicyWire {
+    #[serde(default)]
+    unmaintained: Option<UnmaintainedAction>,
+    #[serde(default)]
+    yanked: Option<DenyAction>,
+}
+
+#[derive(Deserialize)]
+enum UnmaintainedAction {
+    #[serde(rename = "all")]
+    All,
+    #[serde(rename = "deny")]
+    Deny,
+}
+
+#[derive(Deserialize)]
+enum DenyAction {
+    #[serde(rename = "deny")]
+    Deny,
 }
 
 #[derive(Deserialize)]
@@ -122,6 +168,14 @@ struct CargoLockWire {
 #[derive(Deserialize)]
 struct LockPackage {
     name: String,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    advisory_severity: Option<String>,
+    #[serde(default)]
+    unmaintained: bool,
+    #[serde(default)]
+    yanked: bool,
 }
 
 /// Audits one policy fixture against one lock fixture.
@@ -137,23 +191,78 @@ pub fn audit_dependencies(policy: &str, lock: &str) -> Result<AuditReport, Audit
 
     let parsed_policy: AuditPolicyWire =
         toml::from_str(policy).map_err(|_| AuditError::boundary(policy_len, lock_len))?;
-    if parsed_policy.schema_version != 1 {
+    if parsed_policy
+        .schema_version
+        .is_some_and(|version| version != 1)
+        || (parsed_policy.schema_version.is_none()
+            && parsed_policy.licenses.is_none()
+            && parsed_policy.bans.is_none()
+            && parsed_policy.advisories.is_none())
+    {
         return Err(AuditError::boundary(policy_len, lock_len));
     }
 
     let parsed_lock: CargoLockWire =
         toml::from_str(lock).map_err(|_| AuditError::boundary(policy_len, lock_len))?;
-    let denied = parsed_policy
+    let mut denied = parsed_policy
         .denied_crates
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
+    if let Some(bans) = &parsed_policy.bans {
+        denied.extend(bans.deny.iter().map(String::as_str));
+    }
+    let denied_licenses = parsed_policy
+        .licenses
+        .as_ref()
+        .map(|licenses| {
+            licenses
+                .deny
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let allowed_licenses = parsed_policy
+        .licenses
+        .as_ref()
+        .and_then(|licenses| licenses.allow.as_ref())
+        .map(|licenses| licenses.iter().map(String::as_str).collect::<BTreeSet<_>>());
+    let advisories_enabled = true;
+    let unmaintained_enabled = parsed_policy
+        .advisories
+        .as_ref()
+        .is_some_and(|advisories| advisories.unmaintained.is_some());
+    let yanked_enabled = parsed_policy
+        .advisories
+        .as_ref()
+        .is_some_and(|advisories| advisories.yanked.is_some());
     let package_count = parsed_lock.package.len();
     let critical_count = parsed_lock
         .package
         .iter()
-        .filter(|package| denied.contains(package.name.as_str()))
-        .count();
+        .map(|package| {
+            usize::from(denied.contains(package.name.as_str()))
+                + usize::from(package.license.as_deref().is_some_and(|license| {
+                    denied_licenses.contains(license)
+                        || (!denied_licenses.is_empty()
+                            && (license.contains(" OR ")
+                                || license.contains(" AND ")
+                                || license.contains(" WITH ")))
+                }))
+                + usize::from(allowed_licenses.as_ref().is_some_and(|allowed| {
+                    package.license.as_deref().is_none_or(|license| {
+                        !allowed.contains(license)
+                            || license.contains(" OR ")
+                            || license.contains(" AND ")
+                            || license.contains(" WITH ")
+                    })
+                }))
+                + usize::from(advisories_enabled && package.advisory_severity.as_deref().is_some())
+                + usize::from(unmaintained_enabled && package.unmaintained)
+                + usize::from(yanked_enabled && package.yanked)
+        })
+        .sum();
     let disposition = if critical_count == 0 {
         AuditDisposition::Clean
     } else {
@@ -242,5 +351,133 @@ mod tests {
             &serde_json::to_string(&error).expect("serialize boundary error"),
             CANARY_AUDIT_BOUNDARY_70,
         );
+    }
+
+    #[test]
+    fn cargo_deny_license_and_advisory_findings_are_critical() {
+        let policy = "[licenses]\ndeny = [\"GPL-3.0-only\"]\n[bans]\ndeny = []\n[advisories]\nunmaintained = \"all\"\nyanked = \"deny\"\n";
+        let lock = "[[package]]\nname = \"licensed-crate\"\nlicense = \"GPL-3.0-only\"\nadvisory_severity = \"high\"\n";
+
+        let result = audit_dependencies(policy, lock).expect("valid cargo-deny fixture");
+        assert_eq!(result.disposition(), AuditDisposition::Critical);
+        assert_eq!(result.critical_count(), 2);
+    }
+
+    #[test]
+    fn deny_only_compound_license_with_denied_member_fails_closed() {
+        let policy = "[licenses]\ndeny = [\"GPL-3.0-only\"]\n";
+        let lock =
+            "[[package]]\nname = \"compound-license-crate\"\nlicense = \"GPL-3.0-only OR MIT\"\n";
+
+        let result = audit_dependencies(policy, lock).expect("valid deny-only policy fixture");
+        assert_ne!(result.disposition(), AuditDisposition::Clean);
+        assert!(matches!(
+            result.disposition(),
+            AuditDisposition::Critical | AuditDisposition::BoundaryMiss
+        ));
+    }
+
+    #[test]
+    fn allow_list_rejects_package_without_license() {
+        let policy = "[licenses]\nallow = [\"MIT\"]\n";
+        let lock = "[[package]]\nname = \"unlicensed-crate\"\n";
+
+        let result = audit_dependencies(policy, lock).expect("valid policy and lock fixture");
+        assert_eq!(result.disposition(), AuditDisposition::Critical);
+    }
+
+    #[test]
+    fn vulnerability_default_rejects_every_advisory_severity() {
+        let policy = "[advisories]\nunmaintained = \"all\"\nyanked = \"deny\"\n";
+        let lock = "[[package]]\nname = \"low-risk-crate\"\nadvisory_severity = \"low\"\n";
+
+        let result = audit_dependencies(policy, lock).expect("cargo-deny 0.19 policy is valid");
+        assert_eq!(result.disposition(), AuditDisposition::Critical);
+    }
+
+    #[test]
+    fn compound_license_is_not_clean() {
+        let policy = "[licenses]\nallow = [\"MIT\", \"Apache-2.0\"]\n";
+        let lock =
+            "[[package]]\nname = \"compound-license-crate\"\nlicense = \"MIT OR Apache-2.0\"\n";
+
+        let result = audit_dependencies(policy, lock).expect("valid policy and lock fixture");
+        assert_ne!(result.disposition(), AuditDisposition::Clean);
+    }
+
+    #[test]
+    fn diagnostics_remain_payload_free_for_advisory_fixture() {
+        let policy = "[advisories]\nunmaintained = \"all\"\nyanked = \"deny\"\n";
+        let lock = "[[package]]\nname = \"payload-crate\"\nadvisory_severity = \"critical\"\nadvisory_body = \"SECRET_ADVISORY_BODY_R3B\"\n";
+
+        let result = audit_dependencies(policy, lock).expect("valid policy and lock fixture");
+        let serialized = serde_json::to_string(&result).expect("serialize redacted report");
+        assert!(!serialized.contains("SECRET_ADVISORY_BODY_R3B"));
+        assert!(!result.to_string().contains("SECRET_ADVISORY_BODY_R3B"));
+    }
+
+    #[test]
+    fn committed_cargo_deny_shape_rejects_disallowed_license() {
+        let policy = "[licenses]\nallow = [\"MIT\"]\n[advisories]\nunmaintained = \"all\"\nyanked = \"deny\"\n";
+        let lock = "[[package]]\nname = \"gpl-crate\"\nlicense = \"GPL-3.0-only\"\n";
+
+        let result = audit_dependencies(policy, lock).expect("valid committed policy shape");
+        assert_eq!(result.disposition(), AuditDisposition::Critical);
+    }
+
+    #[test]
+    fn committed_advisory_shapes_reject_matching_findings() {
+        let policy = "[licenses]\nallow = [\"MIT\"]\n[advisories]\nunmaintained = \"all\"\nyanked = \"deny\"\n";
+        let lock = "[[package]]\nname = \"flagged-crate\"\nlicense = \"MIT\"\nunmaintained = true\nyanked = true\n";
+
+        let result = audit_dependencies(policy, lock).expect("valid committed policy shape");
+        assert_eq!(result.disposition(), AuditDisposition::Critical);
+        assert_eq!(result.critical_count(), 2);
+    }
+
+    #[test]
+    fn removed_advisory_action_is_a_boundary_miss() {
+        let policy = "[advisories]\nremoved_action = \"warn\"\n";
+        let lock = "[[package]]\nname = \"vulnerable-crate\"\nadvisory_severity = \"high\"\n";
+
+        let error = audit_dependencies(policy, lock).expect_err("warn must fail closed");
+        assert_eq!(error.kind(), AuditDisposition::BoundaryMiss);
+    }
+
+    #[test]
+    fn warn_yanked_action_is_a_boundary_miss() {
+        let policy = "[advisories]\nyanked = \"warn\"\n";
+        let lock = "[[package]]\nname = \"yanked-crate\"\nyanked = true\n";
+
+        let error = audit_dependencies(policy, lock).expect_err("warn must fail closed");
+        assert_eq!(error.kind(), AuditDisposition::BoundaryMiss);
+    }
+
+    #[test]
+    fn unknown_advisory_action_is_a_boundary_miss() {
+        let policy = "[advisories]\nunmaintained = \"review\"\n";
+        let lock = "[[package]]\nname = \"ordinary-crate\"\n";
+
+        let error = audit_dependencies(policy, lock).expect_err("unknown action must fail closed");
+        assert_eq!(error.kind(), AuditDisposition::BoundaryMiss);
+    }
+
+    #[test]
+    fn committed_advisory_actions_still_report_matching_critical_findings() {
+        let policy = "[advisories]\nunmaintained = \"all\"\nyanked = \"deny\"\n";
+        let lock = "[[package]]\nname = \"flagged-crate\"\nunmaintained = true\nyanked = true\n";
+
+        let result = audit_dependencies(policy, lock).expect("committed actions are valid");
+        assert_eq!(result.disposition(), AuditDisposition::Critical);
+        assert_eq!(result.critical_count(), 2);
+    }
+
+    #[test]
+    fn unknown_policy_fields_are_boundary_misses() {
+        let policy = "[licenses]\nallow = [\"MIT\"]\nunsupported = true\n";
+        let lock = "[[package]]\nname = \"ordinary-crate\"\nlicense = \"MIT\"\n";
+
+        let error = audit_dependencies(policy, lock).expect_err("unknown policy must fail closed");
+        assert_eq!(error.kind(), AuditDisposition::BoundaryMiss);
     }
 }

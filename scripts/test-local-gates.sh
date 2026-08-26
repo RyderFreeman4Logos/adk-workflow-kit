@@ -101,6 +101,14 @@ if [[ "$lefthook_config" != *$'pre-push:\n  commands:\n    local-gates:\n      r
 fi
 ((assertions += 2))
 
+justfile_contract="$(<"$repo_root/justfile")"
+if [[ "$justfile_contract" != *'pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit test-local-gates'* ||
+    "$justfile_contract" != *'_quality-gates: fmt-check check clippy dependency-audit test test-local-gates'* ]]; then
+    printf 'FAIL frequent quality gates do not invoke dependency-audit\n' >&2
+    exit 1
+fi
+((assertions += 1))
+
 hook_fixture="$test_root/hook-repo"
 mkdir -p "$hook_fixture"
 git -C "$hook_fixture" init -q -b main
