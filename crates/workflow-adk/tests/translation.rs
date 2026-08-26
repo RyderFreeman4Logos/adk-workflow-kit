@@ -144,9 +144,9 @@ async fn bounded_cycle_honors_max_visits_not_adk_default() {
         .await
         .expect_err("bounded cycle must stop at IR max_visits");
     let rendered = err.to_string();
-    assert!(
-        rendered.contains('2'),
-        "cycle-count evidence must be the IR bound, got {rendered}"
+    assert_eq!(
+        rendered, "visit bound exceeded: max_visits=2",
+        "project diagnostic must retain IR max_visits=2, got {rendered}"
     );
     assert!(
         !rendered.contains("50"),

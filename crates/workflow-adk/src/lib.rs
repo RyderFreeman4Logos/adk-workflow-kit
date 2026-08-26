@@ -192,6 +192,7 @@ impl std::error::Error for TranslationError {}
 pub enum AdkGraphError {
     UnknownRoute { from: String, selector: String },
     RecursionLimit { steps: usize },
+    VisitBound { max_visits: usize },
     Failed,
 }
 
@@ -203,6 +204,9 @@ impl fmt::Display for AdkGraphError {
             }
             Self::RecursionLimit { steps } => {
                 write!(f, "recursion limit exceeded: {steps} steps")
+            }
+            Self::VisitBound { max_visits } => {
+                write!(f, "visit bound exceeded: max_visits={max_visits}")
             }
             Self::Failed => write!(f, "graph execution failed"),
         }
@@ -237,6 +241,7 @@ pub struct AdkGraph {
     input: StateInputMapper,
     output: StateOutputMapper,
     recursion_limit: usize,
+    visit_bound: Option<usize>,
     unmatched: Arc<Mutex<Option<(String, String)>>>,
 }
 
@@ -258,6 +263,11 @@ impl AdkGraph {
                 }
                 Ok(self.output.map(state))
             }
+            Err(GraphError::RecursionLimitExceeded(steps))
+                if self.visit_bound == Some(limit) && steps == limit =>
+            {
+                Err(AdkGraphError::VisitBound { max_visits: limit })
+            }
             Err(GraphError::RecursionLimitExceeded(steps)) => {
                 Err(AdkGraphError::RecursionLimit { steps })
             }
@@ -265,12 +275,15 @@ impl AdkGraph {
                 if let Some((from, selector)) = take_unmatched(&self.unmatched) {
                     return Err(AdkGraphError::UnknownRoute { from, selector });
                 }
+                let visit_bound = visit_bound_from_error(&error);
                 match error {
                     GraphError::UnknownRouteTarget(message) => Err(AdkGraphError::UnknownRoute {
                         from: String::new(),
                         selector: message,
                     }),
-                    _ => Err(AdkGraphError::Failed),
+                    _ => visit_bound.map_or(Err(AdkGraphError::Failed), |max_visits| {
+                        Err(AdkGraphError::VisitBound { max_visits })
+                    }),
                 }
             }
         }
@@ -346,7 +359,8 @@ impl AdkGraphTranslator {
                 });
             }
         }
-        let recursion_limit = ir_recursion_limit(ir);
+        let visit_bound = ir_visit_bound(ir);
+        let recursion_limit = visit_bound.unwrap_or(50);
         let unmatched = Arc::new(Mutex::new(None));
         let mut builder = GraphAgent::builder(ir.workflow_id().as_str())
             .channels(&["terminal"])
@@ -464,6 +478,7 @@ impl AdkGraphTranslator {
             input: StateInputMapper,
             output: StateOutputMapper,
             recursion_limit,
+            visit_bound,
             unmatched,
         })
     }
@@ -505,14 +520,28 @@ fn take_unmatched(unmatched: &Mutex<Option<(String, String)>>) -> Option<(String
     unmatched.lock().ok().and_then(|mut slot| slot.take())
 }
 
-fn ir_recursion_limit(ir: &workflow_ir::WorkflowIr) -> usize {
+fn visit_bound_from_error(error: &GraphError) -> Option<usize> {
+    let message = match error {
+        GraphError::Other(message) | GraphError::NodeExecutionFailed { message, .. } => message,
+        _ => return None,
+    };
+    message
+        .split_once("visit bound ")?
+        .1
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn ir_visit_bound(ir: &workflow_ir::WorkflowIr) -> Option<usize> {
     let bound: usize = ir
         .nodes()
         .iter()
         .filter_map(workflow_ir::IrNode::max_visits)
         .map(|visits| visits as usize)
         .sum();
-    if bound == 0 { 50 } else { bound }
+    (bound != 0).then_some(bound)
 }
 
 fn valid_path(path: &str) -> bool {
