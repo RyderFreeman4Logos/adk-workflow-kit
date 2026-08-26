@@ -417,6 +417,11 @@ impl WorkflowIr {
         encode_canonical(self, &mut hasher);
         CanonicalIrHash(hasher.finalize().into())
     }
+
+    /// Returns the canonical byte-wire version used for content identity.
+    pub fn canonical_wire_version(&self) -> u16 {
+        canonical_wire_version(self)
+    }
 }
 
 impl From<&WorkflowSpec> for WorkflowIr {
@@ -600,30 +605,7 @@ impl ChunkSink for Vec<u8> {
 
 fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
     sink.write_chunk(DOMAIN);
-    write_u16(
-        sink,
-        if !ir.resources.is_empty()
-            || ir
-                .nodes
-                .iter()
-                .any(|node| node.max_visits.is_some() || node.idempotent)
-            || ir.routes.iter().any(|route| route.default.is_some())
-        {
-            CANONICAL_IR_WIRE_VERSION_V5
-        } else if ir
-            .nodes
-            .iter()
-            .any(|node| node.kind == IrNodeKind::Approval)
-        {
-            CANONICAL_IR_WIRE_VERSION_V4
-        } else if ir.state.is_some() {
-            CANONICAL_IR_WIRE_VERSION_V3
-        } else if ir.routes.is_empty() {
-            CANONICAL_IR_WIRE_VERSION_V1
-        } else {
-            CANONICAL_IR_WIRE_VERSION_V2
-        },
-    );
+    write_u16(sink, canonical_wire_version(ir));
     write_u32(sink, ir.schema_version.tag());
     write_frame(sink, ir.workflow_id.as_str());
     write_frame(sink, &ir.workflow_version);
@@ -714,6 +696,30 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
             write_frame(sink, &resource.path);
             write_frame(sink, &resource.sha256);
         }
+    }
+}
+
+fn canonical_wire_version(ir: &WorkflowIr) -> u16 {
+    if !ir.resources.is_empty()
+        || ir
+            .nodes
+            .iter()
+            .any(|node| node.max_visits.is_some() || node.idempotent)
+        || ir.routes.iter().any(|route| route.default.is_some())
+    {
+        CANONICAL_IR_WIRE_VERSION_V5
+    } else if ir
+        .nodes
+        .iter()
+        .any(|node| node.kind == IrNodeKind::Approval)
+    {
+        CANONICAL_IR_WIRE_VERSION_V4
+    } else if ir.state.is_some() {
+        CANONICAL_IR_WIRE_VERSION_V3
+    } else if ir.routes.is_empty() {
+        CANONICAL_IR_WIRE_VERSION_V1
+    } else {
+        CANONICAL_IR_WIRE_VERSION_V2
     }
 }
 

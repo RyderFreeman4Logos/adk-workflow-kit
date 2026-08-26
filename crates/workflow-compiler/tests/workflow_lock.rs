@@ -1,7 +1,7 @@
 use workflow_compiler::{
     CompileError, CompiledPlan, GraphValidationError, WorkflowLock, WorkflowLockError, compile_str,
 };
-use workflow_ir::{CANONICAL_IR_WIRE_VERSION_V1, IrSchemaVersion};
+use workflow_ir::{CANONICAL_IR_WIRE_VERSION_V1, CANONICAL_IR_WIRE_VERSION_V5, IrSchemaVersion};
 
 const GOLDEN_WORKFLOW: &str = r#"
 schema_version = 1
@@ -95,6 +95,33 @@ from = "right"
 to = "done"
 "#;
 
+const BOUNDED_CYCLE_WORKFLOW: &str = r#"
+schema_version = 1
+
+[workflow]
+id = "bounded-cycle"
+version = "1"
+entry = "loop"
+
+[[nodes]]
+id = "done"
+kind = "terminal"
+
+[[nodes]]
+id = "loop"
+kind = "action"
+max_visits = 2
+idempotent = true
+
+[[edges]]
+from = "loop"
+to = "loop"
+
+[[edges]]
+from = "loop"
+to = "done"
+"#;
+
 fn compiled_plan(source_path: &str, source: &str) -> CompiledPlan {
     compile_str(source_path, source).expect("valid fixture should compile")
 }
@@ -182,6 +209,21 @@ fn projects_the_successful_plan_identity_exactly() {
     assert_eq!(lock.workflow_id(), plan.ir().workflow_id().as_str());
     assert_eq!(lock.workflow_version(), plan.ir().workflow_version());
     assert_eq!(lock.ir_hash(), expected_ir_hash(&plan));
+}
+
+#[test]
+fn records_v5_for_a_resource_free_bounded_cycle() {
+    let plan = compiled_plan("bounded-cycle.workflow.toml", BOUNDED_CYCLE_WORKFLOW);
+    let lock = workflow_lock(&plan);
+
+    assert_eq!(
+        lock.canonical_ir_wire_version(),
+        plan.ir().canonical_wire_version()
+    );
+    assert_eq!(
+        lock.canonical_ir_wire_version(),
+        CANONICAL_IR_WIRE_VERSION_V5
+    );
 }
 
 #[test]
