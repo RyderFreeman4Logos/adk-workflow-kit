@@ -1,5 +1,7 @@
 //! Domain-neutral Verbatim boundary for platform-owned workflow calls.
 
+pub mod model_profiles;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
