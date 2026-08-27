@@ -1,6 +1,7 @@
 //! Domain-neutral Verbatim boundary for platform-owned workflow calls.
 
 pub mod model_profiles;
+pub mod tool_bridge;
 
 use std::collections::BTreeMap;
 use std::fmt;

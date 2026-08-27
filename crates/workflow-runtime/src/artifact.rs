@@ -26,6 +26,19 @@ fn next_capability() -> NonZeroU64 {
 pub struct ArtifactId(String);
 
 impl ArtifactId {
+    /// Parses a lowercase hexadecimal SHA-256 artifact handle.
+    pub fn parse(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return None;
+        }
+        Some(Self(value))
+    }
+
     /// Returns the lowercase hexadecimal SHA-256 content identifier.
     pub fn as_str(&self) -> &str {
         &self.0

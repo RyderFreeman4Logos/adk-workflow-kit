@@ -2,6 +2,7 @@
 
 mod approval;
 mod artifact;
+mod bridge;
 mod bubblewrap;
 mod checkpoint;
 mod controller;
@@ -17,11 +18,16 @@ mod tool;
 mod workdir;
 
 pub use approval::{
-    ApprovalDecision, ApprovalGranted, ApprovalTerminal, ApprovalTerminalKind, evaluate_approval,
+    ApprovalDecision, ApprovalGranted, ApprovalLedger, ApprovalTerminal, ApprovalTerminalKind,
+    CallApprovalError, CallScopedApproval, argument_fingerprint, evaluate_approval,
 };
 pub use artifact::{
     ArtifactError, ArtifactErrorKind, ArtifactId, ArtifactPage, ArtifactStore,
     FilesystemArtifactStore, InMemoryArtifactStore, PageRequest, RetentionPolicy, StagedArtifact,
+};
+pub use bridge::{
+    CapabilityIntersection, CapabilityIntersectionError, EffectiveToolCapabilities, ToolBridge,
+    ToolBridgeError, ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolHandler,
 };
 pub use bubblewrap::{
     BubblewrapError, BubblewrapReceipt, BubblewrapRequest, BubblewrapRequestError,
@@ -59,8 +65,8 @@ pub use session::{
     RunSessionIds, SessionId, SessionIdentityError, SessionIdentityErrorKind, SessionRole,
 };
 pub use tool::{
-    StructuredOutputError, ToolEnvelope, ToolFailure, ToolFlags, ToolProvenance, ToolRegistration,
-    ToolRegistrationError, decode_structured_tool_output,
+    StructuredOutputError, ToolEnvelope, ToolFailure, ToolFlags, ToolIdempotency, ToolProvenance,
+    ToolRegistration, ToolRegistrationError, decode_structured_tool_output,
 };
 pub use workdir::{
     CleanupOutcome, Materialization, RunWorkdir, WorkdirError, WorkdirErrorKind, WorkdirId,
@@ -347,7 +353,7 @@ impl<T, D> RunResult<T, D> {
 }
 
 /// A sandbox capability class.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxCapability {
     /// Read access to declared filesystem resources.
