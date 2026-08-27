@@ -26,6 +26,46 @@ from = "agent"
 to = "done"
 "#;
 
+const HETEROGENEOUS_WORKFLOW: &str = r#"
+schema_version = 1
+[workflow]
+id = "m1-10-heterogeneous"
+version = "1"
+entry = "agent"
+[[nodes]]
+id = "agent"
+kind = "agent"
+[[nodes]]
+id = "action"
+kind = "action"
+[[nodes]]
+id = "validator"
+kind = "validator"
+[[nodes]]
+id = "registered"
+kind = "registered"
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "agent"
+to = "action"
+[[edges]]
+from = "action"
+to = "validator"
+[[edges]]
+from = "validator"
+to = "registered"
+[[edges]]
+from = "registered"
+to = "done"
+"#;
+
+const IDENTITY_WASM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/transform_identity.wasm"
+);
+
 fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_workflowctl"))
 }
@@ -165,6 +205,37 @@ fn fake_model_and_tool_execute_end_to_end_through_adk_events() {
     assert!(events.contains("model-ok"));
     assert!(events.contains("\"kind\":\"tool_completed\""));
     assert!(events.contains("tool-ok"));
+
+    fs::remove_dir_all(root).expect("test root must be removed");
+}
+
+#[test]
+fn profile_graph_runs_non_agent_nodes_through_the_wasm_backend() {
+    let root = temp_root("heterogeneous");
+    let mut profile_value = fake_profile();
+    profile_value["pure_transform"] = json!({"module": IDENTITY_WASM});
+    let (workflow, profile, runs) = write_fixture(&root, profile_value);
+    fs::write(&workflow, HETEROGENEOUS_WORKFLOW).expect("workflow fixture must write");
+
+    let output = run_adk(&workflow, &profile, &runs);
+    assert!(
+        output.status.success(),
+        "heterogeneous ADK run must succeed, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let node_outputs = fs::read_dir(run_root(&runs).join("artifacts"))
+        .expect("artifact directory must exist")
+        .filter_map(|entry| fs::read(entry.ok()?.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .find_map(|artifact| artifact.get("node_outputs").cloned())
+        .expect("terminal artifact must persist non-Agent node outputs");
+    for node in ["action", "validator", "registered"] {
+        assert_eq!(
+            node_outputs[node],
+            json!({"value": 7}),
+            "{node} must preserve the WASM transform output instead of a true placeholder"
+        );
+    }
 
     fs::remove_dir_all(root).expect("test root must be removed");
 }

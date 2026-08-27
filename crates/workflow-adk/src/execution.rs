@@ -22,10 +22,12 @@ use serde_json::Value;
 use workflow_compiler::compile_file;
 use workflow_runtime::{
     ArtifactStore, BackendCapabilities, CapabilityIntersection, FilesystemArtifactStore,
-    InMemoryArtifactStore, RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox,
-    SandboxCapability, ToolBridge, ToolBridgeError, ToolCallContext, ToolEnvelope, ToolFlags,
-    ToolHandler, ToolProvenance, ToolRegistration, WorkdirManager, verify_sandbox_capabilities,
+    InMemoryArtifactStore, PureTransformRequest, RequestedCapabilities, RunContext, RunId,
+    RunLimits, RunSandbox, SandboxCapability, ToolBridge, ToolBridgeError, ToolCallContext,
+    ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance, ToolRegistration, WorkdirManager,
+    verify_sandbox_capabilities,
 };
+use workflow_spec::{SourcePath, read_bounded_regular_file};
 
 use crate::{
     AdkGraphTranslator,
@@ -49,6 +51,7 @@ pub struct ExecutionProfileV1 {
     schema_version: u16,
     model: ModelWire,
     tool: Option<ToolWire>,
+    pure_transform: Option<PureTransformWire>,
     sandbox: SandboxWire,
 }
 
@@ -77,6 +80,12 @@ struct ToolWire {
     result: Value,
     #[serde(default)]
     required_capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PureTransformWire {
+    module: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -132,6 +141,10 @@ impl ExecutionProfileV1 {
             .tool
             .as_ref()
             .is_some_and(|tool| tool.name.is_empty())
+            || profile
+                .pure_transform
+                .as_ref()
+                .is_some_and(|transform| transform.module.is_empty())
         {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
         }
@@ -190,6 +203,19 @@ impl ExecutionProfileV1 {
             .bind_worker(&CredentialBroker::new())
             .map(Arc::new)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Model))
+    }
+
+    fn transform_module(&self) -> Result<Option<Vec<u8>>, ExecutionError> {
+        self.pure_transform
+            .as_ref()
+            .map(|transform| {
+                read_bounded_regular_file(
+                    &SourcePath::from(transform.module.as_str()),
+                    PureTransformRequest::MAX_MODULE_BYTES,
+                )
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))
+            })
+            .transpose()
     }
 
     fn profile_identity(&self) -> String {
@@ -419,6 +445,7 @@ impl ExecutionBackend {
 
         let compiled = compile_file(workflow.as_ref().to_string_lossy().as_ref())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Compile))?;
+        let transform_module = profile.transform_module()?;
         let model = profile.bind_model()?;
         let run_id = fresh_run_id()?;
         let context = RunContext::new(run_id.clone(), run_limits());
@@ -448,7 +475,7 @@ impl ExecutionBackend {
             })
             .collect::<BTreeMap<_, _>>();
         let graph = AdkGraphTranslator::new()
-            .translate_with_agents(&compiled, &agents)
+            .translate_profile(&compiled, &agents, transform_module.as_deref(), &input)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
         let mut mapper = AdkEventMapper::new(run_id.as_str(), compiled.ir().workflow_id().as_str())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
@@ -480,10 +507,29 @@ impl ExecutionBackend {
         if !state.contains_key("terminal") {
             return Err(ExecutionError::new(ExecutionErrorKind::Adk));
         }
+        let node_outputs = compiled
+            .ir()
+            .nodes()
+            .iter()
+            .filter(|node| {
+                !matches!(
+                    node.kind(),
+                    workflow_ir::IrNodeKind::Agent | workflow_ir::IrNodeKind::Terminal
+                )
+            })
+            .filter_map(|node| {
+                let id = node.id().as_str();
+                state
+                    .get(&format!("node:{id}"))
+                    .cloned()
+                    .map(|output| (id.to_owned(), output))
+            })
+            .collect::<BTreeMap<_, _>>();
         let terminal = serde_json::to_vec(&serde_json::json!({
             "run_id": run_id.as_str(),
             "status": "succeeded",
-            "terminal": state.get("terminal")
+            "terminal": state.get("terminal"),
+            "node_outputs": node_outputs
         }))
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
         let artifact_id = artifacts

@@ -3206,6 +3206,7 @@ dependencies = [
  "workflow-compiler",
  "workflow-ir",
  "workflow-runtime",
+ "workflow-spec",
 ]
 
 [[package]]

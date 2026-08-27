@@ -10,6 +10,7 @@ adk-rust.workspace = true
 workflow-runtime = { path = "../workflow-runtime" }
 workflow-compiler = { path = "../workflow-compiler" }
 workflow-ir = { path = "../workflow-ir" }
+workflow-spec = { path = "../workflow-spec" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
