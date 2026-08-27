@@ -1,6 +1,7 @@
 //! Domain-neutral Verbatim boundary for platform-owned workflow calls.
 
 pub mod events;
+pub mod execution;
 pub mod model_profiles;
 pub mod tool_bridge;
 
@@ -184,6 +185,9 @@ pub enum TranslationError {
     MissingEntry {
         node: String,
     },
+    MissingAgent {
+        node: String,
+    },
     ResolvedPlanMismatch {
         plan_ir_hash: String,
         ir_hash: String,
@@ -197,6 +201,7 @@ impl fmt::Display for TranslationError {
                 write!(f, "graph translation rejected {from:?} to {target:?}")
             }
             Self::MissingEntry { node } => write!(f, "graph translation missing entry {node:?}"),
+            Self::MissingAgent { node } => write!(f, "graph translation missing agent {node:?}"),
             Self::ResolvedPlanMismatch { .. } => {
                 write!(f, "graph translation rejected resolved plan mismatch")
             }
@@ -505,7 +510,16 @@ impl AdkGraphTranslator {
     }
 
     pub fn translate(&self, plan: &CompiledPlan) -> Result<AdkGraph, TranslationError> {
-        self.translate_ir(plan.ir(), None)
+        self.translate_ir(plan.ir(), None, None)
+    }
+
+    /// Translates with exact live agents supplied for every agent node.
+    pub fn translate_with_agents(
+        &self,
+        plan: &CompiledPlan,
+        agents: &BTreeMap<String, Arc<dyn Agent>>,
+    ) -> Result<AdkGraph, TranslationError> {
+        self.translate_ir(plan.ir(), None, Some(agents))
     }
 
     /// Translates a resolved runtime plan while keeping its canonical IR separate.
@@ -544,6 +558,7 @@ impl AdkGraphTranslator {
                     .map(|capability| (*capability).to_owned())
                     .collect(),
             }),
+            None,
         )
     }
 
@@ -551,6 +566,7 @@ impl AdkGraphTranslator {
         &self,
         ir: &workflow_ir::WorkflowIr,
         plan_binding: Option<PlanBinding>,
+        agents: Option<&BTreeMap<String, Arc<dyn Agent>>>,
     ) -> Result<AdkGraph, TranslationError> {
         let ids: std::collections::BTreeSet<&str> =
             ir.nodes().iter().map(|node| node.id().as_str()).collect();
@@ -597,10 +613,16 @@ impl AdkGraphTranslator {
             let id = node.id().as_str().to_owned();
             order.push(id.clone());
             if node.kind() == IrNodeKind::Agent {
-                let agent = DeterministicAgent::new(id.clone());
-                builder = builder.node(AgentNode::new(Arc::new(agent)).with_output_mapper(
-                    move |_| std::collections::HashMap::from([(format!("node:{id}"), json!(true))]),
-                ));
+                let agent: Arc<dyn Agent> = match agents {
+                    Some(agents) => agents
+                        .get(&id)
+                        .cloned()
+                        .ok_or_else(|| TranslationError::MissingAgent { node: id.clone() })?,
+                    None => Arc::new(DeterministicAgent::new(id.clone())),
+                };
+                builder = builder.node(AgentNode::new(agent).with_output_mapper(move |_| {
+                    std::collections::HashMap::from([(format!("node:{id}"), json!(true))])
+                }));
             } else {
                 let terminal = node.kind() == IrNodeKind::Terminal;
                 if terminal {

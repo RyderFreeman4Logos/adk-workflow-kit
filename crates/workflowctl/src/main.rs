@@ -6,6 +6,9 @@ use clap::{Arg, ArgAction, Command};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use workflow_adk::execution::{
+    ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1, ExecutionReceipt,
+};
 use workflow_compiler::{
     AuditDisposition, Diagnostic, SkillManifest, SkillResourceId, SkillRuntimeLock,
     SkillRuntimeManifest, WorkflowLock, audit_dependencies, compile_file, render_mermaid,
@@ -19,7 +22,7 @@ use workflow_runtime::{
 use workflow_spec::{SourcePath, read_bounded_regular_file};
 use workflow_testkit::{EvalEnvelope, EvalFixture, EvalInput, ReplayBundle, compile_eval};
 
-const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --current-workflow <PATH> --current-module <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
+const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> [--profile <PATH> | --module <PATH>] --input <JSON> --workdir <DIR>\n  resume --run-id <ID> --workdir <DIR>\n  inspect --run-id <ID> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --current-workflow <PATH> --current-module <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}";
 
 fn command() -> Command {
@@ -103,9 +106,15 @@ fn command() -> Command {
                 .arg(
                     Arg::new("module")
                         .long("module")
-                        .required(true)
                         .value_name("PATH")
                         .help("Transform module file"),
+                )
+                .arg(
+                    Arg::new("profile")
+                        .long("profile")
+                        .value_name("PATH")
+                        .conflicts_with("module")
+                        .help("ADK execution profile file"),
                 )
                 .arg(
                     Arg::new("input")
@@ -122,6 +131,8 @@ fn command() -> Command {
                         .help("Run workdir base directory"),
                 ),
         )
+        .subcommand(run_state_command("resume"))
+        .subcommand(run_state_command("inspect"))
         .subcommand(
             Command::new("explain-run")
                 .arg(
@@ -186,6 +197,22 @@ fn command() -> Command {
             ),
         )
         .subcommand(Command::new("audit"))
+}
+
+fn run_state_command(name: &'static str) -> Command {
+    Command::new(name)
+        .arg(
+            Arg::new("run-id")
+                .long("run-id")
+                .required(true)
+                .value_name("ID"),
+        )
+        .arg(
+            Arg::new("workdir")
+                .long("workdir")
+                .required(true)
+                .value_name("DIR"),
+        )
 }
 
 fn exit_diagnostic(diagnostic: Diagnostic, json: bool) -> ! {
@@ -640,6 +667,34 @@ fn write_command_result(envelope: &CliEnvelope, json: bool) {
     }
 }
 
+fn write_execution_receipt(receipt: &ExecutionReceipt, json: bool) {
+    if json {
+        match serde_json::to_string(receipt) {
+            Ok(rendered) => write_stdout(&format!("{rendered}\n"), json),
+            Err(_) => exit_diagnostic(Diagnostic::stdout_write_failed(), json),
+        }
+    } else {
+        write_stdout(
+            &format!(
+                "run_id={} status={} root={}\n",
+                receipt.run_id(),
+                receipt.status(),
+                receipt.run_root().display()
+            ),
+            json,
+        );
+    }
+}
+
+fn exit_execution_error(kind: ExecutionErrorKind, json: bool) -> ! {
+    let diagnostic = if kind == ExecutionErrorKind::InvalidProfile {
+        Diagnostic::run_unsupported_input()
+    } else {
+        Diagnostic::run_failed()
+    };
+    exit_diagnostic(diagnostic, json)
+}
+
 fn main() {
     let arguments = std::env::args_os().skip(1).collect::<Vec<OsString>>();
     let json = arguments
@@ -837,13 +892,35 @@ fn main() {
             let Some(path) = subcommand.get_one::<String>("path") else {
                 exit_invalid_arguments(json);
             };
-            let Some(module) = subcommand.get_one::<String>("module") else {
-                exit_invalid_arguments(json);
-            };
             let Some(input) = subcommand.get_one::<String>("input") else {
                 exit_invalid_arguments(json);
             };
             let Some(workdir) = subcommand.get_one::<String>("workdir") else {
+                exit_invalid_arguments(json);
+            };
+            if let Some(profile_path) = subcommand.get_one::<String>("profile") {
+                let profile_bytes = match read_bounded_regular_file(
+                    &SourcePath::from(profile_path.as_str()),
+                    64 * 1024,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
+                };
+                let profile = match ExecutionProfileV1::parse(&profile_bytes) {
+                    Ok(profile) => profile,
+                    Err(error) => exit_execution_error(error.kind(), json),
+                };
+                let input = match serde_json::from_str(input) {
+                    Ok(input) => input,
+                    Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
+                };
+                match ExecutionBackend::run(path, profile, input, workdir) {
+                    Ok(receipt) => write_execution_receipt(&receipt, json),
+                    Err(error) => exit_execution_error(error.kind(), json),
+                }
+                return;
+            }
+            let Some(module) = subcommand.get_one::<String>("module") else {
                 exit_invalid_arguments(json);
             };
             let plan = match build_run_plan(path.as_str(), module.as_str(), input.as_str()) {
@@ -898,6 +975,23 @@ fn main() {
                 | RunOutcome::PolicyDenied { .. } => {
                     exit_diagnostic(Diagnostic::run_failed(), json);
                 }
+            }
+        }
+        Some(("inspect", subcommand)) | Some(("resume", subcommand)) => {
+            let Some(run_id) = subcommand.get_one::<String>("run-id") else {
+                exit_invalid_arguments(json);
+            };
+            let Some(workdir) = subcommand.get_one::<String>("workdir") else {
+                exit_invalid_arguments(json);
+            };
+            let result = if matches.subcommand_name() == Some("resume") {
+                ExecutionBackend::resume(workdir, run_id)
+            } else {
+                ExecutionBackend::inspect(workdir, run_id)
+            };
+            match result {
+                Ok(receipt) => write_execution_receipt(&receipt, json),
+                Err(error) => exit_execution_error(error.kind(), json),
             }
         }
         Some(("test", subcommand)) => {
