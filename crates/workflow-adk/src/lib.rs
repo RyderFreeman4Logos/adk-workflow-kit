@@ -9,10 +9,12 @@ use std::fmt;
 use std::sync::Arc;
 
 use adk_rust::graph::prelude::{
-    AgentNode, END, ExecutionConfig, GraphAgent, GraphError, NodeOutput, START, State,
+    AgentNode, END, ExecutionConfig, GraphAgent, GraphError, NodeOutput, START, State, StreamEvent,
+    StreamMode,
 };
 use adk_rust::{
     Agent, AgentCapabilities, Content, Event, EventStream, InvocationContext, async_trait,
+    futures::StreamExt as _,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -209,6 +211,7 @@ pub enum AdkGraphError {
     UnknownRoute { from: String, selector: String },
     RecursionLimit { steps: usize },
     VisitBound { max_visits: usize },
+    Observation(events::AdkEventMappingErrorKind),
     Failed,
 }
 
@@ -224,6 +227,7 @@ impl fmt::Display for AdkGraphError {
             Self::VisitBound { max_visits } => {
                 write!(f, "visit bound exceeded: max_visits={max_visits}")
             }
+            Self::Observation(_) => write!(f, "ADK event observation failed"),
             Self::Failed => write!(f, "graph execution failed"),
         }
     }
@@ -323,6 +327,55 @@ impl AdkGraph {
             }
         }
     }
+
+    /// Executes the production graph stream and appends real ADK events through the project mapper.
+    pub async fn invoke_observed(
+        &self,
+        state: State,
+        config: ExecutionConfig,
+        mapper: &mut events::AdkEventMapper,
+    ) -> Result<State, AdkGraphError> {
+        let mut state = self.input.map(state);
+        state.retain(|key, _| !key.starts_with("visits:"));
+        let limit = self.recursion_limit.min(config.recursion_limit);
+        let mut config = config.with_recursion_limit(limit);
+        if let Some(binding) = &self.plan_binding {
+            config = config
+                .with_metadata("workflow.plan_hash", json!(binding.plan_hash))
+                .with_metadata("workflow.resume_identity", json!(binding.resume_identity))
+                .with_metadata(
+                    "workflow.effective_capabilities",
+                    json!(binding.effective_capabilities),
+                );
+        }
+
+        let mut stream = Box::pin(self.graph.stream(state, config, StreamMode::Custom));
+        let mut output = None;
+        while let Some(item) = stream.next().await {
+            match item.map_err(|_| AdkGraphError::Failed)? {
+                StreamEvent::Custom {
+                    node,
+                    event_type,
+                    data,
+                } if event_type == "agent_event" => {
+                    let event = serde_json::from_value::<Event>(data).map_err(|_| {
+                        AdkGraphError::Observation(
+                            events::AdkEventMappingErrorKind::InvalidObservation,
+                        )
+                    })?;
+                    mapper
+                        .map_adk_event(node, event)
+                        .map_err(|error| AdkGraphError::Observation(error.kind()))?;
+                }
+                StreamEvent::Done { state, .. } => output = Some(state),
+                _ => {}
+            }
+        }
+        output
+            .map(|state| self.output.map(state))
+            .ok_or(AdkGraphError::Failed)
+    }
+
     pub fn summary(&self) -> &GraphSummary {
         &self.summary
     }

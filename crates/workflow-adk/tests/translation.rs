@@ -1,11 +1,13 @@
 use adk_rust::graph::prelude::{ExecutionConfig, State};
 use serde_json::json;
+use workflow_adk::events::AdkEventMapper;
 use workflow_adk::{AdkGraphTranslator, TerminalOutcome, TranslationError};
 use workflow_compiler::{
     BindingCategory, BindingRef, CapabilitySet, PredicateRegistry, RegistryEntry, RegistryNotFound,
     RegistryResolutionError, ResolvedBinding, ResolvedRuntimePlan, RuntimePlanRegistry,
     RuntimePlanRequest, compile_str, compile_str_with_predicates,
 };
+use workflow_runtime::WorkflowRuntimeEventKindV1;
 
 const SEQUENTIAL: &str = r#"
 schema_version = 1
@@ -172,6 +174,35 @@ async fn translates_and_executes_sequential_plan_through_adk() {
         graph.terminal_outcome("done"),
         Some(TerminalOutcome::Succeeded)
     );
+}
+
+#[tokio::test]
+async fn production_graph_maps_real_adk_event_into_project_record() {
+    let plan = compile_str("observed.workflow.toml", SEQUENTIAL).expect("fixture compiles");
+    let graph = AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("translation succeeds");
+    let mut mapper = AdkEventMapper::new("run-observed", "sequential").unwrap();
+
+    let state = graph
+        .invoke_observed(
+            State::new(),
+            ExecutionConfig::new("observed-run"),
+            &mut mapper,
+        )
+        .await
+        .expect("production ADK stream is observed");
+
+    assert_eq!(state.get("terminal"), Some(&json!("done")));
+    let [event] = mapper.events() else {
+        panic!("the real ADK agent event must produce exactly one project record");
+    };
+    assert_eq!(event.kind(), WorkflowRuntimeEventKindV1::NodeCompleted);
+    assert_eq!(event.node_id(), Some("agent"));
+    assert_eq!(event.payload()["structured_output"]["role"], "assistant");
+    let persisted = serde_json::to_string(event).unwrap();
+    assert!(persisted.contains("ok"));
+    assert!(!persisted.contains("adk_rust"));
 }
 
 #[test]

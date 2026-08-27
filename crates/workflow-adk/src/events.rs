@@ -285,6 +285,29 @@ impl AdkEventMapper {
             .map_err(Into::into)
     }
 
+    /// Maps one real ADK stream event into a sanitized project event.
+    pub(crate) fn map_adk_event(
+        &mut self,
+        node_id: String,
+        event: adk_rust::Event,
+    ) -> Result<WorkflowRuntimeEventV1, AdkEventMappingError> {
+        let structured_output = event
+            .content()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation))?;
+        let mut observation = AdkRuntimeObservationV1::new(
+            event.id,
+            event.timestamp.to_rfc3339(),
+            AdkRuntimeObservationKindV1::NodeCompleted,
+        )
+        .with_node_id(node_id);
+        if let Some(output) = structured_output {
+            observation = observation.with_structured_output(output);
+        }
+        self.map(observation)
+    }
+
     /// Returns the complete immutable mapped event sequence.
     pub fn events(&self) -> &[WorkflowRuntimeEventV1] {
         self.log.events()

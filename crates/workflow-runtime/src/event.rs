@@ -583,16 +583,17 @@ fn validate_value(value: &Value) -> Result<(), WorkflowRuntimeEventError> {
 }
 
 fn sensitive_key(key: &str) -> bool {
-    matches!(
-        key.to_ascii_lowercase().as_str(),
-        "authorization"
-            | "api_key"
-            | "access_token"
-            | "refresh_token"
-            | "password"
-            | "secret"
-            | "token"
-            | "chain_of_thought"
-            | "reasoning"
-    )
+    let normalized: String = key
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| char::from(byte.to_ascii_lowercase()))
+        .collect();
+    let token_key = normalized.contains("token")
+        && !matches!(normalized.as_str(), "inputtokens" | "outputtokens");
+    normalized.contains("authorization")
+        || normalized.contains("apikey")
+        || normalized.contains("password")
+        || normalized.contains("secret")
+        || token_key
+        || matches!(normalized.as_str(), "chainofthought" | "reasoning")
 }

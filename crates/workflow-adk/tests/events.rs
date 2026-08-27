@@ -96,6 +96,9 @@ fn redacts_sensitive_fields_and_keeps_raw_observations_out_of_events() {
             .with_structured_output(json!({
                 "answer": "visible",
                 "password": "PASSWORD_SECRET",
+                "client_secret": "CLIENT_SECRET",
+                "auth_token": "AUTH_TOKEN",
+                "apiKey": "API_KEY",
                 "nested": {"chain_of_thought": "HIDDEN_REASONING"}
             }))
             .with_sensitive_snapshot(SensitiveSnapshot::chain_of_thought("RAW_REASONING")),
@@ -108,6 +111,9 @@ fn redacts_sensitive_fields_and_keeps_raw_observations_out_of_events() {
         "REQUEST_SECRET",
         "RESPONSE_SECRET",
         "PASSWORD_SECRET",
+        "CLIENT_SECRET",
+        "AUTH_TOKEN",
+        "API_KEY",
         "HIDDEN_REASONING",
         "RAW_REASONING",
     ] {
@@ -117,6 +123,13 @@ fn redacts_sensitive_fields_and_keeps_raw_observations_out_of_events() {
         value["payload"]["structured_output"]["password"],
         json!("<redacted>")
     );
+    for key in ["client_secret", "auth_token", "apiKey"] {
+        assert_eq!(
+            value["payload"]["structured_output"][key],
+            json!("<redacted>"),
+            "structured output did not redact {key}"
+        );
+    }
     assert_eq!(
         value["payload"]["structured_output"]["nested"]["chain_of_thought"],
         json!("<redacted>")
