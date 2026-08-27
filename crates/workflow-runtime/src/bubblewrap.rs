@@ -2,16 +2,16 @@
 //!
 //! `LinuxBubblewrapBackend` mirrors the deterministic fake backend's
 //! request/preflight/execute shape (see `workflow-testkit::sandbox`), but
-//! actually launches a `bwrap` process. The backend binds the caller's
-//! [`RunWorkdir`] roots: `input/`, `package/`, `skills/`, `refs/` read-only and
-//! `work/`, `out/`, `tmp/` read-write, with the host network namespace
-//! unshared by default. Network requests fail closed until a destination
+//! actually launches a `bwrap` process. The backend exposes immutable roots
+//! only with read capability, makes mutable roots writable only with write
+//! capability, and stages `/out` until success. The host network namespace is
+//! unshared by default; network requests fail closed until a destination
 //! allowlist can be enforced.
 
 use std::{
     collections::BTreeMap,
     fmt, fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::Component,
     process::{Command, ExitStatus, Stdio},
     sync::{
@@ -37,6 +37,8 @@ pub struct BubblewrapRequest<'a> {
     wall_time: Option<Duration>,
     /// Maximum combined stdout and stderr bytes retained from this process.
     output_limit: Option<usize>,
+    /// Bounded validated input forwarded to the sandboxed process.
+    stdin: Option<Vec<u8>>,
 }
 
 impl<'a> BubblewrapRequest<'a> {
@@ -48,6 +50,8 @@ impl<'a> BubblewrapRequest<'a> {
     pub const MAX_ENVIRONMENT_ENTRIES: usize = 128;
     /// Maximum combined byte length of environment names and values.
     pub const MAX_ENVIRONMENT_BYTES: usize = 32_768;
+    /// Maximum stdin payload accepted by the sandbox boundary.
+    pub const MAX_STDIN_BYTES: usize = 65_536;
 
     /// Validates a request without executing or touching the host.
     pub fn new(
@@ -122,6 +126,7 @@ impl<'a> BubblewrapRequest<'a> {
             requested,
             wall_time: None,
             output_limit: None,
+            stdin: None,
         })
     }
 
@@ -135,6 +140,17 @@ impl<'a> BubblewrapRequest<'a> {
     pub fn with_output_limit(mut self, bytes: std::num::NonZeroU64) -> Self {
         self.output_limit = Some(usize::try_from(bytes.get()).unwrap_or(usize::MAX));
         self
+    }
+
+    /// Forwards one bounded input payload to the sandboxed process.
+    pub fn with_stdin(mut self, bytes: &[u8]) -> Result<Self, BubblewrapRequestError> {
+        if bytes.len() > Self::MAX_STDIN_BYTES {
+            return Err(BubblewrapRequestError::new(
+                BubblewrapRequestErrorKind::StdinTooLarge,
+            ));
+        }
+        self.stdin = Some(bytes.to_vec());
+        Ok(self)
     }
 }
 
@@ -167,6 +183,8 @@ pub enum BubblewrapRequestErrorKind {
     TooManyEnvironmentVariables,
     /// The environment exceeded [`BubblewrapRequest::MAX_ENVIRONMENT_BYTES`].
     EnvironmentTooLarge,
+    /// Standard input exceeded [`BubblewrapRequest::MAX_STDIN_BYTES`].
+    StdinTooLarge,
 }
 
 /// A privacy-safe error produced while validating a bubblewrap request.
@@ -201,6 +219,7 @@ impl fmt::Display for BubblewrapRequestError {
             BubblewrapRequestErrorKind::EnvironmentTooLarge => {
                 "sandbox environment exceeds the limit"
             }
+            BubblewrapRequestErrorKind::StdinTooLarge => "sandbox stdin exceeds the limit",
         };
         formatter.write_str(message)
     }
@@ -246,16 +265,29 @@ impl LinuxBubblewrapBackend {
         {
             return Err(BubblewrapError::OutputLimitMissing);
         }
+        let staged_output = request
+            .requested
+            .contains(SandboxCapability::FilesystemWrite)
+            .then(|| request.workdir.stage_output())
+            .transpose()?;
 
         let mut command = Command::new("bwrap");
-        configure_bwrap(&mut command, request);
+        let output_path = staged_output.as_ref().map_or_else(
+            || request.workdir.out_dir(),
+            |staged| staged.path().to_owned(),
+        );
+        configure_bwrap(&mut command, request, &output_path);
 
         // Run in a fresh process group so a timeout or cancellation can kill
         // the whole sandboxed tree, not just the bwrap supervisor.
         use std::os::unix::process::CommandExt;
         command.process_group(0);
         command
-            .stdin(Stdio::null())
+            .stdin(if request.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -284,8 +316,23 @@ impl LinuxBubblewrapBackend {
         let output_budget = request.output_limit.map(OutputBudget::new).map(Arc::new);
         let stdout_reader = spawn_pipe_reader(stdout_pipe, output_budget.clone());
         let stderr_reader = spawn_pipe_reader(stderr_pipe, output_budget.clone());
+        let stdin_writer = match request.stdin.as_ref() {
+            Some(bytes) => match child.stdin.take() {
+                Some(pipe) => Some(spawn_stdin_writer(pipe, bytes.clone())),
+                None => {
+                    terminate_and_reap(&mut child, process_group);
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(BubblewrapError::Run {
+                        source: io::Error::other("bubblewrap stdin pipe was not captured"),
+                    });
+                }
+            },
+            None => None,
+        };
         if let Err(source) = publish_host_pid_witness(request, process_group) {
             terminate_and_reap(&mut child, process_group);
+            join_stdin_writer(stdin_writer);
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(BubblewrapError::Run { source });
@@ -310,6 +357,7 @@ impl LinuxBubblewrapBackend {
                 Ok(None) => thread::sleep(Duration::from_millis(10)),
                 Err(source) => {
                     terminate_and_reap(&mut child, process_group);
+                    join_stdin_writer(stdin_writer);
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
                     return Err(BubblewrapError::Run { source });
@@ -317,10 +365,14 @@ impl LinuxBubblewrapBackend {
             }
         };
 
+        join_stdin_writer(stdin_writer);
         let stdout = join_pipe_reader(stdout_reader)?;
         let stderr = join_pipe_reader(stderr_reader)?;
         if output_budget.is_some_and(|budget| budget.exceeded()) {
             return Err(BubblewrapError::OutputLimitExceeded);
+        }
+        if let (true, Some(staged_output)) = (status.success(), staged_output) {
+            staged_output.commit()?;
         }
 
         Ok(BubblewrapReceipt {
@@ -398,6 +450,18 @@ fn spawn_pipe_reader(
     })
 }
 
+fn spawn_stdin_writer(mut pipe: impl Write + Send + 'static, bytes: Vec<u8>) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let _ = pipe.write_all(&bytes);
+    })
+}
+
+fn join_stdin_writer(writer: Option<JoinHandle<()>>) {
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+}
+
 fn join_pipe_reader(reader: JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, BubblewrapError> {
     let result = reader.join().map_err(|_| BubblewrapError::Run {
         source: io::Error::other("bubblewrap output reader panicked"),
@@ -438,9 +502,13 @@ fn timed_out_status() -> ExitStatus {
 
 /// Builds the `bwrap` argv from a validated request.
 ///
-/// Mount order matters: system directories are bound read-only first, then the
-/// immutable payload roots read-only and the mutable roots read-write.
-fn configure_bwrap(command: &mut Command, request: &BubblewrapRequest<'_>) {
+/// Mount order matters: system directories are bound read-only first, followed
+/// by capability-conditioned payload and mutable roots.
+fn configure_bwrap(
+    command: &mut Command,
+    request: &BubblewrapRequest<'_>,
+    output_path: &std::path::Path,
+) {
     let root = request.workdir.root();
 
     // System read-only infrastructure so the sandbox can execute commands.
@@ -470,20 +538,35 @@ fn configure_bwrap(command: &mut Command, request: &BubblewrapRequest<'_>) {
     // executable request therefore keeps the host network namespace private.
     command.arg("--unshare-net");
 
-    // Immutable payload roots.
-    for dir in ["input", "package", "skills", "refs"] {
+    // Immutable payload roots are visible only to callers that declared read access.
+    if request
+        .requested
+        .contains(SandboxCapability::FilesystemRead)
+    {
+        for dir in ["input", "package", "skills", "refs"] {
+            command
+                .arg("--ro-bind")
+                .arg(root.join(dir))
+                .arg(format!("/{dir}"));
+        }
+    }
+    // Mutable roots remain visible for fixed working paths, but become writable
+    // only when the request declared write access.
+    let mutable_mount = if request
+        .requested
+        .contains(SandboxCapability::FilesystemWrite)
+    {
+        "--bind"
+    } else {
+        "--ro-bind"
+    };
+    for dir in ["work", "tmp"] {
         command
-            .arg("--ro-bind")
+            .arg(mutable_mount)
             .arg(root.join(dir))
             .arg(format!("/{dir}"));
     }
-    // Mutable roots.
-    for dir in ["work", "out", "tmp"] {
-        command
-            .arg("--bind")
-            .arg(root.join(dir))
-            .arg(format!("/{dir}"));
-    }
+    command.arg(mutable_mount).arg(output_path).arg("/out");
 
     // Declared environment plus a usable PATH inside the sandbox.
     command

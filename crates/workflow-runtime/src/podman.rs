@@ -141,7 +141,13 @@ impl RootlessPodmanBackend {
     pub fn execute(&self, request: &PodmanRequest<'_>) -> Result<PodmanReceipt, PodmanError> {
         request.workdir.verify_sandbox_mounts()?;
         verify_sandbox_capabilities(&request.requested, &self.capabilities)?;
-        let output = Command::new("podman")
+        let staged_output = request
+            .requested
+            .contains(SandboxCapability::FilesystemWrite)
+            .then(|| request.workdir.stage_output())
+            .transpose()?;
+        let mut command = Command::new("podman");
+        command
             .args([
                 "run",
                 "--rm",
@@ -153,42 +159,40 @@ impl RootlessPodmanBackend {
                 "--security-opt=no-new-privileges",
             ])
             .arg("--workdir")
-            .arg("/work")
+            .arg("/work");
+        if request
+            .requested
+            .contains(SandboxCapability::FilesystemRead)
+        {
+            for dir in ["input", "package", "skills", "refs"] {
+                command.args(["--volume"]).arg(format!(
+                    "{}:/{dir}:ro",
+                    request.workdir.root().join(dir).display()
+                ));
+            }
+        }
+        let mutable_mode = if request
+            .requested
+            .contains(SandboxCapability::FilesystemWrite)
+        {
+            "rw"
+        } else {
+            "ro"
+        };
+        for dir in ["work", "tmp"] {
+            command.args(["--volume"]).arg(format!(
+                "{}:/{dir}:{mutable_mode}",
+                request.workdir.root().join(dir).display()
+            ));
+        }
+        let output_path = staged_output.as_ref().map_or_else(
+            || request.workdir.out_dir(),
+            |staged| staged.path().to_owned(),
+        );
+        command
             .args(["--volume"])
-            .arg(format!(
-                "{}:/input:ro",
-                request.workdir.root().join("input").display()
-            ))
-            .args(["--volume"])
-            .arg(format!(
-                "{}:/package:ro",
-                request.workdir.root().join("package").display()
-            ))
-            .args(["--volume"])
-            .arg(format!(
-                "{}:/skills:ro",
-                request.workdir.root().join("skills").display()
-            ))
-            .args(["--volume"])
-            .arg(format!(
-                "{}:/refs:ro",
-                request.workdir.root().join("refs").display()
-            ))
-            .args(["--volume"])
-            .arg(format!(
-                "{}:/work",
-                request.workdir.root().join("work").display()
-            ))
-            .args(["--volume"])
-            .arg(format!(
-                "{}:/out",
-                request.workdir.root().join("out").display()
-            ))
-            .args(["--volume"])
-            .arg(format!(
-                "{}:/tmp",
-                request.workdir.root().join("tmp").display()
-            ))
+            .arg(format!("{}:/out:{mutable_mode}", output_path.display()));
+        let output = command
             .args([
                 "--env",
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -203,6 +207,9 @@ impl RootlessPodmanBackend {
             .args(["sh", "-c", &request.command])
             .output()
             .map_err(|source| PodmanError::Spawn { source })?;
+        if let (true, Some(staged_output)) = (output.status.success(), staged_output) {
+            staged_output.commit()?;
+        }
         Ok(PodmanReceipt { output })
     }
 }
@@ -450,15 +457,20 @@ mod tests {
             }
             assert!(output.lines().any(|line| line == digest));
             for mount in [
-                format!("{}:/input:ro", workdir.root().join("input").display()),
-                format!("{}:/package:ro", workdir.root().join("package").display()),
-                format!("{}:/skills:ro", workdir.root().join("skills").display()),
-                format!("{}:/refs:ro", workdir.root().join("refs").display()),
-                format!("{}:/work", workdir.root().join("work").display()),
-                format!("{}:/out", workdir.root().join("out").display()),
-                format!("{}:/tmp", workdir.root().join("tmp").display()),
+                format!("{}:/work:ro", workdir.root().join("work").display()),
+                format!("{}:/out:ro", workdir.root().join("out").display()),
+                format!("{}:/tmp:ro", workdir.root().join("tmp").display()),
             ] {
                 assert!(output.lines().any(|line| line == mount));
+            }
+            for private in ["/input", "/package", "/skills", "/refs"] {
+                assert!(
+                    !output
+                        .lines()
+                        .any(|line| line.ends_with(private)
+                            || line.ends_with(&format!("{private}:ro"))),
+                    "undeclared read mount leaked: {private}"
+                );
             }
         });
     }

@@ -157,6 +157,7 @@ fn registered_scripts_run_in_a_child_sandbox_with_narrowed_capabilities() {
     let sandbox = script_sandbox(&base, "child", b"print('child-sandbox')\n");
     let child = sandbox
         .child([
+            SandboxCapability::FilesystemRead,
             SandboxCapability::ProcessSpawn,
             SandboxCapability::OutputBytes,
         ])
@@ -170,6 +171,7 @@ fn registered_scripts_run_in_a_child_sandbox_with_narrowed_capabilities() {
     assert_eq!(
         child.capabilities(),
         &[
+            SandboxCapability::FilesystemRead,
             SandboxCapability::ProcessSpawn,
             SandboxCapability::OutputBytes
         ]
@@ -183,7 +185,11 @@ fn registered_scripts_run_in_a_child_sandbox_with_narrowed_capabilities() {
 #[test]
 fn sigkill_retains_the_run_directory_without_output_artifacts() {
     let base = TestBase::new();
-    let sandbox = script_sandbox(&base, "sigkill", b"import os\nos.kill(os.getpid(), 9)\n");
+    let sandbox = script_sandbox(
+        &base,
+        "sigkill",
+        b"import os\nwith open('/out/partial', 'wb') as artifact:\n    artifact.write(b'partial')\n    artifact.flush()\n    os.fsync(artifact.fileno())\nos.kill(os.getpid(), 9)\n",
+    );
     let root = sandbox.workdir().root().to_path_buf();
     let child = sandbox
         .child([

@@ -17,13 +17,20 @@ use workflow_runtime::{
     ToolProvenance, ToolRegistration, WorkdirManager,
 };
 
-const SCRIPT: &[u8] =
-    b"from pathlib import Path\nPath('adapter-marker').write_text('sandbox')\nprint('ok')\n";
+const SCRIPT: &[u8] = b"import json, sys\nfrom pathlib import Path\nvalue = json.load(sys.stdin)['value']\nPath('adapter-marker').write_text('sandbox')\nprint(json.dumps({'value': value}))\n";
+const READ_ONLY_SCRIPT: &[u8] = b"import json, sys\nvalue = json.load(sys.stdin)['value']\nprint(json.dumps({'value': value}))\n";
+const INVALID_OUTPUT_SCRIPT: &[u8] =
+    b"import json, sys\njson.load(sys.stdin)\nprint(json.dumps({'value': 42}))\n";
+const MISMATCH_SCRIPT: &[u8] = b"from pathlib import Path\nPath('mismatch-marker').write_text('spawned')\nprint('{\"value\":\"wrong\"}')\n";
+const SCRIPT_SHA256: &str =
+    "sha256:845ac6ab6fe2dac6aa1f3ef0fd2d7288bd4b68453552998c5504b466e138434f";
+const READ_ONLY_SCRIPT_SHA256: &str =
+    "sha256:aaa8acf1bf003612061fb9c497d594f21d8b637e9a4b5765b6e6a7124ae04869";
+const INVALID_OUTPUT_SCRIPT_SHA256: &str =
+    "sha256:1b1b2c6c69ded4162b110c4c69520f4c5eebbaf91dd39692328393d9ed9f4503";
 const SCHEMA: &[u8] = br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}"#;
 const SKILL_MARKDOWN: &[u8] =
     b"---\nname: valid-skill\ndescription: A bounded skill.\n---\n# Instructions\n";
-const SCRIPT_SHA256: &str =
-    "sha256:e3727a4aca441dfdaa881bc93aade3d38b42f63c929ca342f900a4d4667117bf";
 const SCHEMA_SHA256: &str =
     "sha256:50eb7b6f8f62ad5dd7fa7904c86da5043e69708b67afce66e0457361a1793a92";
 
@@ -53,7 +60,20 @@ impl Drop for TestBase {
     }
 }
 
-fn manifest(capabilities: &[&str]) -> (SkillRuntimeManifest, SkillRuntimeLock) {
+fn manifest(
+    script: &[u8],
+    capabilities: &[SandboxCapability],
+) -> (SkillRuntimeManifest, SkillRuntimeLock) {
+    let script_sha256 = match script {
+        SCRIPT => SCRIPT_SHA256,
+        READ_ONLY_SCRIPT => READ_ONLY_SCRIPT_SHA256,
+        INVALID_OUTPUT_SCRIPT => INVALID_OUTPUT_SCRIPT_SHA256,
+        _ => panic!("unknown script fixture"),
+    };
+    let capabilities = capabilities
+        .iter()
+        .map(SandboxCapability::as_str)
+        .collect::<Vec<_>>();
     let manifest = SkillRuntimeManifest::parse(
         format!(
             "schema_version = 1\n\
@@ -64,7 +84,7 @@ fn manifest(capabilities: &[&str]) -> (SkillRuntimeManifest, SkillRuntimeLock) {
              id = \"script\"\n\
              path = \"scripts/adapter.py\"\n\
              runtime = \"python3\"\n\
-             sha256 = \"{SCRIPT_SHA256}\"\n\
+             sha256 = \"{script_sha256}\"\n\
              input_schema = \"references/schema.json\"\n\
              output_schema = \"references/schema.json\"\n\
              capabilities = {:?}\n\
@@ -80,14 +100,19 @@ fn manifest(capabilities: &[&str]) -> (SkillRuntimeManifest, SkillRuntimeLock) {
     let lock = SkillRuntimeLock::try_from_declared_bytes(
         &manifest,
         SKILL_MARKDOWN,
-        [("script", SCRIPT)],
+        [("script", script)],
         [(&schema_id, SCHEMA)],
     )
     .expect("fixture lock must bind declared script");
     (manifest, lock)
 }
 
-fn sandbox(base: &TestBase, id: &str, capabilities: Vec<SandboxCapability>) -> RunSandbox {
+fn sandbox(
+    base: &TestBase,
+    id: &str,
+    script: &[u8],
+    capabilities: Vec<SandboxCapability>,
+) -> RunSandbox {
     let context = RunContext::new(
         RunId::new(id.to_owned()).expect("fixture run ID"),
         RunLimits::new(
@@ -105,7 +130,7 @@ fn sandbox(base: &TestBase, id: &str, capabilities: Vec<SandboxCapability>) -> R
         .materialize(
             context.run_id(),
             &Materialization {
-                skills: Some(SCRIPT.to_vec()),
+                skills: Some(script.to_vec()),
                 ..Materialization::default()
             },
         )
@@ -113,43 +138,31 @@ fn sandbox(base: &TestBase, id: &str, capabilities: Vec<SandboxCapability>) -> R
     RunSandbox::new(context, workdir, capabilities).expect("fixture sandbox must bind")
 }
 
-fn registration() -> ToolRegistration {
+fn registration(capabilities: &[SandboxCapability]) -> ToolRegistration {
     ToolRegistration::for_types::<Value, Value>(
         "script",
         ToolProvenance::new("skill.adapter", "1.0.0"),
         ToolFlags::new(true, true, true),
     )
     .expect("fixture registration")
-    .with_required_capabilities([
-        SandboxCapability::ProcessSpawn,
-        SandboxCapability::OutputBytes,
-    ])
+    .with_required_capabilities(capabilities.iter().copied())
 }
 
-#[test]
-fn adk_adapter_invokes_registered_script_in_its_run_sandbox() {
-    let base = TestBase::new();
-    let (manifest, lock) = manifest(&["process.spawn", "limit.output_bytes"]);
-    let sandbox = sandbox(
-        &base,
-        "adapter-invoke",
-        vec![
-            SandboxCapability::ProcessSpawn,
-            SandboxCapability::OutputBytes,
-        ],
-    );
-    let marker = sandbox.workdir().work_dir().join("adapter-marker");
+fn adapter(
+    base: &TestBase,
+    id: &str,
+    locked_script: &[u8],
+    materialized_script: &[u8],
+    capabilities: Vec<SandboxCapability>,
+) -> (AdkToolBridge<InMemoryArtifactStore>, PathBuf) {
+    let (manifest, lock) = manifest(locked_script, &capabilities);
+    let sandbox = sandbox(base, id, materialized_script, capabilities.clone());
+    let work = sandbox.workdir().work_dir();
     let script = RegisteredSkillScript::new(manifest, lock, "script");
     let adapter = AdkToolBridge::for_registered_script(
         sandbox,
-        registration(),
-        CapabilityIntersection::all_for_tool(
-            "script",
-            [
-                SandboxCapability::ProcessSpawn,
-                SandboxCapability::OutputBytes,
-            ],
-        ),
+        registration(&capabilities),
+        CapabilityIntersection::all_for_tool("script", capabilities),
         None,
         InMemoryArtifactStore::new(
             NonZeroU64::new(4_096).expect("positive"),
@@ -158,28 +171,48 @@ fn adk_adapter_invokes_registered_script_in_its_run_sandbox() {
         script,
     )
     .expect("adapter production seam must construct the bridge");
+    (adapter, work)
+}
 
+fn invoke(adapter: &AdkToolBridge<InMemoryArtifactStore>, call_id: &str, value: &str) -> Value {
     let result = adapter
         .invoke(ToolCall::new(
             "script",
-            "call-1",
+            call_id,
             "actor-1",
-            json!({ "value": "ok" }),
+            json!({ "value": value }),
         ))
-        .expect("ADK adapter must invoke the registered script");
+        .expect("registered script invocation must succeed");
+    match result {
+        ToolEnvelope::Success { payload, .. } => payload,
+        other => panic!("expected successful tool envelope, got {other:?}"),
+    }
+}
+
+#[test]
+fn adk_adapter_invokes_registered_script_in_its_run_sandbox() {
+    let base = TestBase::new();
+    let capabilities = vec![
+        SandboxCapability::FilesystemRead,
+        SandboxCapability::FilesystemWrite,
+        SandboxCapability::ProcessSpawn,
+        SandboxCapability::OutputBytes,
+    ];
+    let (adapter, work) = adapter(&base, "adapter-invoke", SCRIPT, SCRIPT, capabilities);
+    let payload = invoke(&adapter, "call-1", "ok");
 
     assert!(
-        marker.is_file(),
+        work.join("adapter-marker").is_file(),
         "script must run in the run sandbox workdir"
     );
-    assert!(matches!(result, ToolEnvelope::Success { .. }));
+    assert_eq!(payload, json!({ "value": "ok" }));
 }
 
 #[test]
 fn adapter_registered_script_api_denies_unknown_script_id() {
     let base = TestBase::new();
-    let (manifest, lock) = manifest(&[]);
-    let sandbox = sandbox(&base, "unknown-script", Vec::new());
+    let (manifest, lock) = manifest(SCRIPT, &[]);
+    let sandbox = sandbox(&base, "unknown-script", SCRIPT, Vec::new());
     let script = RegisteredSkillScript::new(manifest, lock, "unknown");
 
     let error = script
@@ -195,10 +228,11 @@ fn adapter_registered_script_api_denies_unknown_script_id() {
 #[test]
 fn adapter_registered_script_api_cannot_expand_child_capabilities() {
     let base = TestBase::new();
-    let (manifest, lock) = manifest(&["network"]);
+    let (manifest, lock) = manifest(SCRIPT, &[SandboxCapability::Network]);
     let sandbox = sandbox(
         &base,
         "child-capabilities",
+        SCRIPT,
         vec![
             SandboxCapability::ProcessSpawn,
             SandboxCapability::OutputBytes,
@@ -213,5 +247,135 @@ fn adapter_registered_script_api_cannot_expand_child_capabilities() {
     assert_eq!(
         error.kind(),
         ScriptExecutionErrorKind::Sandbox(SandboxExecutionError::CapabilityDenied)
+    );
+}
+
+#[test]
+fn adk_adapter_denies_undeclared_filesystem_write() {
+    let base = TestBase::new();
+    let capabilities = vec![
+        SandboxCapability::FilesystemRead,
+        SandboxCapability::ProcessSpawn,
+        SandboxCapability::OutputBytes,
+    ];
+    let (adapter, work) = adapter(&base, "adapter-no-write", SCRIPT, SCRIPT, capabilities);
+
+    let result = adapter
+        .invoke(ToolCall::new(
+            "script",
+            "call-no-write",
+            "actor-1",
+            json!({ "value": "blocked" }),
+        ))
+        .expect("sandbox denial must return a typed failure envelope");
+
+    assert!(matches!(result, ToolEnvelope::Failure { .. }));
+    assert!(!work.join("adapter-marker").exists());
+}
+
+#[test]
+fn adk_adapter_denies_undeclared_filesystem_read() {
+    let base = TestBase::new();
+    let capabilities = vec![
+        SandboxCapability::ProcessSpawn,
+        SandboxCapability::OutputBytes,
+    ];
+    let (adapter, _) = adapter(
+        &base,
+        "adapter-no-read",
+        READ_ONLY_SCRIPT,
+        READ_ONLY_SCRIPT,
+        capabilities,
+    );
+
+    let result = adapter
+        .invoke(ToolCall::new(
+            "script",
+            "call-no-read",
+            "actor-1",
+            json!({ "value": "blocked" }),
+        ))
+        .expect("sandbox denial must return a typed failure envelope");
+
+    assert!(matches!(result, ToolEnvelope::Failure { .. }));
+}
+
+#[test]
+fn registered_script_rejects_materialized_bytes_that_do_not_match_its_lock() {
+    let base = TestBase::new();
+    let capabilities = vec![
+        SandboxCapability::FilesystemRead,
+        SandboxCapability::FilesystemWrite,
+        SandboxCapability::ProcessSpawn,
+        SandboxCapability::OutputBytes,
+    ];
+    let (manifest, lock) = manifest(SCRIPT, &capabilities);
+    let sandbox = sandbox(&base, "adapter-mismatch", MISMATCH_SCRIPT, capabilities);
+    let marker = sandbox.workdir().work_dir().join("mismatch-marker");
+    let script = RegisteredSkillScript::new(manifest, lock, "script");
+
+    let error = script
+        .execute(&sandbox, br#"{"value":"ok"}"#)
+        .expect_err("mismatched materialized bytes must fail before spawn");
+
+    assert_eq!(
+        error.kind(),
+        ScriptExecutionErrorKind::Sandbox(SandboxExecutionError::ExecutionFailed)
+    );
+    assert!(!marker.exists(), "mismatched script bytes must never spawn");
+}
+
+#[test]
+fn validated_input_json_reaches_the_registered_script() {
+    let base = TestBase::new();
+    let capabilities = vec![
+        SandboxCapability::FilesystemRead,
+        SandboxCapability::ProcessSpawn,
+        SandboxCapability::OutputBytes,
+    ];
+    let (adapter, _) = adapter(
+        &base,
+        "adapter-input",
+        READ_ONLY_SCRIPT,
+        READ_ONLY_SCRIPT,
+        capabilities,
+    );
+
+    assert_eq!(
+        invoke(&adapter, "call-first", "first"),
+        json!({ "value": "first" })
+    );
+    assert_eq!(
+        invoke(&adapter, "call-second", "second"),
+        json!({ "value": "second" })
+    );
+}
+
+#[test]
+fn lock_bound_output_schema_rejects_invalid_script_stdout() {
+    let base = TestBase::new();
+    let capabilities = vec![
+        SandboxCapability::FilesystemRead,
+        SandboxCapability::ProcessSpawn,
+        SandboxCapability::OutputBytes,
+    ];
+    let (adapter, _) = adapter(
+        &base,
+        "adapter-invalid-output",
+        INVALID_OUTPUT_SCRIPT,
+        INVALID_OUTPUT_SCRIPT,
+        capabilities,
+    );
+
+    assert!(
+        adapter
+            .invoke(ToolCall::new(
+                "script",
+                "call-invalid-output",
+                "actor-1",
+                json!({ "value": "ok" }),
+            ))
+            .is_err(),
+        "schema-invalid stdout must fail before ToolEnvelope publication"
     );
 }

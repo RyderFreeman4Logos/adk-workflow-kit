@@ -76,6 +76,9 @@ pub struct ScriptPlan {
     runtime: ScriptRuntime,
     path: String,
     input_sha256: String,
+    input_json: Vec<u8>,
+    script_sha256: String,
+    output_schema: Value,
     capabilities: Vec<SandboxCapability>,
 }
 
@@ -105,12 +108,26 @@ impl ScriptPlan {
         let child = sandbox
             .child(self.capabilities.iter().copied())
             .map_err(ScriptExecutionError::sandbox)?;
-        match self.runtime {
-            // RunWorkdir materializes the already lock-bound script bytes at this fixed path.
-            ScriptRuntime::Python3 => child
-                .execute_python_script("content.bin")
-                .map_err(ScriptExecutionError::sandbox),
+        let receipt = match self.runtime {
+            // The workdir's single materialized script is digest-checked against
+            // the selected lock entry immediately before backend spawn.
+            ScriptRuntime::Python3 => child.execute_registered_python_script(
+                "content.bin",
+                &self.script_sha256,
+                &self.input_json,
+            ),
         }
+        .map_err(ScriptExecutionError::sandbox)?;
+        if receipt.exit_success() {
+            let output = serde_json::from_slice::<Value>(receipt.stdout())
+                .map_err(|_| ScriptExecutionError::invalid_output())?;
+            let validator = jsonschema::validator_for(&self.output_schema)
+                .map_err(|_| ScriptExecutionError::invalid_output())?;
+            if !validator.is_valid(&output) {
+                return Err(ScriptExecutionError::invalid_output());
+            }
+        }
+        Ok(receipt)
     }
 }
 
@@ -121,6 +138,8 @@ pub enum ScriptExecutionErrorKind {
     Denied(ScriptDeniedKind),
     /// The run sandbox rejected or failed the child execution.
     Sandbox(SandboxExecutionError),
+    /// Successful script stdout was not valid lock-bound JSON output.
+    InvalidOutput,
 }
 
 /// A privacy-safe error from registered Skill script execution.
@@ -142,6 +161,12 @@ impl ScriptExecutionError {
         }
     }
 
+    fn invalid_output() -> Self {
+        Self {
+            kind: ScriptExecutionErrorKind::InvalidOutput,
+        }
+    }
+
     /// Returns the stable, payload-free failure category.
     pub const fn kind(self) -> ScriptExecutionErrorKind {
         self.kind
@@ -153,6 +178,7 @@ impl fmt::Display for ScriptExecutionError {
         formatter.write_str(match self.kind {
             ScriptExecutionErrorKind::Denied(_) => "registered script execution denied",
             ScriptExecutionErrorKind::Sandbox(_) => "registered script sandbox execution failed",
+            ScriptExecutionErrorKind::InvalidOutput => "registered script output is invalid",
         })
     }
 }
@@ -314,11 +340,19 @@ pub fn plan_script_execution(
     if !validator.is_valid(&input) {
         return Err(ScriptDenied::new(ScriptDeniedKind::InvalidInput));
     }
+    let Some(output_schema_bytes) = lock.schemas.get(&script.output_schema) else {
+        return Err(ScriptDenied::new(ScriptDeniedKind::LockMismatch));
+    };
+    let output_schema = serde_json::from_slice::<Value>(output_schema_bytes)
+        .map_err(|_| ScriptDenied::new(ScriptDeniedKind::InvalidPolicy))?;
     Ok(ScriptPlan {
         script_id: script.id.clone(),
         runtime: ScriptRuntime::Python3,
         path: script.path.clone(),
         input_sha256: digest(input_json),
+        input_json: input_json.to_vec(),
+        script_sha256: script.sha256.clone(),
+        output_schema,
         capabilities: script.capabilities.clone(),
     })
 }
@@ -1109,7 +1143,7 @@ mod tests {
     const SCHEMA: &[u8] = br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}"#;
     const SKILL_MARKDOWN: &[u8] =
         b"---\nname: valid-skill\ndescription: A bounded skill.\n---\n# Instructions\n";
-    const SCRIPT_BYTES: &[u8] = b"print('ok')\n";
+    const SCRIPT_BYTES: &[u8] = b"import json, sys\nprint(json.dumps(json.load(sys.stdin)))\n";
 
     fn fixture_with_runtime(runtime: &str) -> (SkillRuntimeManifest, SkillRuntimeLock) {
         let skill_id = SkillId::new("valid-skill").expect("fixture skill ID");
@@ -1334,10 +1368,12 @@ mod tests {
     #[test]
     fn registered_script_plan_executes_in_a_child_sandbox() {
         let (manifest, lock) = execution_fixture(vec![
+            SandboxCapability::FilesystemRead,
             SandboxCapability::ProcessSpawn,
             SandboxCapability::OutputBytes,
         ]);
         let sandbox = sandbox(vec![
+            SandboxCapability::FilesystemRead,
             SandboxCapability::ProcessSpawn,
             SandboxCapability::OutputBytes,
         ]);
@@ -1346,7 +1382,7 @@ mod tests {
             execute_registered_script(&manifest, &lock, "script", br#"{"value":"ok"}"#, &sandbox)
                 .expect("registered plan must execute in a child sandbox");
 
-        assert_eq!(receipt.stdout(), b"ok\n");
+        assert_eq!(receipt.stdout(), b"{\"value\": \"ok\"}\n");
     }
 
     #[test]

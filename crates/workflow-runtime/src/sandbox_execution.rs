@@ -2,9 +2,11 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt,
+    fmt, fs,
     path::{Component, Path},
 };
+
+use sha2::{Digest, Sha256};
 
 use crate::{
     BackendCapabilities, BubblewrapError, BubblewrapReceipt, BubblewrapRequest,
@@ -98,6 +100,7 @@ impl RunSandbox {
                 SandboxCapability::ProcessSpawn,
                 SandboxCapability::OutputBytes,
             ],
+            None,
         )
     }
 
@@ -120,16 +123,23 @@ impl RunSandbox {
         &self,
         command: String,
         capabilities: impl IntoIterator<Item = SandboxCapability>,
+        stdin: Option<&[u8]>,
     ) -> Result<BubblewrapReceipt, SandboxExecutionError> {
         let capabilities = capabilities.into_iter().collect::<BTreeSet<_>>();
         if !capabilities.is_subset(&self.capabilities) {
             return Err(SandboxExecutionError::CapabilityDenied);
         }
         let requested = crate::RequestedCapabilities::new(capabilities);
-        let request = BubblewrapRequest::new(command, &self.workdir, BTreeMap::new(), requested)
-            .map_err(|_| SandboxExecutionError::InvalidCommand)?
-            .with_wall_time(self.context.limits().max_tool_time_ms().get())
-            .with_output_limit(self.context.limits().max_tool_output_bytes());
+        let mut request =
+            BubblewrapRequest::new(command, &self.workdir, BTreeMap::new(), requested)
+                .map_err(|_| SandboxExecutionError::InvalidCommand)?
+                .with_wall_time(self.context.limits().max_tool_time_ms().get())
+                .with_output_limit(self.context.limits().max_tool_output_bytes());
+        if let Some(stdin) = stdin {
+            request = request
+                .with_stdin(stdin)
+                .map_err(|_| SandboxExecutionError::InvalidCommand)?;
+        }
         self.backend
             .execute(&request)
             .map_err(SandboxExecutionError::from)
@@ -158,7 +168,28 @@ impl ChildSandbox<'_> {
         }
         let command = format!("python3 '/skills/{path}'");
         self.parent
-            .execute(command, self.capabilities.iter().copied())
+            .execute(command, self.capabilities.iter().copied(), None)
+    }
+
+    /// Executes a lock-bound registered Python script with validated JSON on stdin.
+    pub fn execute_registered_python_script(
+        &self,
+        path: &str,
+        expected_sha256: &str,
+        input_json: &[u8],
+    ) -> Result<BubblewrapReceipt, SandboxExecutionError> {
+        if !is_script_path(path) {
+            return Err(SandboxExecutionError::InvalidScriptPath);
+        }
+        let bytes = fs::read(self.parent.workdir.skills_dir().join(path))
+            .map_err(|_| SandboxExecutionError::ExecutionFailed)?;
+        let actual_sha256 = format!("sha256:{:x}", Sha256::digest(bytes));
+        if actual_sha256 != expected_sha256 {
+            return Err(SandboxExecutionError::ExecutionFailed);
+        }
+        let command = format!("python3 '/skills/{path}'");
+        self.parent
+            .execute(command, self.capabilities.iter().copied(), Some(input_json))
     }
 }
 

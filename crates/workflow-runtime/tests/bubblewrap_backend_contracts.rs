@@ -103,6 +103,32 @@ fn bubblewrap_backend_rejects_an_unbounded_output_request_before_spawn() {
 }
 
 #[test]
+fn bubblewrap_mounts_follow_requested_filesystem_capabilities() {
+    let (_base, workdir) = workdir();
+    let backend =
+        LinuxBubblewrapBackend::new(BackendCapabilities::new([SandboxCapability::ProcessSpawn]));
+    let request = BubblewrapRequest::new(
+        String::from(
+            "test ! -e /input && test ! -e /package && test ! -e /skills && test ! -e /refs && for dir in work out tmp; do if touch /$dir/marker 2>/dev/null; then exit 1; fi; done",
+        ),
+        &workdir,
+        BTreeMap::new(),
+        RequestedCapabilities::new([SandboxCapability::ProcessSpawn]),
+    )
+    .expect("capability probe must be a valid request");
+
+    let receipt = backend
+        .execute(&request)
+        .expect("capability probe must execute");
+
+    assert!(
+        receipt.exit_success(),
+        "undeclared mounts leaked capabilities: {:?}",
+        String::from_utf8_lossy(receipt.stderr())
+    );
+}
+
+#[test]
 fn bubblewrap_backend_rejects_a_swapped_mutable_mount_before_spawn() {
     use std::os::unix::fs::symlink;
 

@@ -83,10 +83,10 @@ impl ToolHandler for RegisteredScriptHandler {
             ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed)
         })?;
         if receipt.exit_success() {
-            Ok(ToolEnvelope::success(
-                serde_json::json!({ "stdout": String::from_utf8_lossy(receipt.stdout()) }),
-                self.provenance.clone(),
-            ))
+            let output = serde_json::from_slice(receipt.stdout()).map_err(|_| {
+                ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed)
+            })?;
+            Ok(ToolEnvelope::success(output, self.provenance.clone()))
         } else {
             Ok(ToolEnvelope::failure(
                 ToolFailure::Unavailable,
