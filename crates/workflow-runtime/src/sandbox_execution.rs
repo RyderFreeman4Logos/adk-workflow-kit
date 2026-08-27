@@ -8,6 +8,11 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+static CHECK_USE_BARRIERS: std::sync::Mutex<
+    Option<std::sync::Arc<(std::sync::Barrier, std::sync::Barrier)>>,
+> = std::sync::Mutex::new(None);
+
 use crate::{
     BackendCapabilities, BubblewrapError, BubblewrapReceipt, BubblewrapRequest,
     LinuxBubblewrapBackend, RunContext, RunWorkdir, SandboxCapability,
@@ -92,7 +97,7 @@ impl RunSandbox {
         &self,
         command: &SandboxCommand,
     ) -> Result<BubblewrapReceipt, SandboxExecutionError> {
-        self.execute(
+        let mut receipt = self.execute(
             command.shell_command(),
             [
                 SandboxCapability::FilesystemRead,
@@ -101,7 +106,14 @@ impl RunSandbox {
                 SandboxCapability::OutputBytes,
             ],
             None,
-        )
+            None,
+        )?;
+        if receipt.exit_success() {
+            receipt
+                .commit_output()
+                .map_err(SandboxExecutionError::from)?;
+        }
+        Ok(receipt)
     }
 
     /// Creates a child sandbox only when its authority is a subset of this run's policy.
@@ -124,6 +136,7 @@ impl RunSandbox {
         command: String,
         capabilities: impl IntoIterator<Item = SandboxCapability>,
         stdin: Option<&[u8]>,
+        sealed_script: Option<(&[u8], &str)>,
     ) -> Result<BubblewrapReceipt, SandboxExecutionError> {
         let capabilities = capabilities.into_iter().collect::<BTreeSet<_>>();
         if !capabilities.is_subset(&self.capabilities) {
@@ -139,6 +152,11 @@ impl RunSandbox {
             request = request
                 .with_stdin(stdin)
                 .map_err(|_| SandboxExecutionError::InvalidCommand)?;
+        }
+        if let Some((bytes, path)) = sealed_script {
+            request = request
+                .with_sealed_script(bytes, format!("/skills/{path}"))
+                .map_err(|_| SandboxExecutionError::ExecutionFailed)?;
         }
         self.backend
             .execute(&request)
@@ -167,8 +185,15 @@ impl ChildSandbox<'_> {
             return Err(SandboxExecutionError::InvalidScriptPath);
         }
         let command = format!("python3 '/skills/{path}'");
-        self.parent
-            .execute(command, self.capabilities.iter().copied(), None)
+        let mut receipt =
+            self.parent
+                .execute(command, self.capabilities.iter().copied(), None, None)?;
+        if receipt.exit_success() {
+            receipt
+                .commit_output()
+                .map_err(SandboxExecutionError::from)?;
+        }
+        Ok(receipt)
     }
 
     /// Executes a lock-bound registered Python script with validated JSON on stdin.
@@ -183,13 +208,26 @@ impl ChildSandbox<'_> {
         }
         let bytes = fs::read(self.parent.workdir.skills_dir().join(path))
             .map_err(|_| SandboxExecutionError::ExecutionFailed)?;
-        let actual_sha256 = format!("sha256:{:x}", Sha256::digest(bytes));
+        let actual_sha256 = format!("sha256:{:x}", Sha256::digest(&bytes));
         if actual_sha256 != expected_sha256 {
             return Err(SandboxExecutionError::ExecutionFailed);
         }
+        #[cfg(test)]
+        if let Some(barriers) = CHECK_USE_BARRIERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            barriers.0.wait();
+            barriers.1.wait();
+        }
         let command = format!("python3 '/skills/{path}'");
-        self.parent
-            .execute(command, self.capabilities.iter().copied(), Some(input_json))
+        self.parent.execute(
+            command,
+            self.capabilities.iter().copied(),
+            Some(input_json),
+            Some((&bytes, path)),
+        )
     }
 }
 
@@ -268,4 +306,86 @@ fn is_script_path(path: &str) -> bool {
                 | Component::RootDir
                 | Component::Prefix(_) => false,
             })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Materialization, RunId, RunLimits, WorkdirManager};
+    use std::{num::NonZeroU64, os::unix::fs::PermissionsExt, sync::Arc};
+
+    #[test]
+    fn lock_digest_executes_the_checked_bytes_after_path_replacement() {
+        let base =
+            std::env::temp_dir().join(format!("workflow-runtime-check-use-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir(&base).expect("test base must be unique");
+        let original = b"print('locked')\n";
+        let context = RunContext::new(
+            RunId::new("check-use".to_owned()).expect("fixture run ID"),
+            RunLimits::new(
+                NonZeroU64::new(1).expect("positive"),
+                NonZeroU64::new(1).expect("positive"),
+                NonZeroU64::new(1).expect("positive"),
+                NonZeroU64::new(2_000).expect("positive"),
+                NonZeroU64::new(2_000).expect("positive"),
+                NonZeroU64::new(2_000).expect("positive"),
+                NonZeroU64::new(1_024).expect("positive"),
+            ),
+        );
+        let workdir = WorkdirManager::new(&base)
+            .expect("test base must be trusted")
+            .materialize(
+                context.run_id(),
+                &Materialization {
+                    skills: Some(original.to_vec()),
+                    ..Materialization::default()
+                },
+            )
+            .expect("script workdir must materialize");
+        let script_path = workdir.skills_dir().join("content.bin");
+        let sandbox = RunSandbox::new(
+            context,
+            workdir,
+            [
+                SandboxCapability::FilesystemRead,
+                SandboxCapability::ProcessSpawn,
+                SandboxCapability::OutputBytes,
+            ],
+        )
+        .expect("sandbox must bind");
+        let child = sandbox
+            .child([
+                SandboxCapability::FilesystemRead,
+                SandboxCapability::ProcessSpawn,
+                SandboxCapability::OutputBytes,
+            ])
+            .expect("child capabilities must narrow");
+        let barriers = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        *CHECK_USE_BARRIERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&barriers));
+        let expected = format!("sha256:{:x}", Sha256::digest(original));
+
+        std::thread::scope(|scope| {
+            let execution = scope
+                .spawn(|| child.execute_registered_python_script("content.bin", &expected, b"{}"));
+            barriers.0.wait();
+            fs::write(&script_path, b"print('replacement')\n")
+                .expect("checked path must be replaceable for the race regression");
+            barriers.1.wait();
+            let receipt = execution
+                .join()
+                .expect("execution thread must join")
+                .expect("locked script must execute");
+            assert_eq!(receipt.stdout(), b"locked\n");
+        });
+
+        fs::set_permissions(
+            script_path.parent().expect("script directory"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("script directory must unlock for cleanup");
+        fs::remove_dir_all(base).expect("test base must be removed");
+    }
 }

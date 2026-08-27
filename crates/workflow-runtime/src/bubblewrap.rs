@@ -4,14 +4,16 @@
 //! request/preflight/execute shape (see `workflow-testkit::sandbox`), but
 //! actually launches a `bwrap` process. The backend exposes immutable roots
 //! only with read capability, makes mutable roots writable only with write
-//! capability, and stages `/out` until success. The host network namespace is
+//! capability, and stages `/out` until the receipt is accepted. The host network namespace is
 //! unshared by default; network requests fail closed until a destination
 //! allowlist can be enforced.
 
 use std::{
     collections::BTreeMap,
     fmt, fs,
-    io::{self, Read, Write},
+    fs::File,
+    io::{self, Read, Seek, Write},
+    os::fd::{AsRawFd, FromRawFd},
     path::Component,
     process::{Command, ExitStatus, Stdio},
     sync::{
@@ -24,7 +26,7 @@ use std::{
 
 use crate::{
     BackendCapabilities, RequestedCapabilities, RunWorkdir, SandboxCapability,
-    UnsatisfiedCapabilities, WorkdirError, verify_sandbox_capabilities,
+    UnsatisfiedCapabilities, WorkdirError, verify_sandbox_capabilities, workdir::StagedOutput,
 };
 
 /// A validated sandbox request for the Linux bubblewrap backend.
@@ -39,6 +41,8 @@ pub struct BubblewrapRequest<'a> {
     output_limit: Option<usize>,
     /// Bounded validated input forwarded to the sandboxed process.
     stdin: Option<Vec<u8>>,
+    /// A sealed script inode mounted over its public materialization path.
+    sealed_script: Option<(File, String)>,
 }
 
 impl<'a> BubblewrapRequest<'a> {
@@ -127,6 +131,7 @@ impl<'a> BubblewrapRequest<'a> {
             wall_time: None,
             output_limit: None,
             stdin: None,
+            sealed_script: None,
         })
     }
 
@@ -152,6 +157,52 @@ impl<'a> BubblewrapRequest<'a> {
         self.stdin = Some(bytes.to_vec());
         Ok(self)
     }
+
+    pub(crate) fn with_sealed_script(
+        mut self,
+        bytes: &[u8],
+        guest_path: String,
+    ) -> io::Result<Self> {
+        self.sealed_script = Some((sealed_memfd(bytes)?, guest_path));
+        Ok(self)
+    }
+}
+
+fn sealed_memfd(bytes: &[u8]) -> io::Result<File> {
+    const MFD_CLOEXEC: i32 = 0x0001;
+    const MFD_ALLOW_SEALING: i32 = 0x0002;
+    const F_ADD_SEALS: i32 = 1033;
+    const F_SEAL_SEAL: i32 = 0x0001;
+    const F_SEAL_SHRINK: i32 = 0x0002;
+    const F_SEAL_GROW: i32 = 0x0004;
+    const F_SEAL_WRITE: i32 = 0x0008;
+
+    unsafe extern "C" {
+        fn memfd_create(name: *const std::ffi::c_char, flags: i32) -> i32;
+        fn fcntl(fd: i32, operation: i32, ...) -> i32;
+    }
+
+    // SAFETY: the name is NUL-terminated and the flags are valid for Linux memfd_create.
+    let fd = unsafe { memfd_create(c"workflow-script".as_ptr(), MFD_CLOEXEC | MFD_ALLOW_SEALING) };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: memfd_create returned a fresh owned descriptor.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(bytes)?;
+    file.seek(io::SeekFrom::Start(0))?;
+    // SAFETY: the descriptor is owned by `file`; these seals make its bytes immutable.
+    if unsafe {
+        fcntl(
+            file.as_raw_fd(),
+            F_ADD_SEALS,
+            F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
 }
 
 fn is_environment_name(name: &str) -> bool {
@@ -281,6 +332,25 @@ impl LinuxBubblewrapBackend {
         // Run in a fresh process group so a timeout or cancellation can kill
         // the whole sandboxed tree, not just the bwrap supervisor.
         use std::os::unix::process::CommandExt;
+        if let Some((sealed_script, _)) = &request.sealed_script {
+            let fd = sealed_script.as_raw_fd();
+            // SAFETY: fcntl is async-signal-safe; the child only clears CLOEXEC
+            // on its private sealed descriptor before execing bubblewrap.
+            unsafe {
+                command.pre_exec(move || {
+                    const F_SETFD: i32 = 2;
+                    unsafe extern "C" {
+                        fn fcntl(fd: i32, operation: i32, ...) -> i32;
+                    }
+                    // SAFETY: `fd` remains owned by the request through spawn.
+                    if fcntl(fd, F_SETFD, 0) == -1 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        }
         command.process_group(0);
         command
             .stdin(if request.stdin.is_some() {
@@ -371,14 +441,13 @@ impl LinuxBubblewrapBackend {
         if output_budget.is_some_and(|budget| budget.exceeded()) {
             return Err(BubblewrapError::OutputLimitExceeded);
         }
-        if let (true, Some(staged_output)) = (status.success(), staged_output) {
-            staged_output.commit()?;
-        }
+        let staged_output = status.success().then_some(staged_output).flatten();
 
         Ok(BubblewrapReceipt {
             status,
             stdout,
             stderr,
+            staged_output,
         })
     }
 }
@@ -549,6 +618,12 @@ fn configure_bwrap(
                 .arg(root.join(dir))
                 .arg(format!("/{dir}"));
         }
+        if let Some((sealed_script, guest_path)) = &request.sealed_script {
+            command
+                .arg("--ro-bind-data")
+                .arg(sealed_script.as_raw_fd().to_string())
+                .arg(guest_path);
+        }
     }
     // Mutable roots remain visible for fixed working paths, but become writable
     // only when the request declared write access.
@@ -646,12 +721,18 @@ pub struct BubblewrapReceipt {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    staged_output: Option<StagedOutput>,
 }
 
 impl BubblewrapReceipt {
     /// Returns whether the sandboxed command exited successfully.
     pub fn exit_success(&self) -> bool {
         self.status.success()
+    }
+
+    /// Returns the conventional process exit code, including `128 + signal` from bubblewrap.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.status.code()
     }
 
     /// Returns the raw stdout captured from the sandboxed command.
@@ -662,5 +743,13 @@ impl BubblewrapReceipt {
     /// Returns the raw stderr captured from the sandboxed command.
     pub fn stderr(&self) -> &[u8] {
         &self.stderr
+    }
+
+    /// Publishes output staged by a successful sandbox process.
+    pub fn commit_output(&mut self) -> Result<(), BubblewrapError> {
+        if let Some(staged_output) = self.staged_output.take() {
+            staged_output.commit()?;
+        }
+        Ok(())
     }
 }

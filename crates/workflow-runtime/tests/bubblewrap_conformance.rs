@@ -177,9 +177,15 @@ fn run_in_with(
     capabilities: &[SandboxCapability],
 ) -> workflow_runtime::BubblewrapReceipt {
     let req = request(workdir, command, capabilities);
-    backend()
+    let mut receipt = backend()
         .execute(&req)
-        .expect("command must execute inside the sandbox")
+        .expect("command must execute inside the sandbox");
+    if receipt.exit_success() {
+        receipt
+            .commit_output()
+            .expect("successful output must publish after acceptance");
+    }
+    receipt
 }
 
 /// Doubles as the documented conformance surface: every check runs through the

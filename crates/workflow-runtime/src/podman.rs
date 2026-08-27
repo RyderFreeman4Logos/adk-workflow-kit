@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     BackendCapabilities, RequestedCapabilities, RunWorkdir, SandboxCapability,
-    UnsatisfiedCapabilities, WorkdirError, verify_sandbox_capabilities,
+    UnsatisfiedCapabilities, WorkdirError, verify_sandbox_capabilities, workdir::StagedOutput,
 };
 
 /// A validated rootless OCI image execution request.
@@ -207,10 +207,11 @@ impl RootlessPodmanBackend {
             .args(["sh", "-c", &request.command])
             .output()
             .map_err(|source| PodmanError::Spawn { source })?;
-        if let (true, Some(staged_output)) = (output.status.success(), staged_output) {
-            staged_output.commit()?;
-        }
-        Ok(PodmanReceipt { output })
+        let staged_output = output.status.success().then_some(staged_output).flatten();
+        Ok(PodmanReceipt {
+            output,
+            staged_output,
+        })
     }
 }
 
@@ -263,6 +264,7 @@ impl std::error::Error for PodmanError {
 #[derive(Debug)]
 pub struct PodmanReceipt {
     output: Output,
+    staged_output: Option<StagedOutput>,
 }
 
 impl PodmanReceipt {
@@ -277,6 +279,14 @@ impl PodmanReceipt {
     /// Returns captured standard error.
     pub fn stderr(&self) -> &[u8] {
         &self.output.stderr
+    }
+
+    /// Publishes output staged by a successful container process.
+    pub fn commit_output(&mut self) -> Result<(), PodmanError> {
+        if let Some(staged_output) = self.staged_output.take() {
+            staged_output.commit()?;
+        }
+        Ok(())
     }
 }
 
@@ -473,6 +483,50 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn successful_backend_receipt_keeps_output_unpublished() {
+        with_podman_shim(
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in *:/out:rw) out=${arg%:/out:rw};; esac\ndone\ntest -n \"$out\"\nprintf staged > \"$out/result\"\n",
+            || {
+                let manager = WorkdirManager::new(std::env::temp_dir()).unwrap();
+                let run_id = RunId::new("podman-unpublished".to_owned()).unwrap();
+                let workdir = manager.allocate(&run_id).unwrap();
+                let request = PodmanRequest::new(
+                    format!("alpine@sha256:{}", "d".repeat(64)),
+                    "true".to_owned(),
+                    &workdir,
+                    BTreeMap::new(),
+                    RequestedCapabilities::new([
+                        SandboxCapability::FilesystemWrite,
+                        SandboxCapability::ProcessSpawn,
+                    ]),
+                )
+                .unwrap();
+                let backend = RootlessPodmanBackend::new(BackendCapabilities::new([
+                    SandboxCapability::FilesystemWrite,
+                    SandboxCapability::ProcessSpawn,
+                ]));
+
+                let mut receipt = backend.execute(&request).expect("shim must execute");
+
+                assert_eq!(
+                    fs::read_dir(workdir.out_dir())
+                        .expect("visible output")
+                        .count(),
+                    0,
+                    "backend success must remain unpublished until validation"
+                );
+                receipt
+                    .commit_output()
+                    .expect("accepted output must publish from its receipt");
+                assert_eq!(
+                    fs::read(workdir.out_dir().join("result")).expect("published output"),
+                    b"staged"
+                );
+            },
+        );
     }
 
     #[test]

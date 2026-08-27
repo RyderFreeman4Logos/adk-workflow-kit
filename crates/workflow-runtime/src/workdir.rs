@@ -197,7 +197,8 @@ pub enum CleanupOutcome {
 
 static NEXT_OUTPUT_STAGE: AtomicU64 = AtomicU64::new(0);
 
-/// A run-local output directory that becomes visible only after success.
+/// A run-local output directory that becomes visible only after acceptance.
+#[derive(Debug)]
 pub(crate) struct StagedOutput {
     staging: Option<PathBuf>,
     visible: PathBuf,

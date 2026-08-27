@@ -188,11 +188,13 @@ fn sigkill_retains_the_run_directory_without_output_artifacts() {
     let sandbox = script_sandbox(
         &base,
         "sigkill",
-        b"import os\nwith open('/out/partial', 'wb') as artifact:\n    artifact.write(b'partial')\n    artifact.flush()\n    os.fsync(artifact.fileno())\nos.kill(os.getpid(), 9)\n",
+        b"import os\nwith open('/out/partial', 'wb') as artifact:\n    artifact.write(b'partial')\n    artifact.flush()\n    os.fsync(artifact.fileno())\nwith open('/work/sigkill-witness', 'wb') as witness:\n    witness.write(b'written')\n    witness.flush()\n    os.fsync(witness.fileno())\nos.kill(os.getpid(), 9)\n",
     );
     let root = sandbox.workdir().root().to_path_buf();
     let child = sandbox
         .child([
+            SandboxCapability::FilesystemRead,
+            SandboxCapability::FilesystemWrite,
             SandboxCapability::ProcessSpawn,
             SandboxCapability::OutputBytes,
         ])
@@ -203,6 +205,15 @@ fn sigkill_retains_the_run_directory_without_output_artifacts() {
         .expect("SIGKILL must be a completed sandbox receipt");
 
     assert!(!receipt.exit_success());
+    assert_eq!(
+        receipt.exit_code(),
+        Some(137),
+        "SIGKILL must remain exit 137"
+    );
+    assert_eq!(
+        fs::read(root.join("work/sigkill-witness")).expect("write witness must survive"),
+        b"written"
+    );
     assert!(
         root.is_dir(),
         "external SIGKILL must retain the run directory"
@@ -213,5 +224,15 @@ fn sigkill_retains_the_run_directory_without_output_artifacts() {
             .next()
             .is_none(),
         "a killed sandbox must not commit a partial output artifact"
+    );
+    assert!(
+        fs::read_dir(&root)
+            .expect("run root must remain readable")
+            .all(|entry| !entry
+                .expect("run-root entry must be readable")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".out-stage-")),
+        "a killed sandbox must clean its private output stage"
     );
 }

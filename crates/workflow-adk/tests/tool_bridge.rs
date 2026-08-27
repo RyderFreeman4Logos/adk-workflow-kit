@@ -20,14 +20,14 @@ use workflow_runtime::{
 const SCRIPT: &[u8] = b"import json, sys\nfrom pathlib import Path\nvalue = json.load(sys.stdin)['value']\nPath('adapter-marker').write_text('sandbox')\nprint(json.dumps({'value': value}))\n";
 const READ_ONLY_SCRIPT: &[u8] = b"import json, sys\nvalue = json.load(sys.stdin)['value']\nprint(json.dumps({'value': value}))\n";
 const INVALID_OUTPUT_SCRIPT: &[u8] =
-    b"import json, sys\njson.load(sys.stdin)\nprint(json.dumps({'value': 42}))\n";
+    b"import json, sys\nfrom pathlib import Path\njson.load(sys.stdin)\nPath('/out/invalid').write_text('unpublished')\nprint(json.dumps({'value': 42}))\n";
 const MISMATCH_SCRIPT: &[u8] = b"from pathlib import Path\nPath('mismatch-marker').write_text('spawned')\nprint('{\"value\":\"wrong\"}')\n";
 const SCRIPT_SHA256: &str =
     "sha256:845ac6ab6fe2dac6aa1f3ef0fd2d7288bd4b68453552998c5504b466e138434f";
 const READ_ONLY_SCRIPT_SHA256: &str =
     "sha256:aaa8acf1bf003612061fb9c497d594f21d8b637e9a4b5765b6e6a7124ae04869";
 const INVALID_OUTPUT_SCRIPT_SHA256: &str =
-    "sha256:1b1b2c6c69ded4162b110c4c69520f4c5eebbaf91dd39692328393d9ed9f4503";
+    "sha256:b01d611ca7d7acbdeaffb980242539baa9442edca5d5800616ca833ae790bcfa";
 const SCHEMA: &[u8] = br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}"#;
 const SKILL_MARKDOWN: &[u8] =
     b"---\nname: valid-skill\ndescription: A bounded skill.\n---\n# Instructions\n";
@@ -157,7 +157,7 @@ fn adapter(
 ) -> (AdkToolBridge<InMemoryArtifactStore>, PathBuf) {
     let (manifest, lock) = manifest(locked_script, &capabilities);
     let sandbox = sandbox(base, id, materialized_script, capabilities.clone());
-    let work = sandbox.workdir().work_dir();
+    let root = sandbox.workdir().root().to_path_buf();
     let script = RegisteredSkillScript::new(manifest, lock, "script");
     let adapter = AdkToolBridge::for_registered_script(
         sandbox,
@@ -171,7 +171,7 @@ fn adapter(
         script,
     )
     .expect("adapter production seam must construct the bridge");
-    (adapter, work)
+    (adapter, root)
 }
 
 fn invoke(adapter: &AdkToolBridge<InMemoryArtifactStore>, call_id: &str, value: &str) -> Value {
@@ -198,11 +198,11 @@ fn adk_adapter_invokes_registered_script_in_its_run_sandbox() {
         SandboxCapability::ProcessSpawn,
         SandboxCapability::OutputBytes,
     ];
-    let (adapter, work) = adapter(&base, "adapter-invoke", SCRIPT, SCRIPT, capabilities);
+    let (adapter, root) = adapter(&base, "adapter-invoke", SCRIPT, SCRIPT, capabilities);
     let payload = invoke(&adapter, "call-1", "ok");
 
     assert!(
-        work.join("adapter-marker").is_file(),
+        root.join("work/adapter-marker").is_file(),
         "script must run in the run sandbox workdir"
     );
     assert_eq!(payload, json!({ "value": "ok" }));
@@ -258,7 +258,7 @@ fn adk_adapter_denies_undeclared_filesystem_write() {
         SandboxCapability::ProcessSpawn,
         SandboxCapability::OutputBytes,
     ];
-    let (adapter, work) = adapter(&base, "adapter-no-write", SCRIPT, SCRIPT, capabilities);
+    let (adapter, root) = adapter(&base, "adapter-no-write", SCRIPT, SCRIPT, capabilities);
 
     let result = adapter
         .invoke(ToolCall::new(
@@ -270,7 +270,7 @@ fn adk_adapter_denies_undeclared_filesystem_write() {
         .expect("sandbox denial must return a typed failure envelope");
 
     assert!(matches!(result, ToolEnvelope::Failure { .. }));
-    assert!(!work.join("adapter-marker").exists());
+    assert!(!root.join("work/adapter-marker").exists());
 }
 
 #[test]
@@ -356,10 +356,11 @@ fn lock_bound_output_schema_rejects_invalid_script_stdout() {
     let base = TestBase::new();
     let capabilities = vec![
         SandboxCapability::FilesystemRead,
+        SandboxCapability::FilesystemWrite,
         SandboxCapability::ProcessSpawn,
         SandboxCapability::OutputBytes,
     ];
-    let (adapter, _) = adapter(
+    let (adapter, root) = adapter(
         &base,
         "adapter-invalid-output",
         INVALID_OUTPUT_SCRIPT,
@@ -377,5 +378,12 @@ fn lock_bound_output_schema_rejects_invalid_script_stdout() {
             ))
             .is_err(),
         "schema-invalid stdout must fail before ToolEnvelope publication"
+    );
+    assert_eq!(
+        fs::read_dir(root.join("out"))
+            .expect("visible output directory must remain readable")
+            .count(),
+        0,
+        "schema-invalid stdout must not publish staged output"
     );
 }

@@ -108,9 +108,8 @@ impl ScriptPlan {
         let child = sandbox
             .child(self.capabilities.iter().copied())
             .map_err(ScriptExecutionError::sandbox)?;
-        let receipt = match self.runtime {
-            // The workdir's single materialized script is digest-checked against
-            // the selected lock entry immediately before backend spawn.
+        let mut receipt = match self.runtime {
+            // The digest-checked bytes are sealed before backend spawn.
             ScriptRuntime::Python3 => child.execute_registered_python_script(
                 "content.bin",
                 &self.script_sha256,
@@ -126,6 +125,10 @@ impl ScriptPlan {
             if !validator.is_valid(&output) {
                 return Err(ScriptExecutionError::invalid_output());
             }
+            receipt
+                .commit_output()
+                .map_err(SandboxExecutionError::from)
+                .map_err(ScriptExecutionError::sandbox)?;
         }
         Ok(receipt)
     }
