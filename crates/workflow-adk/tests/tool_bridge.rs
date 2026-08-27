@@ -248,6 +248,32 @@ fn registered_script_rejects_capabilities_beyond_registration_before_spawn() {
 }
 
 #[test]
+fn registered_script_without_process_spawn_fails_before_backend_spawn() {
+    let base = TestBase::new();
+    let capabilities = vec![
+        SandboxCapability::FilesystemRead,
+        SandboxCapability::FilesystemWrite,
+        SandboxCapability::OutputBytes,
+    ];
+    let (adapter, root) = adapter(&base, "adapter-no-spawn", SCRIPT, SCRIPT, capabilities);
+
+    let error = adapter
+        .invoke(ToolCall::new(
+            "script",
+            "call-no-spawn",
+            "actor-1",
+            json!({ "value": "blocked" }),
+        ))
+        .expect_err("registered Python execution without process.spawn must fail");
+
+    assert_eq!(error.kind(), ToolBridgeErrorKind::HandlerFailed);
+    assert!(
+        !root.join("work/adapter-marker").exists(),
+        "the backend must not start without process.spawn"
+    );
+}
+
+#[test]
 fn adapter_registered_script_api_denies_unknown_script_id() {
     let base = TestBase::new();
     let (manifest, lock) = manifest(SCRIPT, &[]);

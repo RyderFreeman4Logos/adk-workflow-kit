@@ -595,6 +595,18 @@ pub fn verify_sandbox_capabilities(
     }
 }
 
+pub(crate) fn verify_process_spawn_capability(
+    requested: &RequestedCapabilities,
+) -> Result<(), UnsatisfiedCapabilities> {
+    if requested.contains(SandboxCapability::ProcessSpawn) {
+        Ok(())
+    } else {
+        Err(UnsatisfiedCapabilities {
+            missing: vec![SandboxCapability::ProcessSpawn],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

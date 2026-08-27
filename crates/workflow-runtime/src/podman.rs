@@ -9,7 +9,8 @@ use std::{
 
 use crate::{
     BackendCapabilities, RequestedCapabilities, RunWorkdir, SandboxCapability,
-    UnsatisfiedCapabilities, WorkdirError, verify_sandbox_capabilities, workdir::StagedOutput,
+    UnsatisfiedCapabilities, WorkdirError, verify_process_spawn_capability,
+    verify_sandbox_capabilities, workdir::StagedOutput,
 };
 
 /// A validated rootless OCI image execution request.
@@ -141,6 +142,7 @@ impl RootlessPodmanBackend {
     pub fn execute(&self, request: &PodmanRequest<'_>) -> Result<PodmanReceipt, PodmanError> {
         request.workdir.verify_sandbox_mounts()?;
         verify_sandbox_capabilities(&request.requested, &self.capabilities)?;
+        verify_process_spawn_capability(&request.requested)?;
         let staged_output = request
             .requested
             .contains(SandboxCapability::FilesystemWrite)

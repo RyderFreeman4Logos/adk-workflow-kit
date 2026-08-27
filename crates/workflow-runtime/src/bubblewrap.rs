@@ -26,7 +26,8 @@ use std::{
 
 use crate::{
     BackendCapabilities, RequestedCapabilities, RunWorkdir, SandboxCapability,
-    UnsatisfiedCapabilities, WorkdirError, verify_sandbox_capabilities, workdir::StagedOutput,
+    UnsatisfiedCapabilities, WorkdirError, verify_process_spawn_capability,
+    verify_sandbox_capabilities, workdir::StagedOutput,
 };
 
 /// A validated sandbox request for the Linux bubblewrap backend.
@@ -316,6 +317,7 @@ impl LinuxBubblewrapBackend {
         {
             return Err(BubblewrapError::OutputLimitMissing);
         }
+        verify_process_spawn_capability(&request.requested)?;
         let staged_output = request
             .requested
             .contains(SandboxCapability::FilesystemWrite)
