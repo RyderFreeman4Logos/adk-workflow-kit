@@ -14,6 +14,10 @@ use std::{
     io::{self, Read},
     path::Component,
     process::{Command, ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -31,6 +35,8 @@ pub struct BubblewrapRequest<'a> {
     requested: RequestedCapabilities,
     /// Optional wall-clock ceiling enforced by killing the process tree.
     wall_time: Option<Duration>,
+    /// Maximum combined stdout and stderr bytes retained from this process.
+    output_limit: Option<usize>,
 }
 
 impl<'a> BubblewrapRequest<'a> {
@@ -115,12 +121,19 @@ impl<'a> BubblewrapRequest<'a> {
             environment,
             requested,
             wall_time: None,
+            output_limit: None,
         })
     }
 
     /// Sets the wall-clock ceiling in milliseconds.
     pub fn with_wall_time(mut self, milliseconds: u64) -> Self {
         self.wall_time = Some(Duration::from_millis(milliseconds));
+        self
+    }
+
+    /// Sets the combined stdout and stderr byte ceiling.
+    pub fn with_output_limit(mut self, bytes: std::num::NonZeroU64) -> Self {
+        self.output_limit = Some(usize::try_from(bytes.get()).unwrap_or(usize::MAX));
         self
     }
 }
@@ -200,10 +213,11 @@ pub struct LinuxBubblewrapBackend {
     capabilities: BackendCapabilities,
 }
 
-const ENFORCEABLE_CAPABILITIES: [SandboxCapability; 3] = [
+const ENFORCEABLE_CAPABILITIES: [SandboxCapability; 4] = [
     SandboxCapability::FilesystemRead,
     SandboxCapability::FilesystemWrite,
     SandboxCapability::ProcessSpawn,
+    SandboxCapability::OutputBytes,
 ];
 
 impl LinuxBubblewrapBackend {
@@ -227,6 +241,11 @@ impl LinuxBubblewrapBackend {
     ) -> Result<BubblewrapReceipt, BubblewrapError> {
         request.workdir.verify_sandbox_mounts()?;
         verify_sandbox_capabilities(&request.requested, &self.capabilities)?;
+        if request.requested.contains(SandboxCapability::OutputBytes)
+            && request.output_limit.is_none()
+        {
+            return Err(BubblewrapError::OutputLimitMissing);
+        }
 
         let mut command = Command::new("bwrap");
         configure_bwrap(&mut command, request);
@@ -262,8 +281,9 @@ impl LinuxBubblewrapBackend {
                 });
             }
         };
-        let stdout_reader = spawn_pipe_reader(stdout_pipe);
-        let stderr_reader = spawn_pipe_reader(stderr_pipe);
+        let output_budget = request.output_limit.map(OutputBudget::new).map(Arc::new);
+        let stdout_reader = spawn_pipe_reader(stdout_pipe, output_budget.clone());
+        let stderr_reader = spawn_pipe_reader(stderr_pipe, output_budget.clone());
         if let Err(source) = publish_host_pid_witness(request, process_group) {
             terminate_and_reap(&mut child, process_group);
             let _ = stdout_reader.join();
@@ -271,39 +291,37 @@ impl LinuxBubblewrapBackend {
             return Err(BubblewrapError::Run { source });
         }
 
-        let status = match request.wall_time {
-            None => match child.wait() {
-                Ok(status) => status,
+        let deadline = request.wall_time.map(|limit| Instant::now() + limit);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None)
+                    if output_budget
+                        .as_ref()
+                        .is_some_and(|budget| budget.exceeded()) =>
+                {
+                    terminate_and_reap(&mut child, process_group);
+                    break timed_out_status();
+                }
+                Ok(None) if deadline.is_some_and(|limit| Instant::now() >= limit) => {
+                    terminate_and_reap(&mut child, process_group);
+                    break timed_out_status();
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
                 Err(source) => {
                     terminate_and_reap(&mut child, process_group);
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
                     return Err(BubblewrapError::Run { source });
                 }
-            },
-            Some(limit) => {
-                let deadline = Instant::now() + limit;
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => break status,
-                        Ok(None) if Instant::now() >= deadline => {
-                            terminate_and_reap(&mut child, process_group);
-                            break timed_out_status();
-                        }
-                        Ok(None) => thread::sleep(Duration::from_millis(10)),
-                        Err(source) => {
-                            terminate_and_reap(&mut child, process_group);
-                            let _ = stdout_reader.join();
-                            let _ = stderr_reader.join();
-                            return Err(BubblewrapError::Run { source });
-                        }
-                    }
-                }
             }
         };
 
         let stdout = join_pipe_reader(stdout_reader)?;
         let stderr = join_pipe_reader(stderr_reader)?;
+        if output_budget.is_some_and(|budget| budget.exceeded()) {
+            return Err(BubblewrapError::OutputLimitExceeded);
+        }
 
         Ok(BubblewrapReceipt {
             status,
@@ -331,10 +349,52 @@ fn publish_host_pid_witness(request: &BubblewrapRequest<'_>, pid: u32) -> io::Re
     )
 }
 
-fn spawn_pipe_reader(mut pipe: impl Read + Send + 'static) -> JoinHandle<io::Result<Vec<u8>>> {
+struct OutputBudget {
+    remaining: AtomicUsize,
+    exceeded: AtomicBool,
+}
+
+impl OutputBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(limit),
+            exceeded: AtomicBool::new(false),
+        }
+    }
+
+    fn retain(&self, bytes: usize) -> usize {
+        let previous = self
+            .remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                Some(remaining.saturating_sub(bytes))
+            })
+            .expect("output budget update is infallible");
+        if previous < bytes {
+            self.exceeded.store(true, Ordering::Release);
+        }
+        previous.min(bytes)
+    }
+
+    fn exceeded(&self) -> bool {
+        self.exceeded.load(Ordering::Acquire)
+    }
+}
+
+fn spawn_pipe_reader(
+    mut pipe: impl Read + Send + 'static,
+    budget: Option<Arc<OutputBudget>>,
+) -> JoinHandle<io::Result<Vec<u8>>> {
     thread::spawn(move || {
         let mut bytes = Vec::new();
-        pipe.read_to_end(&mut bytes).map(|_| bytes)
+        let mut buffer = [0_u8; 8_192];
+        loop {
+            let read = pipe.read(&mut buffer)?;
+            if read == 0 {
+                return Ok(bytes);
+            }
+            let retained = budget.as_ref().map_or(read, |budget| budget.retain(read));
+            bytes.extend_from_slice(&buffer[..retained]);
+        }
     })
 }
 
@@ -451,6 +511,10 @@ pub enum BubblewrapError {
     Workdir(WorkdirError),
     /// Capability preflight rejected the request.
     Capabilities(UnsatisfiedCapabilities),
+    /// The request required an output ceiling but did not provide one.
+    OutputLimitMissing,
+    /// Captured output exceeded the configured byte ceiling.
+    OutputLimitExceeded,
     /// `bwrap` could not be spawned (fail closed).
     Spawn { source: std::io::Error },
     /// `bwrap` failed while the supervisor waited on it.
@@ -474,6 +538,8 @@ impl fmt::Display for BubblewrapError {
         match self {
             Self::Workdir(_) => formatter.write_str("bubblewrap backend rejected run workdir"),
             Self::Capabilities(error) => fmt::Display::fmt(error, formatter),
+            Self::OutputLimitMissing => formatter.write_str("bubblewrap output limit is missing"),
+            Self::OutputLimitExceeded => formatter.write_str("bubblewrap output exceeds the limit"),
             Self::Spawn { .. } => formatter.write_str("bubblewrap backend could not spawn bwrap"),
             Self::Run { .. } => formatter.write_str("bubblewrap backend failed while running"),
         }
@@ -485,6 +551,7 @@ impl std::error::Error for BubblewrapError {
         match self {
             Self::Workdir(error) => Some(error),
             Self::Capabilities(error) => Some(error),
+            Self::OutputLimitMissing | Self::OutputLimitExceeded => None,
             Self::Spawn { source } | Self::Run { source } => Some(source),
         }
     }

@@ -13,6 +13,7 @@ mod podman;
 mod policy;
 mod production_profile;
 mod pure_transform;
+mod sandbox_execution;
 mod session;
 mod tool;
 mod workdir;
@@ -61,6 +62,7 @@ pub use production_profile::{
 pub use pure_transform::{
     PureTransformBackend, PureTransformError, PureTransformRequest, PureTransformRequestError,
 };
+pub use sandbox_execution::{ChildSandbox, RunSandbox, SandboxCommand, SandboxExecutionError};
 pub use session::{
     RunSessionIds, SessionId, SessionIdentityError, SessionIdentityErrorKind, SessionRole,
 };
