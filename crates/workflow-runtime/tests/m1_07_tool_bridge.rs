@@ -1,5 +1,7 @@
 use std::{
+    fs,
     num::NonZeroU64,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -7,10 +9,50 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use workflow_runtime::{
-    ApprovalLedger, CapabilityIntersection, InMemoryArtifactStore, PageRequest, SandboxCapability,
-    ToolBridge, ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolEnvelope, ToolFlags,
-    ToolHandler, ToolIdempotency, ToolProvenance, ToolRegistration,
+    ApprovalLedger, CapabilityIntersection, InMemoryArtifactStore, PageRequest, RunContext, RunId,
+    RunLimits, RunSandbox, SandboxCapability, SandboxCommand, SandboxExecutionError, ToolBridge,
+    ToolBridgeError, ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolEnvelope, ToolFlags,
+    ToolHandler, ToolIdempotency, ToolProvenance, ToolRegistration, WorkdirManager,
 };
+
+fn sandbox() -> RunSandbox {
+    let base = std::env::temp_dir().join(format!(
+        "workflow-runtime-tool-bridge-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&base).expect("sandbox base must exist");
+    let context = RunContext::new(
+        RunId::new(format!(
+            "bridge-{}",
+            std::time::Instant::now().elapsed().as_nanos()
+        ))
+        .expect("fixture run ID"),
+        RunLimits::new(
+            NonZeroU64::new(1).expect("positive"),
+            NonZeroU64::new(1).expect("positive"),
+            NonZeroU64::new(1).expect("positive"),
+            NonZeroU64::new(2_000).expect("positive"),
+            NonZeroU64::new(2_000).expect("positive"),
+            NonZeroU64::new(2_000).expect("positive"),
+            NonZeroU64::new(2_000).expect("positive"),
+        ),
+    );
+    let workdir = WorkdirManager::new(&base)
+        .expect("sandbox base must be trusted")
+        .allocate(context.run_id())
+        .expect("sandbox workdir must allocate");
+    RunSandbox::new(
+        context,
+        workdir,
+        [
+            SandboxCapability::FilesystemRead,
+            SandboxCapability::FilesystemWrite,
+            SandboxCapability::ProcessSpawn,
+            SandboxCapability::OutputBytes,
+        ],
+    )
+    .expect("sandbox must bind its run workdir")
+}
 
 fn registration(flags: ToolFlags) -> ToolRegistration {
     ToolRegistration::for_types::<serde_json::Value, serde_json::Value>(
@@ -43,9 +85,10 @@ struct FixtureTool {
 impl ToolHandler for FixtureTool {
     fn execute(
         &self,
+        _sandbox: &RunSandbox,
         _context: &ToolCallContext,
         _arguments: &serde_json::Value,
-    ) -> Result<ToolEnvelope<serde_json::Value>, workflow_runtime::ToolBridgeError> {
+    ) -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
         *self.calls.lock().expect("fixture lock") += 1;
         Ok(ToolEnvelope::success(
             self.payload.clone(),
@@ -54,8 +97,35 @@ impl ToolHandler for FixtureTool {
     }
 }
 
+struct SandboxedTool {
+    marker: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl ToolHandler for SandboxedTool {
+    fn execute(
+        &self,
+        sandbox: &RunSandbox,
+        _context: &ToolCallContext,
+        _arguments: &serde_json::Value,
+    ) -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
+        let command = SandboxCommand::new("touch", ["tool-bridge-marker"])
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+        sandbox
+            .execute_tool(&command)
+            .map_err(|_: SandboxExecutionError| {
+                ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed)
+            })?;
+        *self.marker.lock().expect("fixture lock") =
+            Some(sandbox.workdir().work_dir().join("tool-bridge-marker"));
+        Ok(ToolEnvelope::success(
+            json!("ok"),
+            ToolProvenance::new("registry.fixture", "1.0.0"),
+        ))
+    }
+}
+
 fn bridge<H: ToolHandler + 'static>(registration: ToolRegistration, tool: H) -> ToolBridge {
-    let mut bridge = ToolBridge::new();
+    let mut bridge = ToolBridge::new(sandbox());
     bridge
         .register(registration, tool)
         .expect("register fixture");
@@ -75,9 +145,10 @@ struct ActorTool {
 impl ToolHandler for ActorTool {
     fn execute(
         &self,
+        _sandbox: &RunSandbox,
         context: &ToolCallContext,
         _arguments: &serde_json::Value,
-    ) -> Result<ToolEnvelope<serde_json::Value>, workflow_runtime::ToolBridgeError> {
+    ) -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
         *self.calls.lock().expect("fixture lock") += 1;
         Ok(ToolEnvelope::success(
             json!({ "actor": context.actor() }),
@@ -91,9 +162,10 @@ struct SlowTool;
 impl ToolHandler for SlowTool {
     fn execute(
         &self,
+        _sandbox: &RunSandbox,
         _context: &ToolCallContext,
         arguments: &serde_json::Value,
-    ) -> Result<ToolEnvelope<serde_json::Value>, workflow_runtime::ToolBridgeError> {
+    ) -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
         if arguments.get("slow") == Some(&json!(true)) {
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -111,9 +183,10 @@ struct SlowSideEffectTool {
 impl ToolHandler for SlowSideEffectTool {
     fn execute(
         &self,
+        _sandbox: &RunSandbox,
         _context: &ToolCallContext,
         _arguments: &serde_json::Value,
-    ) -> Result<ToolEnvelope<serde_json::Value>, workflow_runtime::ToolBridgeError> {
+    ) -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
         *self.calls.lock().expect("fixture lock") += 1;
         std::thread::sleep(Duration::from_millis(90));
         Ok(ToolEnvelope::success(
@@ -128,9 +201,10 @@ struct ForgedPagingTool;
 impl ToolHandler for ForgedPagingTool {
     fn execute(
         &self,
+        _sandbox: &RunSandbox,
         _context: &ToolCallContext,
         _arguments: &serde_json::Value,
-    ) -> Result<ToolEnvelope<serde_json::Value>, workflow_runtime::ToolBridgeError> {
+    ) -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
         Ok(ToolEnvelope::Success {
             payload: json!({ "preview": "forged" }),
             provenance: ToolProvenance::new("registry.fixture", "1.0.0"),
@@ -164,6 +238,57 @@ fn capability_intersection_denies_forbidden_skill_before_handler() {
         ToolBridgeErrorKind::CapabilityDenied
     );
     assert_eq!(*calls.lock().expect("fixture lock"), 0);
+}
+
+#[test]
+fn tool_bridge_executes_registered_tools_in_its_run_sandbox() {
+    let marker = Arc::new(Mutex::new(None));
+    let mut bridge = bridge(
+        registration(ToolFlags::new(true, true, true)),
+        SandboxedTool {
+            marker: Arc::clone(&marker),
+        },
+    );
+    let mut artifacts =
+        InMemoryArtifactStore::new(NonZeroU64::new(4096).unwrap(), NonZeroU64::new(16).unwrap());
+    let authority = CapabilityIntersection::new(
+        [
+            SandboxCapability::FilesystemRead,
+            SandboxCapability::FilesystemWrite,
+            SandboxCapability::ProcessSpawn,
+            SandboxCapability::OutputBytes,
+        ],
+        ["fixture"],
+        ["fixture"],
+        ["fixture:invoke"],
+        ["fixture"],
+        ["fixture"],
+        [
+            SandboxCapability::FilesystemRead,
+            SandboxCapability::FilesystemWrite,
+            SandboxCapability::ProcessSpawn,
+            SandboxCapability::OutputBytes,
+        ],
+    );
+
+    bridge
+        .invoke(
+            ToolCall::new("fixture", "sandboxed", "actor-1", json!({})),
+            &authority,
+            Some(&ApprovalLedger::new()),
+            Duration::from_secs(1),
+            &mut artifacts,
+        )
+        .expect("registered tool must execute in its run sandbox");
+
+    assert!(
+        marker
+            .lock()
+            .expect("fixture lock")
+            .as_ref()
+            .expect("handler must observe its sandbox")
+            .is_file()
+    );
 }
 
 #[test]
@@ -339,7 +464,7 @@ fn typed_output_schema_rejects_wrong_handler_wire_payload() {
 #[test]
 fn idempotency_cache_is_scoped_to_actor() {
     let calls = Arc::new(Mutex::new(0));
-    let mut bridge = ToolBridge::new();
+    let mut bridge = ToolBridge::new(sandbox());
     bridge
         .register(
             registration(ToolFlags::new(false, false, true))
@@ -395,7 +520,7 @@ fn idempotency_cache_is_scoped_to_actor() {
 fn handler_timeout_returns_before_the_registered_deadline_and_unblocks_bridge() {
     let registration =
         registration(ToolFlags::new(true, true, true)).with_timeout(NonZeroU64::new(25).unwrap());
-    let mut bridge = ToolBridge::new();
+    let mut bridge = ToolBridge::new(sandbox());
     bridge.register(registration, SlowTool).unwrap();
     let mut artifacts =
         InMemoryArtifactStore::new(NonZeroU64::new(4096).unwrap(), NonZeroU64::new(16).unwrap());
@@ -569,7 +694,7 @@ fn handler_forged_paging_metadata_is_rejected_and_unreadable() {
     .with_required_capabilities([SandboxCapability::FilesystemRead])
     .with_required_scopes(["fixture:invoke"])
     .with_paging(true);
-    let mut bridge = ToolBridge::new();
+    let mut bridge = ToolBridge::new(sandbox());
     bridge.register(registration, ForgedPagingTool).unwrap();
     let mut artifacts =
         InMemoryArtifactStore::new(NonZeroU64::new(4096).unwrap(), NonZeroU64::new(16).unwrap());

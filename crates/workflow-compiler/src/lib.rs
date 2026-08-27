@@ -48,9 +48,10 @@ pub use skill_retrieval::{
     SkillRetrievalResult, retrieve_skill_candidates,
 };
 pub use skill_runtime::{
-    DeclaredSkillResource, DeclaredSkillScript, ScriptDenied, ScriptDeniedKind, ScriptPlan,
-    ScriptRuntime, SkillRuntimeLock, SkillRuntimeLockError, SkillRuntimeManifest,
-    SkillRuntimeManifestError, plan_script_execution,
+    DeclaredSkillResource, DeclaredSkillScript, ScriptDenied, ScriptDeniedKind,
+    ScriptExecutionError, ScriptExecutionErrorKind, ScriptPlan, ScriptRuntime, SkillRuntimeLock,
+    SkillRuntimeLockError, SkillRuntimeManifest, SkillRuntimeManifestError,
+    execute_registered_script, plan_script_execution,
 };
 
 /// A typed failure from one compiler pipeline stage.

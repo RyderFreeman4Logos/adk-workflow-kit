@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ApprovalLedger, ArtifactError, ArtifactId, ArtifactPage, ArtifactStore, CallApprovalError,
-    PageRequest, SandboxCapability, ToolEnvelope, ToolIdempotency, ToolRegistration,
+    PageRequest, RunSandbox, SandboxCapability, ToolEnvelope, ToolIdempotency, ToolRegistration,
     argument_fingerprint,
 };
 
@@ -100,9 +100,10 @@ impl ToolCallContext {
 
 /// A registered workflow-kit handler.
 pub trait ToolHandler: Send + Sync {
-    /// Executes one already-authorized call.
+    /// Executes one already-authorized call through its run-scoped sandbox.
     fn execute(
         &self,
+        sandbox: &RunSandbox,
         context: &ToolCallContext,
         arguments: &Value,
     ) -> Result<ToolEnvelope<Value>, ToolBridgeError>;
@@ -110,14 +111,17 @@ pub trait ToolHandler: Send + Sync {
 
 impl<F> ToolHandler for F
 where
-    F: Fn(&ToolCallContext, &Value) -> Result<ToolEnvelope<Value>, ToolBridgeError> + Send + Sync,
+    F: Fn(&RunSandbox, &ToolCallContext, &Value) -> Result<ToolEnvelope<Value>, ToolBridgeError>
+        + Send
+        + Sync,
 {
     fn execute(
         &self,
+        sandbox: &RunSandbox,
         context: &ToolCallContext,
         arguments: &Value,
     ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
-        self(context, arguments)
+        self(sandbox, context, arguments)
     }
 }
 
@@ -385,21 +389,17 @@ struct RegisteredTool {
 
 /// The policy-preserving registered-tool bridge.
 pub struct ToolBridge {
+    sandbox: Arc<RunSandbox>,
     tools: BTreeMap<String, RegisteredTool>,
     idempotent_results: HashMap<String, ToolEnvelope<Value>>,
     in_flight: HashMap<String, mpsc::Receiver<Result<ToolEnvelope<Value>, ToolBridgeError>>>,
 }
 
-impl Default for ToolBridge {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ToolBridge {
-    /// Creates an empty registry.
-    pub fn new() -> Self {
+    /// Creates an empty registry bound to exactly one run sandbox.
+    pub fn new(sandbox: RunSandbox) -> Self {
         Self {
+            sandbox: Arc::new(sandbox),
             tools: BTreeMap::new(),
             idempotent_results: HashMap::new(),
             in_flight: HashMap::new(),
@@ -537,11 +537,12 @@ impl ToolBridge {
             }
             if !self.in_flight.contains_key(&idempotency_key) {
                 let handler = Arc::clone(&handler);
+                let sandbox = Arc::clone(&self.sandbox);
                 let arguments = call.arguments().clone();
                 let (sender, receiver) = mpsc::sync_channel(1);
                 thread::Builder::new()
                     .spawn(move || {
-                        let _ = sender.send(handler.execute(&context, &arguments));
+                        let _ = sender.send(handler.execute(&sandbox, &context, &arguments));
                     })
                     .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
                 self.in_flight.insert(idempotency_key.clone(), receiver);
@@ -560,10 +561,11 @@ impl ToolBridge {
             return Ok(result);
         }
         let arguments = call.arguments().clone();
+        let sandbox = Arc::clone(&self.sandbox);
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::Builder::new()
             .spawn(move || {
-                let _ = sender.send(handler.execute(&context, &arguments));
+                let _ = sender.send(handler.execute(&sandbox, &context, &arguments));
             })
             .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
         let result = receiver
