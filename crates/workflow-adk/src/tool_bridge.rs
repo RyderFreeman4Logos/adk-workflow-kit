@@ -11,7 +11,8 @@ use adk_rust::{
     Tool, ToolContext, Toolset, async_trait,
 };
 use workflow_runtime::{
-    ApprovalLedger, ArtifactStore, CapabilityIntersection, ToolBridge, ToolCall, ToolRegistration,
+    ApprovalLedger, ArtifactPage, ArtifactStore, CapabilityIntersection, PageRequest, ToolBridge,
+    ToolBridgeError, ToolCall, ToolRegistration,
 };
 
 struct BridgeState<S> {
@@ -76,6 +77,25 @@ where
         self.registered_tools()
             .into_iter()
             .find(|tool| tool.name() == name)
+    }
+
+    /// Reads a bounded retained-output page from an opaque tool-result handle.
+    pub fn read_artifact_page(
+        &self,
+        artifact_handle: &str,
+        request: PageRequest,
+    ) -> std::result::Result<ArtifactPage, ToolBridgeError> {
+        let bridge = self
+            .state
+            .bridge
+            .lock()
+            .expect("tool bridge mutex poisoned");
+        let artifacts = self
+            .state
+            .artifacts
+            .lock()
+            .expect("tool artifact store mutex poisoned");
+        bridge.read_artifact_page(&*artifacts, artifact_handle, request)
     }
 
     /// Builds an ADK before-tool callback for non-call-specific fail-closed checks.

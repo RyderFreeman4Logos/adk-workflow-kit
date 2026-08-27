@@ -3,16 +3,18 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{Arc, mpsc},
+    thread,
+    time::Duration,
 };
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ApprovalLedger, ArtifactError, ArtifactStore, CallApprovalError, SandboxCapability,
-    ToolEnvelope, ToolIdempotency, ToolRegistration, argument_fingerprint,
+    ApprovalLedger, ArtifactError, ArtifactId, ArtifactPage, ArtifactStore, CallApprovalError,
+    PageRequest, SandboxCapability, ToolEnvelope, ToolIdempotency, ToolRegistration,
+    argument_fingerprint,
 };
 
 /// One model or workflow function call received by the bridge.
@@ -440,6 +442,20 @@ impl ToolBridge {
         self.tools.keys().cloned().collect()
     }
 
+    /// Reads a bounded artifact page from an opaque handle returned by this bridge.
+    pub fn read_artifact_page(
+        &self,
+        artifacts: &dyn ArtifactStore,
+        artifact_handle: &str,
+        request: PageRequest,
+    ) -> Result<ArtifactPage, ToolBridgeError> {
+        let artifact_id = ArtifactId::parse(artifact_handle)
+            .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::ArtifactFailed))?;
+        artifacts
+            .read_page(&artifact_id, request)
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::ArtifactFailed))
+    }
+
     /// Performs the non-call-specific checks used by ADK before-tool hooks.
     pub fn preflight(
         &self,
@@ -499,7 +515,8 @@ impl ToolBridge {
         }
 
         let fingerprint = argument_fingerprint(call.arguments());
-        let idempotency_key = stable_idempotency_key(call.name(), call.call_id(), &fingerprint);
+        let idempotency_key =
+            stable_idempotency_key(call.name(), call.actor(), call.call_id(), &fingerprint);
         if let Some(result) = self.idempotent_results.get(&idempotency_key) {
             return Ok(result.clone());
         }
@@ -514,17 +531,26 @@ impl ToolBridge {
             implementation_digest: registered.registration.implementation_digest().to_owned(),
             deadline,
         };
-        let started = Instant::now();
-        let result = registered.handler.execute(&context, call.arguments())?;
-        if started.elapsed() > Duration::from_millis(registered.registration.timeout_ms().get()) {
-            return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
-        }
+        let timeout = Duration::from_millis(registered.registration.timeout_ms().get());
+        let handler = Arc::clone(&registered.handler);
+        let arguments = call.arguments().clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .spawn(move || {
+                let _ = sender.send(handler.execute(&context, &arguments));
+            })
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+        let result = receiver
+            .recv_timeout(timeout)
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))??;
         if result.provenance() != registered.registration.provenance() {
             return Err(ToolBridgeError::new(
                 ToolBridgeErrorKind::ProvenanceMismatch,
             ));
         }
+        validate_output(&result, &registered.registration)?;
         let result = bound_output(result, &registered.registration, artifacts)?;
+        validate_output(&result, &registered.registration)?;
         if !registered.registration.flags().read_only() {
             self.idempotent_results
                 .insert(idempotency_key, result.clone());
@@ -533,9 +559,16 @@ impl ToolBridge {
     }
 }
 
-fn stable_idempotency_key(tool_name: &str, call_id: &str, fingerprint: &str) -> String {
+fn stable_idempotency_key(
+    tool_name: &str,
+    actor: &str,
+    call_id: &str,
+    fingerprint: &str,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(tool_name.as_bytes());
+    hasher.update([0]);
+    hasher.update(actor.as_bytes());
     hasher.update([0]);
     hasher.update(call_id.as_bytes());
     hasher.update([0]);
@@ -545,6 +578,21 @@ fn stable_idempotency_key(tool_name: &str, call_id: &str, fingerprint: &str) -> 
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn validate_output(
+    result: &ToolEnvelope<Value>,
+    registration: &ToolRegistration,
+) -> Result<(), ToolBridgeError> {
+    let validator = jsonschema::validator_for(registration.output_schema())
+        .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+    let output = serde_json::to_value(result)
+        .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+    if validator.is_valid(&output) {
+        Ok(())
+    } else {
+        Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))
+    }
 }
 
 fn bound_output(
@@ -563,21 +611,20 @@ fn bound_output(
         return Err(ToolBridgeError::new(ToolBridgeErrorKind::OutputTooLarge));
     }
 
+    let artifact_id = artifacts
+        .put(&bytes)
+        .map_err(|_: ArtifactError| ToolBridgeError::new(ToolBridgeErrorKind::ArtifactFailed))?;
     let mut preview_len = bytes.len().min(limit);
     loop {
         let preview = String::from_utf8_lossy(&bytes[..preview_len]).into_owned();
         let candidate = result
             .clone()
-            .map_payload(|_| json!({ "preview": preview }));
+            .map_payload(|_| json!({ "preview": preview }))
+            .with_artifact(artifact_id.as_str().to_owned(), Some(preview_len as u64));
         let candidate_bytes = serde_json::to_vec(&candidate)
             .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
         if candidate_bytes.len() <= limit {
-            let artifact_id = artifacts.put(&bytes).map_err(|_: ArtifactError| {
-                ToolBridgeError::new(ToolBridgeErrorKind::ArtifactFailed)
-            })?;
-            return Ok(
-                candidate.with_artifact(artifact_id.as_str().to_owned(), Some(preview_len as u64))
-            );
+            return Ok(candidate);
         }
         if preview_len == 0 {
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::OutputTooLarge));

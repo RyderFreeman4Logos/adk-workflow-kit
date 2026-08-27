@@ -394,8 +394,14 @@ impl ToolRegistration {
             ToolRegistrationError::InvalidInputSchema,
             ToolRegistrationError::InputSchemaTooLarge,
         )?;
-        let output_schema = generate_schema::<ToolEnvelope<O>>(
+        let mut output_schema = generate_schema::<ToolEnvelope<O>>(
             schemars::generate::SchemaSettings::draft2020_12().for_serialize(),
+            ToolRegistrationError::InvalidOutputSchema,
+            ToolRegistrationError::OutputSchemaTooLarge,
+        )?;
+        add_paged_payload_schema(&mut output_schema)?;
+        let output_schema = validate_schema(
+            output_schema,
             ToolRegistrationError::InvalidOutputSchema,
             ToolRegistrationError::OutputSchemaTooLarge,
         )?;
@@ -701,6 +707,44 @@ where
     let schema = serde_json::to_value(settings.into_generator().into_root_schema_for::<T>())
         .map_err(|_| invalid_error)?;
     validate_schema(schema, invalid_error, too_large_error)
+}
+
+fn add_paged_payload_schema(schema: &mut Value) -> Result<(), ToolRegistrationError> {
+    let variants = schema
+        .get_mut("oneOf")
+        .and_then(Value::as_array_mut)
+        .ok_or(ToolRegistrationError::InvalidOutputSchema)?;
+    let success = variants
+        .iter_mut()
+        .find(|variant| {
+            variant
+                .pointer("/properties/status/const")
+                .and_then(Value::as_str)
+                == Some("success")
+        })
+        .ok_or(ToolRegistrationError::InvalidOutputSchema)?;
+    let properties = success
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .ok_or(ToolRegistrationError::InvalidOutputSchema)?;
+    let typed_payload = properties
+        .remove("payload")
+        .ok_or(ToolRegistrationError::InvalidOutputSchema)?;
+    properties.insert(
+        "payload".to_owned(),
+        serde_json::json!({
+            "anyOf": [
+                typed_payload,
+                {
+                    "type": "object",
+                    "properties": { "preview": { "type": "string" } },
+                    "required": ["preview"],
+                    "additionalProperties": false,
+                },
+            ],
+        }),
+    );
+    Ok(())
 }
 
 fn validate_schema(
