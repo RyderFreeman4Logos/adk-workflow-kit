@@ -13,8 +13,8 @@ use workflow_compiler::{
 };
 use workflow_runtime::{
     CapabilityIntersection, InMemoryArtifactStore, Materialization, RunContext, RunId, RunLimits,
-    RunSandbox, SandboxCapability, SandboxExecutionError, ToolCall, ToolEnvelope, ToolFlags,
-    ToolProvenance, ToolRegistration, WorkdirManager,
+    RunSandbox, SandboxCapability, SandboxExecutionError, ToolBridgeErrorKind, ToolCall,
+    ToolEnvelope, ToolFlags, ToolProvenance, ToolRegistration, WorkdirManager,
 };
 
 const SCRIPT: &[u8] = b"import json, sys\nfrom pathlib import Path\nvalue = json.load(sys.stdin)['value']\nPath('adapter-marker').write_text('sandbox')\nprint(json.dumps({'value': value}))\n";
@@ -206,6 +206,45 @@ fn adk_adapter_invokes_registered_script_in_its_run_sandbox() {
         "script must run in the run sandbox workdir"
     );
     assert_eq!(payload, json!({ "value": "ok" }));
+}
+
+#[test]
+fn registered_script_rejects_capabilities_beyond_registration_before_spawn() {
+    let base = TestBase::new();
+    let lock_capabilities = vec![
+        SandboxCapability::FilesystemRead,
+        SandboxCapability::FilesystemWrite,
+        SandboxCapability::ProcessSpawn,
+        SandboxCapability::OutputBytes,
+    ];
+    let (manifest, lock) = manifest(SCRIPT, &lock_capabilities);
+    let sandbox = sandbox(
+        &base,
+        "adapter-capability-mismatch",
+        SCRIPT,
+        lock_capabilities,
+    );
+    let marker = sandbox.workdir().work_dir().join("adapter-marker");
+    let result = AdkToolBridge::for_registered_script(
+        sandbox,
+        registration(&[SandboxCapability::FilesystemRead]),
+        CapabilityIntersection::all_for_tool("script", [SandboxCapability::FilesystemRead]),
+        None,
+        InMemoryArtifactStore::new(
+            NonZeroU64::new(4_096).expect("positive"),
+            NonZeroU64::new(1_024).expect("positive"),
+        ),
+        RegisteredSkillScript::new(manifest, lock, "script"),
+    );
+
+    assert!(matches!(
+        result,
+        Err(error) if error.kind() == ToolBridgeErrorKind::CapabilityDenied
+    ));
+    assert!(
+        !marker.exists(),
+        "capability mismatch must fail before spawn"
+    );
 }
 
 #[test]

@@ -51,7 +51,7 @@ pub use skill_runtime::{
     DeclaredSkillResource, DeclaredSkillScript, ScriptDenied, ScriptDeniedKind,
     ScriptExecutionError, ScriptExecutionErrorKind, ScriptPlan, ScriptRuntime, SkillRuntimeLock,
     SkillRuntimeLockError, SkillRuntimeManifest, SkillRuntimeManifestError,
-    execute_registered_script, plan_script_execution,
+    execute_registered_script, execute_registered_script_in_child, plan_script_execution,
 };
 
 /// A typed failure from one compiler pipeline stage.

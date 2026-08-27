@@ -1,7 +1,6 @@
 use std::{
     fs,
     num::NonZeroU64,
-    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -9,10 +8,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use workflow_runtime::{
-    ApprovalLedger, CapabilityIntersection, InMemoryArtifactStore, PageRequest, RunContext, RunId,
-    RunLimits, RunSandbox, SandboxCapability, SandboxCommand, SandboxExecutionError, ToolBridge,
-    ToolBridgeError, ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolEnvelope, ToolFlags,
-    ToolHandler, ToolIdempotency, ToolProvenance, ToolRegistration, WorkdirManager,
+    ApprovalLedger, CapabilityIntersection, ChildSandbox, InMemoryArtifactStore, PageRequest,
+    RunContext, RunId, RunLimits, RunSandbox, SandboxCapability, ToolBridge, ToolBridgeError,
+    ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler,
+    ToolIdempotency, ToolProvenance, ToolRegistration, WorkdirManager,
 };
 
 fn sandbox() -> RunSandbox {
@@ -85,7 +84,7 @@ struct FixtureTool {
 impl ToolHandler for FixtureTool {
     fn execute(
         &self,
-        _sandbox: &RunSandbox,
+        _sandbox: &ChildSandbox<'_>,
         _context: &ToolCallContext,
         _arguments: &serde_json::Value,
     ) -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
@@ -98,25 +97,18 @@ impl ToolHandler for FixtureTool {
 }
 
 struct SandboxedTool {
-    marker: Arc<Mutex<Option<PathBuf>>>,
+    write_denied: Arc<Mutex<Option<bool>>>,
 }
 
 impl ToolHandler for SandboxedTool {
     fn execute(
         &self,
-        sandbox: &RunSandbox,
+        sandbox: &ChildSandbox<'_>,
         _context: &ToolCallContext,
         _arguments: &serde_json::Value,
     ) -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
-        let command = SandboxCommand::new("touch", ["tool-bridge-marker"])
-            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
-        sandbox
-            .execute_tool(&command)
-            .map_err(|_: SandboxExecutionError| {
-                ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed)
-            })?;
-        *self.marker.lock().expect("fixture lock") =
-            Some(sandbox.workdir().work_dir().join("tool-bridge-marker"));
+        *self.write_denied.lock().expect("fixture lock") =
+            Some(sandbox.child([SandboxCapability::FilesystemWrite]).is_err());
         Ok(ToolEnvelope::success(
             json!("ok"),
             ToolProvenance::new("registry.fixture", "1.0.0"),
@@ -145,7 +137,7 @@ struct ActorTool {
 impl ToolHandler for ActorTool {
     fn execute(
         &self,
-        _sandbox: &RunSandbox,
+        _sandbox: &ChildSandbox<'_>,
         context: &ToolCallContext,
         _arguments: &serde_json::Value,
     ) -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
@@ -162,7 +154,7 @@ struct SlowTool;
 impl ToolHandler for SlowTool {
     fn execute(
         &self,
-        _sandbox: &RunSandbox,
+        _sandbox: &ChildSandbox<'_>,
         _context: &ToolCallContext,
         arguments: &serde_json::Value,
     ) -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
@@ -183,7 +175,7 @@ struct SlowSideEffectTool {
 impl ToolHandler for SlowSideEffectTool {
     fn execute(
         &self,
-        _sandbox: &RunSandbox,
+        _sandbox: &ChildSandbox<'_>,
         _context: &ToolCallContext,
         _arguments: &serde_json::Value,
     ) -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
@@ -201,7 +193,7 @@ struct ForgedPagingTool;
 impl ToolHandler for ForgedPagingTool {
     fn execute(
         &self,
-        _sandbox: &RunSandbox,
+        _sandbox: &ChildSandbox<'_>,
         _context: &ToolCallContext,
         _arguments: &serde_json::Value,
     ) -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
@@ -241,12 +233,12 @@ fn capability_intersection_denies_forbidden_skill_before_handler() {
 }
 
 #[test]
-fn tool_bridge_executes_registered_tools_in_its_run_sandbox() {
-    let marker = Arc::new(Mutex::new(None));
+fn tool_bridge_narrows_each_handler_to_effective_capabilities() {
+    let write_denied = Arc::new(Mutex::new(None));
     let mut bridge = bridge(
         registration(ToolFlags::new(true, true, true)),
         SandboxedTool {
-            marker: Arc::clone(&marker),
+            write_denied: Arc::clone(&write_denied),
         },
     );
     let mut artifacts =
@@ -281,14 +273,7 @@ fn tool_bridge_executes_registered_tools_in_its_run_sandbox() {
         )
         .expect("registered tool must execute in its run sandbox");
 
-    assert!(
-        marker
-            .lock()
-            .expect("fixture lock")
-            .as_ref()
-            .expect("handler must observe its sandbox")
-            .is_file()
-    );
+    assert_eq!(*write_denied.lock().expect("fixture lock"), Some(true));
 }
 
 #[test]

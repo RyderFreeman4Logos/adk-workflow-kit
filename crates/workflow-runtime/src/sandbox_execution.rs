@@ -176,6 +176,24 @@ impl ChildSandbox<'_> {
         &self.capabilities
     }
 
+    /// Further narrows this child's authority without exposing its parent.
+    pub fn child(
+        &self,
+        capabilities: impl IntoIterator<Item = SandboxCapability>,
+    ) -> Result<ChildSandbox<'_>, SandboxExecutionError> {
+        let capabilities = capabilities.into_iter().collect::<BTreeSet<_>>();
+        if capabilities
+            .iter()
+            .any(|capability| !self.capabilities.contains(capability))
+        {
+            return Err(SandboxExecutionError::CapabilityDenied);
+        }
+        Ok(ChildSandbox {
+            parent: self.parent,
+            capabilities: capabilities.into_iter().collect(),
+        })
+    }
+
     /// Executes a registered Python Skill file from the read-only `/skills` mount.
     pub fn execute_python_script(
         &self,

@@ -7,7 +7,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use workflow_runtime::{BubblewrapReceipt, RunSandbox, SandboxCapability, SandboxExecutionError};
+use workflow_runtime::{
+    BubblewrapReceipt, ChildSandbox, RunSandbox, SandboxCapability, SandboxExecutionError,
+};
 
 use crate::{SkillActivationReceipt, SkillId, SkillManifest, SkillResourceId};
 
@@ -45,6 +47,11 @@ impl DeclaredSkillScript {
     /// Returns the declared script runtime.
     pub fn runtime(&self) -> &str {
         &self.runtime
+    }
+
+    /// Returns the capability classes required by this script.
+    pub fn capabilities(&self) -> &[SandboxCapability] {
+        &self.capabilities
     }
 }
 
@@ -105,6 +112,16 @@ impl ScriptPlan {
 
     /// Executes this registered plan inside a capability-narrowed child sandbox.
     pub fn execute(&self, sandbox: &RunSandbox) -> Result<BubblewrapReceipt, ScriptExecutionError> {
+        let child = sandbox
+            .child(self.capabilities.iter().copied())
+            .map_err(ScriptExecutionError::sandbox)?;
+        self.execute_in(&child)
+    }
+
+    fn execute_in(
+        &self,
+        sandbox: &ChildSandbox<'_>,
+    ) -> Result<BubblewrapReceipt, ScriptExecutionError> {
         let child = sandbox
             .child(self.capabilities.iter().copied())
             .map_err(ScriptExecutionError::sandbox)?;
@@ -371,6 +388,19 @@ pub fn execute_registered_script(
     plan_script_execution(manifest, lock, script_id, input_json)
         .map_err(ScriptExecutionError::denied)?
         .execute(sandbox)
+}
+
+/// Plans and executes one declared Skill script within an already-narrowed child sandbox.
+pub fn execute_registered_script_in_child(
+    manifest: &SkillRuntimeManifest,
+    lock: &SkillRuntimeLock,
+    script_id: &str,
+    input_json: &[u8],
+    sandbox: &ChildSandbox<'_>,
+) -> Result<BubblewrapReceipt, ScriptExecutionError> {
+    plan_script_execution(manifest, lock, script_id, input_json)
+        .map_err(ScriptExecutionError::denied)?
+        .execute_in(sandbox)
 }
 
 /// A bounded, canonicalized v1 Skill runtime manifest.

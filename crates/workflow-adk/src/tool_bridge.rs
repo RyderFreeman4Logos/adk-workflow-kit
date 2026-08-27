@@ -12,11 +12,12 @@ use adk_rust::{
 };
 use workflow_compiler::{
     ScriptExecutionError, SkillRuntimeLock, SkillRuntimeManifest, execute_registered_script,
+    execute_registered_script_in_child,
 };
 use workflow_runtime::{
-    ApprovalLedger, ArtifactPage, ArtifactStore, CapabilityIntersection, PageRequest, RunSandbox,
-    ToolBridge, ToolBridgeError, ToolCall, ToolEnvelope, ToolFailure, ToolHandler, ToolProvenance,
-    ToolRegistration,
+    ApprovalLedger, ArtifactPage, ArtifactStore, CapabilityIntersection, ChildSandbox, PageRequest,
+    RunSandbox, ToolBridge, ToolBridgeError, ToolCall, ToolEnvelope, ToolFailure, ToolHandler,
+    ToolProvenance, ToolRegistration,
 };
 
 struct BridgeState<S> {
@@ -72,16 +73,21 @@ struct RegisteredScriptHandler {
 impl ToolHandler for RegisteredScriptHandler {
     fn execute(
         &self,
-        sandbox: &RunSandbox,
+        sandbox: &ChildSandbox<'_>,
         _context: &workflow_runtime::ToolCallContext,
         arguments: &serde_json::Value,
     ) -> std::result::Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
         let input_json = serde_json::to_vec(arguments).map_err(|_| {
             ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed)
         })?;
-        let receipt = self.script.execute(sandbox, &input_json).map_err(|_| {
-            ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed)
-        })?;
+        let receipt = execute_registered_script_in_child(
+            &self.script.manifest,
+            &self.script.lock,
+            &self.script.script_id,
+            &input_json,
+            sandbox,
+        )
+        .map_err(|_| ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed))?;
         if receipt.exit_success() {
             let output = serde_json::from_slice(receipt.stdout()).map_err(|_| {
                 ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed)
@@ -133,6 +139,16 @@ where
         artifacts: S,
         script: RegisteredSkillScript,
     ) -> std::result::Result<Self, ToolBridgeError> {
+        if script
+            .manifest
+            .script(&script.script_id)
+            .map(workflow_compiler::DeclaredSkillScript::capabilities)
+            != Some(registration.required_capabilities())
+        {
+            return Err(ToolBridgeError::new(
+                workflow_runtime::ToolBridgeErrorKind::CapabilityDenied,
+            ));
+        }
         let handler = RegisteredScriptHandler {
             script,
             provenance: registration.provenance().clone(),
@@ -225,7 +241,7 @@ where
                 };
                 let bridge = state.bridge.lock().expect("tool bridge mutex poisoned");
                 match bridge.preflight(name, arguments, &state.authority) {
-                    Ok(()) => Ok(None),
+                    Ok(_) => Ok(None),
                     Err(error) => Ok(Some(Content::new("tool").with_text(error.to_string()))),
                 }
             })
