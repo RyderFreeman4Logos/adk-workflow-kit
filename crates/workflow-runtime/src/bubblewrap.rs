@@ -20,7 +20,7 @@ use std::{
 
 use crate::{
     BackendCapabilities, RequestedCapabilities, RunWorkdir, SandboxCapability,
-    UnsatisfiedCapabilities, verify_sandbox_capabilities,
+    UnsatisfiedCapabilities, WorkdirError, verify_sandbox_capabilities,
 };
 
 /// A validated sandbox request for the Linux bubblewrap backend.
@@ -225,6 +225,7 @@ impl LinuxBubblewrapBackend {
         &self,
         request: &BubblewrapRequest<'_>,
     ) -> Result<BubblewrapReceipt, BubblewrapError> {
+        request.workdir.verify_sandbox_mounts()?;
         verify_sandbox_capabilities(&request.requested, &self.capabilities)?;
 
         let mut command = Command::new("bwrap");
@@ -446,12 +447,20 @@ fn configure_bwrap(command: &mut Command, request: &BubblewrapRequest<'_>) {
 /// A categorized bubblewrap failure outside request validation.
 #[derive(Debug)]
 pub enum BubblewrapError {
+    /// The run workdir no longer has its allocated mount layout.
+    Workdir(WorkdirError),
     /// Capability preflight rejected the request.
     Capabilities(UnsatisfiedCapabilities),
     /// `bwrap` could not be spawned (fail closed).
     Spawn { source: std::io::Error },
     /// `bwrap` failed while the supervisor waited on it.
     Run { source: std::io::Error },
+}
+
+impl From<WorkdirError> for BubblewrapError {
+    fn from(workdir: WorkdirError) -> Self {
+        Self::Workdir(workdir)
+    }
 }
 
 impl From<UnsatisfiedCapabilities> for BubblewrapError {
@@ -463,6 +472,7 @@ impl From<UnsatisfiedCapabilities> for BubblewrapError {
 impl fmt::Display for BubblewrapError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Workdir(_) => formatter.write_str("bubblewrap backend rejected run workdir"),
             Self::Capabilities(error) => fmt::Display::fmt(error, formatter),
             Self::Spawn { .. } => formatter.write_str("bubblewrap backend could not spawn bwrap"),
             Self::Run { .. } => formatter.write_str("bubblewrap backend failed while running"),
@@ -473,6 +483,7 @@ impl fmt::Display for BubblewrapError {
 impl std::error::Error for BubblewrapError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Workdir(error) => Some(error),
             Self::Capabilities(error) => Some(error),
             Self::Spawn { source } | Self::Run { source } => Some(source),
         }

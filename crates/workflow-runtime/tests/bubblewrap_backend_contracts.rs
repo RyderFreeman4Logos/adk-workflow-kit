@@ -84,6 +84,40 @@ fn bubblewrap_backend_rejects_forged_unsupported_capabilities_before_spawn() {
 }
 
 #[test]
+fn bubblewrap_backend_rejects_a_swapped_mutable_mount_before_spawn() {
+    use std::os::unix::fs::symlink;
+
+    let backend = LinuxBubblewrapBackend::new(BackendCapabilities::new([
+        SandboxCapability::FilesystemRead,
+        SandboxCapability::FilesystemWrite,
+        SandboxCapability::ProcessSpawn,
+    ]));
+    let (base, workdir) = workdir();
+    let original_work = workdir.work_dir();
+    let displaced_work = base.path().join("displaced-work");
+    let outside = base.path().join("outside");
+    fs::rename(&original_work, &displaced_work).expect("work mount must be displaceable");
+    fs::create_dir(&outside).expect("outside directory must exist");
+    symlink(&outside, &original_work).expect("swapped work mount must be a symlink");
+    let request = BubblewrapRequest::new(
+        String::from("touch /work/escaped"),
+        &workdir,
+        BTreeMap::new(),
+        RequestedCapabilities::new([SandboxCapability::ProcessSpawn]),
+    )
+    .expect("request must validate before mount preflight");
+
+    assert!(
+        backend.execute(&request).is_err(),
+        "a swapped mutable mount must fail before bubblewrap follows it"
+    );
+    assert!(
+        !outside.join("escaped").exists(),
+        "a swapped mount must not grant writes outside the run root"
+    );
+}
+
+#[test]
 fn bubblewrap_backend_pumps_piped_output_before_the_child_exits() {
     let backend = LinuxBubblewrapBackend::new(BackendCapabilities::new([
         SandboxCapability::FilesystemRead,

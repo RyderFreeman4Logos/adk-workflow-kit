@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     BackendCapabilities, RequestedCapabilities, RunWorkdir, SandboxCapability,
-    UnsatisfiedCapabilities, verify_sandbox_capabilities,
+    UnsatisfiedCapabilities, WorkdirError, verify_sandbox_capabilities,
 };
 
 /// A validated rootless OCI image execution request.
@@ -139,6 +139,7 @@ impl RootlessPodmanBackend {
 
     /// Executes a digest-pinned request with rootless isolation flags.
     pub fn execute(&self, request: &PodmanRequest<'_>) -> Result<PodmanReceipt, PodmanError> {
+        request.workdir.verify_sandbox_mounts()?;
         verify_sandbox_capabilities(&request.requested, &self.capabilities)?;
         let output = Command::new("podman")
             .args([
@@ -209,10 +210,18 @@ impl RootlessPodmanBackend {
 /// A typed backend execution failure.
 #[derive(Debug)]
 pub enum PodmanError {
+    /// The run workdir no longer has its allocated mount layout.
+    Workdir(WorkdirError),
     /// Capability preflight rejected the request.
     Capabilities(UnsatisfiedCapabilities),
     /// Podman was unavailable or could not be spawned.
     Spawn { source: io::Error },
+}
+
+impl From<WorkdirError> for PodmanError {
+    fn from(workdir: WorkdirError) -> Self {
+        Self::Workdir(workdir)
+    }
 }
 
 impl From<UnsatisfiedCapabilities> for PodmanError {
@@ -224,6 +233,7 @@ impl From<UnsatisfiedCapabilities> for PodmanError {
 impl fmt::Display for PodmanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Workdir(_) => formatter.write_str("rootless podman backend rejected run workdir"),
             Self::Capabilities(error) => error.fmt(formatter),
             Self::Spawn { .. } => {
                 formatter.write_str("rootless podman backend could not spawn podman")
@@ -235,6 +245,7 @@ impl fmt::Display for PodmanError {
 impl std::error::Error for PodmanError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Workdir(error) => Some(error),
             Self::Capabilities(error) => Some(error),
             Self::Spawn { source } => Some(source),
         }
@@ -351,6 +362,46 @@ mod tests {
             backend.execute(&request),
             Err(PodmanError::Capabilities(_))
         ));
+    }
+
+    #[test]
+    fn swapped_mutable_mount_fails_before_podman_runs() {
+        with_podman_shim("#!/bin/sh\nexit 99\n", || {
+            let base = std::env::temp_dir().join(format!(
+                "workflow-runtime-podman-swapped-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&base);
+            fs::create_dir(&base).expect("test base must exist");
+            let manager = WorkdirManager::new(&base).expect("test base must be trusted");
+            let run_id = RunId::new("podman-swapped".to_owned()).expect("fixture run ID");
+            let workdir = manager.allocate(&run_id).expect("workdir must allocate");
+            let original_work = workdir.work_dir();
+            let outside = base.join("outside");
+            fs::rename(&original_work, base.join("displaced-work"))
+                .expect("work mount must be displaceable");
+            fs::create_dir(&outside).expect("outside directory must exist");
+            std::os::unix::fs::symlink(&outside, &original_work)
+                .expect("swapped work mount must be a symlink");
+            let request = PodmanRequest::new(
+                format!("alpine@sha256:{}", "c".repeat(64)),
+                "touch /work/escaped".to_owned(),
+                &workdir,
+                BTreeMap::new(),
+                RequestedCapabilities::new([SandboxCapability::ProcessSpawn]),
+            )
+            .expect("request must validate before mount preflight");
+            let backend = RootlessPodmanBackend::new(BackendCapabilities::new([
+                SandboxCapability::ProcessSpawn,
+            ]));
+
+            assert!(
+                backend.execute(&request).is_err(),
+                "a swapped mount must fail before Podman follows it"
+            );
+            assert!(!outside.join("escaped").exists());
+            fs::remove_dir_all(base).expect("test base must be removed");
+        });
     }
 
     #[test]

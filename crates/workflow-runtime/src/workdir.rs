@@ -538,6 +538,26 @@ impl RunWorkdir {
         self.active = false;
         Ok(outcome)
     }
+
+    /// Confirms every sandbox mount still belongs to this allocated run.
+    pub(crate) fn verify_sandbox_mounts(&self) -> Result<(), WorkdirError> {
+        let root = fs::symlink_metadata(&self.root)
+            .map_err(|_| WorkdirError::new(WorkdirErrorKind::RootChanged))?;
+        if root.file_type().is_symlink()
+            || !root.is_dir()
+            || Identity::from_metadata(&root) != self.root_identity
+        {
+            return Err(WorkdirError::new(WorkdirErrorKind::RootChanged));
+        }
+        for name in ["input", "package", "skills", "refs", "work", "out", "tmp"] {
+            let mount = fs::symlink_metadata(self.root.join(name))
+                .map_err(|_| WorkdirError::new(WorkdirErrorKind::RootChanged))?;
+            if mount.file_type().is_symlink() || !mount.is_dir() {
+                return Err(WorkdirError::new(WorkdirErrorKind::RootChanged));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
