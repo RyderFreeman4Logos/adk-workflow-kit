@@ -25,7 +25,7 @@ use workflow_runtime::{
     InMemoryArtifactStore, PureTransformRequest, RequestedCapabilities, RunContext, RunId,
     RunLimits, RunSandbox, SandboxCapability, ToolBridge, ToolBridgeError, ToolCallContext,
     ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance, ToolRegistration, WorkdirManager,
-    verify_sandbox_capabilities,
+    WorkflowRuntimeEventKindV1, verify_sandbox_capabilities,
 };
 use workflow_spec::{SourcePath, read_bounded_regular_file};
 
@@ -404,17 +404,28 @@ pub enum ExecutionErrorKind {
     InvalidRunState,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionError {
     kind: ExecutionErrorKind,
+    receipt: Option<Box<ExecutionReceipt>>,
 }
 
 impl ExecutionError {
     fn new(kind: ExecutionErrorKind) -> Self {
-        Self { kind }
+        Self {
+            kind,
+            receipt: None,
+        }
     }
-    pub const fn kind(self) -> ExecutionErrorKind {
+    pub const fn kind(&self) -> ExecutionErrorKind {
         self.kind
+    }
+    pub fn receipt(&self) -> Option<&ExecutionReceipt> {
+        self.receipt.as_deref()
+    }
+    fn with_receipt(mut self, receipt: ExecutionReceipt) -> Self {
+        self.receipt = Some(Box::new(receipt));
+        self
     }
 }
 
@@ -435,6 +446,11 @@ impl ExecutionBackend {
         input: Value,
         workdir_base: impl AsRef<Path>,
     ) -> Result<ExecutionReceipt, ExecutionError> {
+        let input_bytes = serde_json::to_vec(&input)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
+        if input_bytes.len() > PureTransformRequest::MAX_JSON_BYTES {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+        }
         let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
         let requested = RequestedCapabilities::new(required_capabilities.iter().copied());
         verify_sandbox_capabilities(
@@ -447,38 +463,23 @@ impl ExecutionBackend {
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Compile))?;
         let transform_module = profile.transform_module()?;
         let model = profile.bind_model()?;
-        let run_id = fresh_run_id()?;
-        let context = RunContext::new(run_id.clone(), run_limits());
         let manager = WorkdirManager::new(workdir_base)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
+        let run_id = fresh_run_id()?;
+        let context = RunContext::new(run_id.clone(), run_limits());
+        let mut mapper = AdkEventMapper::new(run_id.as_str(), compiled.ir().workflow_id().as_str())
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
         let run_workdir = manager
             .allocate(&run_id)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let run_root = run_workdir.root().to_path_buf();
         let workdir_id = run_workdir.id().as_str().to_owned();
-        let sandbox = RunSandbox::new(context, run_workdir, sandbox_capabilities)
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::SandboxDenied))?;
-        let tool = build_tool(&profile, sandbox, &required_capabilities)?;
-        let agents = compiled
-            .ir()
-            .nodes()
-            .iter()
-            .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
-            .map(|node| {
-                let agent: Arc<dyn Agent> = Arc::new(ProfileAgent {
-                    name: node.id().as_str().to_owned(),
-                    model: Arc::clone(&model),
-                    tool: tool.clone(),
-                    input: input.clone(),
-                });
-                (node.id().as_str().to_owned(), agent)
-            })
-            .collect::<BTreeMap<_, _>>();
-        let graph = AdkGraphTranslator::new()
-            .translate_profile(&compiled, &agents, transform_module.as_deref(), &input)
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
-        let mut mapper = AdkEventMapper::new(run_id.as_str(), compiled.ir().workflow_id().as_str())
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let mut artifacts = FilesystemArtifactStore::try_new(
+            run_root.join("artifacts"),
+            NonZeroU64::new(ARTIFACT_LIMIT).expect("positive artifact limit"),
+            NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page limit"),
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
         mapper
             .map(AdkRuntimeObservationV1::new(
                 "workflow-started",
@@ -486,49 +487,89 @@ impl ExecutionBackend {
                 AdkRuntimeObservationKindV1::WorkflowStarted,
             ))
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-        let mut artifacts = FilesystemArtifactStore::try_new(
-            run_root.join("artifacts"),
-            NonZeroU64::new(ARTIFACT_LIMIT).expect("positive artifact limit"),
-            NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page limit"),
-        )
-        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-        let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
-        let state = runtime
-            .block_on(graph.invoke_observed(
-                State::new(),
-                ExecutionConfig::new(run_id.as_str()),
-                &mut mapper,
-                &mut artifacts,
-            ))
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
-        if !state.contains_key("terminal") {
-            return Err(ExecutionError::new(ExecutionErrorKind::Adk));
-        }
-        let node_outputs = compiled
-            .ir()
-            .nodes()
+        let execution = (|| {
+            let sandbox = RunSandbox::new(context, run_workdir, sandbox_capabilities)
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::SandboxDenied))?;
+            let tool = build_tool(&profile, sandbox, &required_capabilities)?;
+            let agents = compiled
+                .ir()
+                .nodes()
+                .iter()
+                .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
+                .map(|node| {
+                    let agent: Arc<dyn Agent> = Arc::new(ProfileAgent {
+                        name: node.id().as_str().to_owned(),
+                        model: Arc::clone(&model),
+                        tool: tool.clone(),
+                        input: input.clone(),
+                    });
+                    (node.id().as_str().to_owned(), agent)
+                })
+                .collect::<BTreeMap<_, _>>();
+            let graph = AdkGraphTranslator::new()
+                .translate_profile(&compiled, &agents, transform_module.as_deref(), &input)
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
+            let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
+            let state = runtime
+                .block_on(graph.invoke_observed(
+                    State::new(),
+                    ExecutionConfig::new(run_id.as_str()),
+                    &mut mapper,
+                    &mut artifacts,
+                ))
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
+            state
+                .contains_key("terminal")
+                .then_some(state)
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Adk))
+        })();
+        let mut status = mapper
+            .events()
             .iter()
-            .filter(|node| {
-                !matches!(
-                    node.kind(),
-                    workflow_ir::IrNodeKind::Agent | workflow_ir::IrNodeKind::Terminal
-                )
-            })
-            .filter_map(|node| {
-                let id = node.id().as_str();
-                state
-                    .get(&format!("node:{id}"))
-                    .cloned()
-                    .map(|output| (id.to_owned(), output))
-            })
-            .collect::<BTreeMap<_, _>>();
+            .rev()
+            .find_map(|event| match event.kind() {
+                WorkflowRuntimeEventKindV1::WorkflowIncomplete => Some("incomplete"),
+                WorkflowRuntimeEventKindV1::WorkflowFailed => Some("failed"),
+                _ => None,
+            });
+        if execution.is_err() && status.is_none() {
+            mapper
+                .map(AdkRuntimeObservationV1::new(
+                    "workflow-failed",
+                    "workflowctl",
+                    AdkRuntimeObservationKindV1::WorkflowFailed,
+                ))
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+            status = Some("failed");
+        }
+        let status = status.unwrap_or("succeeded");
+        let node_outputs = execution.as_ref().ok().map_or_else(BTreeMap::new, |state| {
+            compiled
+                .ir()
+                .nodes()
+                .iter()
+                .filter(|node| {
+                    !matches!(
+                        node.kind(),
+                        workflow_ir::IrNodeKind::Agent | workflow_ir::IrNodeKind::Terminal
+                    )
+                })
+                .filter_map(|node| {
+                    let id = node.id().as_str();
+                    state
+                        .get(&format!("node:{id}"))
+                        .cloned()
+                        .map(|output| (id.to_owned(), output))
+                })
+                .collect()
+        });
         let terminal = serde_json::to_vec(&serde_json::json!({
             "run_id": run_id.as_str(),
-            "status": "succeeded",
-            "terminal": state.get("terminal"),
+            "status": status,
+            "terminal": execution.as_ref().ok().and_then(|state| state.get("terminal")),
             "node_outputs": node_outputs
         }))
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
@@ -544,12 +585,16 @@ impl ExecutionBackend {
             workdir_id,
             profile_identity: profile.profile_identity(),
             adk_rust_version: "2.1.0".to_owned(),
-            status: "succeeded".to_owned(),
+            status: status.to_owned(),
             artifact_id: artifact_id.as_str().to_owned(),
             resume_count: 0,
         };
         write_json(&run_root.join("run-manifest.json"), &manifest)?;
-        Ok(manifest.receipt(run_root))
+        let receipt = manifest.receipt(run_root);
+        match execution {
+            Ok(_) => Ok(receipt),
+            Err(error) => Err(error.with_receipt(receipt)),
+        }
     }
 
     pub fn inspect(

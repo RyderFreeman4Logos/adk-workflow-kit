@@ -701,8 +701,9 @@ fn main() {
         .iter()
         .take_while(|argument| argument.as_encoded_bytes() != b"--")
         .any(|argument| argument == "--json");
-    let valid = arguments.iter().all(|argument| {
-        argument.as_encoded_bytes().len() <= 4096
+    let valid = arguments.iter().enumerate().all(|(index, argument)| {
+        (index > 0 && arguments[index - 1] == "--input"
+            || argument.as_encoded_bytes().len() <= 4096)
             && argument.to_str().is_some_and(|value| {
                 !value.is_empty()
                     && !value.chars().any(|character| {
@@ -916,7 +917,12 @@ fn main() {
                 };
                 match ExecutionBackend::run(path, profile, input, workdir) {
                     Ok(receipt) => write_execution_receipt(&receipt, json),
-                    Err(error) => exit_execution_error(error.kind(), json),
+                    Err(error) => {
+                        if let Some(receipt) = error.receipt() {
+                            write_execution_receipt(receipt, json);
+                        }
+                        exit_execution_error(error.kind(), json)
+                    }
                 }
                 return;
             }

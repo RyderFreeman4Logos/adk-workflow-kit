@@ -114,6 +114,10 @@ fn fake_profile() -> Value {
 }
 
 fn run_adk(workflow: &Path, profile: &Path, runs: &Path) -> Output {
+    run_adk_with_input(workflow, profile, runs, r#"{"value":7}"#)
+}
+
+fn run_adk_with_input(workflow: &Path, profile: &Path, runs: &Path, input: &str) -> Output {
     binary()
         .args([
             "--json",
@@ -122,7 +126,7 @@ fn run_adk(workflow: &Path, profile: &Path, runs: &Path) -> Output {
             "--profile",
             profile.to_str().expect("UTF-8 profile path"),
             "--input",
-            r#"{"value":7}"#,
+            input,
             "--workdir",
             runs.to_str().expect("UTF-8 run base"),
         ])
@@ -280,6 +284,72 @@ fn sandbox_denial_fails_before_backend_spawn() {
             .next()
             .is_none(),
         "sandbox denial must happen before workdir allocation or backend spawn"
+    );
+
+    fs::remove_dir_all(root).expect("test root must be removed");
+}
+
+#[test]
+fn failed_profile_run_persists_and_remains_inspectable() {
+    let root = temp_root("failed-run");
+    let invalid_module = root.join("invalid.wasm");
+    fs::write(&invalid_module, b"not wasm").expect("invalid module fixture must write");
+    let mut profile_value = fake_profile();
+    profile_value["pure_transform"] =
+        json!({"module": invalid_module.to_str().expect("UTF-8 module path")});
+    let (workflow, profile, runs) = write_fixture(&root, profile_value);
+    fs::write(&workflow, HETEROGENEOUS_WORKFLOW).expect("workflow fixture must write");
+
+    let failed = run_adk(&workflow, &profile, &runs);
+    assert_eq!(failed.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("workflow.run.failed"));
+    let failed_receipt = json_stdout(&failed);
+    let run_id = failed_receipt["run_id"]
+        .as_str()
+        .expect("failed receipt must carry the allocated run ID");
+    assert_eq!(failed_receipt["status"], "failed");
+
+    let inspect = command_json(&[
+        "--json",
+        "inspect",
+        "--run-id",
+        run_id,
+        "--workdir",
+        runs.to_str().expect("UTF-8 run base"),
+    ]);
+    let inspected = json_stdout(&inspect);
+    assert_eq!(inspected["run_id"], run_id);
+    assert_eq!(inspected["status"], "failed");
+    let events = fs::read_to_string(run_root(&runs).join("events.jsonl"))
+        .expect("failed events must be persisted");
+    assert!(events.contains("\"kind\":\"workflow_failed\""));
+    assert!(
+        fs::read_dir(run_root(&runs).join("artifacts"))
+            .expect("failed artifact directory must exist")
+            .next()
+            .is_some(),
+        "failed run must persist a terminal artifact"
+    );
+
+    fs::remove_dir_all(root).expect("test root must be removed");
+}
+
+#[test]
+fn oversized_agent_only_profile_input_fails_before_run_allocation() {
+    let root = temp_root("oversized-input");
+    let (workflow, profile, runs) = write_fixture(&root, fake_profile());
+    let input = serde_json::to_string(&json!({"payload": "x".repeat(64 * 1024)}))
+        .expect("oversized input must serialize");
+
+    let output = run_adk_with_input(&workflow, &profile, &runs, &input);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("workflow.run.unsupported_input"));
+    assert!(
+        fs::read_dir(&runs)
+            .expect("run base must be readable")
+            .next()
+            .is_none(),
+        "oversized input must fail before allocating run state"
     );
 
     fs::remove_dir_all(root).expect("test root must be removed");
