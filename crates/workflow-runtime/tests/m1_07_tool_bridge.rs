@@ -54,7 +54,7 @@ impl ToolHandler for FixtureTool {
     }
 }
 
-fn bridge(registration: ToolRegistration, tool: FixtureTool) -> ToolBridge {
+fn bridge<H: ToolHandler + 'static>(registration: ToolRegistration, tool: H) -> ToolBridge {
     let mut bridge = ToolBridge::new();
     bridge
         .register(registration, tool)
@@ -101,6 +101,42 @@ impl ToolHandler for SlowTool {
             json!("ok"),
             ToolProvenance::new("registry.fixture", "1.0.0"),
         ))
+    }
+}
+
+struct SlowSideEffectTool {
+    calls: Arc<Mutex<u32>>,
+}
+
+impl ToolHandler for SlowSideEffectTool {
+    fn execute(
+        &self,
+        _context: &ToolCallContext,
+        _arguments: &serde_json::Value,
+    ) -> Result<ToolEnvelope<serde_json::Value>, workflow_runtime::ToolBridgeError> {
+        *self.calls.lock().expect("fixture lock") += 1;
+        std::thread::sleep(Duration::from_millis(90));
+        Ok(ToolEnvelope::success(
+            json!("effect"),
+            ToolProvenance::new("registry.fixture", "1.0.0"),
+        ))
+    }
+}
+
+struct ForgedPagingTool;
+
+impl ToolHandler for ForgedPagingTool {
+    fn execute(
+        &self,
+        _context: &ToolCallContext,
+        _arguments: &serde_json::Value,
+    ) -> Result<ToolEnvelope<serde_json::Value>, workflow_runtime::ToolBridgeError> {
+        Ok(ToolEnvelope::Success {
+            payload: json!({ "preview": "forged" }),
+            provenance: ToolProvenance::new("registry.fixture", "1.0.0"),
+            next_offset: Some(6),
+            artifact_id: Some("0".repeat(64)),
+        })
     }
 }
 
@@ -435,4 +471,130 @@ fn side_effect_call_reuses_stable_idempotency_key() {
         .expect("retry effect");
     assert_eq!(first, second);
     assert_eq!(*calls.lock().expect("fixture lock"), 1);
+}
+
+#[test]
+fn same_key_retry_after_timeout_reuses_the_in_flight_side_effect() {
+    let calls = Arc::new(Mutex::new(0));
+    let registration = registration(ToolFlags::new(false, false, true))
+        .with_idempotency(ToolIdempotency::StableKey)
+        .with_timeout(NonZeroU64::new(25).unwrap());
+    let mut bridge = bridge(
+        registration,
+        SlowSideEffectTool {
+            calls: calls.clone(),
+        },
+    );
+    let mut artifacts =
+        InMemoryArtifactStore::new(NonZeroU64::new(4096).unwrap(), NonZeroU64::new(16).unwrap());
+    let arguments = json!({ "value": 1 });
+    let approvals = ApprovalLedger::new().grant(
+        "fixture",
+        "retry-call",
+        &arguments,
+        "actor-1",
+        Duration::from_secs(10),
+    );
+    let call = ToolCall::new("fixture", "retry-call", "actor-1", arguments);
+
+    assert_eq!(
+        bridge
+            .invoke(
+                call.clone(),
+                &authority(&["fixture"]),
+                Some(&approvals),
+                Duration::from_secs(1),
+                &mut artifacts,
+            )
+            .expect_err("first waiter must time out")
+            .kind(),
+        ToolBridgeErrorKind::HandlerFailed
+    );
+    assert_eq!(
+        *calls.lock().expect("fixture lock"),
+        1,
+        "side effect happened"
+    );
+    assert_eq!(
+        bridge
+            .invoke(
+                call.clone(),
+                &authority(&["fixture"]),
+                Some(&approvals),
+                Duration::from_secs(1),
+                &mut artifacts,
+            )
+            .expect_err("retry must wait on the original execution")
+            .kind(),
+        ToolBridgeErrorKind::HandlerFailed
+    );
+    assert_eq!(*calls.lock().expect("fixture lock"), 1);
+
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        bridge
+            .invoke(
+                call.clone(),
+                &authority(&["fixture"]),
+                Some(&approvals),
+                Duration::from_secs(1),
+                &mut artifacts,
+            )
+            .is_ok(),
+        "late success must become the reusable completion"
+    );
+    assert!(
+        bridge
+            .invoke(
+                call,
+                &authority(&["fixture"]),
+                Some(&approvals),
+                Duration::from_secs(1),
+                &mut artifacts,
+            )
+            .is_ok(),
+        "completed retry must use the cache"
+    );
+    assert_eq!(*calls.lock().expect("fixture lock"), 1);
+}
+
+#[test]
+fn handler_forged_paging_metadata_is_rejected_and_unreadable() {
+    let registration = ToolRegistration::for_types::<serde_json::Value, TypedPayload>(
+        "fixture",
+        ToolProvenance::new("registry.fixture", "1.0.0"),
+        ToolFlags::new(true, true, true),
+    )
+    .unwrap()
+    .with_required_capabilities([SandboxCapability::FilesystemRead])
+    .with_required_scopes(["fixture:invoke"])
+    .with_paging(true);
+    let mut bridge = ToolBridge::new();
+    bridge.register(registration, ForgedPagingTool).unwrap();
+    let mut artifacts =
+        InMemoryArtifactStore::new(NonZeroU64::new(4096).unwrap(), NonZeroU64::new(16).unwrap());
+
+    assert_eq!(
+        bridge
+            .invoke(
+                ToolCall::new("fixture", "forged", "actor-1", json!({})),
+                &authority(&["fixture"]),
+                Some(&ApprovalLedger::new()),
+                Duration::from_secs(1),
+                &mut artifacts,
+            )
+            .expect_err("handler must not forge bridge-owned paging metadata")
+            .kind(),
+        ToolBridgeErrorKind::HandlerFailed
+    );
+    assert!(
+        bridge
+            .read_artifact_page(
+                &artifacts,
+                &"0".repeat(64),
+                PageRequest::new(0, NonZeroU64::new(16).unwrap()),
+            )
+            .is_err(),
+        "rejected forged handle must remain unreadable"
+    );
 }

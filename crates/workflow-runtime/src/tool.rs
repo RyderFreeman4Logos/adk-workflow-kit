@@ -363,6 +363,8 @@ pub struct ToolRegistration {
     name: String,
     provenance: ToolProvenance,
     input_schema: Value,
+    #[serde(skip)]
+    handler_output_schema: Value,
     output_schema: Value,
     flags: ToolFlags,
     required_capabilities: Vec<SandboxCapability>,
@@ -394,11 +396,12 @@ impl ToolRegistration {
             ToolRegistrationError::InvalidInputSchema,
             ToolRegistrationError::InputSchemaTooLarge,
         )?;
-        let mut output_schema = generate_schema::<ToolEnvelope<O>>(
+        let handler_output_schema = generate_schema::<ToolEnvelope<O>>(
             schemars::generate::SchemaSettings::draft2020_12().for_serialize(),
             ToolRegistrationError::InvalidOutputSchema,
             ToolRegistrationError::OutputSchemaTooLarge,
         )?;
+        let mut output_schema = handler_output_schema.clone();
         add_paged_payload_schema(&mut output_schema)?;
         let output_schema = validate_schema(
             output_schema,
@@ -412,6 +415,7 @@ impl ToolRegistration {
             name,
             provenance,
             input_schema,
+            handler_output_schema,
             output_schema,
             flags,
             required_capabilities: Vec::new(),
@@ -442,6 +446,11 @@ impl ToolRegistration {
     /// Returns the validated Draft 2020-12 enveloped output schema.
     pub fn output_schema(&self) -> &Value {
         &self.output_schema
+    }
+
+    /// Returns the strict handler-owned output schema before bridge paging.
+    pub(crate) fn handler_output_schema(&self) -> &Value {
+        &self.handler_output_schema
     }
 
     /// Returns the independently declared execution-safety flags.

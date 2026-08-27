@@ -387,6 +387,7 @@ struct RegisteredTool {
 pub struct ToolBridge {
     tools: BTreeMap<String, RegisteredTool>,
     idempotent_results: HashMap<String, ToolEnvelope<Value>>,
+    in_flight: HashMap<String, mpsc::Receiver<Result<ToolEnvelope<Value>, ToolBridgeError>>>,
 }
 
 impl Default for ToolBridge {
@@ -401,6 +402,7 @@ impl ToolBridge {
         Self {
             tools: BTreeMap::new(),
             idempotent_results: HashMap::new(),
+            in_flight: HashMap::new(),
         }
     }
 
@@ -499,7 +501,9 @@ impl ToolBridge {
             .tools
             .get(&call.name)
             .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::UnknownTool))?;
-        if !registered.registration.flags().read_only() {
+        let registration = registered.registration.clone();
+        let handler = Arc::clone(&registered.handler);
+        if !registration.flags().read_only() {
             approvals
                 .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::ApprovalDenied))?
                 .authorize(
@@ -517,22 +521,44 @@ impl ToolBridge {
         let fingerprint = argument_fingerprint(call.arguments());
         let idempotency_key =
             stable_idempotency_key(call.name(), call.actor(), call.call_id(), &fingerprint);
-        if let Some(result) = self.idempotent_results.get(&idempotency_key) {
-            return Ok(result.clone());
-        }
-        let deadline = now.saturating_add(Duration::from_millis(
-            registered.registration.timeout_ms().get(),
-        ));
+        let deadline = now.saturating_add(Duration::from_millis(registration.timeout_ms().get()));
         let context = ToolCallContext {
             call_id: call.call_id().to_owned(),
             actor: call.actor().to_owned(),
             argument_fingerprint: fingerprint,
             idempotency_key: idempotency_key.clone(),
-            implementation_digest: registered.registration.implementation_digest().to_owned(),
+            implementation_digest: registration.implementation_digest().to_owned(),
             deadline,
         };
-        let timeout = Duration::from_millis(registered.registration.timeout_ms().get());
-        let handler = Arc::clone(&registered.handler);
+        let timeout = Duration::from_millis(registration.timeout_ms().get());
+        if !registration.flags().read_only() {
+            if let Some(result) = self.idempotent_results.get(&idempotency_key) {
+                return Ok(result.clone());
+            }
+            if !self.in_flight.contains_key(&idempotency_key) {
+                let handler = Arc::clone(&handler);
+                let arguments = call.arguments().clone();
+                let (sender, receiver) = mpsc::sync_channel(1);
+                thread::Builder::new()
+                    .spawn(move || {
+                        let _ = sender.send(handler.execute(&context, &arguments));
+                    })
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                self.in_flight.insert(idempotency_key.clone(), receiver);
+            }
+            let result = self.wait_for_in_flight(&idempotency_key, timeout)?;
+            if result.provenance() != registration.provenance() {
+                return Err(ToolBridgeError::new(
+                    ToolBridgeErrorKind::ProvenanceMismatch,
+                ));
+            }
+            validate_handler_output(&result, &registration)?;
+            let result = bound_output(result, &registration, artifacts)?;
+            validate_output(&result, &registration)?;
+            self.idempotent_results
+                .insert(idempotency_key, result.clone());
+            return Ok(result);
+        }
         let arguments = call.arguments().clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::Builder::new()
@@ -543,19 +569,32 @@ impl ToolBridge {
         let result = receiver
             .recv_timeout(timeout)
             .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))??;
-        if result.provenance() != registered.registration.provenance() {
+        if result.provenance() != registration.provenance() {
             return Err(ToolBridgeError::new(
                 ToolBridgeErrorKind::ProvenanceMismatch,
             ));
         }
-        validate_output(&result, &registered.registration)?;
-        let result = bound_output(result, &registered.registration, artifacts)?;
-        validate_output(&result, &registered.registration)?;
-        if !registered.registration.flags().read_only() {
-            self.idempotent_results
-                .insert(idempotency_key, result.clone());
-        }
+        validate_handler_output(&result, &registration)?;
+        let result = bound_output(result, &registration, artifacts)?;
+        validate_output(&result, &registration)?;
         Ok(result)
+    }
+
+    fn wait_for_in_flight(
+        &mut self,
+        idempotency_key: &str,
+        timeout: Duration,
+    ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        let result = self
+            .in_flight
+            .get(idempotency_key)
+            .expect("in-flight handler must exist")
+            .recv_timeout(timeout)
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
+        if result.is_ok() {
+            self.in_flight.remove(idempotency_key);
+        }
+        result?
     }
 }
 
@@ -584,7 +623,24 @@ fn validate_output(
     result: &ToolEnvelope<Value>,
     registration: &ToolRegistration,
 ) -> Result<(), ToolBridgeError> {
-    let validator = jsonschema::validator_for(registration.output_schema())
+    validate_output_against_schema(result, registration.output_schema())
+}
+
+fn validate_handler_output(
+    result: &ToolEnvelope<Value>,
+    registration: &ToolRegistration,
+) -> Result<(), ToolBridgeError> {
+    if result.artifact_id().is_some() || result.next_offset().is_some() {
+        return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
+    }
+    validate_output_against_schema(result, registration.handler_output_schema())
+}
+
+fn validate_output_against_schema(
+    result: &ToolEnvelope<Value>,
+    schema: &Value,
+) -> Result<(), ToolBridgeError> {
+    let validator = jsonschema::validator_for(schema)
         .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
     let output = serde_json::to_value(result)
         .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
