@@ -10,9 +10,14 @@ use adk_rust::{
     AdkError, CallbackContext, Content, ErrorCategory, ErrorComponent, ReadonlyContext, Result,
     Tool, ToolContext, Toolset, async_trait,
 };
+use workflow_compiler::{
+    ScriptExecutionError, SkillRuntimeLock, SkillRuntimeManifest, execute_registered_script,
+    execute_registered_script_in_child,
+};
 use workflow_runtime::{
-    ApprovalLedger, ArtifactPage, ArtifactStore, CapabilityIntersection, PageRequest, ToolBridge,
-    ToolBridgeError, ToolCall, ToolRegistration,
+    ApprovalLedger, ArtifactPage, ArtifactStore, CapabilityIntersection, ChildSandbox, PageRequest,
+    RunSandbox, ToolBridge, ToolBridgeError, ToolCall, ToolEnvelope, ToolFailure, ToolHandler,
+    ToolProvenance, ToolRegistration,
 };
 
 struct BridgeState<S> {
@@ -21,6 +26,80 @@ struct BridgeState<S> {
     approvals: Option<ApprovalLedger>,
     artifacts: Mutex<S>,
     started: Instant,
+}
+
+/// One lock-bound Skill script exposed to an ADK tool registration.
+pub struct RegisteredSkillScript {
+    manifest: SkillRuntimeManifest,
+    lock: SkillRuntimeLock,
+    script_id: String,
+}
+
+impl RegisteredSkillScript {
+    /// Binds the declared script identity to its validated manifest and lock.
+    pub fn new(
+        manifest: SkillRuntimeManifest,
+        lock: SkillRuntimeLock,
+        script_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            manifest,
+            lock,
+            script_id: script_id.into(),
+        }
+    }
+
+    /// Executes the declared script through the run's narrowed child sandbox.
+    pub fn execute(
+        &self,
+        sandbox: &RunSandbox,
+        input_json: &[u8],
+    ) -> std::result::Result<workflow_runtime::BubblewrapReceipt, ScriptExecutionError> {
+        execute_registered_script(
+            &self.manifest,
+            &self.lock,
+            &self.script_id,
+            input_json,
+            sandbox,
+        )
+    }
+}
+
+struct RegisteredScriptHandler {
+    script: RegisteredSkillScript,
+    provenance: ToolProvenance,
+}
+
+impl ToolHandler for RegisteredScriptHandler {
+    fn execute(
+        &self,
+        sandbox: &ChildSandbox<'_>,
+        _context: &workflow_runtime::ToolCallContext,
+        arguments: &serde_json::Value,
+    ) -> std::result::Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
+        let input_json = serde_json::to_vec(arguments).map_err(|_| {
+            ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed)
+        })?;
+        let receipt = execute_registered_script_in_child(
+            &self.script.manifest,
+            &self.script.lock,
+            &self.script.script_id,
+            &input_json,
+            sandbox,
+        )
+        .map_err(|_| ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed))?;
+        if receipt.exit_success() {
+            let output = serde_json::from_slice(receipt.stdout()).map_err(|_| {
+                ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed)
+            })?;
+            Ok(ToolEnvelope::success(output, self.provenance.clone()))
+        } else {
+            Ok(ToolEnvelope::failure(
+                ToolFailure::Unavailable,
+                self.provenance.clone(),
+            ))
+        }
+    }
 }
 
 /// Exposes registered workflow-kit tools as ADK [`Tool`] values.
@@ -49,6 +128,54 @@ where
                 started: Instant::now(),
             }),
         }
+    }
+
+    /// Builds the production ADK script tool over exactly one run sandbox.
+    pub fn for_registered_script(
+        sandbox: RunSandbox,
+        registration: ToolRegistration,
+        authority: CapabilityIntersection,
+        approvals: Option<ApprovalLedger>,
+        artifacts: S,
+        script: RegisteredSkillScript,
+    ) -> std::result::Result<Self, ToolBridgeError> {
+        if script
+            .manifest
+            .script(&script.script_id)
+            .map(workflow_compiler::DeclaredSkillScript::capabilities)
+            != Some(registration.required_capabilities())
+        {
+            return Err(ToolBridgeError::new(
+                workflow_runtime::ToolBridgeErrorKind::CapabilityDenied,
+            ));
+        }
+        let handler = RegisteredScriptHandler {
+            script,
+            provenance: registration.provenance().clone(),
+        };
+        let mut bridge = ToolBridge::new(sandbox);
+        bridge.register(registration, handler)?;
+        Ok(Self::new(bridge, authority, approvals, artifacts))
+    }
+
+    /// Invokes one kit tool through the run-bound policy bridge.
+    pub fn invoke(
+        &self,
+        call: ToolCall,
+    ) -> std::result::Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
+        let mut bridge = self.state.bridge.lock().map_err(|_| {
+            ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed)
+        })?;
+        let mut artifacts = self.state.artifacts.lock().map_err(|_| {
+            ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed)
+        })?;
+        bridge.invoke(
+            call,
+            &self.state.authority,
+            self.state.approvals.as_ref(),
+            self.state.started.elapsed(),
+            &mut *artifacts,
+        )
     }
 
     /// Returns every registered tool in deterministic name order.
@@ -114,7 +241,7 @@ where
                 };
                 let bridge = state.bridge.lock().expect("tool bridge mutex poisoned");
                 match bridge.preflight(name, arguments, &state.authority) {
-                    Ok(()) => Ok(None),
+                    Ok(_) => Ok(None),
                     Err(error) => Ok(Some(Content::new("tool").with_text(error.to_string()))),
                 }
             })
@@ -182,38 +309,18 @@ where
             context.user_id(),
             arguments,
         );
-        let mut bridge = self.state.bridge.lock().map_err(|_| {
+        let result = AdkToolBridge {
+            state: Arc::clone(&self.state),
+        }
+        .invoke(call)
+        .map_err(|error| {
             AdkError::new(
                 ErrorComponent::Tool,
                 ErrorCategory::Internal,
-                "tool.bridge.unavailable",
-                "tool bridge unavailable",
+                "tool.bridge.failed",
+                error.to_string(),
             )
         })?;
-        let mut artifacts = self.state.artifacts.lock().map_err(|_| {
-            AdkError::new(
-                ErrorComponent::Tool,
-                ErrorCategory::Internal,
-                "tool.bridge.artifact_store_unavailable",
-                "tool artifact store unavailable",
-            )
-        })?;
-        let result = bridge
-            .invoke(
-                call,
-                &self.state.authority,
-                self.state.approvals.as_ref(),
-                self.state.started.elapsed(),
-                &mut *artifacts,
-            )
-            .map_err(|error| {
-                AdkError::new(
-                    ErrorComponent::Tool,
-                    ErrorCategory::Internal,
-                    "tool.bridge.failed",
-                    error.to_string(),
-                )
-            })?;
         serde_json::to_value(result).map_err(|error| {
             AdkError::new(
                 ErrorComponent::Tool,

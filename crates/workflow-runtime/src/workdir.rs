@@ -6,6 +6,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::Serialize;
@@ -194,6 +195,58 @@ pub enum CleanupOutcome {
     AlreadyAbsent,
 }
 
+static NEXT_OUTPUT_STAGE: AtomicU64 = AtomicU64::new(0);
+
+/// A run-local output directory that becomes visible only after acceptance.
+#[derive(Debug)]
+pub(crate) struct StagedOutput {
+    staging: Option<PathBuf>,
+    visible: PathBuf,
+}
+
+impl StagedOutput {
+    pub(crate) fn path(&self) -> &Path {
+        self.staging
+            .as_deref()
+            .expect("staged output path exists until commit")
+    }
+
+    pub(crate) fn commit(mut self) -> Result<(), WorkdirError> {
+        let staging = self
+            .staging
+            .as_ref()
+            .expect("staged output path exists until commit");
+        let entries = fs::read_dir(staging)
+            .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+            .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::CommitOutput, error))?;
+        for entry in &entries {
+            let file_type = entry.file_type().map_err(|error| {
+                WorkdirError::with_source(WorkdirErrorKind::CommitOutput, error)
+            })?;
+            if !file_type.is_file() || self.visible.join(entry.file_name()).exists() {
+                return Err(WorkdirError::new(WorkdirErrorKind::CommitOutput));
+            }
+        }
+        for entry in entries {
+            fs::rename(entry.path(), self.visible.join(entry.file_name())).map_err(|error| {
+                WorkdirError::with_source(WorkdirErrorKind::CommitOutput, error)
+            })?;
+        }
+        fs::remove_dir(staging)
+            .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::CommitOutput, error))?;
+        self.staging = None;
+        Ok(())
+    }
+}
+
+impl Drop for StagedOutput {
+    fn drop(&mut self) {
+        if let Some(staging) = self.staging.take() {
+            let _ = fs::remove_dir_all(staging);
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Manifest<'a> {
     schema_version: u8,
@@ -352,6 +405,10 @@ pub enum WorkdirErrorKind {
     Rollback,
     /// An allocated root no longer has its recorded identity.
     RootChanged,
+    /// A private output staging directory could not be created.
+    StageOutput,
+    /// Staged output could not be atomically published.
+    CommitOutput,
     /// An allocated root could not be removed.
     Cleanup,
 }
@@ -412,6 +469,8 @@ impl fmt::Display for WorkdirError {
             WorkdirErrorKind::PublishManifest => "failed to publish workdir manifest",
             WorkdirErrorKind::Rollback => "failed to roll back workdir allocation",
             WorkdirErrorKind::RootChanged => "workdir root identity changed",
+            WorkdirErrorKind::StageOutput => "failed to stage run output",
+            WorkdirErrorKind::CommitOutput => "failed to commit run output",
             WorkdirErrorKind::Cleanup => "failed to clean up workdir root",
         })
     }
@@ -519,6 +578,32 @@ impl RunWorkdir {
         self.root.join("out")
     }
 
+    /// Creates an output stage that remains invisible until committed.
+    pub(crate) fn stage_output(&self) -> Result<StagedOutput, WorkdirError> {
+        for _ in 0..8 {
+            let sequence = NEXT_OUTPUT_STAGE.fetch_add(1, Ordering::Relaxed);
+            let staging = self
+                .root
+                .join(format!(".out-stage-{}-{sequence}", std::process::id()));
+            match DirBuilder::new().mode(0o700).create(&staging) {
+                Ok(()) => {
+                    return Ok(StagedOutput {
+                        staging: Some(staging),
+                        visible: self.out_dir(),
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(WorkdirError::with_source(
+                        WorkdirErrorKind::StageOutput,
+                        error,
+                    ));
+                }
+            }
+        }
+        Err(WorkdirError::new(WorkdirErrorKind::StageOutput))
+    }
+
     /// Returns the temporary-files directory.
     pub fn tmp_dir(&self) -> PathBuf {
         self.root.join("tmp")
@@ -537,6 +622,26 @@ impl RunWorkdir {
         )?;
         self.active = false;
         Ok(outcome)
+    }
+
+    /// Confirms every sandbox mount still belongs to this allocated run.
+    pub(crate) fn verify_sandbox_mounts(&self) -> Result<(), WorkdirError> {
+        let root = fs::symlink_metadata(&self.root)
+            .map_err(|_| WorkdirError::new(WorkdirErrorKind::RootChanged))?;
+        if root.file_type().is_symlink()
+            || !root.is_dir()
+            || Identity::from_metadata(&root) != self.root_identity
+        {
+            return Err(WorkdirError::new(WorkdirErrorKind::RootChanged));
+        }
+        for name in ["input", "package", "skills", "refs", "work", "out", "tmp"] {
+            let mount = fs::symlink_metadata(self.root.join(name))
+                .map_err(|_| WorkdirError::new(WorkdirErrorKind::RootChanged))?;
+            if mount.file_type().is_symlink() || !mount.is_dir() {
+                return Err(WorkdirError::new(WorkdirErrorKind::RootChanged));
+            }
+        }
+        Ok(())
     }
 }
 

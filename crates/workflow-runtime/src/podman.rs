@@ -9,7 +9,8 @@ use std::{
 
 use crate::{
     BackendCapabilities, RequestedCapabilities, RunWorkdir, SandboxCapability,
-    UnsatisfiedCapabilities, verify_sandbox_capabilities,
+    UnsatisfiedCapabilities, WorkdirError, verify_process_spawn_capability,
+    verify_sandbox_capabilities, workdir::StagedOutput,
 };
 
 /// A validated rootless OCI image execution request.
@@ -139,8 +140,16 @@ impl RootlessPodmanBackend {
 
     /// Executes a digest-pinned request with rootless isolation flags.
     pub fn execute(&self, request: &PodmanRequest<'_>) -> Result<PodmanReceipt, PodmanError> {
+        request.workdir.verify_sandbox_mounts()?;
         verify_sandbox_capabilities(&request.requested, &self.capabilities)?;
-        let output = Command::new("podman")
+        verify_process_spawn_capability(&request.requested)?;
+        let staged_output = request
+            .requested
+            .contains(SandboxCapability::FilesystemWrite)
+            .then(|| request.workdir.stage_output())
+            .transpose()?;
+        let mut command = Command::new("podman");
+        command
             .args([
                 "run",
                 "--rm",
@@ -152,42 +161,40 @@ impl RootlessPodmanBackend {
                 "--security-opt=no-new-privileges",
             ])
             .arg("--workdir")
-            .arg("/work")
+            .arg("/work");
+        if request
+            .requested
+            .contains(SandboxCapability::FilesystemRead)
+        {
+            for dir in ["input", "package", "skills", "refs"] {
+                command.args(["--volume"]).arg(format!(
+                    "{}:/{dir}:ro",
+                    request.workdir.root().join(dir).display()
+                ));
+            }
+        }
+        let mutable_mode = if request
+            .requested
+            .contains(SandboxCapability::FilesystemWrite)
+        {
+            "rw"
+        } else {
+            "ro"
+        };
+        for dir in ["work", "tmp"] {
+            command.args(["--volume"]).arg(format!(
+                "{}:/{dir}:{mutable_mode}",
+                request.workdir.root().join(dir).display()
+            ));
+        }
+        let output_path = staged_output.as_ref().map_or_else(
+            || request.workdir.out_dir(),
+            |staged| staged.path().to_owned(),
+        );
+        command
             .args(["--volume"])
-            .arg(format!(
-                "{}:/input:ro",
-                request.workdir.root().join("input").display()
-            ))
-            .args(["--volume"])
-            .arg(format!(
-                "{}:/package:ro",
-                request.workdir.root().join("package").display()
-            ))
-            .args(["--volume"])
-            .arg(format!(
-                "{}:/skills:ro",
-                request.workdir.root().join("skills").display()
-            ))
-            .args(["--volume"])
-            .arg(format!(
-                "{}:/refs:ro",
-                request.workdir.root().join("refs").display()
-            ))
-            .args(["--volume"])
-            .arg(format!(
-                "{}:/work",
-                request.workdir.root().join("work").display()
-            ))
-            .args(["--volume"])
-            .arg(format!(
-                "{}:/out",
-                request.workdir.root().join("out").display()
-            ))
-            .args(["--volume"])
-            .arg(format!(
-                "{}:/tmp",
-                request.workdir.root().join("tmp").display()
-            ))
+            .arg(format!("{}:/out:{mutable_mode}", output_path.display()));
+        let output = command
             .args([
                 "--env",
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -202,17 +209,29 @@ impl RootlessPodmanBackend {
             .args(["sh", "-c", &request.command])
             .output()
             .map_err(|source| PodmanError::Spawn { source })?;
-        Ok(PodmanReceipt { output })
+        let staged_output = output.status.success().then_some(staged_output).flatten();
+        Ok(PodmanReceipt {
+            output,
+            staged_output,
+        })
     }
 }
 
 /// A typed backend execution failure.
 #[derive(Debug)]
 pub enum PodmanError {
+    /// The run workdir no longer has its allocated mount layout.
+    Workdir(WorkdirError),
     /// Capability preflight rejected the request.
     Capabilities(UnsatisfiedCapabilities),
     /// Podman was unavailable or could not be spawned.
     Spawn { source: io::Error },
+}
+
+impl From<WorkdirError> for PodmanError {
+    fn from(workdir: WorkdirError) -> Self {
+        Self::Workdir(workdir)
+    }
 }
 
 impl From<UnsatisfiedCapabilities> for PodmanError {
@@ -224,6 +243,7 @@ impl From<UnsatisfiedCapabilities> for PodmanError {
 impl fmt::Display for PodmanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Workdir(_) => formatter.write_str("rootless podman backend rejected run workdir"),
             Self::Capabilities(error) => error.fmt(formatter),
             Self::Spawn { .. } => {
                 formatter.write_str("rootless podman backend could not spawn podman")
@@ -235,6 +255,7 @@ impl fmt::Display for PodmanError {
 impl std::error::Error for PodmanError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Workdir(error) => Some(error),
             Self::Capabilities(error) => Some(error),
             Self::Spawn { source } => Some(source),
         }
@@ -245,6 +266,7 @@ impl std::error::Error for PodmanError {
 #[derive(Debug)]
 pub struct PodmanReceipt {
     output: Output,
+    staged_output: Option<StagedOutput>,
 }
 
 impl PodmanReceipt {
@@ -259,6 +281,14 @@ impl PodmanReceipt {
     /// Returns captured standard error.
     pub fn stderr(&self) -> &[u8] {
         &self.output.stderr
+    }
+
+    /// Publishes output staged by a successful container process.
+    pub fn commit_output(&mut self) -> Result<(), PodmanError> {
+        if let Some(staged_output) = self.staged_output.take() {
+            staged_output.commit()?;
+        }
+        Ok(())
     }
 }
 
@@ -354,6 +384,46 @@ mod tests {
     }
 
     #[test]
+    fn swapped_mutable_mount_fails_before_podman_runs() {
+        with_podman_shim("#!/bin/sh\nexit 99\n", || {
+            let base = std::env::temp_dir().join(format!(
+                "workflow-runtime-podman-swapped-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&base);
+            fs::create_dir(&base).expect("test base must exist");
+            let manager = WorkdirManager::new(&base).expect("test base must be trusted");
+            let run_id = RunId::new("podman-swapped".to_owned()).expect("fixture run ID");
+            let workdir = manager.allocate(&run_id).expect("workdir must allocate");
+            let original_work = workdir.work_dir();
+            let outside = base.join("outside");
+            fs::rename(&original_work, base.join("displaced-work"))
+                .expect("work mount must be displaceable");
+            fs::create_dir(&outside).expect("outside directory must exist");
+            std::os::unix::fs::symlink(&outside, &original_work)
+                .expect("swapped work mount must be a symlink");
+            let request = PodmanRequest::new(
+                format!("alpine@sha256:{}", "c".repeat(64)),
+                "touch /work/escaped".to_owned(),
+                &workdir,
+                BTreeMap::new(),
+                RequestedCapabilities::new([SandboxCapability::ProcessSpawn]),
+            )
+            .expect("request must validate before mount preflight");
+            let backend = RootlessPodmanBackend::new(BackendCapabilities::new([
+                SandboxCapability::ProcessSpawn,
+            ]));
+
+            assert!(
+                backend.execute(&request).is_err(),
+                "a swapped mount must fail before Podman follows it"
+            );
+            assert!(!outside.join("escaped").exists());
+            fs::remove_dir_all(base).expect("test base must be removed");
+        });
+    }
+
+    #[test]
     fn public_execute_conforms_to_digest_and_isolation_contract() {
         with_podman_shim("#!/bin/sh\nprintf '%s\\n' \"$@\"\n", || {
             let manager = WorkdirManager::new(std::env::temp_dir()).unwrap();
@@ -399,17 +469,66 @@ mod tests {
             }
             assert!(output.lines().any(|line| line == digest));
             for mount in [
-                format!("{}:/input:ro", workdir.root().join("input").display()),
-                format!("{}:/package:ro", workdir.root().join("package").display()),
-                format!("{}:/skills:ro", workdir.root().join("skills").display()),
-                format!("{}:/refs:ro", workdir.root().join("refs").display()),
-                format!("{}:/work", workdir.root().join("work").display()),
-                format!("{}:/out", workdir.root().join("out").display()),
-                format!("{}:/tmp", workdir.root().join("tmp").display()),
+                format!("{}:/work:ro", workdir.root().join("work").display()),
+                format!("{}:/out:ro", workdir.root().join("out").display()),
+                format!("{}:/tmp:ro", workdir.root().join("tmp").display()),
             ] {
                 assert!(output.lines().any(|line| line == mount));
             }
+            for private in ["/input", "/package", "/skills", "/refs"] {
+                assert!(
+                    !output
+                        .lines()
+                        .any(|line| line.ends_with(private)
+                            || line.ends_with(&format!("{private}:ro"))),
+                    "undeclared read mount leaked: {private}"
+                );
+            }
         });
+    }
+
+    #[test]
+    fn successful_backend_receipt_keeps_output_unpublished() {
+        with_podman_shim(
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in *:/out:rw) out=${arg%:/out:rw};; esac\ndone\ntest -n \"$out\"\nprintf staged > \"$out/result\"\n",
+            || {
+                let manager = WorkdirManager::new(std::env::temp_dir()).unwrap();
+                let run_id = RunId::new("podman-unpublished".to_owned()).unwrap();
+                let workdir = manager.allocate(&run_id).unwrap();
+                let request = PodmanRequest::new(
+                    format!("alpine@sha256:{}", "d".repeat(64)),
+                    "true".to_owned(),
+                    &workdir,
+                    BTreeMap::new(),
+                    RequestedCapabilities::new([
+                        SandboxCapability::FilesystemWrite,
+                        SandboxCapability::ProcessSpawn,
+                    ]),
+                )
+                .unwrap();
+                let backend = RootlessPodmanBackend::new(BackendCapabilities::new([
+                    SandboxCapability::FilesystemWrite,
+                    SandboxCapability::ProcessSpawn,
+                ]));
+
+                let mut receipt = backend.execute(&request).expect("shim must execute");
+
+                assert_eq!(
+                    fs::read_dir(workdir.out_dir())
+                        .expect("visible output")
+                        .count(),
+                    0,
+                    "backend success must remain unpublished until validation"
+                );
+                receipt
+                    .commit_output()
+                    .expect("accepted output must publish from its receipt");
+                assert_eq!(
+                    fs::read(workdir.out_dir().join("result")).expect("published output"),
+                    b"staged"
+                );
+            },
+        );
     }
 
     #[test]

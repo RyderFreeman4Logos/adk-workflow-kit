@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ApprovalLedger, ArtifactError, ArtifactId, ArtifactPage, ArtifactStore, CallApprovalError,
-    PageRequest, SandboxCapability, ToolEnvelope, ToolIdempotency, ToolRegistration,
-    argument_fingerprint,
+    ChildSandbox, PageRequest, RunSandbox, SandboxCapability, ToolEnvelope, ToolIdempotency,
+    ToolRegistration, argument_fingerprint,
 };
 
 /// One model or workflow function call received by the bridge.
@@ -100,9 +100,10 @@ impl ToolCallContext {
 
 /// A registered workflow-kit handler.
 pub trait ToolHandler: Send + Sync {
-    /// Executes one already-authorized call.
+    /// Executes one already-authorized call through its capability-narrowed child sandbox.
     fn execute(
         &self,
+        sandbox: &ChildSandbox<'_>,
         context: &ToolCallContext,
         arguments: &Value,
     ) -> Result<ToolEnvelope<Value>, ToolBridgeError>;
@@ -110,14 +111,21 @@ pub trait ToolHandler: Send + Sync {
 
 impl<F> ToolHandler for F
 where
-    F: Fn(&ToolCallContext, &Value) -> Result<ToolEnvelope<Value>, ToolBridgeError> + Send + Sync,
+    F: Fn(
+            &ChildSandbox<'_>,
+            &ToolCallContext,
+            &Value,
+        ) -> Result<ToolEnvelope<Value>, ToolBridgeError>
+        + Send
+        + Sync,
 {
     fn execute(
         &self,
+        sandbox: &ChildSandbox<'_>,
         context: &ToolCallContext,
         arguments: &Value,
     ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
-        self(context, arguments)
+        self(sandbox, context, arguments)
     }
 }
 
@@ -385,21 +393,17 @@ struct RegisteredTool {
 
 /// The policy-preserving registered-tool bridge.
 pub struct ToolBridge {
+    sandbox: Arc<RunSandbox>,
     tools: BTreeMap<String, RegisteredTool>,
     idempotent_results: HashMap<String, ToolEnvelope<Value>>,
     in_flight: HashMap<String, mpsc::Receiver<Result<ToolEnvelope<Value>, ToolBridgeError>>>,
 }
 
-impl Default for ToolBridge {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ToolBridge {
-    /// Creates an empty registry.
-    pub fn new() -> Self {
+    /// Creates an empty registry bound to exactly one run sandbox.
+    pub fn new(sandbox: RunSandbox) -> Self {
         Self {
+            sandbox: Arc::new(sandbox),
             tools: BTreeMap::new(),
             idempotent_results: HashMap::new(),
             in_flight: HashMap::new(),
@@ -464,12 +468,12 @@ impl ToolBridge {
         name: &str,
         arguments: &Value,
         authority: &CapabilityIntersection,
-    ) -> Result<(), ToolBridgeError> {
+    ) -> Result<EffectiveToolCapabilities, ToolBridgeError> {
         let registered = self
             .tools
             .get(name)
             .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::UnknownTool))?;
-        authority
+        let effective = authority
             .authorize(&registered.registration)
             .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
         if !registered.registration.flags().read_only()
@@ -484,7 +488,7 @@ impl ToolBridge {
         if !validator.is_valid(arguments) {
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
         }
-        Ok(())
+        Ok(effective)
     }
 
     /// Dispatches an authorized call and returns a typed, bounded envelope.
@@ -496,7 +500,7 @@ impl ToolBridge {
         now: Duration,
         artifacts: &mut dyn ArtifactStore,
     ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
-        self.preflight(call.name(), call.arguments(), authority)?;
+        let effective = self.preflight(call.name(), call.arguments(), authority)?;
         let registered = self
             .tools
             .get(&call.name)
@@ -531,17 +535,26 @@ impl ToolBridge {
             deadline,
         };
         let timeout = Duration::from_millis(registration.timeout_ms().get());
+        let capabilities = effective.capabilities;
         if !registration.flags().read_only() {
             if let Some(result) = self.idempotent_results.get(&idempotency_key) {
                 return Ok(result.clone());
             }
             if !self.in_flight.contains_key(&idempotency_key) {
                 let handler = Arc::clone(&handler);
+                let sandbox = Arc::clone(&self.sandbox);
+                let capabilities = capabilities.clone();
                 let arguments = call.arguments().clone();
                 let (sender, receiver) = mpsc::sync_channel(1);
                 thread::Builder::new()
                     .spawn(move || {
-                        let _ = sender.send(handler.execute(&context, &arguments));
+                        let result = sandbox
+                            .child(capabilities)
+                            .map_err(|_| {
+                                ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied)
+                            })
+                            .and_then(|sandbox| handler.execute(&sandbox, &context, &arguments));
+                        let _ = sender.send(result);
                     })
                     .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
                 self.in_flight.insert(idempotency_key.clone(), receiver);
@@ -560,10 +573,15 @@ impl ToolBridge {
             return Ok(result);
         }
         let arguments = call.arguments().clone();
+        let sandbox = Arc::clone(&self.sandbox);
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::Builder::new()
             .spawn(move || {
-                let _ = sender.send(handler.execute(&context, &arguments));
+                let result = sandbox
+                    .child(capabilities)
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))
+                    .and_then(|sandbox| handler.execute(&sandbox, &context, &arguments));
+                let _ = sender.send(result);
             })
             .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
         let result = receiver

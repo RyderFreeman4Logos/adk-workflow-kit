@@ -56,31 +56,110 @@ fn workdir() -> (TestBase, workflow_runtime::RunWorkdir) {
 }
 
 #[test]
-fn bubblewrap_backend_rejects_forged_unsupported_capabilities_before_spawn() {
+fn bubblewrap_backend_rejects_forged_network_capability_before_spawn() {
     let (_base, workdir) = workdir();
-    for capability in [SandboxCapability::Network, SandboxCapability::OutputBytes] {
-        let backend = LinuxBubblewrapBackend::new(BackendCapabilities::new([
-            SandboxCapability::ProcessSpawn,
-            capability,
-        ]));
-        let request = BubblewrapRequest::new(
-            String::from("true"),
-            &workdir,
-            BTreeMap::new(),
-            RequestedCapabilities::new([capability]),
-        )
-        .expect("capability request must be valid");
+    let backend = LinuxBubblewrapBackend::new(BackendCapabilities::new([
+        SandboxCapability::ProcessSpawn,
+        SandboxCapability::Network,
+    ]));
+    let request = BubblewrapRequest::new(
+        String::from("true"),
+        &workdir,
+        BTreeMap::new(),
+        RequestedCapabilities::new([SandboxCapability::Network]),
+    )
+    .expect("capability request must be valid");
 
-        let error = backend
-            .execute(&request)
-            .expect_err("forged unsupported capability must fail before spawn");
-        match error {
-            workflow_runtime::BubblewrapError::Capabilities(unsatisfied) => {
-                assert!(unsatisfied.missing().contains(&capability));
-            }
-            other => panic!("expected capability failure, got {other:?}"),
+    let error = backend
+        .execute(&request)
+        .expect_err("forged unsupported capability must fail before spawn");
+    match error {
+        workflow_runtime::BubblewrapError::Capabilities(unsatisfied) => {
+            assert!(unsatisfied.missing().contains(&SandboxCapability::Network));
         }
+        other => panic!("expected capability failure, got {other:?}"),
     }
+}
+
+#[test]
+fn bubblewrap_backend_rejects_an_unbounded_output_request_before_spawn() {
+    let (_base, workdir) = workdir();
+    let backend = LinuxBubblewrapBackend::new(BackendCapabilities::new([
+        SandboxCapability::ProcessSpawn,
+        SandboxCapability::OutputBytes,
+    ]));
+    let request = BubblewrapRequest::new(
+        String::from("true"),
+        &workdir,
+        BTreeMap::new(),
+        RequestedCapabilities::new([SandboxCapability::OutputBytes]),
+    )
+    .expect("output request must be valid");
+
+    assert!(matches!(
+        backend.execute(&request),
+        Err(workflow_runtime::BubblewrapError::OutputLimitMissing)
+    ));
+}
+
+#[test]
+fn bubblewrap_mounts_follow_requested_filesystem_capabilities() {
+    let (_base, workdir) = workdir();
+    let backend =
+        LinuxBubblewrapBackend::new(BackendCapabilities::new([SandboxCapability::ProcessSpawn]));
+    let request = BubblewrapRequest::new(
+        String::from(
+            "test ! -e /input && test ! -e /package && test ! -e /skills && test ! -e /refs && for dir in work out tmp; do if touch /$dir/marker 2>/dev/null; then exit 1; fi; done",
+        ),
+        &workdir,
+        BTreeMap::new(),
+        RequestedCapabilities::new([SandboxCapability::ProcessSpawn]),
+    )
+    .expect("capability probe must be a valid request");
+
+    let receipt = backend
+        .execute(&request)
+        .expect("capability probe must execute");
+
+    assert!(
+        receipt.exit_success(),
+        "undeclared mounts leaked capabilities: {:?}",
+        String::from_utf8_lossy(receipt.stderr())
+    );
+}
+
+#[test]
+fn bubblewrap_backend_rejects_a_swapped_mutable_mount_before_spawn() {
+    use std::os::unix::fs::symlink;
+
+    let backend = LinuxBubblewrapBackend::new(BackendCapabilities::new([
+        SandboxCapability::FilesystemRead,
+        SandboxCapability::FilesystemWrite,
+        SandboxCapability::ProcessSpawn,
+    ]));
+    let (base, workdir) = workdir();
+    let original_work = workdir.work_dir();
+    let displaced_work = base.path().join("displaced-work");
+    let outside = base.path().join("outside");
+    fs::rename(&original_work, &displaced_work).expect("work mount must be displaceable");
+    fs::create_dir(&outside).expect("outside directory must exist");
+    symlink(&outside, &original_work).expect("swapped work mount must be a symlink");
+    let request = BubblewrapRequest::new(
+        String::from("touch /work/escaped"),
+        &workdir,
+        BTreeMap::new(),
+        RequestedCapabilities::new([SandboxCapability::ProcessSpawn]),
+    )
+    .expect("request must validate before mount preflight");
+
+    assert!(
+        backend.execute(&request).is_err(),
+        "a swapped mutable mount must fail before bubblewrap follows it"
+    );
+    assert!(
+        !outside.join("escaped").exists(),
+        "a swapped mount must not grant writes outside the run root"
+    );
 }
 
 #[test]

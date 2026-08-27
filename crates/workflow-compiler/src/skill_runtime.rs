@@ -7,7 +7,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use workflow_runtime::SandboxCapability;
+use workflow_runtime::{
+    BubblewrapReceipt, ChildSandbox, RunSandbox, SandboxCapability, SandboxExecutionError,
+};
 
 use crate::{SkillActivationReceipt, SkillId, SkillManifest, SkillResourceId};
 
@@ -46,6 +48,11 @@ impl DeclaredSkillScript {
     pub fn runtime(&self) -> &str {
         &self.runtime
     }
+
+    /// Returns the capability classes required by this script.
+    pub fn capabilities(&self) -> &[SandboxCapability] {
+        &self.capabilities
+    }
 }
 
 /// A validated non-executable resource declaration from `skill.runtime.toml`.
@@ -76,6 +83,10 @@ pub struct ScriptPlan {
     runtime: ScriptRuntime,
     path: String,
     input_sha256: String,
+    input_json: Vec<u8>,
+    script_sha256: String,
+    output_schema: Value,
+    capabilities: Vec<SandboxCapability>,
 }
 
 impl ScriptPlan {
@@ -98,7 +109,101 @@ impl ScriptPlan {
     pub fn input_sha256(&self) -> &str {
         &self.input_sha256
     }
+
+    /// Executes this registered plan inside a capability-narrowed child sandbox.
+    pub fn execute(&self, sandbox: &RunSandbox) -> Result<BubblewrapReceipt, ScriptExecutionError> {
+        let child = sandbox
+            .child(self.capabilities.iter().copied())
+            .map_err(ScriptExecutionError::sandbox)?;
+        self.execute_in(&child)
+    }
+
+    fn execute_in(
+        &self,
+        sandbox: &ChildSandbox<'_>,
+    ) -> Result<BubblewrapReceipt, ScriptExecutionError> {
+        let child = sandbox
+            .child(self.capabilities.iter().copied())
+            .map_err(ScriptExecutionError::sandbox)?;
+        let mut receipt = match self.runtime {
+            // The digest-checked bytes are sealed before backend spawn.
+            ScriptRuntime::Python3 => child.execute_registered_python_script(
+                "content.bin",
+                &self.script_sha256,
+                &self.input_json,
+            ),
+        }
+        .map_err(ScriptExecutionError::sandbox)?;
+        if receipt.exit_success() {
+            let output = serde_json::from_slice::<Value>(receipt.stdout())
+                .map_err(|_| ScriptExecutionError::invalid_output())?;
+            let validator = jsonschema::validator_for(&self.output_schema)
+                .map_err(|_| ScriptExecutionError::invalid_output())?;
+            if !validator.is_valid(&output) {
+                return Err(ScriptExecutionError::invalid_output());
+            }
+            receipt
+                .commit_output()
+                .map_err(SandboxExecutionError::from)
+                .map_err(ScriptExecutionError::sandbox)?;
+        }
+        Ok(receipt)
+    }
 }
+
+/// A closed execution failure for a registered Skill script plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScriptExecutionErrorKind {
+    /// Planning denied the requested registered script ID or input.
+    Denied(ScriptDeniedKind),
+    /// The run sandbox rejected or failed the child execution.
+    Sandbox(SandboxExecutionError),
+    /// Successful script stdout was not valid lock-bound JSON output.
+    InvalidOutput,
+}
+
+/// A privacy-safe error from registered Skill script execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScriptExecutionError {
+    kind: ScriptExecutionErrorKind,
+}
+
+impl ScriptExecutionError {
+    fn denied(error: ScriptDenied) -> Self {
+        Self {
+            kind: ScriptExecutionErrorKind::Denied(error.kind()),
+        }
+    }
+
+    fn sandbox(error: SandboxExecutionError) -> Self {
+        Self {
+            kind: ScriptExecutionErrorKind::Sandbox(error),
+        }
+    }
+
+    fn invalid_output() -> Self {
+        Self {
+            kind: ScriptExecutionErrorKind::InvalidOutput,
+        }
+    }
+
+    /// Returns the stable, payload-free failure category.
+    pub const fn kind(self) -> ScriptExecutionErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for ScriptExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.kind {
+            ScriptExecutionErrorKind::Denied(_) => "registered script execution denied",
+            ScriptExecutionErrorKind::Sandbox(_) => "registered script sandbox execution failed",
+            ScriptExecutionErrorKind::InvalidOutput => "registered script output is invalid",
+        })
+    }
+}
+
+impl std::error::Error for ScriptExecutionError {}
 
 /// A fixed privacy-safe denial category for Skill script planning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -255,12 +360,47 @@ pub fn plan_script_execution(
     if !validator.is_valid(&input) {
         return Err(ScriptDenied::new(ScriptDeniedKind::InvalidInput));
     }
+    let Some(output_schema_bytes) = lock.schemas.get(&script.output_schema) else {
+        return Err(ScriptDenied::new(ScriptDeniedKind::LockMismatch));
+    };
+    let output_schema = serde_json::from_slice::<Value>(output_schema_bytes)
+        .map_err(|_| ScriptDenied::new(ScriptDeniedKind::InvalidPolicy))?;
     Ok(ScriptPlan {
         script_id: script.id.clone(),
         runtime: ScriptRuntime::Python3,
         path: script.path.clone(),
         input_sha256: digest(input_json),
+        input_json: input_json.to_vec(),
+        script_sha256: script.sha256.clone(),
+        output_schema,
+        capabilities: script.capabilities.clone(),
     })
+}
+
+/// Plans and executes one declared Skill script ID through a narrowed child sandbox.
+pub fn execute_registered_script(
+    manifest: &SkillRuntimeManifest,
+    lock: &SkillRuntimeLock,
+    script_id: &str,
+    input_json: &[u8],
+    sandbox: &RunSandbox,
+) -> Result<BubblewrapReceipt, ScriptExecutionError> {
+    plan_script_execution(manifest, lock, script_id, input_json)
+        .map_err(ScriptExecutionError::denied)?
+        .execute(sandbox)
+}
+
+/// Plans and executes one declared Skill script within an already-narrowed child sandbox.
+pub fn execute_registered_script_in_child(
+    manifest: &SkillRuntimeManifest,
+    lock: &SkillRuntimeLock,
+    script_id: &str,
+    input_json: &[u8],
+    sandbox: &ChildSandbox<'_>,
+) -> Result<BubblewrapReceipt, ScriptExecutionError> {
+    plan_script_execution(manifest, lock, script_id, input_json)
+        .map_err(ScriptExecutionError::denied)?
+        .execute_in(sandbox)
 }
 
 /// A bounded, canonicalized v1 Skill runtime manifest.
@@ -1013,17 +1153,30 @@ fn digest(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        num::NonZeroU64,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
     use super::{
-        DeclaredSkillResource, DeclaredSkillScript, ScriptDeniedKind, ScriptPlan, ScriptRuntime,
-        SkillRuntimeLock, SkillRuntimeManifest, is_script_path, plan_script_execution,
+        DeclaredSkillResource, DeclaredSkillScript, ScriptDeniedKind, ScriptExecutionErrorKind,
+        ScriptPlan, ScriptRuntime, SkillRuntimeLock, SkillRuntimeManifest,
+        execute_registered_script, is_script_path, plan_script_execution,
     };
     use crate::{SkillId, SkillResourceId};
     use sha2::{Digest, Sha256};
+    use workflow_runtime::{
+        Materialization, RunContext, RunId, RunLimits, RunSandbox, SandboxCapability,
+        SandboxExecutionError, WorkdirManager,
+    };
+
+    static NEXT_SANDBOX: AtomicU64 = AtomicU64::new(0);
 
     const SCHEMA: &[u8] = br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}"#;
     const SKILL_MARKDOWN: &[u8] =
         b"---\nname: valid-skill\ndescription: A bounded skill.\n---\n# Instructions\n";
-    const SCRIPT_BYTES: &[u8] = b"print('ok')\n";
+    const SCRIPT_BYTES: &[u8] = b"import json, sys\nprint(json.dumps(json.load(sys.stdin)))\n";
 
     fn fixture_with_runtime(runtime: &str) -> (SkillRuntimeManifest, SkillRuntimeLock) {
         let skill_id = SkillId::new("valid-skill").expect("fixture skill ID");
@@ -1144,6 +1297,125 @@ mod tests {
             assert!(!rendered.contains("PAYLOAD_MARKER"));
             assert!(!rendered.contains("SECRET_MARKER"));
         }
+    }
+
+    fn execution_fixture(
+        capabilities: Vec<SandboxCapability>,
+    ) -> (SkillRuntimeManifest, SkillRuntimeLock) {
+        let skill_id = SkillId::new("valid-skill").expect("fixture skill ID");
+        let schema_id = SkillResourceId::new("references/schema.json").expect("fixture schema ID");
+        let script_id = SkillId::new("script").expect("fixture script ID");
+        let manifest = SkillRuntimeManifest {
+            skill_id: skill_id.clone(),
+            skill_version: "1.2.3".to_owned(),
+            scripts: vec![DeclaredSkillScript {
+                id: script_id,
+                path: "scripts/normalize.py".to_owned(),
+                runtime: "python3".to_owned(),
+                sha256: digest(SCRIPT_BYTES),
+                input_schema: schema_id.clone(),
+                output_schema: schema_id.clone(),
+                capabilities,
+            }],
+            resources: vec![DeclaredSkillResource {
+                id: schema_id.clone(),
+                sha256: digest(SCHEMA),
+            }],
+        };
+        let lock = SkillRuntimeLock::try_from_declared_bytes(
+            &manifest,
+            SKILL_MARKDOWN,
+            [("script", SCRIPT_BYTES)],
+            [(&schema_id, SCHEMA)],
+        )
+        .expect("fixture lock");
+        (manifest, lock)
+    }
+
+    fn sandbox(capabilities: Vec<SandboxCapability>) -> RunSandbox {
+        let sequence = NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "workflow-compiler-skill-runtime-{}-{}",
+            std::process::id(),
+            sequence
+        ));
+        fs::create_dir(&base).expect("fixture base must be unique");
+        let context = RunContext::new(
+            RunId::new(format!("script-{sequence}")).expect("fixture run ID"),
+            RunLimits::new(
+                NonZeroU64::new(1).expect("positive"),
+                NonZeroU64::new(1).expect("positive"),
+                NonZeroU64::new(1).expect("positive"),
+                NonZeroU64::new(2_000).expect("positive"),
+                NonZeroU64::new(2_000).expect("positive"),
+                NonZeroU64::new(2_000).expect("positive"),
+                NonZeroU64::new(2_000).expect("positive"),
+            ),
+        );
+        let workdir = WorkdirManager::new(&base)
+            .expect("fixture base must be trusted")
+            .materialize(
+                context.run_id(),
+                &Materialization {
+                    skills: Some(SCRIPT_BYTES.to_vec()),
+                    ..Materialization::default()
+                },
+            )
+            .expect("fixture workdir must materialize");
+        RunSandbox::new(context, workdir, capabilities).expect("fixture sandbox must bind")
+    }
+
+    #[test]
+    fn unknown_script_id_is_denied_before_child_sandbox_creation() {
+        let (manifest, lock) = execution_fixture(vec![SandboxCapability::Network]);
+        let sandbox = sandbox(Vec::new());
+
+        let error =
+            execute_registered_script(&manifest, &lock, "unknown", br#"{"value":"ok"}"#, &sandbox)
+                .expect_err("unknown script IDs must be denied before sandbox creation");
+
+        assert_eq!(
+            error.kind(),
+            ScriptExecutionErrorKind::Denied(ScriptDeniedKind::UnknownScript)
+        );
+    }
+
+    #[test]
+    fn script_plan_capabilities_cannot_exceed_parent_sandbox() {
+        let (manifest, lock) = execution_fixture(vec![SandboxCapability::Network]);
+        let sandbox = sandbox(vec![
+            SandboxCapability::ProcessSpawn,
+            SandboxCapability::OutputBytes,
+        ]);
+
+        let error =
+            execute_registered_script(&manifest, &lock, "script", br#"{"value":"ok"}"#, &sandbox)
+                .expect_err("child sandbox must not expand its parent authority");
+
+        assert_eq!(
+            error.kind(),
+            ScriptExecutionErrorKind::Sandbox(SandboxExecutionError::CapabilityDenied)
+        );
+    }
+
+    #[test]
+    fn registered_script_plan_executes_in_a_child_sandbox() {
+        let (manifest, lock) = execution_fixture(vec![
+            SandboxCapability::FilesystemRead,
+            SandboxCapability::ProcessSpawn,
+            SandboxCapability::OutputBytes,
+        ]);
+        let sandbox = sandbox(vec![
+            SandboxCapability::FilesystemRead,
+            SandboxCapability::ProcessSpawn,
+            SandboxCapability::OutputBytes,
+        ]);
+
+        let receipt =
+            execute_registered_script(&manifest, &lock, "script", br#"{"value":"ok"}"#, &sandbox)
+                .expect("registered plan must execute in a child sandbox");
+
+        assert_eq!(receipt.stdout(), b"{\"value\": \"ok\"}\n");
     }
 
     #[test]

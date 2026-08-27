@@ -151,14 +151,41 @@ fn run(command: &str) -> workflow_runtime::BubblewrapReceipt {
     run_in(&fixture.workdir, command)
 }
 
+fn run_with_filesystem(command: &str) -> workflow_runtime::BubblewrapReceipt {
+    let fixture = Fixture::new();
+    run_in_with(
+        &fixture.workdir,
+        command,
+        &[
+            SandboxCapability::FilesystemRead,
+            SandboxCapability::FilesystemWrite,
+            SandboxCapability::ProcessSpawn,
+        ],
+    )
+}
+
 fn run_in(
     workdir: &workflow_runtime::RunWorkdir,
     command: &str,
 ) -> workflow_runtime::BubblewrapReceipt {
-    let req = request(workdir, command, &[SandboxCapability::ProcessSpawn]);
-    backend()
+    run_in_with(workdir, command, &[SandboxCapability::ProcessSpawn])
+}
+
+fn run_in_with(
+    workdir: &workflow_runtime::RunWorkdir,
+    command: &str,
+    capabilities: &[SandboxCapability],
+) -> workflow_runtime::BubblewrapReceipt {
+    let req = request(workdir, command, capabilities);
+    let mut receipt = backend()
         .execute(&req)
-        .expect("command must execute inside the sandbox")
+        .expect("command must execute inside the sandbox");
+    if receipt.exit_success() {
+        receipt
+            .commit_output()
+            .expect("successful output must publish after acceptance");
+    }
+    receipt
 }
 
 /// Doubles as the documented conformance surface: every check runs through the
@@ -205,7 +232,7 @@ fn check01_cannot_read_undeclared_host_file() {
 #[test]
 fn check02_cannot_write_read_only_input_skill_reference() {
     for dir in ["input", "package", "skills", "refs"] {
-        let receipt = run(&format!("touch /{dir}/escape"));
+        let receipt = run_with_filesystem(&format!("touch /{dir}/escape"));
         assert!(!receipt.exit_success(), "/{dir} must stay read-only");
         assert!(
             String::from_utf8_lossy(receipt.stderr()).contains("Read-only"),
@@ -219,9 +246,14 @@ fn check02_cannot_write_read_only_input_skill_reference() {
 fn check03_can_write_only_declared_work_and_output_paths() {
     let fixture = Fixture::new();
 
-    let receipt = run_in(
+    let receipt = run_in_with(
         &fixture.workdir,
         "echo work > /work/w.txt; echo out > /out/o.txt",
+        &[
+            SandboxCapability::FilesystemRead,
+            SandboxCapability::FilesystemWrite,
+            SandboxCapability::ProcessSpawn,
+        ],
     );
     assert!(
         receipt.exit_success(),
@@ -421,9 +453,14 @@ fn check11_symlink_escape_is_blocked() {
 fn check12_artifacts_retain_correct_ownership_and_hashes() {
     let fixture = Fixture::new();
     let bytes = b"artifact-content";
-    let receipt = run_in(
+    let receipt = run_in_with(
         &fixture.workdir,
         "printf artifact-content > /work/binary.dat",
+        &[
+            SandboxCapability::FilesystemRead,
+            SandboxCapability::FilesystemWrite,
+            SandboxCapability::ProcessSpawn,
+        ],
     );
     assert!(
         receipt.exit_success(),
