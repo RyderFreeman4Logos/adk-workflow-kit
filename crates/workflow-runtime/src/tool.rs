@@ -1,7 +1,10 @@
-use std::fmt;
+use std::{fmt, num::NonZeroU64};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use super::SandboxCapability;
 
 const DRAFT_2020_12_SCHEMA: &str = "https://json-schema.org/draft/2020-12/schema";
 const MAX_SCHEMA_BYTES: usize = 65_536;
@@ -38,6 +41,84 @@ pub enum ToolEnvelope<T> {
 }
 
 impl<T> ToolEnvelope<T> {
+    /// Creates a successful result without exposing its wire representation.
+    pub fn success(payload: T, provenance: ToolProvenance) -> Self {
+        Self::Success {
+            payload,
+            provenance,
+            next_offset: None,
+            artifact_id: None,
+        }
+    }
+
+    /// Creates an explicit successful empty result.
+    pub fn empty(provenance: ToolProvenance) -> Self {
+        Self::Empty { provenance }
+    }
+
+    /// Creates a typed failure result.
+    pub fn failure(failure: ToolFailure, provenance: ToolProvenance) -> Self {
+        Self::Failure {
+            failure,
+            provenance,
+        }
+    }
+
+    /// Maps a successful payload while preserving terminal metadata.
+    pub fn map_payload<U>(self, map: impl FnOnce(T) -> U) -> ToolEnvelope<U> {
+        match self {
+            Self::Success {
+                payload,
+                provenance,
+                next_offset,
+                artifact_id,
+            } => ToolEnvelope::Success {
+                payload: map(payload),
+                provenance,
+                next_offset,
+                artifact_id,
+            },
+            Self::Empty { provenance } => ToolEnvelope::Empty { provenance },
+            Self::Failure {
+                failure,
+                provenance,
+            } => ToolEnvelope::Failure {
+                failure,
+                provenance,
+            },
+        }
+    }
+
+    /// Adds opaque retained-output metadata to a successful result.
+    pub fn with_artifact(mut self, artifact_id: String, next_offset: Option<u64>) -> Self {
+        if let Self::Success {
+            next_offset: current_offset,
+            artifact_id: current_artifact,
+            ..
+        } = &mut self
+        {
+            *current_offset = next_offset;
+            *current_artifact = Some(artifact_id);
+        }
+        self
+    }
+
+    /// Returns the next byte offset when the result is paged.
+    pub fn next_offset(&self) -> Option<u64> {
+        match self {
+            Self::Success { next_offset, .. } => *next_offset,
+            Self::Empty { .. } | Self::Failure { .. } => None,
+        }
+    }
+
+    /// Returns the opaque artifact handle when the result is paged.
+    pub fn artifact_id(&self) -> Option<&str> {
+        match self {
+            Self::Success { artifact_id, .. } => artifact_id.as_deref(),
+            Self::Empty { .. } | Self::Failure { .. } => None,
+        }
+    }
+
     /// Returns the exact registered tool identity for this result.
     pub fn provenance(&self) -> &ToolProvenance {
         match self {
@@ -284,6 +365,13 @@ pub struct ToolRegistration {
     input_schema: Value,
     output_schema: Value,
     flags: ToolFlags,
+    required_capabilities: Vec<SandboxCapability>,
+    required_scopes: Vec<String>,
+    timeout_ms: NonZeroU64,
+    inline_output_limit_bytes: NonZeroU64,
+    paging: bool,
+    idempotency: ToolIdempotency,
+    implementation_digest: String,
 }
 
 impl ToolRegistration {
@@ -311,6 +399,8 @@ impl ToolRegistration {
             ToolRegistrationError::InvalidOutputSchema,
             ToolRegistrationError::OutputSchemaTooLarge,
         )?;
+        let implementation_digest =
+            implementation_digest(&name, &provenance, &input_schema, &output_schema);
 
         Ok(Self {
             name,
@@ -318,6 +408,13 @@ impl ToolRegistration {
             input_schema,
             output_schema,
             flags,
+            required_capabilities: Vec::new(),
+            required_scopes: Vec::new(),
+            timeout_ms: NonZeroU64::new(30_000).expect("constant is positive"),
+            inline_output_limit_bytes: NonZeroU64::new(64 * 1024).expect("constant is positive"),
+            paging: false,
+            idempotency: ToolIdempotency::NotRequired,
+            implementation_digest,
         })
     }
 
@@ -345,6 +442,126 @@ impl ToolRegistration {
     pub fn flags(&self) -> ToolFlags {
         self.flags
     }
+
+    /// Adds the capability classes required by this tool.
+    pub fn with_required_capabilities(
+        mut self,
+        capabilities: impl IntoIterator<Item = SandboxCapability>,
+    ) -> Self {
+        self.required_capabilities = capabilities.into_iter().collect();
+        self.required_capabilities
+            .sort_unstable_by_key(SandboxCapability::as_str);
+        self.required_capabilities.dedup();
+        self
+    }
+
+    /// Adds caller scopes required by this tool.
+    pub fn with_required_scopes<S>(mut self, scopes: impl IntoIterator<Item = S>) -> Self
+    where
+        S: Into<String>,
+    {
+        self.required_scopes = scopes.into_iter().map(Into::into).collect();
+        self.required_scopes.sort_unstable();
+        self.required_scopes.dedup();
+        self
+    }
+
+    /// Sets the per-call timeout.
+    pub fn with_timeout(mut self, timeout_ms: NonZeroU64) -> Self {
+        self.timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Sets the maximum inline serialized output size.
+    pub fn with_inline_output_limit(mut self, limit_bytes: NonZeroU64) -> Self {
+        self.inline_output_limit_bytes = limit_bytes;
+        self
+    }
+
+    /// Enables or disables artifact paging for oversized output.
+    pub fn with_paging(mut self, paging: bool) -> Self {
+        self.paging = paging;
+        self
+    }
+
+    /// Sets the side-effect idempotency strategy.
+    pub fn with_idempotency(mut self, idempotency: ToolIdempotency) -> Self {
+        self.idempotency = idempotency;
+        self
+    }
+
+    /// Sets the externally supplied implementation digest.
+    pub fn with_implementation_digest(mut self, digest: impl Into<String>) -> Self {
+        self.implementation_digest = digest.into();
+        self
+    }
+
+    /// Returns the required sandbox capability classes.
+    pub fn required_capabilities(&self) -> &[SandboxCapability] {
+        &self.required_capabilities
+    }
+
+    /// Returns the required caller scopes.
+    pub fn required_scopes(&self) -> &[String] {
+        &self.required_scopes
+    }
+
+    /// Returns the per-call timeout in milliseconds.
+    pub const fn timeout_ms(&self) -> NonZeroU64 {
+        self.timeout_ms
+    }
+
+    /// Returns the maximum inline serialized output size.
+    pub const fn inline_output_limit_bytes(&self) -> NonZeroU64 {
+        self.inline_output_limit_bytes
+    }
+
+    /// Returns whether oversized results may be retained and paged.
+    pub const fn paging(&self) -> bool {
+        self.paging
+    }
+
+    /// Returns the declared idempotency strategy.
+    pub const fn idempotency(&self) -> ToolIdempotency {
+        self.idempotency
+    }
+
+    /// Returns the stable implementation digest.
+    pub fn implementation_digest(&self) -> &str {
+        &self.implementation_digest
+    }
+}
+
+/// The closed idempotency strategies for registered tools.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolIdempotency {
+    /// The tool has no side effects and needs no idempotency key.
+    #[default]
+    NotRequired,
+    /// Side effects are deduplicated with a bridge-generated stable key.
+    StableKey,
+}
+
+fn implementation_digest(
+    name: &str,
+    provenance: &ToolProvenance,
+    input_schema: &Value,
+    output_schema: &Value,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update([0]);
+    hasher.update(provenance.tool_id().as_bytes());
+    hasher.update([0]);
+    hasher.update(provenance.tool_version().as_bytes());
+    hasher.update(serde_json::to_vec(input_schema).expect("schema serialization cannot fail"));
+    hasher.update(serde_json::to_vec(output_schema).expect("schema serialization cannot fail"));
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Independently declared execution-safety properties for a tool.

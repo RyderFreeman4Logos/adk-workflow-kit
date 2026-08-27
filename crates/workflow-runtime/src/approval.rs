@@ -1,8 +1,173 @@
 //! Pure approval decision evaluation and terminal classification.
 
-use std::{fmt, time::Duration};
+use std::{collections::BTreeMap, fmt, time::Duration};
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+/// A kit-owned approval bound to one exact function call.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallScopedApproval {
+    tool_name: String,
+    call_id: String,
+    argument_fingerprint: String,
+    actor: String,
+    expires_at_ms: u64,
+}
+
+impl CallScopedApproval {
+    /// Creates an approval for the supplied call and expiry.
+    pub fn new(
+        tool_name: impl Into<String>,
+        call_id: impl Into<String>,
+        arguments: &Value,
+        actor: impl Into<String>,
+        expires_at: Duration,
+    ) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            call_id: call_id.into(),
+            argument_fingerprint: argument_fingerprint(arguments),
+            actor: actor.into(),
+            expires_at_ms: expires_at.as_millis().try_into().unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Returns the call-bound argument fingerprint without exposing arguments.
+    pub fn argument_fingerprint(&self) -> &str {
+        &self.argument_fingerprint
+    }
+
+    /// Returns the expiry in the monotonic millisecond domain.
+    pub const fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
+}
+
+/// A small in-memory ledger for call-scoped approvals.
+#[derive(Clone, Debug, Default)]
+pub struct ApprovalLedger {
+    records: BTreeMap<(String, String, String), CallScopedApproval>,
+}
+
+impl ApprovalLedger {
+    /// Creates an empty approval ledger.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a grant bound to tool, call ID, actor, arguments, and expiry.
+    pub fn grant(
+        mut self,
+        tool_name: impl Into<String>,
+        call_id: impl Into<String>,
+        arguments: &Value,
+        actor: impl Into<String>,
+        expires_at: Duration,
+    ) -> Self {
+        let approval = CallScopedApproval::new(tool_name, call_id, arguments, actor, expires_at);
+        self.records.insert(
+            (
+                approval.tool_name.clone(),
+                approval.call_id.clone(),
+                approval.actor.clone(),
+            ),
+            approval,
+        );
+        self
+    }
+
+    /// Authorizes only the exact call represented by a recorded grant.
+    pub fn authorize(
+        &self,
+        tool_name: &str,
+        call_id: &str,
+        arguments: &Value,
+        actor: &str,
+        now: Duration,
+    ) -> Result<ApprovalGranted, CallApprovalError> {
+        let Some(record) =
+            self.records
+                .get(&(tool_name.to_owned(), call_id.to_owned(), actor.to_owned()))
+        else {
+            return Err(CallApprovalError::Missing);
+        };
+        if record.argument_fingerprint != argument_fingerprint(arguments) {
+            return Err(CallApprovalError::ArgumentMismatch);
+        }
+        if now.as_millis() >= u128::from(record.expires_at_ms) {
+            return Err(CallApprovalError::Expired);
+        }
+        Ok(ApprovalGranted)
+    }
+}
+
+/// A closed reason why a call-scoped grant cannot be used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallApprovalError {
+    /// No grant matches the tool, call ID, and actor.
+    Missing,
+    /// The arguments differ from the approved arguments.
+    ArgumentMismatch,
+    /// The grant's expiry has elapsed.
+    Expired,
+}
+
+impl fmt::Display for CallApprovalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Missing => "call approval is missing",
+            Self::ArgumentMismatch => "call approval arguments do not match",
+            Self::Expired => "call approval has expired",
+        })
+    }
+}
+
+impl std::error::Error for CallApprovalError {}
+
+/// Computes a stable SHA-256 fingerprint for JSON arguments.
+pub fn argument_fingerprint(arguments: &Value) -> String {
+    let mut canonical = String::new();
+    write_canonical_json(arguments, &mut canonical);
+    let digest = Sha256::digest(canonical.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn write_canonical_json(value: &Value, output: &mut String) {
+    match value {
+        Value::Object(object) => {
+            output.push('{');
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                output.push_str(
+                    &serde_json::to_string(key).expect("JSON string serialization cannot fail"),
+                );
+                output.push(':');
+                write_canonical_json(&object[key], output);
+            }
+            output.push('}');
+        }
+        Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                write_canonical_json(value, output);
+            }
+            output.push(']');
+        }
+        _ => {
+            output.push_str(&serde_json::to_string(value).expect("JSON serialization cannot fail"))
+        }
+    }
+}
 
 /// The closed approval decision vocabulary supplied by an external human.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
