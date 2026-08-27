@@ -1,5 +1,6 @@
 //! Domain-neutral Verbatim boundary for platform-owned workflow calls.
 
+pub mod events;
 pub mod model_profiles;
 pub mod tool_bridge;
 
