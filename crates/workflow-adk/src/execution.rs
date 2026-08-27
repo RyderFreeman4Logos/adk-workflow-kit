@@ -22,10 +22,10 @@ use serde_json::Value;
 use workflow_compiler::compile_file;
 use workflow_runtime::{
     ArtifactStore, BackendCapabilities, CapabilityIntersection, FilesystemArtifactStore,
-    InMemoryArtifactStore, PureTransformRequest, RequestedCapabilities, RunContext, RunId,
-    RunLimits, RunSandbox, SandboxCapability, ToolBridge, ToolBridgeError, ToolCallContext,
-    ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance, ToolRegistration, WorkdirManager,
-    WorkflowRuntimeEventKindV1, verify_sandbox_capabilities,
+    InMemoryArtifactStore, ProtectedArtifactReferenceV1, PureTransformRequest,
+    RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox, SandboxCapability, ToolBridge,
+    ToolBridgeError, ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance,
+    ToolRegistration, WorkdirManager, WorkflowRuntimeEventKindV1, verify_sandbox_capabilities,
 };
 use workflow_spec::{SourcePath, read_bounded_regular_file};
 
@@ -546,31 +546,47 @@ impl ExecutionBackend {
             status = Some("failed");
         }
         let status = status.unwrap_or("succeeded");
-        let node_outputs = execution.as_ref().ok().map_or_else(BTreeMap::new, |state| {
-            compiled
-                .ir()
-                .nodes()
-                .iter()
-                .filter(|node| {
-                    !matches!(
-                        node.kind(),
-                        workflow_ir::IrNodeKind::Agent | workflow_ir::IrNodeKind::Terminal
+        let mut node_output_refs = BTreeMap::new();
+        let mut persistence_error = None;
+        if let Ok(state) = &execution {
+            for node in compiled.ir().nodes().iter().filter(|node| {
+                !matches!(
+                    node.kind(),
+                    workflow_ir::IrNodeKind::Agent | workflow_ir::IrNodeKind::Terminal
+                )
+            }) {
+                let id = node.id().as_str();
+                let Some(output) = state.get(&format!("node:{id}")) else {
+                    continue;
+                };
+                let reference = (|| {
+                    let encoded = serde_json::to_vec(output)
+                        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+                    let artifact_id = artifacts
+                        .put(&encoded)
+                        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+                    ProtectedArtifactReferenceV1::new(
+                        artifact_id.as_str(),
+                        format!("sha256:{}", artifact_id.as_str()),
+                        u64::try_from(encoded.len())
+                            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?,
                     )
-                })
-                .filter_map(|node| {
-                    let id = node.id().as_str();
-                    state
-                        .get(&format!("node:{id}"))
-                        .cloned()
-                        .map(|output| (id.to_owned(), output))
-                })
-                .collect()
-        });
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+                })();
+                match reference {
+                    Ok(reference) => {
+                        node_output_refs.insert(id.to_owned(), reference);
+                    }
+                    Err(error) if persistence_error.is_none() => persistence_error = Some(error),
+                    Err(_) => {}
+                }
+            }
+        }
         let terminal = serde_json::to_vec(&serde_json::json!({
             "run_id": run_id.as_str(),
             "status": status,
             "terminal": execution.as_ref().ok().and_then(|state| state.get("terminal")),
-            "node_outputs": node_outputs
+            "node_output_refs": node_output_refs
         }))
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
         let artifact_id = artifacts
@@ -591,9 +607,9 @@ impl ExecutionBackend {
         };
         write_json(&run_root.join("run-manifest.json"), &manifest)?;
         let receipt = manifest.receipt(run_root);
-        match execution {
-            Ok(_) => Ok(receipt),
-            Err(error) => Err(error.with_receipt(receipt)),
+        match (execution, persistence_error) {
+            (Err(error), _) | (Ok(_), Some(error)) => Err(error.with_receipt(receipt)),
+            (Ok(_), None) => Ok(receipt),
         }
     }
 

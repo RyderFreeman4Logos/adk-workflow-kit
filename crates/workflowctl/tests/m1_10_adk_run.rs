@@ -1,11 +1,14 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 static TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -134,6 +137,53 @@ fn run_adk_with_input(workflow: &Path, profile: &Path, runs: &Path, input: &str)
         .expect("workflowctl run must start")
 }
 
+fn non_agent_workflow(node_count: usize) -> String {
+    let mut workflow = String::from(
+        "schema_version = 1\n[workflow]\nid = \"m1-10-large-outputs\"\nversion = \"1\"\nentry = \"node-0\"\n",
+    );
+    for index in 0..node_count {
+        workflow.push_str(&format!(
+            "[[nodes]]\nid = \"node-{index}\"\nkind = \"action\"\n"
+        ));
+    }
+    workflow.push_str("[[nodes]]\nid = \"done\"\nkind = \"terminal\"\n");
+    for index in 0..node_count {
+        let target = if index + 1 == node_count {
+            "done".to_owned()
+        } else {
+            format!("node-{}", index + 1)
+        };
+        workflow.push_str(&format!(
+            "[[edges]]\nfrom = \"node-{index}\"\nto = \"{target}\"\n"
+        ));
+    }
+    workflow
+}
+
+fn large_input() -> (Value, String) {
+    let value = json!({"payload": "x".repeat(40 * 1024)});
+    let encoded = serde_json::to_string(&value).expect("large input must serialize");
+    assert!(
+        encoded.len() < 64 * 1024,
+        "canonical input must remain bounded"
+    );
+    (value, encoded)
+}
+
+fn terminal_artifact(run_root: &Path) -> (Vec<u8>, Value) {
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(run_root.join("run-manifest.json")).expect("manifest must be readable"),
+    )
+    .expect("manifest must be JSON");
+    let artifact_id = manifest["artifact_id"]
+        .as_str()
+        .expect("manifest must reference the terminal artifact");
+    let bytes = fs::read(run_root.join("artifacts").join(artifact_id))
+        .expect("terminal artifact must be readable");
+    let value = serde_json::from_slice(&bytes).expect("terminal artifact must be JSON");
+    (bytes, value)
+}
+
 fn json_stdout(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
         panic!(
@@ -227,19 +277,161 @@ fn profile_graph_runs_non_agent_nodes_through_the_wasm_backend() {
         "heterogeneous ADK run must succeed, stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let node_outputs = fs::read_dir(run_root(&runs).join("artifacts"))
-        .expect("artifact directory must exist")
-        .filter_map(|entry| fs::read(entry.ok()?.path()).ok())
-        .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .find_map(|artifact| artifact.get("node_outputs").cloned())
-        .expect("terminal artifact must persist non-Agent node outputs");
+    let run_root = run_root(&runs);
+    let (_, terminal) = terminal_artifact(&run_root);
+    let node_outputs = terminal["node_output_refs"]
+        .as_object()
+        .expect("terminal artifact must reference non-Agent node outputs");
     for node in ["action", "validator", "registered"] {
+        let artifact_id = node_outputs[node]["artifact_id"]
+            .as_str()
+            .expect("node output must have an artifact reference");
+        let output: Value = serde_json::from_slice(
+            &fs::read(run_root.join("artifacts").join(artifact_id))
+                .expect("referenced node output must be readable"),
+        )
+        .expect("node output artifact must be JSON");
         assert_eq!(
-            node_outputs[node],
+            output,
             json!({"value": 7}),
             "{node} must preserve the WASM transform output instead of a true placeholder"
         );
     }
+
+    fs::remove_dir_all(root).expect("test root must be removed");
+}
+
+#[test]
+fn large_non_agent_outputs_are_individually_persisted_and_inspectable() {
+    let root = temp_root("large-node-outputs");
+    let mut profile_value = fake_profile();
+    profile_value["pure_transform"] = json!({"module": IDENTITY_WASM});
+    let (workflow, profile, runs) = write_fixture(&root, profile_value);
+    fs::write(&workflow, non_agent_workflow(2)).expect("workflow fixture must write");
+    let (input_value, input) = large_input();
+
+    let output = run_adk_with_input(&workflow, &profile, &runs, &input);
+    assert!(
+        output.status.success(),
+        "large multi-node run must succeed, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt = json_stdout(&output);
+    let run_id = receipt["run_id"].as_str().expect("run ID must be text");
+    let inspect = command_json(&[
+        "--json",
+        "inspect",
+        "--run-id",
+        run_id,
+        "--workdir",
+        runs.to_str().expect("UTF-8 run base"),
+    ]);
+    assert_eq!(json_stdout(&inspect), receipt);
+
+    let run_root = run_root(&runs);
+    let (terminal_bytes, terminal) = terminal_artifact(&run_root);
+    assert!(terminal_bytes.len() <= 64 * 1024);
+    assert!(terminal.get("node_outputs").is_none());
+    let refs = terminal["node_output_refs"]
+        .as_object()
+        .expect("terminal artifact must contain node output references");
+    assert_eq!(refs.len(), 2);
+    let mut combined_bytes = 0_u64;
+    for node in ["node-0", "node-1"] {
+        let reference = &refs[node];
+        let artifact_id = reference["artifact_id"]
+            .as_str()
+            .expect("reference must contain an artifact ID");
+        assert_eq!(reference["sha256"], format!("sha256:{artifact_id}"));
+        combined_bytes += reference["byte_len"]
+            .as_u64()
+            .expect("reference must contain a byte length");
+        let persisted: Value = serde_json::from_slice(
+            &fs::read(run_root.join("artifacts").join(artifact_id))
+                .expect("node artifact must be readable"),
+        )
+        .expect("node artifact must be JSON");
+        assert_eq!(persisted, input_value);
+    }
+    assert!(combined_bytes > 64 * 1024);
+
+    fs::remove_dir_all(root).expect("test root must be removed");
+}
+
+#[test]
+fn post_execution_artifact_failure_still_persists_the_returned_receipt() {
+    let root = temp_root("node-output-persistence-failure");
+    let mut profile_value = fake_profile();
+    profile_value["pure_transform"] = json!({"module": IDENTITY_WASM});
+    let (workflow, profile, runs) = write_fixture(&root, profile_value);
+    fs::write(&workflow, non_agent_workflow(16)).expect("workflow fixture must write");
+    let (input_value, input) = large_input();
+    let output_digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&input_value).expect("node output must serialize"))
+    );
+
+    let mut child = binary()
+        .args([
+            "--json",
+            "run",
+            workflow.to_str().expect("UTF-8 workflow path"),
+            "--profile",
+            profile.to_str().expect("UTF-8 profile path"),
+            "--input",
+            &input,
+            "--workdir",
+            runs.to_str().expect("UTF-8 run base"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("workflowctl run must start");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let artifact_root = loop {
+        let candidate = fs::read_dir(&runs)
+            .expect("run base must be readable")
+            .next()
+            .transpose()
+            .expect("run entry must be readable")
+            .map(|entry| entry.path().join("artifacts"));
+        if let Some(path) = candidate
+            && path.is_dir()
+        {
+            break path;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("timed-out child must stop");
+            let _ = child.wait();
+            panic!("artifact store was not allocated before the deadline");
+        }
+        thread::yield_now();
+    };
+    fs::create_dir(artifact_root.join(output_digest))
+        .expect("collision fixture must make node artifact persistence fail");
+
+    let failed = child
+        .wait_with_output()
+        .expect("workflowctl run must finish after persistence failure");
+    assert_eq!(failed.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("workflow.run.failed"));
+    let failed_receipt = json_stdout(&failed);
+    assert_eq!(
+        failed_receipt["status"], "succeeded",
+        "artifact persistence failure must occur after graph execution"
+    );
+    let run_id = failed_receipt["run_id"]
+        .as_str()
+        .expect("persistence failure must return the allocated run ID");
+    let inspect = command_json(&[
+        "--json",
+        "inspect",
+        "--run-id",
+        run_id,
+        "--workdir",
+        runs.to_str().expect("UTF-8 run base"),
+    ]);
+    assert_eq!(json_stdout(&inspect), failed_receipt);
 
     fs::remove_dir_all(root).expect("test root must be removed");
 }
