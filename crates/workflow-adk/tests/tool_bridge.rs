@@ -224,7 +224,8 @@ fn registered_script_rejects_capabilities_beyond_registration_before_spawn() {
         SCRIPT,
         lock_capabilities,
     );
-    let marker = sandbox.workdir().work_dir().join("adapter-marker");
+    let root = sandbox.workdir().root().to_path_buf();
+    let marker = root.join("work/adapter-marker");
     let result = AdkToolBridge::for_registered_script(
         sandbox,
         registration(&[SandboxCapability::FilesystemRead]),
@@ -241,6 +242,10 @@ fn registered_script_rejects_capabilities_beyond_registration_before_spawn() {
         result,
         Err(error) if error.kind() == ToolBridgeErrorKind::CapabilityDenied
     ));
+    assert!(
+        !root.join("pid").exists(),
+        "capability mismatch must not create a backend PID witness"
+    );
     assert!(
         !marker.exists(),
         "capability mismatch must fail before spawn"
@@ -267,6 +272,10 @@ fn registered_script_without_process_spawn_fails_before_backend_spawn() {
         .expect_err("registered Python execution without process.spawn must fail");
 
     assert_eq!(error.kind(), ToolBridgeErrorKind::HandlerFailed);
+    assert!(
+        !root.join("pid").exists(),
+        "the backend must not create a PID witness without process.spawn"
+    );
     assert!(
         !root.join("work/adapter-marker").exists(),
         "the backend must not start without process.spawn"
@@ -376,7 +385,8 @@ fn registered_script_rejects_materialized_bytes_that_do_not_match_its_lock() {
     ];
     let (manifest, lock) = manifest(SCRIPT, &capabilities);
     let sandbox = sandbox(&base, "adapter-mismatch", MISMATCH_SCRIPT, capabilities);
-    let marker = sandbox.workdir().work_dir().join("mismatch-marker");
+    let root = sandbox.workdir().root().to_path_buf();
+    let marker = root.join("work/mismatch-marker");
     let script = RegisteredSkillScript::new(manifest, lock, "script");
 
     let error = script
@@ -386,6 +396,10 @@ fn registered_script_rejects_materialized_bytes_that_do_not_match_its_lock() {
     assert_eq!(
         error.kind(),
         ScriptExecutionErrorKind::Sandbox(SandboxExecutionError::ExecutionFailed)
+    );
+    assert!(
+        !root.join("pid").exists(),
+        "mismatched script bytes must not create a backend PID witness"
     );
     assert!(!marker.exists(), "mismatched script bytes must never spawn");
 }
