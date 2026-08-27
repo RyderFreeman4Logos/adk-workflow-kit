@@ -83,6 +83,28 @@ fn model_mapping_json_snapshot_is_stable_and_project_owned() {
 }
 
 #[test]
+fn persisted_digests_use_the_recursive_redacted_copy() {
+    let map = |event_id, public, secret| {
+        let mut mapper = AdkEventMapper::new(format!("run-{event_id}"), "workflow-digest").unwrap();
+        mapper
+            .map(
+                observation(event_id, AdkRuntimeObservationKindV1::ModelRequestCompleted)
+                    .with_request(json!({"public": public, "nested": {"api_key": secret}}))
+                    .with_response(json!({"public": public, "nested": [{"password": secret}]})),
+            )
+            .unwrap()
+    };
+    let first = map("first", "same", "first-secret");
+    let changed_secret = map("second", "same", "second-secret");
+    let changed_public = map("third", "changed", "first-secret");
+
+    for key in ["request_digest", "response_digest"] {
+        assert_eq!(first.payload()[key], changed_secret.payload()[key]);
+        assert_ne!(first.payload()[key], changed_public.payload()[key]);
+    }
+}
+
+#[test]
 fn redacts_sensitive_fields_and_keeps_raw_observations_out_of_events() {
     let mut mapper = AdkEventMapper::new("run-private", "workflow-private").unwrap();
     let event = mapper

@@ -329,11 +329,12 @@ impl AdkGraph {
     }
 
     /// Executes the production graph stream and appends real ADK events through the project mapper.
-    pub async fn invoke_observed(
+    pub async fn invoke_observed<S: workflow_runtime::ArtifactStore>(
         &self,
         state: State,
         config: ExecutionConfig,
         mapper: &mut events::AdkEventMapper,
+        artifacts: &mut S,
     ) -> Result<State, AdkGraphError> {
         let mut state = self.input.map(state);
         state.retain(|key, _| !key.starts_with("visits:"));
@@ -353,6 +354,32 @@ impl AdkGraph {
         let mut output = None;
         while let Some(item) = stream.next().await {
             match item.map_err(|_| AdkGraphError::Failed)? {
+                StreamEvent::NodeStart { node, step } => {
+                    mapper
+                        .map_stream_observation(
+                            Some(node),
+                            events::AdkRuntimeObservationKindV1::NodeStarted,
+                            Some(json!({ "step": step })),
+                            None,
+                            artifacts,
+                        )
+                        .map_err(|error| AdkGraphError::Observation(error.kind()))?;
+                }
+                StreamEvent::NodeEnd {
+                    node,
+                    step,
+                    duration_ms,
+                } => {
+                    mapper
+                        .map_stream_observation(
+                            Some(node),
+                            events::AdkRuntimeObservationKindV1::NodeCompleted,
+                            Some(json!({ "step": step })),
+                            Some(duration_ms),
+                            artifacts,
+                        )
+                        .map_err(|error| AdkGraphError::Observation(error.kind()))?;
+                }
                 StreamEvent::Custom {
                     node,
                     event_type,
@@ -364,11 +391,69 @@ impl AdkGraph {
                         )
                     })?;
                     mapper
-                        .map_adk_event(node, event)
+                        .map_adk_event(node, event, artifacts)
                         .map_err(|error| AdkGraphError::Observation(error.kind()))?;
                 }
-                StreamEvent::Done { state, .. } => output = Some(state),
-                _ => {}
+                StreamEvent::Done { state, total_steps } => {
+                    mapper
+                        .map_stream_observation(
+                            None,
+                            events::AdkRuntimeObservationKindV1::WorkflowCompleted,
+                            Some(json!({ "total_steps": total_steps })),
+                            None,
+                            artifacts,
+                        )
+                        .map_err(|error| AdkGraphError::Observation(error.kind()))?;
+                    output = Some(state);
+                }
+                StreamEvent::Resumed {
+                    step,
+                    pending_nodes,
+                } => {
+                    mapper
+                        .map_stream_observation(
+                            None,
+                            events::AdkRuntimeObservationKindV1::WorkflowResumed,
+                            Some(json!({ "step": step, "pending_nodes": pending_nodes })),
+                            None,
+                            artifacts,
+                        )
+                        .map_err(|error| AdkGraphError::Observation(error.kind()))?;
+                }
+                StreamEvent::Interrupted { node, message } => {
+                    mapper
+                        .map_stream_observation(
+                            Some(node),
+                            events::AdkRuntimeObservationKindV1::WorkflowIncomplete,
+                            Some(json!({ "message": message })),
+                            None,
+                            artifacts,
+                        )
+                        .map_err(|error| AdkGraphError::Observation(error.kind()))?;
+                }
+                StreamEvent::Error { message, node } => {
+                    mapper
+                        .map_stream_observation(
+                            node,
+                            events::AdkRuntimeObservationKindV1::WorkflowFailed,
+                            Some(json!({ "message": message })),
+                            None,
+                            artifacts,
+                        )
+                        .map_err(|error| AdkGraphError::Observation(error.kind()))?;
+                }
+                StreamEvent::State { .. }
+                | StreamEvent::Updates { .. }
+                | StreamEvent::Message { .. }
+                | StreamEvent::Custom { .. }
+                | StreamEvent::Debug { .. }
+                | StreamEvent::StepComplete { .. }
+                | StreamEvent::NodeInterrupt { .. }
+                | StreamEvent::RouteDispatched { .. } => {
+                    return Err(AdkGraphError::Observation(
+                        events::AdkEventMappingErrorKind::InvalidObservation,
+                    ));
+                }
             }
         }
         output

@@ -508,6 +508,13 @@ fn digest_json(value: &Value) -> Result<String, WorkflowRuntimeEventError> {
     Ok(format!("sha256:{}", encode_hex(&Sha256::digest(encoded))))
 }
 
+/// Computes a JSON digest only after applying the runtime event sanitizer.
+pub fn redacted_json_digest(value: &Value) -> Result<String, WorkflowRuntimeEventError> {
+    let mut redacted = value.clone();
+    sanitize_payload(&mut redacted);
+    digest_json(&redacted)
+}
+
 fn sanitize_payload(value: &mut Value) {
     match value {
         Value::Object(object) => {

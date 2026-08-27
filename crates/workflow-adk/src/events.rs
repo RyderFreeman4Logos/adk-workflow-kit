@@ -1,11 +1,10 @@
 use std::fmt;
 
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use workflow_runtime::{
-    ProtectedArtifactReferenceV1, REDACTION_MARKER, SensitiveSnapshot, WorkflowRuntimeEventError,
-    WorkflowRuntimeEventErrorKind, WorkflowRuntimeEventKindV1, WorkflowRuntimeEventLogV1,
-    WorkflowRuntimeEventV1,
+    ArtifactStore, ProtectedArtifactReferenceV1, REDACTION_MARKER, SensitiveSnapshot,
+    WorkflowRuntimeEventError, WorkflowRuntimeEventErrorKind, WorkflowRuntimeEventKindV1,
+    WorkflowRuntimeEventLogV1, WorkflowRuntimeEventV1, redacted_json_digest,
 };
 
 const MAX_INLINE_STRUCTURED_OUTPUT_BYTES: usize = 4 * 1024;
@@ -217,12 +216,15 @@ impl AdkEventMapper {
 
         let mut payload = Map::new();
         if let Some(request) = observation.request.as_ref() {
-            payload.insert("request_digest".to_owned(), Value::String(digest(request)?));
+            payload.insert(
+                "request_digest".to_owned(),
+                Value::String(redacted_json_digest(request)?),
+            );
         }
         if let Some(response) = observation.response.as_ref() {
             payload.insert(
                 "response_digest".to_owned(),
-                Value::String(digest(response)?),
+                Value::String(redacted_json_digest(response)?),
             );
         }
         if let Some(tokens) = observation.input_tokens {
@@ -249,7 +251,7 @@ impl AdkEventMapper {
                 }
                 payload.insert(
                     "structured_output_digest".to_owned(),
-                    Value::String(digest_bytes(&encoded)),
+                    Value::String(redacted_json_digest(&output)?),
                 );
             } else {
                 payload.insert("structured_output".to_owned(), output);
@@ -286,24 +288,102 @@ impl AdkEventMapper {
     }
 
     /// Maps one real ADK stream event into a sanitized project event.
-    pub(crate) fn map_adk_event(
+    pub(crate) fn map_adk_event<S: ArtifactStore>(
         &mut self,
         node_id: String,
         event: adk_rust::Event,
+        artifacts: &mut S,
     ) -> Result<WorkflowRuntimeEventV1, AdkEventMappingError> {
+        let kind = if event.llm_response.error_code.is_some() {
+            AdkRuntimeObservationKindV1::WorkflowFailed
+        } else if event.tool_progress_stream().is_some() {
+            AdkRuntimeObservationKindV1::ToolStarted
+        } else if !event.tool_results().is_empty() {
+            AdkRuntimeObservationKindV1::ToolCompleted
+        } else if !event.tool_calls().is_empty() {
+            AdkRuntimeObservationKindV1::ToolRequested
+        } else if event.content().is_some()
+            || event.llm_request.is_some()
+            || event.llm_response.usage_metadata.is_some()
+            || event.llm_response.finish_reason.is_some()
+        {
+            AdkRuntimeObservationKindV1::ModelRequestCompleted
+        } else {
+            return Err(AdkEventMappingError::new(
+                AdkEventMappingErrorKind::InvalidObservation,
+            ));
+        };
         let structured_output = event
             .content()
             .map(serde_json::to_value)
             .transpose()
             .map_err(|_| AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation))?;
-        let mut observation = AdkRuntimeObservationV1::new(
-            event.id,
-            event.timestamp.to_rfc3339(),
-            AdkRuntimeObservationKindV1::NodeCompleted,
-        )
-        .with_node_id(node_id);
+        let request = event
+            .llm_request
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|_| AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation))?;
+        let mut observation =
+            AdkRuntimeObservationV1::new(event.id, event.timestamp.to_rfc3339(), kind)
+                .with_node_id(node_id);
+        if let Some(request) = request {
+            observation = observation.with_request(request);
+        }
         if let Some(output) = structured_output {
-            observation = observation.with_structured_output(output);
+            observation = observation
+                .with_response(output.clone())
+                .with_structured_output(output.clone());
+            observation = protect_large_payload(observation, &output, artifacts)?;
+        }
+        if let Some(usage) = event.llm_response.usage_metadata {
+            let input_tokens = u64::try_from(usage.prompt_token_count).map_err(|_| {
+                AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
+            })?;
+            let output_tokens = u64::try_from(usage.candidates_token_count).map_err(|_| {
+                AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
+            })?;
+            observation = observation.with_tokens(input_tokens, output_tokens);
+        }
+        if let Some(reason) = event.llm_response.finish_reason {
+            observation = observation.with_finish_reason(match reason {
+                adk_rust::FinishReason::Stop => "stop",
+                adk_rust::FinishReason::MaxTokens => "max_tokens",
+                adk_rust::FinishReason::Safety => "safety",
+                adk_rust::FinishReason::Recitation => "recitation",
+                adk_rust::FinishReason::Other => "other",
+            });
+        }
+        if let Some(latency_ms) = event
+            .provider_metadata
+            .get("latency_ms")
+            .map(|value| value.parse())
+            .transpose()
+            .map_err(|_| AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation))?
+        {
+            observation = observation.with_latency_ms(latency_ms);
+        }
+        self.map(observation)
+    }
+
+    pub(crate) fn map_stream_observation<S: ArtifactStore>(
+        &mut self,
+        node_id: Option<String>,
+        kind: AdkRuntimeObservationKindV1,
+        structured_output: Option<Value>,
+        latency_ms: Option<u64>,
+        artifacts: &mut S,
+    ) -> Result<WorkflowRuntimeEventV1, AdkEventMappingError> {
+        let sequence = self.log.events().len() + 1;
+        let mut observation =
+            AdkRuntimeObservationV1::new(format!("adk-stream-{sequence}"), "adk-stream", kind);
+        observation.node_id = node_id;
+        if let Some(output) = structured_output {
+            observation = observation.with_structured_output(output.clone());
+            observation = protect_large_payload(observation, &output, artifacts)?;
+        }
+        if let Some(latency_ms) = latency_ms {
+            observation = observation.with_latency_ms(latency_ms);
         }
         self.map(observation)
     }
@@ -383,21 +463,26 @@ impl fmt::Display for AdkEventMappingError {
 
 impl std::error::Error for AdkEventMappingError {}
 
-fn digest(value: &Value) -> Result<String, AdkEventMappingError> {
-    let bytes = serde_json::to_vec(value)
+fn protect_large_payload<S: ArtifactStore>(
+    observation: AdkRuntimeObservationV1,
+    output: &Value,
+    artifacts: &mut S,
+) -> Result<AdkRuntimeObservationV1, AdkEventMappingError> {
+    let encoded = serde_json::to_vec(output)
         .map_err(|_| AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation))?;
-    Ok(digest_bytes(&bytes))
-}
-
-fn digest_bytes(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    if encoded.len() <= MAX_INLINE_STRUCTURED_OUTPUT_BYTES {
+        return Ok(observation);
     }
-    format!("sha256:{encoded}")
+    let artifact_id = artifacts
+        .put(&encoded)
+        .map_err(|_| AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation))?;
+    let reference = ProtectedArtifactReferenceV1::new(
+        artifact_id.as_str(),
+        format!("sha256:{}", artifact_id.as_str()),
+        u64::try_from(encoded.len())
+            .map_err(|_| AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation))?,
+    )?;
+    Ok(observation.with_artifact_reference(reference))
 }
 
 fn valid_finish_reason(reason: &str) -> bool {
@@ -417,4 +502,100 @@ fn tool_call_kind(kind: AdkRuntimeObservationKindV1) -> bool {
             | AdkRuntimeObservationKindV1::ToolStarted
             | AdkRuntimeObservationKindV1::ToolCompleted
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use adk_rust::{Content, Event, FinishReason, FunctionResponseData, Part, UsageMetadata};
+    use serde_json::json;
+    use workflow_runtime::InMemoryArtifactStore;
+
+    use super::*;
+
+    #[test]
+    fn real_adk_model_and_tool_events_keep_their_categories_and_metadata() {
+        let mut mapper = AdkEventMapper::new("run-real", "workflow-real").unwrap();
+        let mut artifacts = InMemoryArtifactStore::new(
+            NonZeroU64::new(16 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024).unwrap(),
+        );
+
+        let mut model = Event::new("invocation");
+        model.set_content(Content::new("assistant").with_text("done"));
+        model.llm_request = Some(r#"{"prompt":"hello"}"#.to_owned());
+        model.llm_response.usage_metadata = Some(UsageMetadata {
+            prompt_token_count: 3,
+            candidates_token_count: 2,
+            total_token_count: 5,
+            ..UsageMetadata::default()
+        });
+        model.llm_response.finish_reason = Some(FinishReason::Stop);
+        model
+            .provider_metadata
+            .insert("latency_ms".to_owned(), "17".to_owned());
+        let model = mapper
+            .map_adk_event("agent".to_owned(), model, &mut artifacts)
+            .unwrap();
+
+        let mut requested = Event::new("invocation");
+        requested.set_content(Content {
+            role: "assistant".to_owned(),
+            parts: vec![Part::FunctionCall {
+                name: "lookup".to_owned(),
+                args: json!({"query": "value"}),
+                id: Some("call-1".to_owned()),
+                thought_signature: None,
+            }],
+        });
+        let requested = mapper
+            .map_adk_event("agent".to_owned(), requested, &mut artifacts)
+            .unwrap();
+
+        let mut completed = Event::new("invocation");
+        completed.set_content(Content {
+            role: "function".to_owned(),
+            parts: vec![Part::FunctionResponse {
+                function_response: FunctionResponseData::new("lookup", json!({"value": 42})),
+                id: Some("call-1".to_owned()),
+                annotations: None,
+            }],
+        });
+        let completed = mapper
+            .map_adk_event("agent".to_owned(), completed, &mut artifacts)
+            .unwrap();
+
+        assert_eq!(
+            model.kind(),
+            WorkflowRuntimeEventKindV1::ModelRequestCompleted
+        );
+        assert!(model.payload().get("request_digest").is_some());
+        assert!(model.payload().get("response_digest").is_some());
+        assert_eq!(model.payload()["input_tokens"], 3);
+        assert_eq!(model.payload()["output_tokens"], 2);
+        assert_eq!(model.payload()["latency_ms"], 17);
+        assert_eq!(model.payload()["finish_reason"], "stop");
+        assert_eq!(requested.kind(), WorkflowRuntimeEventKindV1::ToolRequested);
+        assert_eq!(completed.kind(), WorkflowRuntimeEventKindV1::ToolCompleted);
+    }
+
+    #[test]
+    fn real_adk_large_payload_is_committed_before_the_event_reference() {
+        let mut mapper = AdkEventMapper::new("run-large-real", "workflow-large-real").unwrap();
+        let mut artifacts = InMemoryArtifactStore::new(
+            NonZeroU64::new(16 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024).unwrap(),
+        );
+        let mut event = Event::new("invocation");
+        event.set_content(Content::new("assistant").with_text("x".repeat(5_000)));
+
+        let mapped = mapper
+            .map_adk_event("agent".to_owned(), event, &mut artifacts)
+            .unwrap();
+
+        assert!(mapped.payload().get("structured_output").is_none());
+        assert!(mapped.payload().get("structured_output_digest").is_some());
+        assert!(mapped.payload().get("artifact_reference").is_some());
+    }
 }
