@@ -35,7 +35,11 @@ pub use bubblewrap::{
     BubblewrapError, BubblewrapReceipt, BubblewrapRequest, BubblewrapRequestError,
     BubblewrapRequestErrorKind, LinuxBubblewrapBackend,
 };
-pub use checkpoint::{Checkpoint, CheckpointBackend, CheckpointError, CheckpointErrorKind};
+pub use checkpoint::{
+    Checkpoint, CheckpointBackend, CheckpointCompatibilityManifestV1, CheckpointError,
+    CheckpointErrorKind, CheckpointManifestV1, DurableCheckpointV1, SqliteCheckpointBackend,
+    SqliteCheckpointStore,
+};
 pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
 };
