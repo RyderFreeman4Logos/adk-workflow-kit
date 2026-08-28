@@ -468,7 +468,7 @@ fn protect_large_payload<S: ArtifactStore>(
     output: &Value,
     artifacts: &mut S,
 ) -> Result<AdkRuntimeObservationV1, AdkEventMappingError> {
-    let encoded = serde_json::to_vec(output)
+    let encoded = serde_json::to_vec(&workflow_runtime::redact_json_value(output))
         .map_err(|_| AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation))?;
     if encoded.len() <= MAX_INLINE_STRUCTURED_OUTPUT_BYTES {
         return Ok(observation);
@@ -510,7 +510,7 @@ mod tests {
 
     use adk_rust::{Content, Event, FinishReason, FunctionResponseData, Part, UsageMetadata};
     use serde_json::json;
-    use workflow_runtime::InMemoryArtifactStore;
+    use workflow_runtime::{ArtifactId, ArtifactStore, InMemoryArtifactStore, PageRequest};
 
     use super::*;
 
@@ -597,5 +597,46 @@ mod tests {
         assert!(mapped.payload().get("structured_output").is_none());
         assert!(mapped.payload().get("structured_output_digest").is_some());
         assert!(mapped.payload().get("artifact_reference").is_some());
+    }
+
+    #[test]
+    fn large_adk_artifact_bytes_redact_secret_like_fields_before_put() {
+        let mut mapper = AdkEventMapper::new("run-secret-large", "workflow-secret-large").unwrap();
+        let mut artifacts = InMemoryArtifactStore::new(
+            NonZeroU64::new(16 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024).unwrap(),
+        );
+        let canary = "fixture-large-adk-secret";
+        let mut event = Event::new("invocation");
+        event.set_content(Content {
+            role: "function".to_owned(),
+            parts: vec![Part::FunctionResponse {
+                function_response: FunctionResponseData::new(
+                    "lookup",
+                    json!({"api_token": canary, "filler": "x".repeat(5_000)}),
+                ),
+                id: Some("call-1".to_owned()),
+                annotations: None,
+            }],
+        });
+
+        let mapped = mapper
+            .map_adk_event("agent".to_owned(), event, &mut artifacts)
+            .unwrap();
+        let reference: ProtectedArtifactReferenceV1 =
+            serde_json::from_value(mapped.payload()["artifact_reference"].clone()).unwrap();
+        let page = artifacts
+            .read_page(
+                &ArtifactId::parse(reference.artifact_id()).unwrap(),
+                PageRequest::new(0, NonZeroU64::new(16 * 1024).unwrap()),
+            )
+            .unwrap();
+        assert!(
+            !page
+                .bytes()
+                .windows(canary.len())
+                .any(|window| window == canary.as_bytes())
+        );
+        assert!(String::from_utf8_lossy(page.bytes()).contains("<redacted>"));
     }
 }

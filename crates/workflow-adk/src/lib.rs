@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
+use adk_rust::graph::Checkpointer;
 use adk_rust::graph::prelude::{
     AgentNode, END, ExecutionConfig, GraphAgent, GraphError, NodeOutput, START, State, StreamEvent,
     StreamMode,
@@ -351,7 +352,9 @@ impl AdkGraph {
         artifacts: &mut S,
     ) -> Result<State, AdkGraphError> {
         let mut state = self.input.map(state);
-        state.retain(|key, _| !key.starts_with("visits:"));
+        if config.resume_from.is_none() {
+            state.retain(|key, _| !key.starts_with("visits:"));
+        }
         let limit = self.recursion_limit.min(config.recursion_limit);
         let mut config = config.with_recursion_limit(limit);
         if let Some(binding) = &self.plan_binding {
@@ -525,7 +528,7 @@ impl AdkGraphTranslator {
     }
 
     pub fn translate(&self, plan: &CompiledPlan) -> Result<AdkGraph, TranslationError> {
-        self.translate_ir(plan.ir(), None, None, None)
+        self.translate_ir(plan.ir(), None, None, None, None)
     }
 
     /// Translates with exact live agents supplied for every agent node.
@@ -534,7 +537,7 @@ impl AdkGraphTranslator {
         plan: &CompiledPlan,
         agents: &BTreeMap<String, Arc<dyn Agent>>,
     ) -> Result<AdkGraph, TranslationError> {
-        self.translate_ir(plan.ir(), None, Some(agents), None)
+        self.translate_ir(plan.ir(), None, Some(agents), None, None)
     }
 
     /// Translates a profile graph with WASM-backed non-Agent execution nodes.
@@ -545,6 +548,18 @@ impl AdkGraphTranslator {
         module: Option<&[u8]>,
         input: &Value,
     ) -> Result<AdkGraph, TranslationError> {
+        self.translate_profile_with_checkpointer(plan, agents, module, input, None)
+    }
+
+    /// Translates a profile graph with a runtime-local ADK checkpointer.
+    pub(crate) fn translate_profile_with_checkpointer(
+        &self,
+        plan: &CompiledPlan,
+        agents: &BTreeMap<String, Arc<dyn Agent>>,
+        module: Option<&[u8]>,
+        input: &Value,
+        checkpointer: Option<Arc<dyn Checkpointer>>,
+    ) -> Result<AdkGraph, TranslationError> {
         self.translate_ir(
             plan.ir(),
             None,
@@ -553,6 +568,7 @@ impl AdkGraphTranslator {
                 module: module.map(Arc::from),
                 input: input.clone(),
             }),
+            checkpointer,
         )
     }
 
@@ -594,6 +610,7 @@ impl AdkGraphTranslator {
             }),
             None,
             None,
+            None,
         )
     }
 
@@ -603,6 +620,7 @@ impl AdkGraphTranslator {
         plan_binding: Option<PlanBinding>,
         agents: Option<&BTreeMap<String, Arc<dyn Agent>>>,
         profile_backend: Option<ProfileNodeBackend>,
+        checkpointer: Option<Arc<dyn Checkpointer>>,
     ) -> Result<AdkGraph, TranslationError> {
         let ids: std::collections::BTreeSet<&str> =
             ir.nodes().iter().map(|node| node.id().as_str()).collect();
@@ -810,6 +828,9 @@ impl AdkGraphTranslator {
         }
         for terminal in &terminals {
             builder = builder.edge(terminal, END);
+        }
+        if let Some(checkpointer) = checkpointer {
+            builder = builder.checkpointer_arc(checkpointer);
         }
         let graph = builder
             .build()

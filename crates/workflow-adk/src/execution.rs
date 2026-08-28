@@ -1,18 +1,19 @@
 //! Profile-driven execution and kit-owned run-state persistence.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     num::NonZeroU64,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use adk_rust::graph::prelude::{ExecutionConfig, State};
+use adk_rust::graph::{Checkpoint, Checkpointer, GraphError};
 use adk_rust::{
     Agent, AgentCapabilities, Content, Event, EventStream, FunctionResponseData, InvocationContext,
     LlmRequest, Part, async_trait, futures::StreamExt as _,
@@ -22,11 +23,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use workflow_compiler::compile_file;
 use workflow_runtime::{
-    ArtifactStore, BackendCapabilities, CapabilityIntersection, FilesystemArtifactStore,
-    InMemoryArtifactStore, ProtectedArtifactReferenceV1, PureTransformRequest,
-    RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox, SandboxCapability, ToolBridge,
-    ToolBridgeError, ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance,
-    ToolRegistration, WorkdirManager, WorkflowRuntimeEventKindV1, verify_sandbox_capabilities,
+    ArtifactId, ArtifactStore, BackendCapabilities, CapabilityIntersection, CheckpointManifestV1,
+    DurableCheckpointV1, FilesystemArtifactStore, InMemoryArtifactStore, PageRequest,
+    ProtectedArtifactReferenceV1, PureTransformRequest, RequestedCapabilities, RunContext, RunId,
+    RunLimits, RunSandbox, SandboxCapability, SqliteCheckpointStore, ToolBridge, ToolBridgeError,
+    ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance, ToolRegistration,
+    WorkdirManager, WorkflowRuntimeEventKindV1, contains_sensitive_key, redact_json_value,
+    verify_sandbox_capabilities,
 };
 use workflow_spec::{SourcePath, read_bounded_regular_file};
 
@@ -42,11 +45,176 @@ use crate::{
 
 const MAX_STATE_BYTES: usize = 1024 * 1024;
 const ARTIFACT_LIMIT: u64 = 64 * 1024;
+const GRAPH_CONTINUATION_KEY: &str = "kit_graph_continuation_v1";
 static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
 type BoundTool = (String, Arc<AdkToolBridge<InMemoryArtifactStore>>);
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GraphContinuationV1 {
+    schema_version: u8,
+    pending_nodes: Vec<String>,
+    step: usize,
+    retry: BTreeMap<String, u32>,
+    route_frontier: BTreeMap<String, Value>,
+    visits: BTreeMap<String, u64>,
+}
+
+impl GraphContinuationV1 {
+    fn from_checkpoint(checkpoint: &Checkpoint) -> Self {
+        let route_frontier = checkpoint
+            .state
+            .iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix("route:")
+                    .map(|node| (node.to_owned(), value.clone()))
+            })
+            .collect();
+        let visits = checkpoint
+            .state
+            .iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix("visits:")
+                    .zip(value.as_u64())
+                    .map(|(node, visits)| (node.to_owned(), visits))
+            })
+            .collect();
+        Self {
+            schema_version: 1,
+            pending_nodes: checkpoint.pending_nodes.clone(),
+            step: checkpoint.step,
+            retry: checkpoint
+                .attempts
+                .iter()
+                .map(|(node, attempts)| (node.clone(), *attempts))
+                .collect(),
+            route_frontier,
+            visits,
+        }
+    }
+
+    fn restore(
+        self,
+        state: &mut State,
+        run_id: &str,
+        nodes: &BTreeSet<String>,
+    ) -> Option<Checkpoint> {
+        if self.schema_version != 1
+            || self
+                .pending_nodes
+                .iter()
+                .chain(self.retry.keys())
+                .chain(self.route_frontier.keys())
+                .chain(self.visits.keys())
+                .any(|node| !nodes.contains(node))
+        {
+            return None;
+        }
+        for (node, route) in &self.route_frontier {
+            state.insert(format!("route:{node}"), route.clone());
+        }
+        for (node, visits) in &self.visits {
+            state.insert(format!("visits:{node}"), json!(visits));
+        }
+        let mut checkpoint = Checkpoint::new(run_id, state.clone(), self.step, self.pending_nodes);
+        checkpoint.attempts = self.retry.into_iter().collect();
+        Some(checkpoint)
+    }
+}
+
+#[derive(Default)]
+struct GraphCheckpointMemory(Mutex<Option<Checkpoint>>);
+
+impl GraphCheckpointMemory {
+    fn latest(&self) -> Option<Checkpoint> {
+        self.0.lock().ok()?.clone()
+    }
+
+    fn restore(&self, checkpoint: Checkpoint) -> bool {
+        self.0
+            .lock()
+            .map(|mut saved| *saved = Some(checkpoint))
+            .is_ok()
+    }
+}
+
+#[async_trait]
+impl Checkpointer for GraphCheckpointMemory {
+    async fn save(&self, checkpoint: &Checkpoint) -> Result<String, GraphError> {
+        *self
+            .0
+            .lock()
+            .map_err(|_| GraphError::Other("graph checkpoint unavailable".to_owned()))? =
+            Some(checkpoint.clone());
+        Ok(checkpoint.checkpoint_id.clone())
+    }
+
+    async fn load(&self, thread_id: &str) -> Result<Option<Checkpoint>, GraphError> {
+        Ok(self
+            .latest()
+            .filter(|checkpoint| checkpoint.thread_id == thread_id))
+    }
+
+    async fn load_by_id(&self, checkpoint_id: &str) -> Result<Option<Checkpoint>, GraphError> {
+        Ok(self
+            .latest()
+            .filter(|checkpoint| checkpoint.checkpoint_id == checkpoint_id))
+    }
+
+    async fn list(&self, thread_id: &str) -> Result<Vec<Checkpoint>, GraphError> {
+        Ok(self.load(thread_id).await?.into_iter().collect())
+    }
+
+    async fn delete(&self, thread_id: &str) -> Result<(), GraphError> {
+        if self
+            .latest()
+            .is_some_and(|checkpoint| checkpoint.thread_id == thread_id)
+        {
+            *self
+                .0
+                .lock()
+                .map_err(|_| GraphError::Other("graph checkpoint unavailable".to_owned()))? = None;
+        }
+        Ok(())
+    }
+}
+
+fn checkpoint_state(
+    mut state: State,
+    checkpoint: &Checkpoint,
+    prior_retry: Option<&BTreeMap<String, u32>>,
+) -> Result<State, ExecutionError> {
+    let mut continuation = GraphContinuationV1::from_checkpoint(checkpoint);
+    if let Some(prior_retry) = prior_retry {
+        for (node, attempts) in prior_retry {
+            continuation.retry.entry(node.clone()).or_insert(*attempts);
+        }
+    }
+    state.insert(
+        GRAPH_CONTINUATION_KEY.to_owned(),
+        serde_json::to_value(continuation)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?,
+    );
+    Ok(state)
+}
+
+fn restore_checkpoint_state(
+    state: &mut State,
+    run_id: &str,
+    nodes: BTreeSet<String>,
+) -> Result<Checkpoint, ExecutionError> {
+    let continuation = state
+        .remove(GRAPH_CONTINUATION_KEY)
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+    let continuation = serde_json::from_value::<GraphContinuationV1>(continuation)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+    continuation
+        .restore(state, run_id, &nodes)
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))
+}
+
 /// A validated runtime profile supplied to the reusable ADK executor.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionProfileV1 {
     schema_version: u16,
@@ -56,7 +224,7 @@ pub struct ExecutionProfileV1 {
     sandbox: SandboxWire,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "provider", rename_all = "kebab-case", deny_unknown_fields)]
 enum ModelWire {
     Fake {
@@ -74,7 +242,7 @@ enum ModelWire {
     },
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ToolWire {
     name: String,
@@ -83,13 +251,13 @@ struct ToolWire {
     required_capabilities: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PureTransformWire {
     module: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SandboxWire {
     #[serde(default)]
@@ -375,6 +543,7 @@ struct RunManifestV1 {
     status: String,
     artifact_id: String,
     resume_count: u64,
+    checkpoint_manifest: Option<CheckpointManifestV1>,
 }
 
 impl RunManifestV1 {
@@ -452,6 +621,9 @@ impl ExecutionBackend {
         if input_bytes.len() > PureTransformRequest::MAX_JSON_BYTES {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
         }
+        if contains_sensitive_key(&input) {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+        }
         let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
         let requested = RequestedCapabilities::new(required_capabilities.iter().copied());
         verify_sandbox_capabilities(
@@ -475,6 +647,14 @@ impl ExecutionBackend {
         let manager = WorkdirManager::new(workdir_base)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let run_id = fresh_run_id()?;
+        let checkpoint_manifest = build_checkpoint_manifest(
+            &run_id,
+            compiled.ir().workflow_id().as_str(),
+            compiled.ir().workflow_version(),
+            crate::canonical_ir_hash(compiled.ir()),
+            &profile,
+            transform_module.as_deref(),
+        )?;
         let context = RunContext::new(run_id.clone(), run_limits());
         let mut mapper = AdkEventMapper::new(run_id.as_str(), compiled.ir().workflow_id().as_str())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
@@ -483,6 +663,9 @@ impl ExecutionBackend {
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let run_root = run_workdir.root().to_path_buf();
         let workdir_id = run_workdir.id().as_str().to_owned();
+        let workflow_source = fs::read(workflow.as_ref())
+            .ok()
+            .filter(|bytes| !bytes.is_empty() && bytes.len() <= MAX_STATE_BYTES);
         let mut artifacts = FilesystemArtifactStore::try_new(
             run_root.join("artifacts"),
             NonZeroU64::new(ARTIFACT_LIMIT).expect("positive artifact limit"),
@@ -490,6 +673,26 @@ impl ExecutionBackend {
         )
         .ok();
         let mut persistence_error = None;
+        let mut checkpoint_failed = false;
+        if workflow_source
+            .as_deref()
+            .is_none_or(|source| write_atomic(&run_root.join("workflow.toml"), source).is_err())
+            || write_json(&run_root.join("execution-profile.json"), &profile).is_err()
+            || write_json(&run_root.join("execution-input.json"), &input).is_err()
+        {
+            persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
+        }
+        let mut checkpoint_store = match SqliteCheckpointStore::open(
+            run_root.join("checkpoint.sqlite"),
+            checkpoint_manifest.clone(),
+        ) {
+            Ok(store) => Some(store),
+            Err(_) => {
+                checkpoint_failed = true;
+                persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
+                None
+            }
+        };
         if artifacts.is_none() {
             persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
         }
@@ -526,8 +729,15 @@ impl ExecutionBackend {
                         (node.id().as_str().to_owned(), agent)
                     })
                     .collect::<BTreeMap<_, _>>();
+                let continuation = Arc::new(GraphCheckpointMemory::default());
                 let graph = AdkGraphTranslator::new()
-                    .translate_profile(&compiled, &agents, transform_module.as_deref(), &input)
+                    .translate_profile_with_checkpointer(
+                        &compiled,
+                        &agents,
+                        transform_module.as_deref(),
+                        &input,
+                        Some(continuation.clone()),
+                    )
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
                 let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -541,6 +751,13 @@ impl ExecutionBackend {
                         artifacts,
                     ))
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
+                let state = checkpoint_state(
+                    state,
+                    &continuation
+                        .latest()
+                        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Adk))?,
+                    None,
+                )?;
                 state
                     .contains_key("terminal")
                     .then_some(state)
@@ -570,7 +787,7 @@ impl ExecutionBackend {
                     .get_or_insert(ExecutionError::new(ExecutionErrorKind::Persistence));
             }
         }
-        let status = status.unwrap_or("succeeded");
+        let mut status = status.unwrap_or("succeeded");
         let mut node_output_refs = BTreeMap::new();
         let mut references_overflowed = false;
         let mut reference_count = 0_u64;
@@ -587,7 +804,7 @@ impl ExecutionBackend {
                     continue;
                 };
                 let reference = (|| {
-                    let encoded = serde_json::to_vec(output)
+                    let encoded = serde_json::to_vec(&redact_json_value(output))
                         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
                     let artifact_id = artifacts
                         .put(&encoded)
@@ -629,6 +846,75 @@ impl ExecutionBackend {
             }
         }
         let reference_digest = format!("sha256:{:x}", reference_hasher.finalize());
+        if references_overflowed {
+            checkpoint_failed = true;
+            persistence_error.get_or_insert(ExecutionError::new(ExecutionErrorKind::Persistence));
+        }
+        if let Err(error) = write_events(&run_root.join("events.jsonl"), mapper.events()) {
+            persistence_error.get_or_insert(error);
+        }
+        if persistence_error.is_none() {
+            if let (Ok(state), Some(store)) = (&execution, checkpoint_store.as_mut()) {
+                let state_bytes = match serde_json::to_vec(state) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        checkpoint_failed = true;
+                        persistence_error =
+                            Some(ExecutionError::new(ExecutionErrorKind::Persistence));
+                        Vec::new()
+                    }
+                };
+                if !state_bytes.is_empty() {
+                    let node_id = mapper
+                        .events()
+                        .iter()
+                        .rev()
+                        .find_map(|event| event.node_id())
+                        .unwrap_or("terminal")
+                        .to_owned();
+                    let mut artifact_refs = node_output_refs
+                        .values()
+                        .map(|reference| reference.artifact_id().to_owned())
+                        .collect::<BTreeSet<_>>();
+                    for event in mapper.events() {
+                        if let Some(artifact_id) = event
+                            .payload()
+                            .get("artifact_reference")
+                            .and_then(|reference| reference.get("artifact_id"))
+                            .and_then(Value::as_str)
+                        {
+                            artifact_refs.insert(artifact_id.to_owned());
+                        }
+                    }
+                    match DurableCheckpointV1::new(
+                        run_id.clone(),
+                        node_id,
+                        mapper.events().last().map_or(0, |event| event.sequence()),
+                        state_bytes,
+                        artifact_refs,
+                    ) {
+                        Ok(checkpoint) => {
+                            if store.save_checkpoint(checkpoint).is_err() {
+                                checkpoint_failed = true;
+                                persistence_error =
+                                    Some(ExecutionError::new(ExecutionErrorKind::Persistence));
+                            }
+                        }
+                        Err(_) => {
+                            checkpoint_failed = true;
+                            persistence_error =
+                                Some(ExecutionError::new(ExecutionErrorKind::Persistence));
+                        }
+                    }
+                }
+            } else if execution.is_ok() {
+                checkpoint_failed = true;
+                persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
+            }
+        }
+        if checkpoint_failed {
+            status = "failed";
+        }
         let terminal = match bounded_terminal_artifact(
             run_id.as_str(),
             status,
@@ -658,9 +944,6 @@ impl ExecutionBackend {
             },
             None => "unavailable".to_owned(),
         };
-        if let Err(error) = write_events(&run_root.join("events.jsonl"), mapper.events()) {
-            persistence_error.get_or_insert(error);
-        }
         let manifest = RunManifestV1 {
             schema_version: 1,
             run_id: run_id.as_str().to_owned(),
@@ -672,6 +955,7 @@ impl ExecutionBackend {
             status: status.to_owned(),
             artifact_id,
             resume_count: 0,
+            checkpoint_manifest: Some(checkpoint_manifest),
         };
         if let Err(error) = write_json(&run_root.join("run-manifest.json"), &manifest) {
             persistence_error.get_or_insert(error);
@@ -696,8 +980,83 @@ impl ExecutionBackend {
         run_id: &str,
     ) -> Result<ExecutionReceipt, ExecutionError> {
         let (root, mut manifest) = find_run(workdir_base.as_ref(), run_id)?;
+        let checkpoint_manifest = manifest
+            .checkpoint_manifest
+            .clone()
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let run_identity = RunId::new(run_id.to_owned())
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let mut checkpoint_store = SqliteCheckpointStore::open(
+            root.join("checkpoint.sqlite"),
+            checkpoint_manifest.clone(),
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let checkpoint = checkpoint_store
+            .load_latest(&run_identity)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let mut artifacts = FilesystemArtifactStore::try_new(
+            root.join("artifacts"),
+            NonZeroU64::new(ARTIFACT_LIMIT).expect("positive artifact limit"),
+            NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page limit"),
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        for reference in checkpoint.artifact_refs() {
+            let artifact_id = ArtifactId::parse(reference)
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+            let page = artifacts
+                .read_page(
+                    &artifact_id,
+                    PageRequest::new(
+                        0,
+                        NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page size"),
+                    ),
+                )
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+            if page.next_offset().is_some()
+                || format!("{:x}", Sha256::digest(page.bytes())) != artifact_id.as_str()
+            {
+                return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+            }
+        }
+        let profile =
+            ExecutionProfileV1::parse(&bounded_read(&root.join("execution-profile.json"))?)?;
+        let input =
+            serde_json::from_slice::<Value>(&bounded_read(&root.join("execution-input.json"))?)
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let workflow = root.join("workflow.toml");
+        let compiled = compile_file(workflow.to_string_lossy().as_ref())
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if compiled.ir().workflow_id().as_str() != manifest.workflow_id
+            || compiled.ir().workflow_version() != manifest.workflow_version
+        {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        let transform_module = profile.transform_module()?;
+        let live_checkpoint_manifest = build_checkpoint_manifest(
+            &run_identity,
+            compiled.ir().workflow_id().as_str(),
+            compiled.ir().workflow_version(),
+            crate::canonical_ir_hash(compiled.ir()),
+            &profile,
+            transform_module.as_deref(),
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if live_checkpoint_manifest != checkpoint_manifest {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        let model = profile.bind_model()?;
+        let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
+        verify_sandbox_capabilities(
+            &RequestedCapabilities::new(required_capabilities.iter().copied()),
+            &BackendCapabilities::new(sandbox_capabilities.iter().copied()),
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let events_path = root.join("events.jsonl");
         let events = read_events(&events_path)?;
+        if events.last().map_or(0, |event| event.sequence()) != checkpoint.event_sequence() {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
         let mut mapper = AdkEventMapper::resume(run_id, &manifest.workflow_id, events)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let next = manifest.resume_count + 1;
@@ -708,11 +1067,170 @@ impl ExecutionBackend {
                 AdkRuntimeObservationKindV1::WorkflowResumed,
             ))
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let base = root
+            .parent()
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let manager = WorkdirManager::new(base)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let run_workdir = manager
+            .reopen(&run_identity, &root)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let sandbox = RunSandbox::new(
+            RunContext::new(run_identity.clone(), run_limits()),
+            run_workdir,
+            sandbox_capabilities,
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let tool = build_tool(&profile, sandbox, &required_capabilities)?;
+        let agents = compiled
+            .ir()
+            .nodes()
+            .iter()
+            .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
+            .map(|node| {
+                let agent: Arc<dyn Agent> = Arc::new(ProfileAgent {
+                    name: node.id().as_str().to_owned(),
+                    model: Arc::clone(&model),
+                    tool: tool.clone(),
+                    input: input.clone(),
+                });
+                (node.id().as_str().to_owned(), agent)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut state = serde_json::from_slice::<State>(checkpoint.state())
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let nodes = compiled
+            .ir()
+            .nodes()
+            .iter()
+            .map(|node| node.id().as_str().to_owned())
+            .collect();
+        let restored = restore_checkpoint_state(&mut state, run_id, nodes)?;
+        let retry = restored
+            .attempts
+            .iter()
+            .map(|(node, attempts)| (node.clone(), *attempts))
+            .collect::<BTreeMap<_, _>>();
+        let continuation = Arc::new(GraphCheckpointMemory::default());
+        if !continuation.restore(restored.clone()) {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        let graph = AdkGraphTranslator::new()
+            .translate_profile_with_checkpointer(
+                &compiled,
+                &agents,
+                transform_module.as_deref(),
+                &input,
+                Some(continuation.clone()),
+            )
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let recursion_limit = compiled
+            .ir()
+            .nodes()
+            .iter()
+            .filter_map(workflow_ir::IrNode::max_visits)
+            .map(|visits| visits as usize)
+            .sum::<usize>()
+            .max(50);
+        let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let state = runtime
+            .block_on(
+                graph.invoke_observed(
+                    state,
+                    ExecutionConfig::new(run_id)
+                        .with_recursion_limit(recursion_limit)
+                        .with_resume_from(&restored.checkpoint_id),
+                    &mut mapper,
+                    &mut artifacts,
+                ),
+            )
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let state = checkpoint_state(
+            state,
+            &continuation
+                .latest()
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?,
+            Some(&retry),
+        )?;
+        let state_bytes = serde_json::to_vec(&state)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let node_id = mapper
+            .events()
+            .iter()
+            .rev()
+            .find_map(|event| event.node_id())
+            .unwrap_or("terminal")
+            .to_owned();
+        let mut artifact_refs = checkpoint
+            .artifact_refs()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for event in mapper.events() {
+            if let Some(artifact_id) = event
+                .payload()
+                .get("artifact_reference")
+                .and_then(|reference| reference.get("artifact_id"))
+                .and_then(Value::as_str)
+            {
+                artifact_refs.insert(artifact_id.to_owned());
+            }
+        }
+        let checkpoint = DurableCheckpointV1::new(
+            run_identity.clone(),
+            node_id,
+            mapper.events().last().map_or(0, |event| event.sequence()),
+            state_bytes,
+            artifact_refs,
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         write_events(&events_path, mapper.events())?;
+        checkpoint_store
+            .save_checkpoint(checkpoint)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         manifest.resume_count = next;
         write_json(&root.join("run-manifest.json"), &manifest)?;
         Ok(manifest.receipt(root))
     }
+}
+
+fn build_checkpoint_manifest(
+    run_id: &RunId,
+    workflow_id: &str,
+    workflow_version: &str,
+    workflow_hash: String,
+    profile: &ExecutionProfileV1,
+    transform_module: Option<&[u8]>,
+) -> Result<CheckpointManifestV1, ExecutionError> {
+    let profile_hash = serde_json::to_vec(profile)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+    let mut manifest = CheckpointManifestV1::new(run_id, workflow_id, workflow_version)
+        .with_workflow_hash(workflow_hash.clone())
+        .with_resource_hash("workflow.ir", workflow_hash)
+        .with_implementation("model", profile.profile_identity())
+        .with_implementation("adk-rust", "2.1.0")
+        .with_implementation(
+            "execution-profile",
+            format!("sha256:{:x}", Sha256::digest(profile_hash)),
+        )
+        .with_sandbox_policy_hash(format!(
+            "sha256:{:x}",
+            Sha256::digest(profile.sandbox.capabilities.join("\n").as_bytes())
+        ))
+        .with_event_log_identity("workflow-runtime-events-v1");
+    if let Some(tool) = &profile.tool {
+        manifest = manifest.with_implementation("tool", format!("{}:profile", tool.name));
+    }
+    if let Some(transform) = transform_module {
+        manifest = manifest.with_resource_hash(
+            "pure-transform",
+            format!("sha256:{:x}", Sha256::digest(transform)),
+        );
+    }
+    Ok(manifest)
 }
 
 fn build_tool(
@@ -806,11 +1324,11 @@ fn bounded_terminal_artifact(
     reference_count: u64,
     reference_digest: &str,
 ) -> Result<Vec<u8>, ExecutionError> {
-    let terminal = terminal.unwrap_or(&Value::Null);
+    let terminal = terminal.map(redact_json_value).unwrap_or(Value::Null);
     let complete = serde_json::to_vec(&json!({
         "run_id": run_id,
         "status": status,
-        "terminal": terminal,
+        "terminal": &terminal,
         "node_output_refs": node_output_refs,
     }))
     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
@@ -826,7 +1344,7 @@ fn bounded_terminal_artifact(
     let bounded = serde_json::to_vec(&json!({
         "run_id": run_id,
         "status": status,
-        "terminal": terminal,
+        "terminal": &terminal,
         "node_output_refs": {},
         "node_output_refs_summary": summary,
     }))
@@ -835,7 +1353,7 @@ fn bounded_terminal_artifact(
         return Ok(bounded);
     }
 
-    let terminal_bytes = serde_json::to_vec(terminal)
+    let terminal_bytes = serde_json::to_vec(&terminal)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
     serde_json::to_vec(&json!({
         "run_id": run_id,
