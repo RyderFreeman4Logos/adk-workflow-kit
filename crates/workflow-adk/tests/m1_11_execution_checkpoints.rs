@@ -100,6 +100,63 @@ fn resume_consumes_checkpoint_state_and_invokes_the_adk_graph() {
 }
 
 #[test]
+fn resume_rejects_truncated_events_before_graph_invocation() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .unwrap();
+    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
+    let receipt =
+        ExecutionBackend::run(workflow, profile, json!({"request":"public"}), &root.0).unwrap();
+    let events_path = receipt.run_root().join("events.jsonl");
+    let events_before = fs::read(&events_path).unwrap();
+    let prefix_end = events_before[..events_before.len() - 1]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .expect("successful run has at least two events")
+        + 1;
+    let truncated_events = events_before[..prefix_end].to_vec();
+    fs::write(&events_path, &truncated_events).unwrap();
+
+    let checkpoint_path = receipt.run_root().join("checkpoint.sqlite");
+    let manifest: CheckpointManifestV1 = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("checkpoint-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let run_id = RunId::new(receipt.run_id().to_owned()).unwrap();
+    let store = SqliteCheckpointStore::open(&checkpoint_path, manifest).unwrap();
+    let checkpoint_before = store.load_latest(&run_id).unwrap().expect("checkpoint");
+    let checkpoint_bytes_before = fs::read(&checkpoint_path).unwrap();
+
+    let error = ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(fs::read(&events_path).unwrap(), truncated_events);
+
+    let manifest: CheckpointManifestV1 = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("checkpoint-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let store = SqliteCheckpointStore::open(&checkpoint_path, manifest).unwrap();
+    assert_eq!(
+        store.load_latest(&run_id).unwrap().expect("checkpoint"),
+        checkpoint_before
+    );
+    assert_eq!(fs::read(checkpoint_path).unwrap(), checkpoint_bytes_before);
+}
+
+#[test]
 fn resume_rejects_redacted_checkpoint_value_before_graph_invocation() {
     let root = TestRoot::new();
     let profile = ExecutionProfileV1::parse(

@@ -856,6 +856,9 @@ impl ExecutionBackend {
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let events_path = root.join("events.jsonl");
         let events = read_events(&events_path)?;
+        if events.last().map_or(0, |event| event.sequence()) != checkpoint.event_sequence() {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
         let mut mapper = AdkEventMapper::resume(run_id, &manifest.workflow_id, events)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let next = manifest.resume_count + 1;
