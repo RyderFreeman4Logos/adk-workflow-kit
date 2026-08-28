@@ -101,7 +101,8 @@ fn resume_consumes_checkpoint_state_and_invokes_the_adk_graph() {
 #[test]
 fn execution_rejects_secret_like_input_before_persistence() {
     let root = TestRoot::new();
-    let workflow = root.0.join("secret.workflow.toml");
+    let workflow_root = TestRoot::new();
+    let workflow = workflow_root.0.join("secret.workflow.toml");
     fs::write(
         &workflow,
         r#"schema_version = 1
