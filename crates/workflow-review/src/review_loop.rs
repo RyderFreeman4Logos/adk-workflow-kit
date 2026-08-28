@@ -10,7 +10,7 @@ use std::{
     num::NonZeroU64,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::Instant,
 };
 
 use serde::Serialize;
@@ -128,6 +128,7 @@ pub struct ReviewerExecutionBoundary {
     capabilities: CapabilityIntersection,
     read_only_tools: Vec<String>,
     artifacts: Arc<Mutex<InMemoryArtifactStore>>,
+    started: Instant,
 }
 
 /// Run-scoped accounting for reviewer tool dispatches.
@@ -192,6 +193,7 @@ impl ReviewerExecutionBoundary {
                 NonZeroU64::new(64 * 1024).expect("constant artifact limit is positive"),
                 NonZeroU64::new(64 * 1024).expect("constant page limit is positive"),
             ))),
+            started: Instant::now(),
         }
     }
 
@@ -223,7 +225,7 @@ impl ReviewerExecutionBoundary {
             ToolCall::new(tool_name, call_id, reviewer_session_id, arguments),
             &self.capabilities,
             None,
-            Duration::ZERO,
+            self.started.elapsed(),
             &mut *artifacts,
         )
     }

@@ -5,6 +5,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use serde_json::json;
@@ -219,6 +220,71 @@ fn reviewer_is_narrowed_to_an_isolated_read_only_request() {
     .expect("narrow reviewer request must complete");
     assert!(saw_request);
     assert!(matches!(result, ReviewLoopOutcome::Published { .. }));
+}
+
+#[test]
+fn reviewer_tool_deadlines_advance_from_boundary_start() {
+    let deadlines = Arc::new(Mutex::new(Vec::new()));
+    let provenance = ToolProvenance::new("review.inspect", "1");
+    let timeout_ms = 250_u64;
+    let registration = ToolRegistration::for_types::<serde_json::Value, serde_json::Value>(
+        "inspect",
+        provenance.clone(),
+        ToolFlags::new(true, true, true),
+    )
+    .expect("fixture registration")
+    .with_timeout(NonZeroU64::new(timeout_ms).expect("positive timeout"));
+    let mut bridge = ToolBridge::new(reviewer_sandbox());
+    let observed = Arc::clone(&deadlines);
+    bridge
+        .register(
+            registration,
+            move |_: &ChildSandbox<'_>,
+                  context: &ToolCallContext,
+                  _: &serde_json::Value|
+                  -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
+                observed
+                    .lock()
+                    .expect("deadline observations lock")
+                    .push(context.deadline());
+                Ok(ToolEnvelope::success(
+                    json!({"ok": true}),
+                    provenance.clone(),
+                ))
+            },
+        )
+        .expect("fixture tool registration");
+    let boundary =
+        ReviewerExecutionBoundary::new(bridge, CapabilityIntersection::all_for_tool("inspect", []));
+
+    let result = run_bounded_review_loop(
+        || Ok::<_, ToolBridgeError>(artifact("candidate")),
+        |_| Ok(valid()),
+        |request| {
+            request
+                .authority()
+                .invoke_tool("first-call", "inspect", json!({}))
+                .expect("first reviewer tool call must execute");
+            request
+                .authority()
+                .invoke_tool("second-call", "inspect", json!({}))
+                .expect("second reviewer tool call must execute");
+            Ok(pass())
+        },
+        |_| panic!("a passing review does not need a reviser"),
+        config()
+            .with_max_tool_calls(2)
+            .with_read_only_tools(vec!["inspect".to_owned()])
+            .with_execution_boundary(boundary),
+    )
+    .expect("review must publish");
+
+    assert!(matches!(result, ReviewLoopOutcome::Published { .. }));
+    let deadlines = deadlines.lock().expect("deadline observations lock");
+    assert_eq!(deadlines.len(), 2);
+    assert!(deadlines[0] >= Duration::from_millis(timeout_ms));
+    assert!(deadlines[1] >= Duration::from_millis(timeout_ms));
+    assert!(deadlines[1] > deadlines[0]);
 }
 
 #[test]
