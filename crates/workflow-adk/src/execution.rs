@@ -18,7 +18,8 @@ use adk_rust::{
     LlmRequest, Part, async_trait, futures::StreamExt as _,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use workflow_compiler::compile_file;
 use workflow_runtime::{
     ArtifactStore, BackendCapabilities, CapabilityIntersection, FilesystemArtifactStore,
@@ -463,6 +464,14 @@ impl ExecutionBackend {
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Compile))?;
         let transform_module = profile.transform_module()?;
         let model = profile.bind_model()?;
+        let recursion_limit = compiled
+            .ir()
+            .nodes()
+            .iter()
+            .filter_map(workflow_ir::IrNode::max_visits)
+            .map(|visits| visits as usize)
+            .sum::<usize>()
+            .max(50);
         let manager = WorkdirManager::new(workdir_base)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let run_id = fresh_run_id()?;
@@ -479,53 +488,65 @@ impl ExecutionBackend {
             NonZeroU64::new(ARTIFACT_LIMIT).expect("positive artifact limit"),
             NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page limit"),
         )
-        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-        mapper
+        .ok();
+        let mut persistence_error = None;
+        if artifacts.is_none() {
+            persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
+        }
+        if mapper
             .map(AdkRuntimeObservationV1::new(
                 "workflow-started",
                 "workflowctl",
                 AdkRuntimeObservationKindV1::WorkflowStarted,
             ))
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-        let execution = (|| {
-            let sandbox = RunSandbox::new(context, run_workdir, sandbox_capabilities)
-                .map_err(|_| ExecutionError::new(ExecutionErrorKind::SandboxDenied))?;
-            let tool = build_tool(&profile, sandbox, &required_capabilities)?;
-            let agents = compiled
-                .ir()
-                .nodes()
-                .iter()
-                .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
-                .map(|node| {
-                    let agent: Arc<dyn Agent> = Arc::new(ProfileAgent {
-                        name: node.id().as_str().to_owned(),
-                        model: Arc::clone(&model),
-                        tool: tool.clone(),
-                        input: input.clone(),
-                    });
-                    (node.id().as_str().to_owned(), agent)
-                })
-                .collect::<BTreeMap<_, _>>();
-            let graph = AdkGraphTranslator::new()
-                .translate_profile(&compiled, &agents, transform_module.as_deref(), &input)
-                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
-            let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
-            let state = runtime
-                .block_on(graph.invoke_observed(
-                    State::new(),
-                    ExecutionConfig::new(run_id.as_str()),
-                    &mut mapper,
-                    &mut artifacts,
-                ))
-                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
-            state
-                .contains_key("terminal")
-                .then_some(state)
-                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Adk))
-        })();
+            .is_err()
+        {
+            persistence_error.get_or_insert(ExecutionError::new(ExecutionErrorKind::Persistence));
+        }
+        let execution = if persistence_error.is_some() {
+            Err(ExecutionError::new(ExecutionErrorKind::Persistence))
+        } else {
+            let artifacts = artifacts.as_mut().expect("artifact store must be present");
+            (|| {
+                let sandbox = RunSandbox::new(context, run_workdir, sandbox_capabilities)
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::SandboxDenied))?;
+                let tool = build_tool(&profile, sandbox, &required_capabilities)?;
+                let agents = compiled
+                    .ir()
+                    .nodes()
+                    .iter()
+                    .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
+                    .map(|node| {
+                        let agent: Arc<dyn Agent> = Arc::new(ProfileAgent {
+                            name: node.id().as_str().to_owned(),
+                            model: Arc::clone(&model),
+                            tool: tool.clone(),
+                            input: input.clone(),
+                        });
+                        (node.id().as_str().to_owned(), agent)
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let graph = AdkGraphTranslator::new()
+                    .translate_profile(&compiled, &agents, transform_module.as_deref(), &input)
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
+                let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
+                let state = runtime
+                    .block_on(graph.invoke_observed(
+                        State::new(),
+                        ExecutionConfig::new(run_id.as_str()).with_recursion_limit(recursion_limit),
+                        &mut mapper,
+                        artifacts,
+                    ))
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
+                state
+                    .contains_key("terminal")
+                    .then_some(state)
+                    .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Adk))
+            })()
+        };
         let mut status = mapper
             .events()
             .iter()
@@ -536,19 +557,25 @@ impl ExecutionBackend {
                 _ => None,
             });
         if execution.is_err() && status.is_none() {
-            mapper
+            status = Some("failed");
+            if mapper
                 .map(AdkRuntimeObservationV1::new(
                     "workflow-failed",
                     "workflowctl",
                     AdkRuntimeObservationKindV1::WorkflowFailed,
                 ))
-                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-            status = Some("failed");
+                .is_err()
+            {
+                persistence_error
+                    .get_or_insert(ExecutionError::new(ExecutionErrorKind::Persistence));
+            }
         }
         let status = status.unwrap_or("succeeded");
         let mut node_output_refs = BTreeMap::new();
-        let mut persistence_error = None;
-        if let Ok(state) = &execution {
+        let mut references_overflowed = false;
+        let mut reference_count = 0_u64;
+        let mut reference_hasher = Sha256::new();
+        if let (Ok(state), Some(artifacts)) = (&execution, artifacts.as_mut()) {
             for node in compiled.ir().nodes().iter().filter(|node| {
                 !matches!(
                     node.kind(),
@@ -575,24 +602,65 @@ impl ExecutionBackend {
                 })();
                 match reference {
                     Ok(reference) => {
-                        node_output_refs.insert(id.to_owned(), reference);
+                        reference_count += 1;
+                        match serde_json::to_vec(&(id, &reference)) {
+                            Ok(encoded) => {
+                                reference_hasher.update(encoded);
+                                reference_hasher.update([0]);
+                            }
+                            Err(_) => {
+                                persistence_error.get_or_insert(ExecutionError::new(
+                                    ExecutionErrorKind::Persistence,
+                                ));
+                            }
+                        }
+                        if !references_overflowed {
+                            node_output_refs.insert(id.to_owned(), reference);
+                            references_overflowed = serde_json::to_vec(&node_output_refs)
+                                .map_or(true, |encoded| encoded.len() > ARTIFACT_LIMIT as usize);
+                            if references_overflowed {
+                                node_output_refs.clear();
+                            }
+                        }
                     }
                     Err(error) if persistence_error.is_none() => persistence_error = Some(error),
                     Err(_) => {}
                 }
             }
         }
-        let terminal = serde_json::to_vec(&serde_json::json!({
-            "run_id": run_id.as_str(),
-            "status": status,
-            "terminal": execution.as_ref().ok().and_then(|state| state.get("terminal")),
-            "node_output_refs": node_output_refs
-        }))
-        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-        let artifact_id = artifacts
-            .put(&terminal)
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-        write_events(&run_root.join("events.jsonl"), mapper.events())?;
+        let reference_digest = format!("sha256:{:x}", reference_hasher.finalize());
+        let terminal = match bounded_terminal_artifact(
+            run_id.as_str(),
+            status,
+            execution
+                .as_ref()
+                .ok()
+                .and_then(|state| state.get("terminal")),
+            &node_output_refs,
+            references_overflowed,
+            reference_count,
+            &reference_digest,
+        ) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                persistence_error.get_or_insert(error);
+                Vec::new()
+            }
+        };
+        let artifact_id = match artifacts.as_mut() {
+            Some(artifacts) => match artifacts.put(&terminal) {
+                Ok(artifact_id) => artifact_id.as_str().to_owned(),
+                Err(_) => {
+                    persistence_error
+                        .get_or_insert(ExecutionError::new(ExecutionErrorKind::Persistence));
+                    "unavailable".to_owned()
+                }
+            },
+            None => "unavailable".to_owned(),
+        };
+        if let Err(error) = write_events(&run_root.join("events.jsonl"), mapper.events()) {
+            persistence_error.get_or_insert(error);
+        }
         let manifest = RunManifestV1 {
             schema_version: 1,
             run_id: run_id.as_str().to_owned(),
@@ -602,14 +670,16 @@ impl ExecutionBackend {
             profile_identity: profile.profile_identity(),
             adk_rust_version: "2.1.0".to_owned(),
             status: status.to_owned(),
-            artifact_id: artifact_id.as_str().to_owned(),
+            artifact_id,
             resume_count: 0,
         };
-        write_json(&run_root.join("run-manifest.json"), &manifest)?;
+        if let Err(error) = write_json(&run_root.join("run-manifest.json"), &manifest) {
+            persistence_error.get_or_insert(error);
+        }
         let receipt = manifest.receipt(run_root);
-        match (execution, persistence_error) {
-            (Err(error), _) | (Ok(_), Some(error)) => Err(error.with_receipt(receipt)),
-            (Ok(_), None) => Ok(receipt),
+        match (execution.err(), persistence_error) {
+            (Some(error), _) | (None, Some(error)) => Err(error.with_receipt(receipt)),
+            (None, None) => Ok(receipt),
         }
     }
 
@@ -727,6 +797,58 @@ fn run_limits() -> RunLimits {
     )
 }
 
+fn bounded_terminal_artifact(
+    run_id: &str,
+    status: &str,
+    terminal: Option<&Value>,
+    node_output_refs: &BTreeMap<String, ProtectedArtifactReferenceV1>,
+    references_overflowed: bool,
+    reference_count: u64,
+    reference_digest: &str,
+) -> Result<Vec<u8>, ExecutionError> {
+    let terminal = terminal.unwrap_or(&Value::Null);
+    let complete = serde_json::to_vec(&json!({
+        "run_id": run_id,
+        "status": status,
+        "terminal": terminal,
+        "node_output_refs": node_output_refs,
+    }))
+    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+    if !references_overflowed && complete.len() <= ARTIFACT_LIMIT as usize {
+        return Ok(complete);
+    }
+
+    let summary = json!({
+        "count": reference_count,
+        "sha256": reference_digest,
+        "overflowed": references_overflowed,
+    });
+    let bounded = serde_json::to_vec(&json!({
+        "run_id": run_id,
+        "status": status,
+        "terminal": terminal,
+        "node_output_refs": {},
+        "node_output_refs_summary": summary,
+    }))
+    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+    if bounded.len() <= ARTIFACT_LIMIT as usize {
+        return Ok(bounded);
+    }
+
+    let terminal_bytes = serde_json::to_vec(terminal)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+    serde_json::to_vec(&json!({
+        "run_id": run_id,
+        "status": status,
+        "terminal": Value::Null,
+        "terminal_digest": format!("sha256:{:x}", Sha256::digest(&terminal_bytes)),
+        "terminal_byte_len": terminal_bytes.len(),
+        "node_output_refs": {},
+        "node_output_refs_summary": summary,
+    }))
+    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+}
+
 fn find_run(base: &Path, run_id: &str) -> Result<(PathBuf, RunManifestV1), ExecutionError> {
     WorkdirManager::new(base).map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
     // ponytail: scan run manifests; add an index when run counts make lookup measurable.
@@ -789,12 +911,18 @@ fn write_events(
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
         bytes.push(b'\n');
     }
+    if bytes.len() > MAX_STATE_BYTES {
+        return Err(ExecutionError::new(ExecutionErrorKind::Persistence));
+    }
     write_atomic(path, &bytes)
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), ExecutionError> {
     let bytes = serde_json::to_vec(value)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+    if bytes.len() > MAX_STATE_BYTES {
+        return Err(ExecutionError::new(ExecutionErrorKind::Persistence));
+    }
     write_atomic(path, &bytes)
 }
 

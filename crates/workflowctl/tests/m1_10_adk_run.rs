@@ -143,7 +143,7 @@ fn non_agent_workflow(node_count: usize) -> String {
     );
     for index in 0..node_count {
         workflow.push_str(&format!(
-            "[[nodes]]\nid = \"node-{index}\"\nkind = \"action\"\n"
+            "[[nodes]]\nid = \"node-{index}\"\nkind = \"action\"\nmax_visits = 2\n"
         ));
     }
     workflow.push_str("[[nodes]]\nid = \"done\"\nkind = \"terminal\"\n");
@@ -354,6 +354,46 @@ fn large_non_agent_outputs_are_individually_persisted_and_inspectable() {
         assert_eq!(persisted, input_value);
     }
     assert!(combined_bytes > 64 * 1024);
+
+    fs::remove_dir_all(root).expect("test root must be removed");
+}
+
+#[test]
+fn oversized_node_output_reference_aggregate_remains_bounded_and_inspectable() {
+    let root = temp_root("oversized-node-reference-aggregate");
+    let mut profile_value = fake_profile();
+    profile_value["pure_transform"] = json!({"module": IDENTITY_WASM});
+    let (workflow, profile, runs) = write_fixture(&root, profile_value);
+    fs::write(&workflow, non_agent_workflow(350)).expect("workflow fixture must write");
+
+    let output = run_adk(&workflow, &profile, &runs);
+    assert!(
+        output.status.success(),
+        "large reference aggregate must still succeed, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt = json_stdout(&output);
+    let run_id = receipt["run_id"].as_str().expect("run ID must be text");
+    let inspect = command_json(&[
+        "--json",
+        "inspect",
+        "--run-id",
+        run_id,
+        "--workdir",
+        runs.to_str().expect("UTF-8 run base"),
+    ]);
+    assert_eq!(json_stdout(&inspect), receipt);
+
+    let run_root = run_root(&runs);
+    let (terminal_bytes, terminal) = terminal_artifact(&run_root);
+    assert!(terminal_bytes.len() <= 64 * 1024);
+    assert_eq!(terminal["node_output_refs"], json!({}));
+    assert_eq!(terminal["node_output_refs_summary"]["count"], 350);
+    assert!(
+        terminal["node_output_refs_summary"]["sha256"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:"))
+    );
 
     fs::remove_dir_all(root).expect("test root must be removed");
 }
