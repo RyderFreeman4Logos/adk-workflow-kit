@@ -872,10 +872,20 @@ impl ExecutionBackend {
                         .find_map(|event| event.node_id())
                         .unwrap_or("terminal")
                         .to_owned();
-                    let artifact_refs = node_output_refs
+                    let mut artifact_refs = node_output_refs
                         .values()
                         .map(|reference| reference.artifact_id().to_owned())
-                        .collect::<Vec<_>>();
+                        .collect::<BTreeSet<_>>();
+                    for event in mapper.events() {
+                        if let Some(artifact_id) = event
+                            .payload()
+                            .get("artifact_reference")
+                            .and_then(|reference| reference.get("artifact_id"))
+                            .and_then(Value::as_str)
+                        {
+                            artifact_refs.insert(artifact_id.to_owned());
+                        }
+                    }
                     match DurableCheckpointV1::new(
                         run_id.clone(),
                         node_id,
@@ -994,12 +1004,20 @@ impl ExecutionBackend {
         for reference in checkpoint.artifact_refs() {
             let artifact_id = ArtifactId::parse(reference)
                 .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-            artifacts
+            let page = artifacts
                 .read_page(
                     &artifact_id,
-                    PageRequest::new(0, NonZeroU64::new(1).expect("positive page size")),
+                    PageRequest::new(
+                        0,
+                        NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page size"),
+                    ),
                 )
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+            if page.next_offset().is_some()
+                || format!("{:x}", Sha256::digest(page.bytes())) != artifact_id.as_str()
+            {
+                return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+            }
         }
         let profile =
             ExecutionProfileV1::parse(&bounded_read(&root.join("execution-profile.json"))?)?;

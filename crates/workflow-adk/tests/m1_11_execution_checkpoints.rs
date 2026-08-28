@@ -432,7 +432,20 @@ fn resume_preserves_artifact_references_from_prior_execution() {
     let store = SqliteCheckpointStore::open(receipt.run_root().join("checkpoint.sqlite"), manifest)
         .unwrap();
     let before = store.load_latest(&run_id).unwrap().unwrap();
-    assert!(before.artifact_refs().is_empty());
+    let event_artifact_id = fs::read_to_string(receipt.run_root().join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find_map(|event| {
+            event
+                .get("payload")
+                .and_then(|payload| payload.get("artifact_reference"))
+                .and_then(|reference| reference.get("artifact_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .expect("large ADK output must persist an event artifact reference");
+    assert_eq!(before.artifact_refs(), &[event_artifact_id]);
 
     ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap();
 
@@ -451,6 +464,59 @@ fn resume_preserves_artifact_references_from_prior_execution() {
             .join(reference)
             .is_file()
     }));
+}
+
+#[test]
+fn resume_rejects_missing_or_tampered_first_checkpoint_artifact_before_graph_invocation() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["x".repeat(5_000)]
+            },
+            "sandbox": {"capabilities": []}
+        }))
+        .unwrap()
+        .as_slice(),
+    )
+    .unwrap();
+    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
+    let receipt =
+        ExecutionBackend::run(workflow, profile, json!({"request":"public"}), &root.0).unwrap();
+    let events_path = receipt.run_root().join("events.jsonl");
+    let events_before = fs::read(&events_path).unwrap();
+    let manifest: CheckpointManifestV1 = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("checkpoint-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let run_id = RunId::new(receipt.run_id().to_owned()).unwrap();
+    let store = SqliteCheckpointStore::open(receipt.run_root().join("checkpoint.sqlite"), manifest)
+        .unwrap();
+    let checkpoint = store.load_latest(&run_id).unwrap().unwrap();
+    let artifact_id = checkpoint
+        .artifact_refs()
+        .first()
+        .expect("first checkpoint must retain the large event artifact")
+        .clone();
+    let artifact_path = receipt.run_root().join("artifacts").join(&artifact_id);
+    let artifact_bytes = fs::read(&artifact_path).unwrap();
+
+    fs::remove_file(&artifact_path).unwrap();
+    let error = ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(fs::read(&events_path).unwrap(), events_before);
+
+    fs::write(&artifact_path, b"tampered").unwrap();
+    let error = ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(fs::read(&events_path).unwrap(), events_before);
+    fs::write(artifact_path, artifact_bytes).unwrap();
 }
 
 #[test]
