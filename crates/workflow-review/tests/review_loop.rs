@@ -281,16 +281,23 @@ fn digest_mismatch_budget_and_attempts_are_recorded() {
     assert!(!mismatch_error.to_string().contains("secret-token"));
     assert!(!mismatch_error.to_string().contains("/etc/shadow"));
 
+    let mut reviser_calls = 0;
     let exhausted = run_bounded_review_loop(
         || Ok::<_, &'static str>(artifact("candidate")),
         |_| Ok(valid()),
         |_| {
             Ok(ReviewerResponse::new(
                 revise("still_wrong").review().clone(),
-                ReviewCost::new(2, 0),
+                ReviewCost::new(1, 0),
             ))
         },
-        |_| panic!("budget exhaustion happens before revision"),
+        |_| {
+            reviser_calls += 1;
+            Ok(RevisionResponse::new(
+                artifact("revised"),
+                ReviewCost::default(),
+            ))
+        },
         config().with_max_model_turns(1),
     )
     .expect("budget exhaustion must abstain");
@@ -299,7 +306,11 @@ fn digest_mismatch_budget_and_attempts_are_recorded() {
         Some(ReviewLoopDiagnosticCode::BudgetExhausted)
     );
     assert_eq!(exhausted.metrics().reviewer_attempts(), 1);
-    assert_eq!(exhausted.metrics().cost().model_turns(), 2);
+    assert_eq!(exhausted.metrics().cost().model_turns(), 1);
+    assert_eq!(
+        reviser_calls, 0,
+        "zero remaining budget must block revision"
+    );
 }
 
 #[test]

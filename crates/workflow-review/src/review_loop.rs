@@ -971,8 +971,8 @@ fn severity_rank(severity: crate::ReviewSeverity) -> u8 {
 }
 
 fn budget_exhausted(metrics: &ReviewLoopMetrics, config: &ReviewLoopConfig) -> bool {
-    metrics.cost.model_turns > config.max_model_turns
-        || metrics.cost.tool_calls > config.max_tool_calls
+    metrics.cost.model_turns >= config.max_model_turns
+        || metrics.cost.tool_calls >= config.max_tool_calls
 }
 
 fn abstain(mut metrics: ReviewLoopMetrics, code: ReviewLoopDiagnosticCode) -> ReviewLoopOutcome {
