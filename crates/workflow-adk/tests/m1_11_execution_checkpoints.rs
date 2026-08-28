@@ -4,8 +4,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use serde_json::json;
-use workflow_adk::execution::{ExecutionBackend, ExecutionProfileV1};
+use serde_json::{Value, json};
+use workflow_adk::execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1};
 use workflow_runtime::{CheckpointManifestV1, RunId, SqliteCheckpointStore};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -173,5 +173,121 @@ to = "done"
         !bytes
             .windows("fixture-secret-value".len())
             .any(|window| window == b"fixture-secret-value")
+    }));
+}
+
+#[test]
+fn resume_rejects_same_workflow_identity_with_changed_canonical_content() {
+    let root = TestRoot::new();
+    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .unwrap();
+    let receipt =
+        ExecutionBackend::run(workflow, profile, json!({"request":"public"}), &root.0).unwrap();
+
+    let workflow_path = receipt.run_root().join("workflow.toml");
+    let source = fs::read_to_string(&workflow_path).unwrap();
+    let changed = source
+        .replace("id = \"done\"", "id = \"finish\"")
+        .replace("to = \"done\"", "to = \"finish\"");
+    fs::write(workflow_path, changed).unwrap();
+
+    let error = ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+}
+
+#[test]
+fn resume_rejects_changed_profile_content_with_stable_profile_identity() {
+    let root = TestRoot::new();
+    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .unwrap();
+    let receipt =
+        ExecutionBackend::run(workflow, profile, json!({"request":"public"}), &root.0).unwrap();
+
+    let profile_path = receipt.run_root().join("execution-profile.json");
+    let mut changed: Value = serde_json::from_slice(&fs::read(&profile_path).unwrap()).unwrap();
+    changed["model"]["responses"][0] = json!("changed");
+    fs::write(profile_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+
+    let error = ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+}
+
+#[test]
+fn resume_persists_artifact_references_from_reexecution() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["x".repeat(5_000)]
+            },
+            "sandbox": {"capabilities": []}
+        }))
+        .unwrap()
+        .as_slice(),
+    )
+    .unwrap();
+    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
+    let receipt =
+        ExecutionBackend::run(workflow, profile, json!({"request":"public"}), &root.0).unwrap();
+    let manifest: CheckpointManifestV1 = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("checkpoint-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let run_id = RunId::new(receipt.run_id().to_owned()).unwrap();
+    let store = SqliteCheckpointStore::open(receipt.run_root().join("checkpoint.sqlite"), manifest)
+        .unwrap();
+    let before = store.load_latest(&run_id).unwrap().unwrap();
+    assert!(before.artifact_refs().is_empty());
+
+    ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap();
+
+    let manifest: CheckpointManifestV1 = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("checkpoint-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let store = SqliteCheckpointStore::open(receipt.run_root().join("checkpoint.sqlite"), manifest)
+        .unwrap();
+    let after = store.load_latest(&run_id).unwrap().unwrap();
+    assert!(!after.artifact_refs().is_empty());
+    assert!(after.artifact_refs().iter().all(|reference| {
+        receipt
+            .run_root()
+            .join("artifacts")
+            .join(reference)
+            .is_file()
     }));
 }

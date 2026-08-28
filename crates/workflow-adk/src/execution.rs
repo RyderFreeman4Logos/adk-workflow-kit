@@ -1,7 +1,7 @@
 //! Profile-driven execution and kit-owned run-state persistence.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     num::NonZeroU64,
     path::{Path, PathBuf},
@@ -477,31 +477,14 @@ impl ExecutionBackend {
         let manager = WorkdirManager::new(workdir_base)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let run_id = fresh_run_id()?;
-        let sandbox_identity = format!(
-            "sha256:{:x}",
-            Sha256::digest(profile.sandbox.capabilities.join("\n").as_bytes())
-        );
-        let mut checkpoint_manifest = CheckpointManifestV1::new(
+        let checkpoint_manifest = build_checkpoint_manifest(
             &run_id,
             compiled.ir().workflow_id().as_str(),
             compiled.ir().workflow_version(),
-        )
-        .with_workflow_hash(crate::canonical_ir_hash(compiled.ir()))
-        .with_resource_hash("workflow.ir", crate::canonical_ir_hash(compiled.ir()))
-        .with_implementation("model", profile.profile_identity())
-        .with_implementation("adk-rust", "2.1.0")
-        .with_sandbox_policy_hash(sandbox_identity)
-        .with_event_log_identity("workflow-runtime-events-v1");
-        if let Some(tool) = &profile.tool {
-            checkpoint_manifest =
-                checkpoint_manifest.with_implementation("tool", format!("{}:profile", tool.name));
-        }
-        if let Some(transform) = transform_module.as_deref() {
-            checkpoint_manifest = checkpoint_manifest.with_resource_hash(
-                "pure-transform",
-                format!("sha256:{:x}", Sha256::digest(transform)),
-            );
-        }
+            crate::canonical_ir_hash(compiled.ir()),
+            &profile,
+            transform_module.as_deref(),
+        )?;
         let context = RunContext::new(run_id.clone(), run_limits());
         let mut mapper = AdkEventMapper::new(run_id.as_str(), compiled.ir().workflow_id().as_str())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
@@ -812,9 +795,11 @@ impl ExecutionBackend {
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let run_identity = RunId::new(run_id.to_owned())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let mut checkpoint_store =
-            SqliteCheckpointStore::open(root.join("checkpoint.sqlite"), checkpoint_manifest)
-                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let mut checkpoint_store = SqliteCheckpointStore::open(
+            root.join("checkpoint.sqlite"),
+            checkpoint_manifest.clone(),
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let checkpoint = checkpoint_store
             .load_latest(&run_identity)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
@@ -849,6 +834,18 @@ impl ExecutionBackend {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
         let transform_module = profile.transform_module()?;
+        let live_checkpoint_manifest = build_checkpoint_manifest(
+            &run_identity,
+            compiled.ir().workflow_id().as_str(),
+            compiled.ir().workflow_version(),
+            crate::canonical_ir_hash(compiled.ir()),
+            &profile,
+            transform_module.as_deref(),
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if live_checkpoint_manifest != checkpoint_manifest {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
         let model = profile.bind_model()?;
         let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
         verify_sandbox_capabilities(
@@ -924,6 +921,21 @@ impl ExecutionBackend {
             .find_map(|event| event.node_id())
             .unwrap_or("terminal")
             .to_owned();
+        let mut artifact_refs = checkpoint
+            .artifact_refs()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for event in mapper.events() {
+            if let Some(artifact_id) = event
+                .payload()
+                .get("artifact_reference")
+                .and_then(|reference| reference.get("artifact_id"))
+                .and_then(Value::as_str)
+            {
+                artifact_refs.insert(artifact_id.to_owned());
+            }
+        }
         checkpoint_store
             .save_checkpoint(
                 DurableCheckpointV1::new(
@@ -931,7 +943,7 @@ impl ExecutionBackend {
                     node_id,
                     mapper.events().last().map_or(0, |event| event.sequence()),
                     state_bytes,
-                    checkpoint.artifact_refs().iter().cloned(),
+                    artifact_refs,
                 )
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?,
             )
@@ -941,6 +953,42 @@ impl ExecutionBackend {
         write_json(&root.join("run-manifest.json"), &manifest)?;
         Ok(manifest.receipt(root))
     }
+}
+
+fn build_checkpoint_manifest(
+    run_id: &RunId,
+    workflow_id: &str,
+    workflow_version: &str,
+    workflow_hash: String,
+    profile: &ExecutionProfileV1,
+    transform_module: Option<&[u8]>,
+) -> Result<CheckpointManifestV1, ExecutionError> {
+    let profile_hash = serde_json::to_vec(profile)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+    let mut manifest = CheckpointManifestV1::new(run_id, workflow_id, workflow_version)
+        .with_workflow_hash(workflow_hash.clone())
+        .with_resource_hash("workflow.ir", workflow_hash)
+        .with_implementation("model", profile.profile_identity())
+        .with_implementation("adk-rust", "2.1.0")
+        .with_implementation(
+            "execution-profile",
+            format!("sha256:{:x}", Sha256::digest(profile_hash)),
+        )
+        .with_sandbox_policy_hash(format!(
+            "sha256:{:x}",
+            Sha256::digest(profile.sandbox.capabilities.join("\n").as_bytes())
+        ))
+        .with_event_log_identity("workflow-runtime-events-v1");
+    if let Some(tool) = &profile.tool {
+        manifest = manifest.with_implementation("tool", format!("{}:profile", tool.name));
+    }
+    if let Some(transform) = transform_module {
+        manifest = manifest.with_resource_hash(
+            "pure-transform",
+            format!("sha256:{:x}", Sha256::digest(transform)),
+        );
+    }
+    Ok(manifest)
 }
 
 fn build_tool(
