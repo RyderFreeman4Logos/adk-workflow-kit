@@ -19,7 +19,7 @@ id = "inspect_evidence"
 kind = "agent"
 [[nodes]]
 id = "coverage_decision"
-kind = "validator"
+kind = "agent"
 [[nodes]]
 id = "retry_search_code"
 kind = "agent"
@@ -28,13 +28,13 @@ id = "retry_inspect_evidence"
 kind = "agent"
 [[nodes]]
 id = "retry_coverage_decision"
-kind = "validator"
+kind = "agent"
 [[nodes]]
 id = "draft"
 kind = "agent"
 [[nodes]]
 id = "grounding_validation"
-kind = "validator"
+kind = "agent"
 max_visits = 32
 [[nodes]]
 id = "review"

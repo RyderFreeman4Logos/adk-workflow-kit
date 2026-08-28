@@ -7,9 +7,13 @@ use std::{
     collections::BTreeMap,
     fmt,
     path::{Component, Path},
+    sync::Arc,
 };
 
-use adk_rust::{Content, Llm, LlmRequest, LlmResponse, Part, futures::StreamExt};
+use adk_rust::{
+    Agent, AgentCapabilities, Content, Event, EventStream, InvocationContext, Llm, LlmRequest,
+    LlmResponse, Part, async_trait, futures::StreamExt,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -1189,19 +1193,32 @@ impl SyntheticInvestigation {
         advance(&mut session, InvestigationStage::Planner, &mut stages);
         routes.push("planner".to_owned());
         advance(&mut session, InvestigationStage::SearchCode, &mut stages);
-        let selected_call = fake_model_tool()
+        let selected_call = fake_model_tool("retry", Some("src"))
             .ok_or_else(|| InvestigationError::new(DiagnosticCode::ModelFailed))?;
         let tools = ReadOnlyTools::new(&snapshot);
         let _initial = tools
             .search_code(&selected_call.query, selected_call.path.as_deref())
             .map_err(|_| InvestigationError::new(DiagnosticCode::CoverageExhausted))?;
         routes.push("search_code".to_owned());
-        let mut calls = vec![ToolCall {
+        let calls = vec![ToolCall {
             tool: selected_call.tool,
             route: "search_code".to_owned(),
             query: selected_call.query,
             path: selected_call.path,
         }];
+        self.complete_from_search(snapshot, session, stages, routes, calls, requested_verdict)
+    }
+
+    fn complete_from_search(
+        &self,
+        snapshot: Snapshot,
+        mut session: InvestigationSession,
+        mut stages: Vec<String>,
+        mut routes: Vec<String>,
+        mut calls: Vec<ToolCall>,
+        requested_verdict: ReviewVerdict,
+    ) -> Result<InvestigationResult, InvestigationError> {
+        let tools = ReadOnlyTools::new(&snapshot);
         advance(
             &mut session,
             InvestigationStage::InspectEvidence,
@@ -1218,14 +1235,16 @@ impl SyntheticInvestigation {
         routes.push("retry_search_code".to_owned());
 
         advance(&mut session, InvestigationStage::SearchCode, &mut stages);
+        let retry_call = fake_model_tool("pub", Some("src"))
+            .ok_or_else(|| InvestigationError::new(DiagnosticCode::ModelFailed))?;
         let hits = tools
-            .search_code("retry", Some("src"))
+            .search_code(&retry_call.query, retry_call.path.as_deref())
             .map_err(|_| InvestigationError::new(DiagnosticCode::CoverageExhausted))?;
         calls.push(ToolCall {
-            tool: ReadOnlyTool::SearchCode,
-            route: "inspect_evidence".to_owned(),
-            query: "retry".to_owned(),
-            path: Some("src".to_owned()),
+            tool: retry_call.tool,
+            route: "retry_search_code".to_owned(),
+            query: retry_call.query,
+            path: retry_call.path,
         });
         routes.push("search_code".to_owned());
         routes.push("retry_inspect_evidence".to_owned());
@@ -1371,12 +1390,18 @@ impl SyntheticInvestigation {
         };
         advance(&mut session, terminal_stage, &mut stages);
         routes.push(terminal_stage.as_str().to_owned());
-        let adk_terminal = exercise_adk_graph(graph_review_route);
-        if adk_terminal.is_none() {
+        let adk = exercise_adk_graph(graph_review_route)
+            .ok_or_else(|| InvestigationError::new(DiagnosticCode::GraphFailed))?;
+        if adk.terminal
+            != if status == InvestigationStatus::Published {
+                "publish"
+            } else {
+                "abstain"
+            }
+        {
             return Err(InvestigationError::new(DiagnosticCode::GraphFailed));
         }
-        let adk_terminal = adk_terminal.expect("checked above");
-        routes.push("adk:retry_coverage_decision:sufficient".to_owned());
+        routes.extend(adk.routes);
         let artifact = serde_json::to_string(&answer)
             .map_err(|_| InvestigationError::new(DiagnosticCode::ArtifactFailed))?;
         let trace = InvestigationTrace {
@@ -1385,7 +1410,7 @@ impl SyntheticInvestigation {
             tool_calls: calls,
             llm_requests: 1,
             adk_graph_exercised: true,
-            adk_terminal: Some(adk_terminal),
+            adk_terminal: Some(adk.terminal),
         };
         let replay_digest = trace.digest();
         Ok(InvestigationResult {
@@ -1425,7 +1450,7 @@ impl SyntheticInvestigation {
                 return killed_result(snapshot, stages, routes, Vec::new(), 0, step);
             }
             advance(&mut session, InvestigationStage::SearchCode, &mut stages);
-            let selected_call = fake_model_tool()
+            let selected_call = fake_model_tool("retry", Some("src"))
                 .ok_or_else(|| InvestigationError::new(DiagnosticCode::ModelFailed))?;
             let tools = ReadOnlyTools::new(&snapshot);
             tools
@@ -1467,10 +1492,50 @@ impl SyntheticInvestigation {
         if expected.checkpoint.as_ref() != Some(checkpoint) {
             return Err(InvestigationError::new(DiagnosticCode::CheckpointInvalid));
         }
-        let mut resumed = self.run_fake_with_review(ReviewVerdict::Pass)?;
-        resumed.trace.routes.push("resume:search_code".to_owned());
-        resumed.replay_digest = resumed.trace.digest();
-        Ok(resumed)
+        let snapshot = expected.snapshot;
+        let mut session = self.session();
+        let mut stages = Vec::new();
+        let mut routes = Vec::new();
+        match checkpoint.step {
+            1 => {
+                advance(&mut session, InvestigationStage::Planner, &mut stages);
+                routes.push("planner".to_owned());
+                advance(&mut session, InvestigationStage::SearchCode, &mut stages);
+            }
+            2 => {
+                session.advance(InvestigationStage::Planner)?;
+                advance(&mut session, InvestigationStage::SearchCode, &mut stages);
+            }
+            3 => {
+                session.advance(InvestigationStage::Planner)?;
+                session.advance(InvestigationStage::SearchCode)?;
+            }
+            _ => return Err(InvestigationError::new(DiagnosticCode::CheckpointInvalid)),
+        }
+        let calls = if checkpoint.step < 3 {
+            let selected_call = fake_model_tool("retry", Some("src"))
+                .ok_or_else(|| InvestigationError::new(DiagnosticCode::ModelFailed))?;
+            ReadOnlyTools::new(&snapshot)
+                .search_code(&selected_call.query, selected_call.path.as_deref())
+                .map_err(|_| InvestigationError::new(DiagnosticCode::CoverageExhausted))?;
+            routes.push("search_code".to_owned());
+            vec![ToolCall {
+                tool: selected_call.tool,
+                route: "search_code".to_owned(),
+                query: selected_call.query,
+                path: selected_call.path,
+            }]
+        } else {
+            Vec::new()
+        };
+        self.complete_from_search(
+            snapshot,
+            session,
+            stages,
+            routes,
+            calls,
+            ReviewVerdict::Pass,
+        )
     }
 
     fn expected_answer(
@@ -1599,9 +1664,11 @@ struct ModelToolCall {
     path: Option<String>,
 }
 
-fn fake_model_tool() -> Option<ModelToolCall> {
+fn fake_model_tool(query: &str, path: Option<&str>) -> Option<ModelToolCall> {
+    let query = query.to_owned();
+    let path = path.map(ToOwned::to_owned);
     let model = crate::ScriptedLlm::new(vec![crate::ScriptStep::new(
-        |request| {
+        move |request| {
             (request.model == "code-investigation-fake")
                 .then_some(())
                 .ok_or_else(|| "unexpected fake model request".to_owned())
@@ -1610,7 +1677,7 @@ fn fake_model_tool() -> Option<ModelToolCall> {
             role: "model".to_owned(),
             parts: vec![Part::FunctionCall {
                 name: ReadOnlyTool::SearchCode.as_str().to_owned(),
-                args: json!({"query": "retry", "path": "src"}),
+                args: json!({"query": query, "path": path}),
                 id: Some("search-1".to_owned()),
                 thought_signature: None,
             }],
@@ -1651,7 +1718,45 @@ fn fake_model_tool() -> Option<ModelToolCall> {
     })
 }
 
-fn exercise_adk_graph(review_route: &str) -> Option<String> {
+struct GraphExercise {
+    terminal: String,
+    routes: Vec<String>,
+}
+
+struct GraphRouteAgent {
+    name: String,
+    output: String,
+}
+
+#[async_trait]
+impl Agent for GraphRouteAgent {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        "deterministic code-investigation graph agent"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &[]
+    }
+
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            shared_state: true,
+            ..AgentCapabilities::default()
+        }
+    }
+
+    async fn run(&self, _context: Arc<dyn InvocationContext>) -> adk_rust::Result<EventStream> {
+        let mut event = Event::new(&self.name);
+        event.set_content(Content::new("assistant").with_text(self.output.clone()));
+        Ok(Box::pin(adk_rust::futures::stream::iter([Ok(event)])))
+    }
+}
+
+fn exercise_adk_graph(review_route: &str) -> Option<GraphExercise> {
     let Ok(plan) = compile_str_with_predicates(
         "fixtures/code_investigation/workflow.toml",
         FIXTURE_WORKFLOW,
@@ -1659,7 +1764,34 @@ fn exercise_adk_graph(review_route: &str) -> Option<String> {
     ) else {
         return None;
     };
-    let Ok(graph) = workflow_adk::AdkGraphTranslator::new().translate(&plan) else {
+    let routes = [
+        ("prepare_workspace", "prepared"),
+        ("planner", "planned"),
+        ("search_code", "searched"),
+        ("inspect_evidence", "inspected"),
+        ("coverage_decision", "insufficient"),
+        ("retry_search_code", "searched"),
+        ("retry_inspect_evidence", "inspected"),
+        ("retry_coverage_decision", "sufficient"),
+        ("draft", "drafted"),
+        ("grounding_validation", "valid"),
+        ("review", review_route),
+        ("revise", "revised"),
+    ];
+    let agents: BTreeMap<String, Arc<dyn Agent>> = routes
+        .iter()
+        .map(|(name, output)| {
+            (
+                (*name).to_owned(),
+                Arc::new(GraphRouteAgent {
+                    name: (*name).to_owned(),
+                    output: (*output).to_owned(),
+                }) as Arc<dyn Agent>,
+            )
+        })
+        .collect();
+    let Ok(graph) = workflow_adk::AdkGraphTranslator::new().translate_with_agents(&plan, &agents)
+    else {
         return None;
     };
     let Ok(runtime) = adk_rust::tokio::runtime::Builder::new_current_thread()
@@ -1669,24 +1801,44 @@ fn exercise_adk_graph(review_route: &str) -> Option<String> {
         return None;
     };
     runtime.block_on(async {
-        let mut state = adk_rust::graph::prelude::State::new();
-        state.insert("route:coverage_decision".to_owned(), json!("insufficient"));
-        state.insert(
-            "route:retry_coverage_decision".to_owned(),
-            json!("sufficient"),
-        );
-        state.insert("route:grounding_validation".to_owned(), json!("valid"));
-        state.insert("route:review".to_owned(), json!(review_route));
-        graph
+        let state = graph
             .invoke(
-                state,
+                adk_rust::graph::prelude::State::new(),
                 adk_rust::graph::prelude::ExecutionConfig::new("code-investigation"),
             )
             .await
-            .ok()?
-            .get("terminal")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned)
+            .ok()?;
+        let terminal = state.get("terminal")?.as_str()?.to_owned();
+        let mut trace = Vec::new();
+        for node in [
+            "prepare_workspace",
+            "planner",
+            "search_code",
+            "inspect_evidence",
+            "retry_search_code",
+            "retry_inspect_evidence",
+            "draft",
+            "revise",
+            "publish",
+            "abstain",
+        ] {
+            if state.contains_key(&format!("node:{node}")) {
+                trace.push(format!("adk:{node}"));
+            }
+        }
+        for node in [
+            "coverage_decision",
+            "retry_coverage_decision",
+            "grounding_validation",
+            "review",
+        ] {
+            let selector = state.get(&format!("node:{node}"))?.as_str()?;
+            trace.push(format!("adk:{node}:{selector}"));
+        }
+        Some(GraphExercise {
+            terminal,
+            routes: trace,
+        })
     })
 }
 

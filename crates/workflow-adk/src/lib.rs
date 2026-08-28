@@ -674,8 +674,17 @@ impl AdkGraphTranslator {
                         .ok_or_else(|| TranslationError::MissingAgent { node: id.clone() })?,
                     None => Arc::new(DeterministicAgent::new(id.clone())),
                 };
-                builder = builder.node(AgentNode::new(agent).with_output_mapper(move |_| {
-                    std::collections::HashMap::from([(format!("node:{id}"), json!(true))])
+                builder = builder.node(AgentNode::new(agent).with_output_mapper(move |events| {
+                    let value = events
+                        .iter()
+                        .rev()
+                        .find_map(|event| {
+                            event
+                                .content()
+                                .and_then(|content| content.parts.first()?.text())
+                        })
+                        .map_or_else(|| json!(true), |text| json!(text));
+                    std::collections::HashMap::from([(format!("node:{id}"), value)])
                 }));
             } else {
                 let terminal = node.kind() == IrNodeKind::Terminal;
@@ -815,6 +824,7 @@ impl AdkGraphTranslator {
                 move |state| {
                     let selected = state
                         .get(&format!("route:{from}"))
+                        .or_else(|| state.get(&format!("node:{from}")))
                         .and_then(|value| value.as_str())
                         .map(str::to_owned);
                     match selected {

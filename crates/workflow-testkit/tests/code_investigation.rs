@@ -29,8 +29,26 @@ fn synthetic_repo_has_expected_grounded_answer() {
             .trace()
             .routes()
             .iter()
-            .any(|route| route == "adk:retry_coverage_decision:sufficient")
+            .any(|route| route == "adk:coverage_decision:insufficient")
     );
+    for route in [
+        "adk:search_code",
+        "adk:inspect_evidence",
+        "adk:retry_search_code",
+        "adk:retry_inspect_evidence",
+        "adk:retry_coverage_decision:sufficient",
+        "adk:grounding_validation:valid",
+        "adk:review:pass",
+        "adk:publish",
+    ] {
+        assert!(result.trace().routes().iter().any(|actual| actual == route));
+    }
+    assert!(result.trace().tool_calls().iter().any(|call| {
+        call.tool() == ReadOnlyTool::SearchCode
+            && call.route() == "retry_search_code"
+            && call.query() == "pub"
+            && call.path() == Some("src")
+    }));
 }
 
 #[test]
@@ -74,16 +92,19 @@ fn kill_resume_inspect_and_replay_are_deterministic() {
         .resume(killed.checkpoint().expect("checkpoint"))
         .expect("fresh-process resume should complete");
     assert_eq!(resumed.status(), InvestigationStatus::Published);
-    assert!(
-        resumed
-            .trace()
-            .routes()
-            .iter()
-            .any(|route| route == "resume:search_code")
+    assert_eq!(
+        resumed.trace().stages().first().map(String::as_str),
+        Some("inspect_evidence"),
+        "the new instance continues after checkpoint.step"
+    );
+    assert_eq!(
+        resumed.trace().routes().first().map(String::as_str),
+        Some("inspect_evidence")
     );
     assert!(resumed.trace().tool_calls().iter().any(|call| {
         call.tool() == ReadOnlyTool::SearchCode
-            && call.query() == "retry"
+            && call.route() == "retry_search_code"
+            && call.query() == "pub"
             && call.path() == Some("src")
     }));
     let inspected = resumed.inspect_artifact(0).expect("artifact page exists");

@@ -107,6 +107,25 @@ cases = { left = "left" }
 default = "fallback"
 "#;
 
+const AGENT_SELECTED_ROUTE: &str = r#"
+schema_version = 1
+edges = []
+[workflow]
+id = "agent-selected-route"
+version = "1"
+entry = "decide"
+[[nodes]]
+id = "decide"
+kind = "agent"
+[[nodes]]
+id = "left"
+kind = "terminal"
+[[routes]]
+from = "decide"
+predicate = { id = "route-pred", version = "1" }
+cases = { ok = "left" }
+"#;
+
 const UNKNOWN_ROUTE: &str = r#"
 schema_version = 1
 edges = []
@@ -373,6 +392,26 @@ async fn conditional_plan_executes_cases_and_ir_default_fallback() {
         .await
         .expect("IR default is fallback, not a literal default case key");
     assert_eq!(fallback_state.get("terminal"), Some(&json!("fallback")));
+}
+
+#[tokio::test]
+async fn translated_agent_output_selects_conditional_edge() {
+    let plan = compile_str_with_predicates(
+        "agent-selected-route.workflow.toml",
+        AGENT_SELECTED_ROUTE,
+        &AnyPredicate,
+    )
+    .expect("fixture compiles");
+    let graph = AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("translation succeeds");
+
+    let state = graph
+        .invoke(State::new(), ExecutionConfig::new("agent-selected-route"))
+        .await
+        .expect("the agent's text output selects a declared route");
+    assert_eq!(state.get("node:decide"), Some(&json!("ok")));
+    assert_eq!(state.get("terminal"), Some(&json!("left")));
 }
 
 #[tokio::test]
