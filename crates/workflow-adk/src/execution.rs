@@ -24,11 +24,12 @@ use sha2::{Digest, Sha256};
 use workflow_compiler::compile_file;
 use workflow_runtime::{
     ArtifactId, ArtifactStore, BackendCapabilities, CapabilityIntersection, CheckpointManifestV1,
-    DurableCheckpointV1, FilesystemArtifactStore, InMemoryArtifactStore, PageRequest,
-    ProtectedArtifactReferenceV1, PureTransformRequest, RequestedCapabilities, RunContext, RunId,
-    RunLimits, RunSandbox, SandboxCapability, SqliteCheckpointStore, ToolBridge, ToolBridgeError,
-    ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance, ToolRegistration,
-    WorkdirManager, WorkflowRuntimeEventKindV1, contains_sensitive_key, redact_json_value,
+    DurableCheckpointV1, EffectCommit, EffectJournal, EffectKey, FilesystemArtifactStore,
+    InMemoryArtifactStore, PageRequest, ProtectedArtifactReferenceV1, PureTransformRequest,
+    RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox, SandboxCapability,
+    SqliteCheckpointStore, ToolBridge, ToolBridgeError, ToolBridgeErrorKind, ToolCallContext,
+    ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance, ToolRegistration, WorkdirManager,
+    WorkflowRuntimeEventKindV1, contains_sensitive_key, redact_json_value,
     verify_sandbox_capabilities,
 };
 use workflow_spec::{SourcePath, read_bounded_regular_file};
@@ -682,6 +683,13 @@ impl ExecutionBackend {
         {
             persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
         }
+        let effect_journal = match EffectJournal::open(run_root.join("effects.sqlite")) {
+            Ok(journal) => Some(Arc::new(journal)),
+            Err(_) => {
+                persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
+                None
+            }
+        };
         let mut checkpoint_store = match SqliteCheckpointStore::open(
             run_root.join("checkpoint.sqlite"),
             checkpoint_manifest.clone(),
@@ -706,6 +714,57 @@ impl ExecutionBackend {
         {
             persistence_error.get_or_insert(ExecutionError::new(ExecutionErrorKind::Persistence));
         }
+        if persistence_error.is_none() {
+            let initial = Checkpoint::new(
+                run_id.as_str(),
+                State::new(),
+                0,
+                vec![compiled.ir().entry_node_id().as_str().to_owned()],
+            );
+            let initial_state = checkpoint_state(State::new(), &initial, None);
+            let initial_state = initial_state
+                .and_then(|state| {
+                    serde_json::to_vec(&state)
+                        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+                })
+                .and_then(|state| {
+                    DurableCheckpointV1::new(
+                        run_id.clone(),
+                        compiled.ir().entry_node_id().as_str().to_owned(),
+                        mapper.events().last().map_or(0, |event| event.sequence()),
+                        state,
+                        BTreeSet::<String>::new(),
+                    )
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+                });
+            if write_events(&run_root.join("events.jsonl"), mapper.events()).is_err()
+                || initial_state.as_ref().is_err_and(|_| true)
+                || checkpoint_store.as_mut().is_none_or(|store| {
+                    initial_state
+                        .as_ref()
+                        .is_ok_and(|checkpoint| store.save_checkpoint(checkpoint.clone()).is_err())
+                })
+            {
+                persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
+            } else {
+                let provisional = RunManifestV1 {
+                    schema_version: 1,
+                    run_id: run_id.as_str().to_owned(),
+                    workflow_id: compiled.ir().workflow_id().as_str().to_owned(),
+                    workflow_version: compiled.ir().workflow_version().to_owned(),
+                    workdir_id: workdir_id.clone(),
+                    profile_identity: profile.profile_identity(),
+                    adk_rust_version: "2.1.0".to_owned(),
+                    status: "running".to_owned(),
+                    artifact_id: "unavailable".to_owned(),
+                    resume_count: 0,
+                    checkpoint_manifest: Some(checkpoint_manifest.clone()),
+                };
+                if write_json(&run_root.join("run-manifest.json"), &provisional).is_err() {
+                    persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
+                }
+            }
+        }
         let execution = if persistence_error.is_some() {
             Err(ExecutionError::new(ExecutionErrorKind::Persistence))
         } else {
@@ -713,7 +772,13 @@ impl ExecutionBackend {
             (|| {
                 let sandbox = RunSandbox::new(context, run_workdir, sandbox_capabilities)
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::SandboxDenied))?;
-                let tool = build_tool(&profile, sandbox, &required_capabilities)?;
+                let tool = build_tool(
+                    &profile,
+                    sandbox,
+                    &required_capabilities,
+                    &run_id,
+                    effect_journal.clone(),
+                )?;
                 let agents = compiled
                     .ir()
                     .nodes()
@@ -850,9 +915,11 @@ impl ExecutionBackend {
             checkpoint_failed = true;
             persistence_error.get_or_insert(ExecutionError::new(ExecutionErrorKind::Persistence));
         }
+        crash_barrier("before-result");
         if let Err(error) = write_events(&run_root.join("events.jsonl"), mapper.events()) {
             persistence_error.get_or_insert(error);
         }
+        crash_barrier("after-result");
         if persistence_error.is_none() {
             if let (Ok(state), Some(store)) = (&execution, checkpoint_store.as_mut()) {
                 let state_bytes = match serde_json::to_vec(state) {
@@ -894,11 +961,13 @@ impl ExecutionBackend {
                         artifact_refs,
                     ) {
                         Ok(checkpoint) => {
+                            crash_barrier("before-checkpoint");
                             if store.save_checkpoint(checkpoint).is_err() {
                                 checkpoint_failed = true;
                                 persistence_error =
                                     Some(ExecutionError::new(ExecutionErrorKind::Persistence));
                             }
+                            crash_barrier("after-checkpoint");
                         }
                         Err(_) => {
                             checkpoint_failed = true;
@@ -1053,8 +1122,19 @@ impl ExecutionBackend {
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let events_path = root.join("events.jsonl");
-        let events = read_events(&events_path)?;
-        if events.last().map_or(0, |event| event.sequence()) != checkpoint.event_sequence() {
+        let mut events = read_events(&events_path)?;
+        let event_sequence = events.last().map_or(0, |event| event.sequence());
+        if event_sequence > checkpoint.event_sequence() {
+            let prefix_len = events
+                .iter()
+                .take_while(|event| event.sequence() <= checkpoint.event_sequence())
+                .count();
+            if prefix_len != checkpoint.event_sequence() as usize {
+                return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+            }
+            events.truncate(prefix_len);
+            write_events(&events_path, &events)?;
+        } else if event_sequence != checkpoint.event_sequence() {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
         let mut mapper = AdkEventMapper::resume(run_id, &manifest.workflow_id, events)
@@ -1081,7 +1161,17 @@ impl ExecutionBackend {
             sandbox_capabilities,
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let tool = build_tool(&profile, sandbox, &required_capabilities)?;
+        let effect_journal = Arc::new(
+            EffectJournal::open(root.join("effects.sqlite"))
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?,
+        );
+        let tool = build_tool(
+            &profile,
+            sandbox,
+            &required_capabilities,
+            &run_identity,
+            Some(effect_journal),
+        )?;
         let agents = compiled
             .ir()
             .nodes()
@@ -1187,10 +1277,31 @@ impl ExecutionBackend {
             artifact_refs,
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let terminal = bounded_terminal_artifact(
+            run_id,
+            "succeeded",
+            state.get("terminal"),
+            &BTreeMap::<String, ProtectedArtifactReferenceV1>::new(),
+            false,
+            0,
+            &format!("sha256:{:x}", Sha256::digest([])),
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let artifact_id = artifacts
+            .put(&terminal)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+            .as_str()
+            .to_owned();
+        crash_barrier("before-result");
         write_events(&events_path, mapper.events())?;
+        crash_barrier("after-result");
+        crash_barrier("before-checkpoint");
         checkpoint_store
             .save_checkpoint(checkpoint)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        crash_barrier("after-checkpoint");
+        manifest.status = "succeeded".to_owned();
+        manifest.artifact_id = artifact_id;
         manifest.resume_count = next;
         write_json(&root.join("run-manifest.json"), &manifest)?;
         Ok(manifest.receipt(root))
@@ -1237,6 +1348,8 @@ fn build_tool(
     profile: &ExecutionProfileV1,
     sandbox: RunSandbox,
     required_capabilities: &[SandboxCapability],
+    run_id: &RunId,
+    effect_journal: Option<Arc<EffectJournal>>,
 ) -> Result<Option<BoundTool>, ExecutionError> {
     let Some(tool) = &profile.tool else {
         return Ok(None);
@@ -1256,6 +1369,9 @@ fn build_tool(
             StaticToolHandler {
                 result: tool.result.clone(),
                 provenance: provenance.clone(),
+                run_id: run_id.as_str().to_owned(),
+                node_id: tool.name.clone(),
+                effect_journal,
             },
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
@@ -1274,6 +1390,9 @@ fn build_tool(
 struct StaticToolHandler {
     result: Value,
     provenance: ToolProvenance,
+    run_id: String,
+    node_id: String,
+    effect_journal: Option<Arc<EffectJournal>>,
 }
 
 impl ToolHandler for StaticToolHandler {
@@ -1281,12 +1400,35 @@ impl ToolHandler for StaticToolHandler {
         &self,
         _sandbox: &workflow_runtime::ChildSandbox<'_>,
         _context: &ToolCallContext,
-        _arguments: &Value,
+        arguments: &Value,
     ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
-        Ok(ToolEnvelope::success(
-            self.result.clone(),
-            self.provenance.clone(),
-        ))
+        let result = if let Some(journal) = &self.effect_journal {
+            let key = EffectKey::new(&self.run_id, &self.node_id, &self.node_id, arguments);
+            crash_barrier("before-effect");
+            match journal.commit(&key, &self.result) {
+                Ok(EffectCommit::Committed) => self.result.clone(),
+                Ok(EffectCommit::AlreadyCommitted(result)) => result,
+                Err(_) => return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed)),
+            }
+        } else {
+            self.result.clone()
+        };
+        crash_barrier("after-effect");
+        Ok(ToolEnvelope::success(result, self.provenance.clone()))
+    }
+}
+
+fn crash_barrier(name: &str) {
+    let configured = std::env::var("WORKFLOW_KIT_TEST_CRASH_BARRIER").ok();
+    if configured.as_deref() != Some(name) {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        // Test-only barrier: the real workflowctl process is killed, not a simulated run.
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGKILL);
+        }
     }
 }
 
@@ -1369,8 +1511,12 @@ fn bounded_terminal_artifact(
 
 fn find_run(base: &Path, run_id: &str) -> Result<(PathBuf, RunManifestV1), ExecutionError> {
     WorkdirManager::new(base).map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
+    let base =
+        fs::canonicalize(base).map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
     // ponytail: scan run manifests; add an index when run counts make lookup measurable.
-    for entry in fs::read_dir(base).map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))? {
+    for entry in
+        fs::read_dir(&base).map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?
+    {
         let entry = entry.map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let file_type = entry
             .file_type()

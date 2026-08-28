@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 adk-rust.workspace = true
+libc = "=0.2.189"
 workflow-runtime = { path = "../workflow-runtime" }
 workflow-compiler = { path = "../workflow-compiler" }
 workflow-ir = { path = "../workflow-ir" }
