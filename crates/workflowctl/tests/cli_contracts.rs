@@ -11,7 +11,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> --module <PATH> --input <JSON> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --current-workflow <PATH> --current-module <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
+const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> [--profile <PATH> | --module <PATH>] --input <JSON> --workdir <DIR>\n  resume --run-id <ID> --workdir <DIR>\n  inspect --run-id <ID> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --current-workflow <PATH> --current-module <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const HUMAN_ERROR: &str =
     "[workflow.cli.invalid_arguments] invalid command-line arguments location=null details={}\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}\n";

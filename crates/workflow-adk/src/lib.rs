@@ -1,6 +1,7 @@
 //! Domain-neutral Verbatim boundary for platform-owned workflow calls.
 
 pub mod events;
+pub mod execution;
 pub mod model_profiles;
 pub mod tool_bridge;
 
@@ -17,9 +18,12 @@ use adk_rust::{
     futures::StreamExt as _,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use workflow_compiler::{CompiledPlan, ResolvedRuntimePlan};
 use workflow_ir::IrNodeKind;
+use workflow_runtime::{
+    PureTransformBackend, PureTransformRequest, RequestedCapabilities, SandboxCapability,
+};
 
 const MAX_PATH_BYTES: usize = 256;
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -184,6 +188,12 @@ pub enum TranslationError {
     MissingEntry {
         node: String,
     },
+    MissingAgent {
+        node: String,
+    },
+    MissingNodeBackend {
+        node: String,
+    },
     ResolvedPlanMismatch {
         plan_ir_hash: String,
         ir_hash: String,
@@ -197,6 +207,10 @@ impl fmt::Display for TranslationError {
                 write!(f, "graph translation rejected {from:?} to {target:?}")
             }
             Self::MissingEntry { node } => write!(f, "graph translation missing entry {node:?}"),
+            Self::MissingAgent { node } => write!(f, "graph translation missing agent {node:?}"),
+            Self::MissingNodeBackend { node } => {
+                write!(f, "graph translation missing node backend {node:?}")
+            }
             Self::ResolvedPlanMismatch { .. } => {
                 write!(f, "graph translation rejected resolved plan mismatch")
             }
@@ -499,13 +513,47 @@ impl AdkGraph {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AdkGraphTranslator;
 
+#[derive(Clone)]
+struct ProfileNodeBackend {
+    module: Option<Arc<[u8]>>,
+    input: Value,
+}
+
 impl AdkGraphTranslator {
     pub const fn new() -> Self {
         Self
     }
 
     pub fn translate(&self, plan: &CompiledPlan) -> Result<AdkGraph, TranslationError> {
-        self.translate_ir(plan.ir(), None)
+        self.translate_ir(plan.ir(), None, None, None)
+    }
+
+    /// Translates with exact live agents supplied for every agent node.
+    pub fn translate_with_agents(
+        &self,
+        plan: &CompiledPlan,
+        agents: &BTreeMap<String, Arc<dyn Agent>>,
+    ) -> Result<AdkGraph, TranslationError> {
+        self.translate_ir(plan.ir(), None, Some(agents), None)
+    }
+
+    /// Translates a profile graph with WASM-backed non-Agent execution nodes.
+    pub fn translate_profile(
+        &self,
+        plan: &CompiledPlan,
+        agents: &BTreeMap<String, Arc<dyn Agent>>,
+        module: Option<&[u8]>,
+        input: &Value,
+    ) -> Result<AdkGraph, TranslationError> {
+        self.translate_ir(
+            plan.ir(),
+            None,
+            Some(agents),
+            Some(ProfileNodeBackend {
+                module: module.map(Arc::from),
+                input: input.clone(),
+            }),
+        )
     }
 
     /// Translates a resolved runtime plan while keeping its canonical IR separate.
@@ -544,6 +592,8 @@ impl AdkGraphTranslator {
                     .map(|capability| (*capability).to_owned())
                     .collect(),
             }),
+            None,
+            None,
         )
     }
 
@@ -551,6 +601,8 @@ impl AdkGraphTranslator {
         &self,
         ir: &workflow_ir::WorkflowIr,
         plan_binding: Option<PlanBinding>,
+        agents: Option<&BTreeMap<String, Arc<dyn Agent>>>,
+        profile_backend: Option<ProfileNodeBackend>,
     ) -> Result<AdkGraph, TranslationError> {
         let ids: std::collections::BTreeSet<&str> =
             ir.nodes().iter().map(|node| node.id().as_str()).collect();
@@ -597,19 +649,38 @@ impl AdkGraphTranslator {
             let id = node.id().as_str().to_owned();
             order.push(id.clone());
             if node.kind() == IrNodeKind::Agent {
-                let agent = DeterministicAgent::new(id.clone());
-                builder = builder.node(AgentNode::new(Arc::new(agent)).with_output_mapper(
-                    move |_| std::collections::HashMap::from([(format!("node:{id}"), json!(true))]),
-                ));
+                let agent: Arc<dyn Agent> = match agents {
+                    Some(agents) => agents
+                        .get(&id)
+                        .cloned()
+                        .ok_or_else(|| TranslationError::MissingAgent { node: id.clone() })?,
+                    None => Arc::new(DeterministicAgent::new(id.clone())),
+                };
+                builder = builder.node(AgentNode::new(agent).with_output_mapper(move |_| {
+                    std::collections::HashMap::from([(format!("node:{id}"), json!(true))])
+                }));
             } else {
                 let terminal = node.kind() == IrNodeKind::Terminal;
                 if terminal {
                     terminals.push(id.clone());
                 }
+                let transform = if terminal {
+                    None
+                } else if let Some(backend) = &profile_backend {
+                    Some((
+                        backend.module.clone().ok_or_else(|| {
+                            TranslationError::MissingNodeBackend { node: id.clone() }
+                        })?,
+                        backend.input.clone(),
+                    ))
+                } else {
+                    None
+                };
                 let max_visits = node.max_visits();
                 let node_name = id.clone();
                 builder = builder.node_fn(&node_name, move |context| {
                     let id = id.clone();
+                    let transform = transform.clone();
                     async move {
                         let visits_key = format!("visits:{id}");
                         let visits = context
@@ -625,9 +696,27 @@ impl AdkGraphTranslator {
                                 "visit bound {max} exceeded for {id}"
                             )));
                         }
+                        let value = match transform {
+                            Some((module, input)) => {
+                                let request = PureTransformRequest::new(
+                                    &module,
+                                    input,
+                                    RequestedCapabilities::new(
+                                        std::iter::empty::<SandboxCapability>(),
+                                    ),
+                                )
+                                .map_err(|_| {
+                                    GraphError::Other("pure-transform request failed".to_owned())
+                                })?;
+                                PureTransformBackend::new().execute(&request).map_err(|_| {
+                                    GraphError::Other("pure-transform execution failed".to_owned())
+                                })?
+                            }
+                            None => json!(true),
+                        };
                         let key = format!("node:{id}");
                         let mut output = NodeOutput::new()
-                            .with_update(&key, json!(true))
+                            .with_update(&key, value)
                             .with_update(&visits_key, json!(visits));
                         if terminal {
                             output = output.with_update("terminal", json!(id));
