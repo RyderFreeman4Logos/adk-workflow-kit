@@ -99,7 +99,7 @@ fn resume_consumes_checkpoint_state_and_invokes_the_adk_graph() {
 }
 
 #[test]
-fn checkpoint_state_and_artifacts_redact_planted_secret_like_values() {
+fn execution_rejects_secret_like_input_before_persistence() {
     let root = TestRoot::new();
     let workflow = root.0.join("secret.workflow.toml");
     fs::write(
@@ -146,34 +146,15 @@ to = "done"
         .as_slice(),
     )
     .unwrap();
-    let receipt = ExecutionBackend::run(
+    let error = ExecutionBackend::run(
         &workflow,
         profile,
         json!({"api_token": "fixture-secret-value"}),
         &root.0,
     )
-    .unwrap();
-    let manifest: CheckpointManifestV1 = serde_json::from_slice(
-        &fs::read(receipt.run_root().join("checkpoint-manifest.json")).unwrap(),
-    )
-    .unwrap();
-    let store = SqliteCheckpointStore::open(receipt.run_root().join("checkpoint.sqlite"), manifest)
-        .unwrap();
-    let checkpoint = store
-        .load_latest(&RunId::new(receipt.run_id().to_owned()).unwrap())
-        .unwrap()
-        .unwrap();
-    let state = String::from_utf8_lossy(checkpoint.state());
-    assert!(!state.contains("fixture-secret-value"));
-    let artifact_bytes = fs::read_dir(receipt.run_root().join("artifacts"))
-        .unwrap()
-        .map(|entry| fs::read(entry.unwrap().path()).unwrap())
-        .collect::<Vec<_>>();
-    assert!(artifact_bytes.iter().all(|bytes| {
-        !bytes
-            .windows("fixture-secret-value".len())
-            .any(|window| window == b"fixture-secret-value")
-    }));
+    .unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidProfile);
+    assert!(fs::read_dir(&root.0).unwrap().next().is_none());
 }
 
 #[test]

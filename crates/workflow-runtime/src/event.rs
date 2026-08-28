@@ -520,6 +520,17 @@ pub fn redact_json_value(value: &Value) -> Value {
     redacted
 }
 
+/// Reports whether a JSON value contains a secret-like object key.
+pub fn contains_sensitive_key(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object
+            .iter()
+            .any(|(key, value)| sensitive_key(key) || contains_sensitive_key(value)),
+        Value::Array(values) => values.iter().any(contains_sensitive_key),
+        _ => false,
+    }
+}
+
 fn sanitize_payload(value: &mut Value) {
     match value {
         Value::Object(object) => {

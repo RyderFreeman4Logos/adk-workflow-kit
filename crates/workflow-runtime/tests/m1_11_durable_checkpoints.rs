@@ -130,23 +130,49 @@ fn sqlite_checkpoint_write_failure_is_typed_and_does_not_publish_state() {
 }
 
 #[test]
-fn checkpoint_manifest_and_artifact_references_are_secret_free() {
+fn durable_checkpoint_rejects_secret_like_state_instead_of_redacting_it() {
+    let run_id = RunId::new("run-secret-state".to_owned()).unwrap();
+    let error = DurableCheckpointV1::new(
+        run_id,
+        "node",
+        1,
+        br#"{"api_token":"fixture-secret-value","step":2}"#,
+        std::iter::empty::<String>(),
+    )
+    .expect_err("secret-like executable state must fail closed");
+    assert_eq!(error.kind(), CheckpointErrorKind::Unavailable);
+}
+
+#[test]
+fn durable_checkpoint_rejects_redacted_placeholder_state() {
+    let run_id = RunId::new("run-redacted-state".to_owned()).unwrap();
+    let error = DurableCheckpointV1::new(
+        run_id,
+        "node",
+        1,
+        br#"{"api_token":"<redacted>","step":2}"#,
+        std::iter::empty::<String>(),
+    )
+    .expect_err("redacted state must not become executable checkpoint state");
+    assert_eq!(error.kind(), CheckpointErrorKind::Unavailable);
+}
+
+#[test]
+fn checkpoint_rejects_secret_like_state_without_persisting_it() {
     let root = TestRoot::new();
     let run_id = RunId::new("run-private".to_owned()).unwrap();
     let manifest = manifest(&run_id);
-    let mut store = SqliteCheckpointStore::open(root.database(), manifest).unwrap();
-    store
-        .save_checkpoint(
-            DurableCheckpointV1::new(
-                run_id,
-                "node",
-                1,
-                br#"{"api_token":"fixture-secret-value"}"#,
-                ["sha256:artifact"],
-            )
-            .unwrap(),
-        )
-        .unwrap();
+    let error = DurableCheckpointV1::new(
+        run_id.clone(),
+        "node",
+        1,
+        br#"{"api_token":"fixture-secret-value"}"#,
+        ["sha256:artifact"],
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), CheckpointErrorKind::Unavailable);
+    let store = SqliteCheckpointStore::open(root.database(), manifest).unwrap();
+    assert_eq!(store.load_latest(&run_id).unwrap(), None);
     drop(store);
     let bytes = fs::read(root.database()).unwrap();
     assert!(

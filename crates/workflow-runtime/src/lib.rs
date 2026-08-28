@@ -46,7 +46,8 @@ pub use controller::{
 pub use event::{
     EventIntegrityV1, ProtectedArtifactReferenceV1, WORKFLOW_RUNTIME_EVENT_SCHEMA_VERSION_V1,
     WorkflowRuntimeEventError, WorkflowRuntimeEventErrorKind, WorkflowRuntimeEventKindV1,
-    WorkflowRuntimeEventLogV1, WorkflowRuntimeEventV1, redact_json_value, redacted_json_digest,
+    WorkflowRuntimeEventLogV1, WorkflowRuntimeEventV1, contains_sensitive_key, redact_json_value,
+    redacted_json_digest,
 };
 pub use execution::{
     PURE_TRANSFORM_BINDING_ID, PURE_TRANSFORM_BINDING_VERSION, PURE_TRANSFORM_PLAN_VERSION_V1,

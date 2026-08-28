@@ -27,7 +27,8 @@ use workflow_runtime::{
     ProtectedArtifactReferenceV1, PureTransformRequest, RequestedCapabilities, RunContext, RunId,
     RunLimits, RunSandbox, SandboxCapability, SqliteCheckpointStore, ToolBridge, ToolBridgeError,
     ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance, ToolRegistration,
-    WorkdirManager, WorkflowRuntimeEventKindV1, redact_json_value, verify_sandbox_capabilities,
+    WorkdirManager, WorkflowRuntimeEventKindV1, contains_sensitive_key, redact_json_value,
+    verify_sandbox_capabilities,
 };
 use workflow_spec::{SourcePath, read_bounded_regular_file};
 
@@ -452,6 +453,9 @@ impl ExecutionBackend {
         let input_bytes = serde_json::to_vec(&input)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
         if input_bytes.len() > PureTransformRequest::MAX_JSON_BYTES {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+        }
+        if contains_sensitive_key(&input) {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
         }
         let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
