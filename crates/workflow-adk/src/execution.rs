@@ -718,9 +718,6 @@ impl ExecutionBackend {
                 persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
             }
         }
-        if persistence_error.is_some() {
-            checkpoint_failed = true;
-        }
         if checkpoint_failed {
             status = "failed";
         }
