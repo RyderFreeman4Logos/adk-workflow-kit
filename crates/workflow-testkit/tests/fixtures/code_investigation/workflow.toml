@@ -35,12 +35,15 @@ kind = "agent"
 [[nodes]]
 id = "grounding_validation"
 kind = "validator"
+max_visits = 32
 [[nodes]]
 id = "review"
 kind = "agent"
+max_visits = 32
 [[nodes]]
 id = "revise"
 kind = "agent"
+max_visits = 32
 [[nodes]]
 id = "publish"
 kind = "terminal"
@@ -94,14 +97,8 @@ to = "retry_coverage_decision"
 from = "draft"
 to = "grounding_validation"
 [[edges]]
-from = "grounding_validation"
-to = "review"
-[[edges]]
-from = "review"
-to = "revise"
-[[edges]]
 from = "revise"
-to = "publish"
+to = "grounding_validation"
 
 [[routes]]
 from = "coverage_decision"
@@ -112,3 +109,13 @@ cases = { insufficient = "retry_search_code", sufficient = "draft", impossible =
 from = "retry_coverage_decision"
 predicate = { id = "coverage.decision@v1", version = "1.0.0" }
 cases = { insufficient = "abstain", sufficient = "draft", impossible = "abstain" }
+
+[[routes]]
+from = "grounding_validation"
+predicate = { id = "grounding.verdict@v1", version = "1.0.0" }
+cases = { invalid = "revise", valid = "review", abstain = "abstain" }
+
+[[routes]]
+from = "review"
+predicate = { id = "review.verdict@v1", version = "1.0.0" }
+cases = { pass = "publish", revise = "revise", abstain = "abstain" }
