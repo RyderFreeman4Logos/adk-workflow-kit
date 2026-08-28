@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 mod grounded_answer;
 mod multi_hop;
 mod package;
+mod review_loop;
 
 pub use grounded_answer::{
     GroundedAnswerCitation, GroundedAnswerClaim, GroundedAnswerDiagnostic,
@@ -28,6 +29,13 @@ pub use multi_hop::{
 pub use package::{
     PackageArchiveEntry, PackageFile, PackageManifest, PackageValidationError,
     SecretFixtureSurface, validate_package, validate_secret_free_fixture,
+};
+
+pub use review_loop::{
+    CandidateArtifact, CandidateDigestError, ReviewCost, ReviewLoopConfig, ReviewLoopDiagnostic,
+    ReviewLoopDiagnosticCode, ReviewLoopError, ReviewLoopMetrics, ReviewLoopOutcome,
+    ReviewLoopStage, ReviewerAuthority, ReviewerRequest, ReviewerResponse, RevisionRequest,
+    RevisionResponse, SelectedEvidence, ValidationReport, run_bounded_review_loop,
 };
 
 /// The only supported review schema version.
