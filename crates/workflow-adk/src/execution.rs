@@ -1511,8 +1511,12 @@ fn bounded_terminal_artifact(
 
 fn find_run(base: &Path, run_id: &str) -> Result<(PathBuf, RunManifestV1), ExecutionError> {
     WorkdirManager::new(base).map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
+    let base =
+        fs::canonicalize(base).map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
     // ponytail: scan run manifests; add an index when run counts make lookup measurable.
-    for entry in fs::read_dir(base).map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))? {
+    for entry in
+        fs::read_dir(&base).map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?
+    {
         let entry = entry.map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let file_type = entry
             .file_type()

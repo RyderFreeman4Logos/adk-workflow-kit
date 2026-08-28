@@ -155,6 +155,33 @@ fn resume(workdir: &Path, id: &str) -> (Output, (u32, u64)) {
 }
 
 #[test]
+fn relative_workdir_run_then_fresh_process_resume_succeeds() {
+    let root = TestRoot::new();
+    let profile = profile(&root.0);
+    let workdir = Path::new("runs");
+    fs::create_dir(root.0.join(workdir)).expect("workdir");
+    let mut run = run_args(&profile, workdir);
+    run.current_dir(&root.0);
+    let (child, _) = spawn_and_capture(run);
+    assert!(wait(child).status.success());
+
+    let persisted_workdir = root.0.join(workdir);
+    let run_root = run_root(&persisted_workdir);
+    let id = run_id(&run_root);
+    let mut resume_command = command();
+    resume_command
+        .current_dir(&root.0)
+        .arg("resume")
+        .arg("--run-id")
+        .arg(id)
+        .arg("--workdir")
+        .arg(workdir);
+    let (child, _) = spawn_and_capture(resume_command);
+    let resumed = wait(child);
+    assert!(resumed.status.success(), "relative resume: {resumed:?}");
+}
+
+#[test]
 fn sigkill_matrix_resumes_in_fresh_process_without_duplicate_effects() {
     for barrier in [
         "before-effect",
