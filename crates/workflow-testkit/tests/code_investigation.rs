@@ -82,3 +82,42 @@ fn live_dogfood_is_opt_in_and_safe_to_skip() {
         !diagnostic.debug_string().contains("sk-") && !diagnostic.display_string().contains("sk-")
     }));
 }
+
+#[test]
+fn fixture_package_resources_load_with_workflow() {
+    let package = SyntheticInvestigation::fixture_package().expect("fixture package loads");
+    assert_eq!(package.skill_id(), "code-investigation");
+    assert_eq!(package.resource_count(), 6);
+}
+
+#[test]
+fn review_loop_publishes_from_structured_pass_verdict() {
+    let result = SyntheticInvestigation::new(FixtureRepo::synthetic())
+        .run_fake()
+        .expect("review loop should complete");
+    assert!(
+        result
+            .trace()
+            .routes()
+            .iter()
+            .any(|route| route == "review_loop_pass")
+    );
+    assert!(
+        !result
+            .trace()
+            .routes()
+            .iter()
+            .any(|route| route == "revise")
+    );
+}
+
+#[test]
+fn opt_in_without_constructable_profile_abstains_fail_closed() {
+    let live = LiveDogfood::opt_in().run();
+    assert!(live.is_abstained());
+    assert!(!live.is_published());
+    assert_eq!(
+        live.diagnostic().map(|diagnostic| diagnostic.code()),
+        Some(DiagnosticCode::LiveProfileUnavailable)
+    );
+}

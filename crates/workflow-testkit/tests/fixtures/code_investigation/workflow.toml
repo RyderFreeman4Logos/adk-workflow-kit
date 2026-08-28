@@ -48,6 +48,30 @@ kind = "terminal"
 id = "abstain"
 kind = "terminal"
 
+[[resources]]
+path = "skills/code-investigation/SKILL.md"
+sha256 = "sha256:c4adb08d04aa18d9f870310301d4782a5ea2c5344d024fd4136bab5ffb4fc189"
+
+[[resources]]
+path = "prompts/planner.md"
+sha256 = "sha256:88514865356dc67787a99259300895827f21cbaab0c7b42f0add7fef3d2ec325"
+
+[[resources]]
+path = "prompts/reviewer.md"
+sha256 = "sha256:632f3f0af5d7c5454696e9bac01f9e2849bbd99b7cf44ca316bcde284c93bce7"
+
+[[resources]]
+path = "prompts/reviser.md"
+sha256 = "sha256:0493c534da1c066f01d23e87a3426f0ec2184e80ae5f7e25e2b16db6c9a72142"
+
+[[resources]]
+path = "schemas/investigation-input.json"
+sha256 = "sha256:079e99957548044be0471e22c626114585d9edc01991cc178175145ab745b397"
+
+[[resources]]
+path = "schemas/investigation-output.json"
+sha256 = "sha256:373e0b3773fc555083922d63e745efd1c22822680ce0a111ced8c6a80828f764"
+
 [[edges]]
 from = "prepare_workspace"
 to = "planner"

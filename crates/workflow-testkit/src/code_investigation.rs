@@ -13,9 +13,17 @@ use adk_rust::{Content, Llm, LlmRequest, LlmResponse, Part, futures::StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use workflow_adk::model_profiles::{
+    CredentialHandle, ModelProfileRegistry, OpenAiCompatibleProfile,
+};
 use workflow_compiler::{
-    PredicateRegistry, RegistryCategory, RegistryEntry, RegistryNotFound, compile_str,
-    compile_str_with_predicates,
+    PredicateRegistry, RegistryCategory, RegistryEntry, RegistryNotFound, SkillManifest,
+    compile_str, compile_str_with_predicates,
+};
+use workflow_review::{
+    CandidateArtifact, ReviewCost, ReviewDefect, ReviewLoopConfig, ReviewLoopOutcome, ReviewResult,
+    ReviewSeverity, ReviewVerdict, ReviewerResponse, RevisionResponse, SelectedEvidence,
+    ValidationReport, run_bounded_review_loop,
 };
 
 const MAX_CYCLES: usize = 2;
@@ -101,6 +109,8 @@ pub enum DiagnosticCode {
     GraphFailed,
     ArtifactFailed,
     LiveDisabled,
+    LiveProfileUnavailable,
+    ReviewAbstained,
 }
 
 impl DiagnosticCode {
@@ -128,6 +138,8 @@ impl DiagnosticCode {
             Self::GraphFailed => "graph_failed",
             Self::ArtifactFailed => "artifact_failed",
             Self::LiveDisabled => "live_disabled",
+            Self::LiveProfileUnavailable => "live_profile_unavailable",
+            Self::ReviewAbstained => "review_abstained",
         }
     }
 }
@@ -752,6 +764,17 @@ pub fn finish_review(
     answer: InvestigationAnswer,
     snapshot: &Snapshot,
 ) -> Result<InvestigationAnswer, InvestigationError> {
+    finish_review_with_verdict(answer, snapshot, ReviewVerdict::Pass)
+}
+
+fn finish_review_with_verdict(
+    answer: InvestigationAnswer,
+    snapshot: &Snapshot,
+    verdict: ReviewVerdict,
+) -> Result<InvestigationAnswer, InvestigationError> {
+    if !matches!(verdict, ReviewVerdict::Pass) {
+        return Err(InvestigationError::new(DiagnosticCode::ReviewAbstained));
+    }
     validate_answer(&answer, snapshot)?;
     Ok(answer)
 }
@@ -999,6 +1022,110 @@ pub enum InvestigationStatus {
     Abstained,
 }
 
+/// The fixture-owned Skill, prompt, and schema resources.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FixturePackage {
+    skill_id: String,
+    resource_count: usize,
+}
+
+impl FixturePackage {
+    fn load() -> Result<Self, InvestigationError> {
+        let plan = compile_str_with_predicates(
+            "code-investigation.workflow.toml",
+            FIXTURE_WORKFLOW,
+            &PredicateFixture,
+        )
+        .map_err(|_| InvestigationError::new(DiagnosticCode::SchemaInvalid))?;
+        let resources = [
+            (
+                "skills/code-investigation/SKILL.md",
+                include_bytes!(
+                    "../tests/fixtures/code_investigation/skills/code-investigation/SKILL.md"
+                )
+                .as_slice(),
+                "sha256:c4adb08d04aa18d9f870310301d4782a5ea2c5344d024fd4136bab5ffb4fc189",
+            ),
+            (
+                "prompts/planner.md",
+                include_bytes!("../tests/fixtures/code_investigation/prompts/planner.md")
+                    .as_slice(),
+                "sha256:88514865356dc67787a99259300895827f21cbaab0c7b42f0add7fef3d2ec325",
+            ),
+            (
+                "prompts/reviewer.md",
+                include_bytes!("../tests/fixtures/code_investigation/prompts/reviewer.md")
+                    .as_slice(),
+                "sha256:632f3f0af5d7c5454696e9bac01f9e2849bbd99b7cf44ca316bcde284c93bce7",
+            ),
+            (
+                "prompts/reviser.md",
+                include_bytes!("../tests/fixtures/code_investigation/prompts/reviser.md")
+                    .as_slice(),
+                "sha256:0493c534da1c066f01d23e87a3426f0ec2184e80ae5f7e25e2b16db6c9a72142",
+            ),
+            (
+                "schemas/investigation-input.json",
+                include_bytes!(
+                    "../tests/fixtures/code_investigation/schemas/investigation-input.json"
+                )
+                .as_slice(),
+                "sha256:079e99957548044be0471e22c626114585d9edc01991cc178175145ab745b397",
+            ),
+            (
+                "schemas/investigation-output.json",
+                include_bytes!(
+                    "../tests/fixtures/code_investigation/schemas/investigation-output.json"
+                )
+                .as_slice(),
+                "sha256:373e0b3773fc555083922d63e745efd1c22822680ce0a111ced8c6a80828f764",
+            ),
+        ];
+        let declared = plan.ir().resources();
+        if declared.len() != resources.len()
+            || resources.iter().any(|(path, _, expected_digest)| {
+                !declared.iter().any(|resource| {
+                    resource.path() == *path && resource.sha256() == *expected_digest
+                })
+            })
+        {
+            return Err(InvestigationError::new(DiagnosticCode::SchemaInvalid));
+        }
+        for (path, bytes, expected_digest) in resources {
+            if digest(bytes) != expected_digest {
+                return Err(InvestigationError::new(DiagnosticCode::SchemaInvalid));
+            }
+            if path.ends_with(".json")
+                && !serde_json::from_slice::<serde_json::Value>(bytes)
+                    .is_ok_and(|value| value.is_object())
+            {
+                return Err(InvestigationError::new(DiagnosticCode::SchemaInvalid));
+            }
+        }
+        SkillManifest::parse(
+            Path::new("code-investigation"),
+            include_bytes!(
+                "../tests/fixtures/code_investigation/skills/code-investigation/SKILL.md"
+            ),
+        )
+        .map_err(|_| InvestigationError::new(DiagnosticCode::SchemaInvalid))?;
+        Ok(Self {
+            skill_id: "code-investigation".to_owned(),
+            resource_count: resources.len(),
+        })
+    }
+
+    /// Returns the validated Skill identifier.
+    pub fn skill_id(&self) -> &str {
+        &self.skill_id
+    }
+
+    /// Returns the number of digest-checked package resources.
+    pub const fn resource_count(&self) -> usize {
+        self.resource_count
+    }
+}
+
 /// The production-shaped offline investigation harness.
 #[derive(Clone, Debug)]
 pub struct SyntheticInvestigation {
@@ -1006,6 +1133,11 @@ pub struct SyntheticInvestigation {
 }
 
 impl SyntheticInvestigation {
+    /// Loads and verifies the fixture Skill package.
+    pub fn fixture_package() -> Result<FixturePackage, InvestigationError> {
+        FixturePackage::load()
+    }
+
     /// Creates a bounded investigation over one immutable logical repository.
     pub fn new(repo: FixtureRepo) -> Self {
         Self { repo }
@@ -1018,6 +1150,7 @@ impl SyntheticInvestigation {
 
     /// Runs the deterministic fake-model GREEN path.
     pub fn run_fake(&self) -> Result<InvestigationResult, InvestigationError> {
+        let _package = Self::fixture_package()?;
         let snapshot = self.repo.snapshot();
         let predicate_registry = PredicateFixture;
         let plan = compile_str_with_predicates(
@@ -1099,9 +1232,94 @@ impl SyntheticInvestigation {
         let answer = finish_investigation(answer, &snapshot)?;
         advance(&mut session, InvestigationStage::Review, &mut stages);
         routes.push("review".to_owned());
-        advance(&mut session, InvestigationStage::Revise, &mut stages);
-        routes.push("revise".to_owned());
-        let answer = finish_review(answer, &snapshot)?;
+        let selected_evidence = answer
+            .claims()
+            .iter()
+            .flat_map(|claim| {
+                claim.evidence().iter().map(move |evidence| {
+                    SelectedEvidence::new(
+                        format!("{}:{}", claim.id(), evidence.path()),
+                        evidence.snippet().to_owned(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let candidate_bytes = serde_json::to_vec(&answer)
+            .map_err(|_| InvestigationError::new(DiagnosticCode::ArtifactFailed))?;
+        let snapshot_for_validation = snapshot.clone();
+        let review_outcome = run_bounded_review_loop(
+            || -> Result<CandidateArtifact, InvestigationError> {
+                Ok(CandidateArtifact::new(candidate_bytes.clone()))
+            },
+            |candidate| {
+                let parsed = serde_json::from_slice::<InvestigationAnswer>(candidate.bytes());
+                let validation = match parsed {
+                    Ok(candidate) => match validate_answer(&candidate, &snapshot_for_validation) {
+                        Ok(()) => ValidationReport::valid(),
+                        Err(error) => ValidationReport::invalid(vec![ReviewDefect::new(
+                            error.code().as_str().to_owned(),
+                            ReviewSeverity::Error,
+                            None,
+                            Vec::new(),
+                            "deterministic answer validation failed".to_owned(),
+                            None,
+                        )]),
+                    },
+                    Err(_) => ValidationReport::invalid(vec![ReviewDefect::new(
+                        "answer_decode".to_owned(),
+                        ReviewSeverity::Error,
+                        None,
+                        Vec::new(),
+                        "answer artifact is not valid JSON".to_owned(),
+                        None,
+                    )]),
+                };
+                Ok(validation)
+            },
+            |request| {
+                let (verdict, defects) = if request.validation().is_valid() {
+                    (ReviewVerdict::Pass, Vec::new())
+                } else {
+                    (
+                        ReviewVerdict::Revise,
+                        request.validation().defects().to_vec(),
+                    )
+                };
+                let review = ReviewResult::new(
+                    1,
+                    verdict,
+                    "isolated structured review".to_owned(),
+                    defects,
+                    1.0,
+                )
+                .map_err(|_| InvestigationError::new(DiagnosticCode::SchemaInvalid))?;
+                Ok(ReviewerResponse::new(review, ReviewCost::new(1, 0)))
+            },
+            |request| {
+                Ok(RevisionResponse::new(
+                    CandidateArtifact::new(request.candidate().bytes().to_vec()),
+                    ReviewCost::new(1, 0),
+                ))
+            },
+            ReviewLoopConfig::default().with_evidence(selected_evidence),
+        )
+        .map_err(|_| InvestigationError::new(DiagnosticCode::ModelFailed))?;
+        let reviewed_answer = match review_outcome {
+            ReviewLoopOutcome::Published { artifact, metrics } => {
+                routes.push("review_loop".to_owned());
+                if metrics.revisions() == 0 {
+                    routes.push("review_loop_pass".to_owned());
+                } else {
+                    routes.push("review_loop_revise".to_owned());
+                }
+                serde_json::from_slice::<InvestigationAnswer>(artifact.bytes())
+                    .map_err(|_| InvestigationError::new(DiagnosticCode::ArtifactFailed))?
+            }
+            ReviewLoopOutcome::Abstained { .. } => {
+                return Err(InvestigationError::new(DiagnosticCode::ReviewAbstained));
+            }
+        };
+        let answer = finish_review_with_verdict(reviewed_answer, &snapshot, ReviewVerdict::Pass)?;
         advance(&mut session, InvestigationStage::Publish, &mut stages);
         routes.push("publish".to_owned());
         let adk_graph_exercised = exercise_adk_graph();
@@ -1398,18 +1616,35 @@ impl LiveDogfood {
         Self { enabled: true }
     }
 
-    /// Runs only the safe opt-in gate; no secret-bearing value is inspected.
-    pub const fn run(self) -> LiveResult {
-        if self.enabled {
-            LiveResult {
-                status: LiveStatus::Abstained,
-                diagnostic: Some(InvestigationError::new(DiagnosticCode::LiveDisabled)),
-            }
-        } else {
-            LiveResult {
+    /// Runs the opt-in gate without reading any credential value.
+    pub fn run(self) -> LiveResult {
+        if !self.enabled {
+            return LiveResult {
                 status: LiveStatus::Skipped,
                 diagnostic: None,
-            }
+            };
+        }
+
+        let profile = OpenAiCompatibleProfile::new(
+            "code-investigation-live",
+            "1",
+            "code-investigation",
+            "https://127.0.0.1:0/v1",
+            CredentialHandle::environment("ADK_WORKFLOW_KIT_M1_14_API_KEY"),
+        );
+        if ModelProfileRegistry::new().with_worker(profile).is_err() {
+            return LiveResult {
+                status: LiveStatus::Abstained,
+                diagnostic: Some(InvestigationError::new(
+                    DiagnosticCode::LiveProfileUnavailable,
+                )),
+            };
+        }
+        LiveResult {
+            status: LiveStatus::Abstained,
+            diagnostic: Some(InvestigationError::new(
+                DiagnosticCode::LiveProfileUnavailable,
+            )),
         }
     }
 }
