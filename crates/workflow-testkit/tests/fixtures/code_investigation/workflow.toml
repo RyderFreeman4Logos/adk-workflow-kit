@@ -1,0 +1,90 @@
+schema_version = 1
+
+[workflow]
+id = "code.investigation"
+version = "1"
+entry = "prepare_workspace"
+
+[[nodes]]
+id = "prepare_workspace"
+kind = "agent"
+[[nodes]]
+id = "planner"
+kind = "agent"
+[[nodes]]
+id = "search_code"
+kind = "agent"
+[[nodes]]
+id = "inspect_evidence"
+kind = "agent"
+[[nodes]]
+id = "coverage_decision"
+kind = "validator"
+[[nodes]]
+id = "retry_search_code"
+kind = "agent"
+[[nodes]]
+id = "retry_inspect_evidence"
+kind = "agent"
+[[nodes]]
+id = "retry_coverage_decision"
+kind = "validator"
+[[nodes]]
+id = "draft"
+kind = "agent"
+[[nodes]]
+id = "grounding_validation"
+kind = "validator"
+[[nodes]]
+id = "review"
+kind = "agent"
+[[nodes]]
+id = "revise"
+kind = "agent"
+[[nodes]]
+id = "publish"
+kind = "terminal"
+[[nodes]]
+id = "abstain"
+kind = "terminal"
+
+[[edges]]
+from = "prepare_workspace"
+to = "planner"
+[[edges]]
+from = "planner"
+to = "search_code"
+[[edges]]
+from = "search_code"
+to = "inspect_evidence"
+[[edges]]
+from = "inspect_evidence"
+to = "coverage_decision"
+[[edges]]
+from = "retry_search_code"
+to = "retry_inspect_evidence"
+[[edges]]
+from = "retry_inspect_evidence"
+to = "retry_coverage_decision"
+[[edges]]
+from = "draft"
+to = "grounding_validation"
+[[edges]]
+from = "grounding_validation"
+to = "review"
+[[edges]]
+from = "review"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "publish"
+
+[[routes]]
+from = "coverage_decision"
+predicate = { id = "coverage.decision@v1", version = "1.0.0" }
+cases = { insufficient = "retry_search_code", sufficient = "draft", impossible = "abstain" }
+
+[[routes]]
+from = "retry_coverage_decision"
+predicate = { id = "coverage.decision@v1", version = "1.0.0" }
+cases = { insufficient = "abstain", sufficient = "draft", impossible = "abstain" }

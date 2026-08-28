@@ -3330,6 +3330,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "workflow-adk",
  "workflow-compiler",
  "workflow-ir",
  "workflow-review",

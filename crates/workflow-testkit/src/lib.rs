@@ -1,6 +1,7 @@
 //! Deterministic offline ADK-Rust test doubles and exact tool registry fixtures.
 
 mod bench;
+pub mod code_investigation;
 mod eval;
 mod non_progress;
 mod replay;
