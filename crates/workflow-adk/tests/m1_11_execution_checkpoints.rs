@@ -311,3 +311,50 @@ fn resume_persists_artifact_references_from_reexecution() {
             .is_file()
     }));
 }
+
+#[test]
+fn resume_does_not_advance_checkpoint_when_event_persistence_fails() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .unwrap();
+    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
+    let receipt =
+        ExecutionBackend::run(workflow, profile, json!({"request":"public"}), &root.0).unwrap();
+    let events_path = receipt.run_root().join("events.jsonl");
+    let events_before = fs::read(&events_path).unwrap();
+    let manifest: CheckpointManifestV1 = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("checkpoint-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let run_id = RunId::new(receipt.run_id().to_owned()).unwrap();
+    let store = SqliteCheckpointStore::open(receipt.run_root().join("checkpoint.sqlite"), manifest)
+        .unwrap();
+    let checkpoint_before = store.load_latest(&run_id).unwrap().unwrap();
+
+    fs::create_dir(events_path.with_extension("tmp")).unwrap();
+    let error = ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::Persistence);
+
+    let manifest: CheckpointManifestV1 = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("checkpoint-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let store = SqliteCheckpointStore::open(receipt.run_root().join("checkpoint.sqlite"), manifest)
+        .unwrap();
+    let checkpoint_after = store.load_latest(&run_id).unwrap().unwrap();
+    assert_eq!(checkpoint_after, checkpoint_before);
+    assert_eq!(fs::read(events_path).unwrap(), events_before);
+}

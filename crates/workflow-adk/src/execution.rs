@@ -937,19 +937,18 @@ impl ExecutionBackend {
                 artifact_refs.insert(artifact_id.to_owned());
             }
         }
-        checkpoint_store
-            .save_checkpoint(
-                DurableCheckpointV1::new(
-                    run_identity.clone(),
-                    node_id,
-                    mapper.events().last().map_or(0, |event| event.sequence()),
-                    state_bytes,
-                    artifact_refs,
-                )
-                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?,
-            )
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let checkpoint = DurableCheckpointV1::new(
+            run_identity.clone(),
+            node_id,
+            mapper.events().last().map_or(0, |event| event.sequence()),
+            state_bytes,
+            artifact_refs,
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         write_events(&events_path, mapper.events())?;
+        checkpoint_store
+            .save_checkpoint(checkpoint)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         manifest.resume_count = next;
         write_json(&root.join("run-manifest.json"), &manifest)?;
         Ok(manifest.receipt(root))
