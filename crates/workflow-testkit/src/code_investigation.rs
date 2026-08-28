@@ -276,6 +276,20 @@ impl FixtureRepo {
         }
     }
 
+    /// Creates the checked-in kit repository snapshot for live dogfood.
+    fn kit_repo() -> Self {
+        Self::from_files([
+            (
+                "Cargo.toml".to_owned(),
+                include_str!("../../../Cargo.toml").to_owned(),
+            ),
+            (
+                "crates/workflow-testkit/src/code_investigation.rs".to_owned(),
+                include_str!("code_investigation.rs").to_owned(),
+            ),
+        ])
+    }
+
     /// Creates a repository from logical files for containment tests.
     pub fn from_files(files: impl IntoIterator<Item = (String, String)>) -> Self {
         Self {
@@ -1171,33 +1185,6 @@ impl SyntheticInvestigation {
         self.run_fake_with_review(ReviewVerdict::Pass)
     }
 
-    fn run_graph_body(
-        &self,
-        requested_verdict: ReviewVerdict,
-    ) -> Result<InvestigationResult, InvestigationError> {
-        let snapshot = self.repo.snapshot();
-        let mut session = self.session();
-        let mut stages = vec![InvestigationStage::PrepareWorkspace.as_str().to_owned()];
-        let mut routes = vec!["prepare_workspace".to_owned()];
-        advance(&mut session, InvestigationStage::Planner, &mut stages);
-        routes.push("planner".to_owned());
-        advance(&mut session, InvestigationStage::SearchCode, &mut stages);
-        let selected_call = fake_model_tool("retry", Some("src"))
-            .ok_or_else(|| InvestigationError::new(DiagnosticCode::ModelFailed))?;
-        let tools = ReadOnlyTools::new(&snapshot);
-        tools
-            .search_code(&selected_call.query, selected_call.path.as_deref())
-            .map_err(|_| InvestigationError::new(DiagnosticCode::CoverageExhausted))?;
-        routes.push("search_code".to_owned());
-        let calls = vec![ToolCall {
-            tool: selected_call.tool,
-            route: "search_code".to_owned(),
-            query: selected_call.query,
-            path: selected_call.path,
-        }];
-        self.complete_from_search(snapshot, session, stages, routes, calls, requested_verdict)
-    }
-
     /// Runs the fake model with one structured reviewer verdict for route coverage.
     pub fn run_fake_with_review(
         &self,
@@ -1753,45 +1740,172 @@ struct GraphExercise {
 struct GraphRun {
     investigation: SyntheticInvestigation,
     requested_verdict: ReviewVerdict,
-    result: Option<Result<InvestigationResult, InvestigationError>>,
+    snapshot: Snapshot,
+    session: InvestigationSession,
+    stages: Vec<String>,
+    calls: Vec<ToolCall>,
+    answer: Option<InvestigationAnswer>,
+    review_routes: Vec<String>,
+    error: Option<InvestigationError>,
 }
 
 impl GraphRun {
+    fn new(investigation: SyntheticInvestigation, requested_verdict: ReviewVerdict) -> Self {
+        Self {
+            snapshot: investigation.repo.snapshot(),
+            session: investigation.session(),
+            investigation,
+            requested_verdict,
+            stages: vec![InvestigationStage::PrepareWorkspace.as_str().to_owned()],
+            calls: Vec::new(),
+            answer: None,
+            review_routes: Vec::new(),
+            error: None,
+        }
+    }
+
     fn execute(&mut self, node: &str) -> String {
-        if node == "prepare_workspace" && self.result.is_none() {
-            let investigation = self.investigation.clone();
-            let requested_verdict = self.requested_verdict;
-            self.result = Some(
-                std::thread::spawn(move || investigation.run_graph_body(requested_verdict))
-                    .join()
-                    .unwrap_or_else(|_| Err(InvestigationError::new(DiagnosticCode::GraphFailed))),
-            );
+        if self.error.is_some() {
+            return "abstain".to_owned();
         }
+        match self.execute_node(node) {
+            Ok(output) => output.to_owned(),
+            Err(error) => {
+                self.error = Some(error);
+                "abstain".to_owned()
+            }
+        }
+    }
+
+    fn execute_node(&mut self, node: &str) -> Result<&'static str, InvestigationError> {
         match node {
-            "coverage_decision" => "insufficient".to_owned(),
-            "retry_coverage_decision" => "sufficient".to_owned(),
-            "grounding_validation" => "valid".to_owned(),
-            "review" => self
-                .result
-                .as_ref()
-                .and_then(|result| result.as_ref().ok())
-                .map(|result| {
-                    if result.status() == InvestigationStatus::Published {
-                        "pass"
-                    } else {
-                        "abstain"
-                    }
-                })
-                .unwrap_or("abstain")
-                .to_owned(),
-            "prepare_workspace" => "prepared".to_owned(),
-            "planner" => "planned".to_owned(),
-            "search_code" | "retry_search_code" => "searched".to_owned(),
-            "inspect_evidence" | "retry_inspect_evidence" => "inspected".to_owned(),
-            "draft" => "drafted".to_owned(),
-            "revise" => "revised".to_owned(),
-            _ => "abstain".to_owned(),
+            "prepare_workspace" => Ok("prepared"),
+            "planner" => {
+                self.advance(InvestigationStage::Planner)?;
+                Ok("planned")
+            }
+            "search_code" => {
+                self.search("retry", "search_code")?;
+                Ok("searched")
+            }
+            "inspect_evidence" => {
+                self.inspect("retry", "inspect_evidence")?;
+                Ok("inspected")
+            }
+            "coverage_decision" => {
+                self.advance(InvestigationStage::CoverageDecision)?;
+                Ok("insufficient")
+            }
+            "retry_search_code" => {
+                self.search("pub", "retry_search_code")?;
+                Ok("searched")
+            }
+            "retry_inspect_evidence" => {
+                self.inspect("retry", "retry_inspect_evidence")?;
+                Ok("inspected")
+            }
+            "retry_coverage_decision" => {
+                self.advance(InvestigationStage::CoverageDecision)?;
+                Ok("sufficient")
+            }
+            "draft" => {
+                self.advance(InvestigationStage::Draft)?;
+                self.answer = Some(
+                    self.investigation
+                        .expected_answer(&ReadOnlyTools::new(&self.snapshot))?,
+                );
+                Ok("drafted")
+            }
+            "grounding_validation" => {
+                self.advance(InvestigationStage::GroundingValidation)?;
+                let answer = self
+                    .answer
+                    .take()
+                    .ok_or_else(|| InvestigationError::new(DiagnosticCode::GraphFailed))?;
+                self.answer = Some(finish_investigation(answer, &self.snapshot)?);
+                Ok("valid")
+            }
+            "review" => {
+                self.advance(InvestigationStage::Review)?;
+                let answer = self
+                    .answer
+                    .as_ref()
+                    .ok_or_else(|| InvestigationError::new(DiagnosticCode::GraphFailed))?;
+                if self.requested_verdict == ReviewVerdict::Pass {
+                    finish_review(answer.clone(), &self.snapshot)?;
+                    self.review_routes.push("review_loop_pass".to_owned());
+                    Ok("pass")
+                } else {
+                    self.review_routes.push("review_loop_abstain".to_owned());
+                    Ok("abstain")
+                }
+            }
+            "revise" => {
+                self.advance(InvestigationStage::Revise)?;
+                Ok("revised")
+            }
+            _ => Ok("abstain"),
         }
+    }
+
+    fn advance(&mut self, next: InvestigationStage) -> Result<(), InvestigationError> {
+        self.session.advance(next)?;
+        self.stages.push(next.as_str().to_owned());
+        Ok(())
+    }
+
+    fn search(&mut self, query: &str, route: &str) -> Result<(), InvestigationError> {
+        self.advance(InvestigationStage::SearchCode)?;
+        let selected_call = fake_model_tool(query, Some("src"))
+            .ok_or_else(|| InvestigationError::new(DiagnosticCode::ModelFailed))?;
+        ReadOnlyTools::new(&self.snapshot)
+            .search_code(&selected_call.query, selected_call.path.as_deref())
+            .map_err(|_| InvestigationError::new(DiagnosticCode::CoverageExhausted))?;
+        self.calls.push(ToolCall {
+            tool: selected_call.tool,
+            route: route.to_owned(),
+            query: selected_call.query,
+            path: selected_call.path,
+        });
+        Ok(())
+    }
+
+    fn inspect(&mut self, query: &str, route: &str) -> Result<(), InvestigationError> {
+        self.advance(InvestigationStage::InspectEvidence)?;
+        let tools = ReadOnlyTools::new(&self.snapshot);
+        let hit = tools
+            .search_code(query, Some("src"))?
+            .into_iter()
+            .find(|hit| hit.path() == "src/retry.rs")
+            .ok_or_else(|| InvestigationError::new(DiagnosticCode::CoverageExhausted))?;
+        tools.read_source_range(hit.path(), hit.line(), hit.line())?;
+        self.calls.push(ToolCall {
+            tool: ReadOnlyTool::ReadSourceRange,
+            route: route.to_owned(),
+            query: query.to_owned(),
+            path: Some(hit.path().to_owned()),
+        });
+        Ok(())
+    }
+
+    fn finish(&mut self, terminal: &str) -> Result<GraphExercise, InvestigationError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        let terminal_stage = match terminal {
+            "publish" => InvestigationStage::Publish,
+            "abstain" => InvestigationStage::Abstain,
+            _ => return Err(InvestigationError::new(DiagnosticCode::GraphFailed)),
+        };
+        self.advance(terminal_stage)?;
+        Ok(GraphExercise {
+            terminal: terminal.to_owned(),
+            routes: std::mem::take(&mut self.review_routes),
+            snapshot: self.snapshot.clone(),
+            answer: self.answer.clone(),
+            stages: self.stages.clone(),
+            calls: self.calls.clone(),
+        })
     }
 }
 
@@ -1822,11 +1936,15 @@ impl Agent for GraphRouteAgent {
     }
 
     async fn run(&self, _context: Arc<dyn InvocationContext>) -> adk_rust::Result<EventStream> {
-        let output = self
-            .run
-            .lock()
-            .map(|mut run| run.execute(&self.name))
-            .unwrap_or_else(|_| "abstain".to_owned());
+        let run = Arc::clone(&self.run);
+        let name = self.name.clone();
+        let output = std::thread::spawn(move || {
+            run.lock()
+                .map(|mut run| run.execute(&name))
+                .unwrap_or_else(|_| "abstain".to_owned())
+        })
+        .join()
+        .unwrap_or_else(|_| "abstain".to_owned());
         let mut event = Event::new(&self.name);
         event.set_content(Content::new("assistant").with_text(output));
         Ok(Box::pin(adk_rust::futures::stream::iter([Ok(event)])))
@@ -1843,11 +1961,7 @@ fn run_investigation_graph(
         &PredicateFixture,
     )
     .map_err(|_| InvestigationError::new(DiagnosticCode::GraphFailed))?;
-    let run = Arc::new(Mutex::new(GraphRun {
-        investigation,
-        requested_verdict,
-        result: None,
-    }));
+    let run = Arc::new(Mutex::new(GraphRun::new(investigation, requested_verdict)));
     let agents: BTreeMap<String, Arc<dyn Agent>> = [
         "prepare_workspace",
         "planner",
@@ -1895,12 +2009,10 @@ fn run_investigation_graph(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| InvestigationError::new(DiagnosticCode::GraphFailed))?
         .to_owned();
-    let mut result = run
+    let mut exercise = run
         .lock()
         .map_err(|_| InvestigationError::new(DiagnosticCode::GraphFailed))?
-        .result
-        .take()
-        .ok_or_else(|| InvestigationError::new(DiagnosticCode::GraphFailed))??;
+        .finish(&terminal)?;
     let mut routes = Vec::new();
     for node in [
         "prepare_workspace",
@@ -1931,26 +2043,10 @@ fn run_investigation_graph(
             routes.push(route);
         }
     }
-    routes.push(terminal.clone());
-    routes.extend(
-        result
-            .trace
-            .routes
-            .iter()
-            .filter(|route| route.starts_with("review_loop"))
-            .cloned(),
-    );
-    result.trace.routes = routes.clone();
-    result.trace.adk_graph_exercised = true;
-    result.trace.adk_terminal = Some(terminal.clone());
-    Ok(GraphExercise {
-        terminal,
-        routes,
-        snapshot: result.snapshot,
-        answer: Some(result.answer),
-        stages: result.trace.stages,
-        calls: result.trace.tool_calls,
-    })
+    routes.push(terminal);
+    routes.append(&mut exercise.routes);
+    exercise.routes = routes;
+    Ok(exercise)
 }
 
 struct PredicateFixture;
@@ -2072,25 +2168,64 @@ impl LiveDogfood {
                 };
             }
         };
-        if registry.bind_worker(broker).is_err() {
-            return LiveResult {
-                status: LiveStatus::Abstained,
-                diagnostic: Some(InvestigationError::new(
-                    DiagnosticCode::LiveProfileUnavailable,
-                )),
-            };
-        }
-        match SyntheticInvestigation::new(FixtureRepo::synthetic()).run_fake() {
-            Ok(result) if result.status() == InvestigationStatus::Published => LiveResult {
+        let worker = match registry.bind_worker(broker) {
+            Ok(worker) => worker,
+            Err(_) => {
+                return LiveResult {
+                    status: LiveStatus::Abstained,
+                    diagnostic: Some(InvestigationError::new(
+                        DiagnosticCode::LiveProfileUnavailable,
+                    )),
+                };
+            }
+        };
+        if attempt_live_kit_repo(&worker).is_ok() {
+            LiveResult {
                 status: LiveStatus::Published,
                 diagnostic: None,
-            },
-            _ => LiveResult {
+            }
+        } else {
+            LiveResult {
                 status: LiveStatus::Abstained,
                 diagnostic: Some(InvestigationError::new(DiagnosticCode::ModelFailed)),
-            },
+            }
         }
     }
+}
+
+fn attempt_live_kit_repo(
+    worker: &workflow_adk::model_profiles::ModelBinding,
+) -> Result<(), InvestigationError> {
+    let snapshot = FixtureRepo::kit_repo().snapshot();
+    let tools = ReadOnlyTools::new(&snapshot);
+    let hit = tools
+        .search_code("workflow", Some("crates/workflow-testkit/src"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| InvestigationError::new(DiagnosticCode::PathNotFound))?;
+    let evidence = tools.read_source_range(hit.path(), hit.line(), hit.line())?;
+    let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| InvestigationError::new(DiagnosticCode::ModelFailed))?;
+    runtime.block_on(async {
+        let mut stream = worker
+            .generate_content(
+                LlmRequest::new(
+                    "code-investigation-live",
+                    vec![Content::new("user").with_text(evidence.snippet())],
+                ),
+                false,
+            )
+            .await
+            .map_err(|_| InvestigationError::new(DiagnosticCode::ModelFailed))?;
+        stream
+            .next()
+            .await
+            .ok_or_else(|| InvestigationError::new(DiagnosticCode::ModelFailed))?
+            .map_err(|_| InvestigationError::new(DiagnosticCode::ModelFailed))?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -2113,9 +2248,13 @@ mod tests {
     }
 
     #[test]
-    fn live_dogfood_attempts_kit_repo_after_a_successful_bind() {
+    fn live_dogfood_abstains_when_the_kit_repo_attempt_fails_after_binding() {
         let broker = CredentialBroker::new().with_secret_provider(Arc::new(TestSecrets));
         let live = LiveDogfood::opt_in().run_with_broker(&broker);
-        assert!(live.is_published());
+        assert!(live.is_abstained());
+        assert_eq!(
+            live.diagnostic().map(InvestigationError::code),
+            Some(DiagnosticCode::ModelFailed)
+        );
     }
 }

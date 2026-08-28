@@ -57,6 +57,11 @@ fn synthetic_repo_has_expected_grounded_answer() {
             && call.query() == "pub"
             && call.path() == Some("src")
     }));
+    assert!(result.trace().tool_calls().iter().any(|call| {
+        call.tool() == ReadOnlyTool::ReadSourceRange
+            && call.route() == "inspect_evidence"
+            && call.path() == Some("src/retry.rs")
+    }));
 }
 
 #[test]
