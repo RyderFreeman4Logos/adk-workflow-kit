@@ -1,7 +1,21 @@
+use std::{
+    num::NonZeroU64,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+use serde_json::json;
 use workflow_review::{
     CandidateArtifact, ReviewCost, ReviewDefect, ReviewLoopConfig, ReviewLoopDiagnosticCode,
-    ReviewLoopOutcome, ReviewSeverity, ReviewVerdict, ReviewerResponse, RevisionResponse,
-    SelectedEvidence, ValidationReport, run_bounded_review_loop,
+    ReviewLoopOutcome, ReviewSeverity, ReviewVerdict, ReviewerExecutionBoundary, ReviewerResponse,
+    RevisionResponse, SelectedEvidence, ValidationReport, run_bounded_review_loop,
+};
+use workflow_runtime::{
+    CapabilityIntersection, ChildSandbox, RunContext, RunId, RunLimits, RunSandbox, ToolBridge,
+    ToolBridgeError, ToolCallContext, ToolEnvelope, ToolFlags, ToolProvenance, ToolRegistration,
+    WorkdirManager,
 };
 
 const RUBRIC: &str = "publish only complete, evidenced candidates";
@@ -326,4 +340,110 @@ fn callback_failures_have_static_diagnostics() {
     .expect_err("producer error must be returned");
     assert!(!format!("{error:?}").contains(hostile));
     assert!(!error.to_string().contains(hostile));
+}
+
+#[test]
+fn public_path_accepts_multiline_rubric_and_evidence() {
+    let result = run_bounded_review_loop(
+        || Ok::<_, &'static str>(artifact("candidate")),
+        |_| Ok(valid()),
+        |request| {
+            assert_eq!(
+                request.rubric(),
+                "line one\nline two\tline three\rline four"
+            );
+            assert_eq!(
+                request.selected_evidence()[0].content(),
+                "evidence\ncontinues"
+            );
+            Ok(pass())
+        },
+        |_| panic!("a passing review does not need a reviser"),
+        config()
+            .with_rubric("line one\nline two\tline three\rline four")
+            .with_evidence(vec![SelectedEvidence::new(
+                "evidence:claim-0".to_owned(),
+                "evidence\ncontinues".to_owned(),
+            )]),
+    )
+    .expect("ordinary multiline review text must be accepted");
+    assert!(matches!(result, ReviewLoopOutcome::Published { .. }));
+}
+
+fn reviewer_sandbox() -> RunSandbox {
+    let run_id = RunId::new("review-boundary-test".to_owned()).expect("valid fixture run ID");
+    let limits = RunLimits::new(
+        NonZeroU64::new(4).expect("positive"),
+        NonZeroU64::new(4).expect("positive"),
+        NonZeroU64::new(4).expect("positive"),
+        NonZeroU64::new(2_000).expect("positive"),
+        NonZeroU64::new(2_000).expect("positive"),
+        NonZeroU64::new(2_000).expect("positive"),
+        NonZeroU64::new(64 * 1024).expect("positive"),
+    );
+    let context = RunContext::new(run_id.clone(), limits);
+    let base = std::env::temp_dir().join(format!("workflow-review-{}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("fixture base must exist");
+    let workdir = WorkdirManager::new(&base)
+        .expect("fixture workdir manager")
+        .allocate(&run_id)
+        .expect("fixture workdir");
+    RunSandbox::new(context, workdir, []).expect("fixture sandbox")
+}
+
+#[test]
+fn reviewer_execution_boundary_rejects_write_tools_without_running_them() {
+    let handler_called = Arc::new(AtomicBool::new(false));
+    let registration = ToolRegistration::for_types::<String, String>(
+        "write-tool",
+        ToolProvenance::new("fixture.write", "1"),
+        ToolFlags::new(false, false, false),
+    )
+    .expect("fixture registration");
+    let mut bridge = ToolBridge::new(reviewer_sandbox());
+    let called = Arc::clone(&handler_called);
+    bridge
+        .register(
+            registration,
+            move |_: &ChildSandbox<'_>,
+                  _: &ToolCallContext,
+                  _: &serde_json::Value|
+                  -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
+                called.store(true, Ordering::SeqCst);
+                Ok(ToolEnvelope::success(
+                    serde_json::Value::String("executed".to_owned()),
+                    ToolProvenance::new("fixture.write", "1"),
+                ))
+            },
+        )
+        .expect("fixture tool registration");
+    let boundary = ReviewerExecutionBoundary::new(
+        bridge,
+        CapabilityIntersection::all_for_tool("write-tool", []),
+    );
+
+    let error = run_bounded_review_loop(
+        || Ok::<_, ToolBridgeError>(artifact("candidate")),
+        |_| Ok(valid()),
+        |request| {
+            assert_ne!(request.session_id(), request.producer_session_id());
+            let error = request
+                .authority()
+                .invoke_tool("write-call", "write-tool", json!("side effect"))
+                .expect_err("reviewer write must be denied at dispatch");
+            assert_eq!(
+                error.kind(),
+                workflow_runtime::ToolBridgeErrorKind::CapabilityDenied
+            );
+            Err(error)
+        },
+        |_| panic!("denied reviewer tool must not reach the reviser"),
+        config().with_execution_boundary(boundary),
+    )
+    .expect_err("write-tool denial must reach the reviewer boundary");
+    assert!(matches!(
+        error,
+        workflow_review::ReviewLoopError::Reviewer(_)
+    ));
+    assert!(!handler_called.load(Ordering::SeqCst));
 }

@@ -4,11 +4,21 @@
 //! a read-only authority. It cannot alter the deterministic validator or any
 //! run limit because those controls are outside the review result schema.
 
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::HashSet,
+    fmt,
+    num::NonZeroU64,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
-use workflow_runtime::{RunSessionIds, SessionRole};
+use workflow_runtime::{
+    CapabilityIntersection, InMemoryArtifactStore, RunSessionIds, SessionRole, ToolBridge,
+    ToolBridgeError, ToolBridgeErrorKind, ToolCall, ToolEnvelope,
+};
 
 use crate::{REVIEW_SCHEMA_VERSION_V1, ReviewDefect, ReviewResult, ReviewVerdict};
 
@@ -106,10 +116,98 @@ impl fmt::Debug for SelectedEvidence {
     }
 }
 
+/// The runtime-enforced tool boundary exposed to a semantic reviewer.
+///
+/// The boundary owns the registered bridge and artifact store. Calls cannot
+/// reach a handler unless the registered tool is read-only and every runtime
+/// capability layer authorizes it.
+#[derive(Clone)]
+pub struct ReviewerExecutionBoundary {
+    bridge: Arc<Mutex<ToolBridge>>,
+    capabilities: CapabilityIntersection,
+    read_only_tools: Vec<String>,
+    artifacts: Arc<Mutex<InMemoryArtifactStore>>,
+}
+
+impl ReviewerExecutionBoundary {
+    /// Binds reviewer dispatch to one registered-tool bridge and intersection.
+    pub fn new(bridge: ToolBridge, capabilities: CapabilityIntersection) -> Self {
+        let read_only_tools = bridge
+            .tool_names()
+            .into_iter()
+            .filter(|name| {
+                bridge
+                    .registration(name)
+                    .is_some_and(|registration| registration.flags().read_only())
+            })
+            .collect();
+        Self {
+            bridge: Arc::new(Mutex::new(bridge)),
+            capabilities,
+            read_only_tools,
+            artifacts: Arc::new(Mutex::new(InMemoryArtifactStore::new(
+                NonZeroU64::new(64 * 1024).expect("constant artifact limit is positive"),
+                NonZeroU64::new(64 * 1024).expect("constant page limit is positive"),
+            ))),
+        }
+    }
+
+    /// Returns the registered tools that are eligible for reviewer dispatch.
+    pub fn read_only_tools(&self) -> &[String] {
+        &self.read_only_tools
+    }
+
+    fn invoke(
+        &self,
+        reviewer_session_id: &str,
+        call_id: &str,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        if !self.read_only_tools.iter().any(|name| name == tool_name) {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
+        }
+        let mut bridge = self
+            .bridge
+            .lock()
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+        let mut artifacts = self
+            .artifacts
+            .lock()
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+        bridge.invoke(
+            ToolCall::new(tool_name, call_id, reviewer_session_id, arguments),
+            &self.capabilities,
+            None,
+            Duration::ZERO,
+            &mut *artifacts,
+        )
+    }
+}
+
+impl fmt::Debug for ReviewerExecutionBoundary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReviewerExecutionBoundary")
+            .field("read_only_tools", &self.read_only_tools)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ReviewerExecutionBoundary {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.bridge, &other.bridge) && self.read_only_tools == other.read_only_tools
+    }
+}
+
+impl Eq for ReviewerExecutionBoundary {}
+
 /// The immutable authority exposed to a semantic reviewer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewerAuthority {
     read_only_tools: Vec<String>,
+    boundary: Option<ReviewerExecutionBoundary>,
+    reviewer_session_id: String,
 }
 
 impl ReviewerAuthority {
@@ -137,6 +235,24 @@ impl ReviewerAuthority {
     pub fn read_only_tools(&self) -> &[String] {
         &self.read_only_tools
     }
+
+    /// Invokes a registered tool through the reviewer execution boundary.
+    pub fn invoke_tool(
+        &self,
+        call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        arguments: Value,
+    ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        let tool_name = tool_name.into();
+        if !self.read_only_tools.iter().any(|name| name == &tool_name) {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
+        }
+        let call_id = call_id.into();
+        self.boundary.as_ref().map_or_else(
+            || Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied)),
+            |boundary| boundary.invoke(&self.reviewer_session_id, &call_id, &tool_name, arguments),
+        )
+    }
 }
 
 /// Bounded policy for one reviewer/reviser run.
@@ -151,6 +267,7 @@ pub struct ReviewLoopConfig {
     rubric: String,
     evidence: Vec<SelectedEvidence>,
     read_only_tools: Vec<String>,
+    execution_boundary: Option<ReviewerExecutionBoundary>,
 }
 
 impl Default for ReviewLoopConfig {
@@ -165,6 +282,7 @@ impl Default for ReviewLoopConfig {
             rubric: "review the candidate against the acceptance contract".to_owned(),
             evidence: Vec::new(),
             read_only_tools: Vec::new(),
+            execution_boundary: None,
         }
     }
 }
@@ -221,6 +339,12 @@ impl ReviewLoopConfig {
     /// Replaces the reviewer read-only tool identities.
     pub fn with_read_only_tools(mut self, tools: Vec<String>) -> Self {
         self.read_only_tools = tools;
+        self
+    }
+
+    /// Sets the runtime-enforced reviewer tool boundary.
+    pub fn with_execution_boundary(mut self, boundary: ReviewerExecutionBoundary) -> Self {
+        self.execution_boundary = Some(boundary);
         self
     }
 }
@@ -758,7 +882,16 @@ where
             session_id: &reviewer_session_id,
             producer_session_id: &producer_session_id,
             authority: ReviewerAuthority {
-                read_only_tools: config.read_only_tools.clone(),
+                read_only_tools: if config.read_only_tools.is_empty() {
+                    config
+                        .execution_boundary
+                        .as_ref()
+                        .map_or_else(Vec::new, |boundary| boundary.read_only_tools().to_vec())
+                } else {
+                    config.read_only_tools.clone()
+                },
+                boundary: config.execution_boundary.clone(),
+                reviewer_session_id: reviewer_session_id.clone(),
             },
         };
         let response = reviewer(&request).map_err(ReviewLoopError::Reviewer)?;
@@ -827,20 +960,34 @@ where
 
 fn validate_config<E>(config: &ReviewLoopConfig) -> Result<(), ReviewLoopError<E>> {
     if config.rubric.is_empty()
-        || config.rubric.bytes().any(|byte| byte.is_ascii_control())
+        || !valid_free_text(&config.rubric)
         || config.evidence.iter().any(|evidence| {
             evidence.id.is_empty()
                 || evidence.id.bytes().any(|byte| byte.is_ascii_control())
-                || evidence.content.bytes().any(|byte| byte.is_ascii_control())
+                || !valid_free_text(&evidence.content)
         })
         || config
             .read_only_tools
             .iter()
             .any(|tool| tool.is_empty() || tool.bytes().any(|byte| byte.is_ascii_control()))
+        || (!config.read_only_tools.is_empty() && config.execution_boundary.is_none())
+        || config.execution_boundary.as_ref().is_some_and(|boundary| {
+            config.read_only_tools.iter().any(|tool| {
+                !boundary
+                    .read_only_tools()
+                    .iter()
+                    .any(|allowed| allowed == tool)
+            })
+        })
     {
         return Err(ReviewLoopError::InvalidConfiguration);
     }
     Ok(())
+}
+
+fn valid_free_text(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| !byte.is_ascii_control() || matches!(byte, b'\n' | b'\r' | b'\t'))
 }
 
 fn validation_review<E>(validation: &ValidationReport) -> Result<ReviewResult, ReviewLoopError<E>> {
