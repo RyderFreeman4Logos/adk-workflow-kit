@@ -1255,9 +1255,10 @@ fn record_response_cost(
     reported: ReviewCost,
     tool_budget: &ReviewerToolBudget,
 ) -> bool {
+    let billed_model_turns = reported.model_turns().max(1);
     let Some(cost) = metrics
         .cost
-        .checked_add(ReviewCost::new(reported.model_turns(), 0))
+        .checked_add(ReviewCost::new(billed_model_turns, 0))
     else {
         return false;
     };

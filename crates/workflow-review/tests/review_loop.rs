@@ -400,6 +400,68 @@ fn digest_mismatch_budget_and_attempts_are_recorded() {
 }
 
 #[test]
+fn underreported_callback_cost_cannot_bypass_model_turn_budget() {
+    let mut reviser_calls = 0;
+    let reviewer_exhausted = run_bounded_review_loop(
+        || Ok::<_, &'static str>(artifact("candidate")),
+        |_| Ok(valid()),
+        |_| Ok(revise("semantic_gap")),
+        |_| {
+            reviser_calls += 1;
+            Ok(RevisionResponse::new(
+                artifact("revised"),
+                ReviewCost::default(),
+            ))
+        },
+        config().with_max_model_turns(1),
+    )
+    .expect("underreported reviewer cost must exhaust the budget");
+    assert_eq!(
+        reviewer_exhausted
+            .diagnostic()
+            .map(|diagnostic| diagnostic.code()),
+        Some(ReviewLoopDiagnosticCode::BudgetExhausted)
+    );
+    assert_eq!(reviewer_exhausted.metrics().cost().model_turns(), 1);
+    assert_eq!(reviser_calls, 0, "budget must block the reviser dispatch");
+
+    let mut reviewer_calls = 0;
+    let reviser_exhausted = run_bounded_review_loop(
+        || Ok::<_, &'static str>(artifact("candidate")),
+        |candidate| {
+            if candidate.bytes() == b"candidate" {
+                Ok(invalid("missing_evidence"))
+            } else {
+                Ok(valid())
+            }
+        },
+        |_| {
+            reviewer_calls += 1;
+            Ok(pass())
+        },
+        |_| {
+            Ok(RevisionResponse::new(
+                artifact("revised"),
+                ReviewCost::default(),
+            ))
+        },
+        config().with_max_model_turns(1),
+    )
+    .expect("underreported reviser cost must exhaust the budget");
+    assert_eq!(
+        reviser_exhausted
+            .diagnostic()
+            .map(|diagnostic| diagnostic.code()),
+        Some(ReviewLoopDiagnosticCode::BudgetExhausted)
+    );
+    assert_eq!(reviser_exhausted.metrics().cost().model_turns(), 1);
+    assert_eq!(
+        reviewer_calls, 0,
+        "budget must block the next reviewer dispatch"
+    );
+}
+
+#[test]
 fn callback_failures_have_static_diagnostics() {
     let hostile = "secret-token=/etc/shadow";
     let error = run_bounded_review_loop(
