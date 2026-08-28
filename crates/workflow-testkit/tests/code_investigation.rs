@@ -29,17 +29,25 @@ fn synthetic_repo_has_expected_grounded_answer() {
             .trace()
             .routes()
             .iter()
-            .any(|route| route == "adk:coverage_decision:insufficient")
+            .all(|route| !route.starts_with("adk:")),
+        "the investigation trace must be produced by graph state, not a sidecar graph stamp"
+    );
+    assert!(
+        result
+            .trace()
+            .routes()
+            .iter()
+            .any(|route| route == "coverage_decision:insufficient")
     );
     for route in [
-        "adk:search_code",
-        "adk:inspect_evidence",
-        "adk:retry_search_code",
-        "adk:retry_inspect_evidence",
-        "adk:retry_coverage_decision:sufficient",
-        "adk:grounding_validation:valid",
-        "adk:review:pass",
-        "adk:publish",
+        "search_code",
+        "inspect_evidence",
+        "retry_search_code",
+        "retry_inspect_evidence",
+        "retry_coverage_decision:sufficient",
+        "grounding_validation:valid",
+        "review:pass",
+        "publish",
     ] {
         assert!(result.trace().routes().iter().any(|actual| actual == route));
     }
