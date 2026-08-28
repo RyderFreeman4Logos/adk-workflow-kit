@@ -129,6 +129,48 @@ pub struct ReviewerExecutionBoundary {
     artifacts: Arc<Mutex<InMemoryArtifactStore>>,
 }
 
+/// Run-scoped accounting for reviewer tool dispatches.
+#[derive(Clone, Debug)]
+struct ReviewerToolBudget {
+    state: Arc<Mutex<ReviewerToolBudgetState>>,
+}
+
+#[derive(Debug)]
+struct ReviewerToolBudgetState {
+    remaining: u64,
+    consumed: u64,
+}
+
+impl ReviewerToolBudget {
+    fn new(max_tool_calls: u64) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ReviewerToolBudgetState {
+                remaining: max_tool_calls,
+                consumed: 0,
+            })),
+        }
+    }
+
+    fn reserve(&self) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.remaining == 0 {
+            return false;
+        }
+        let Some(consumed) = state.consumed.checked_add(1) else {
+            return false;
+        };
+        state.remaining -= 1;
+        state.consumed = consumed;
+        true
+    }
+
+    fn consumed(&self) -> Option<u64> {
+        self.state.lock().ok().map(|state| state.consumed)
+    }
+}
+
 impl ReviewerExecutionBoundary {
     /// Binds reviewer dispatch to one registered-tool bridge and intersection.
     pub fn new(bridge: ToolBridge, capabilities: CapabilityIntersection) -> Self {
@@ -163,8 +205,9 @@ impl ReviewerExecutionBoundary {
         call_id: &str,
         tool_name: &str,
         arguments: Value,
+        budget: &ReviewerToolBudget,
     ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
-        if !self.read_only_tools.iter().any(|name| name == tool_name) {
+        if !self.read_only_tools.iter().any(|name| name == tool_name) || !budget.reserve() {
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
         }
         let mut bridge = self
@@ -203,12 +246,23 @@ impl PartialEq for ReviewerExecutionBoundary {
 impl Eq for ReviewerExecutionBoundary {}
 
 /// The immutable authority exposed to a semantic reviewer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ReviewerAuthority {
     read_only_tools: Vec<String>,
     boundary: Option<ReviewerExecutionBoundary>,
     reviewer_session_id: String,
+    tool_budget: Option<ReviewerToolBudget>,
 }
+
+impl PartialEq for ReviewerAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        self.read_only_tools == other.read_only_tools
+            && self.boundary == other.boundary
+            && self.reviewer_session_id == other.reviewer_session_id
+    }
+}
+
+impl Eq for ReviewerAuthority {}
 
 impl ReviewerAuthority {
     /// Reports that this authority can only inspect selected read-only tools.
@@ -250,7 +304,20 @@ impl ReviewerAuthority {
         let call_id = call_id.into();
         self.boundary.as_ref().map_or_else(
             || Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied)),
-            |boundary| boundary.invoke(&self.reviewer_session_id, &call_id, &tool_name, arguments),
+            |boundary| {
+                self.tool_budget.as_ref().map_or_else(
+                    || Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied)),
+                    |budget| {
+                        boundary.invoke(
+                            &self.reviewer_session_id,
+                            &call_id,
+                            &tool_name,
+                            arguments,
+                            budget,
+                        )
+                    },
+                )
+            },
         )
     }
 }
@@ -420,11 +487,15 @@ impl ReviewCost {
         self.tool_calls
     }
 
-    fn saturating_add(self, other: Self) -> Self {
-        Self {
-            model_turns: self.model_turns.saturating_add(other.model_turns),
-            tool_calls: self.tool_calls.saturating_add(other.tool_calls),
-        }
+    fn checked_add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            model_turns: self.model_turns.checked_add(other.model_turns)?,
+            tool_calls: self.tool_calls.checked_add(other.tool_calls)?,
+        })
+    }
+
+    fn with_tool_calls(self, tool_calls: u64) -> Self {
+        Self { tool_calls, ..self }
     }
 }
 
@@ -633,9 +704,9 @@ impl fmt::Display for ReviewLoopDiagnostic {
 /// Aggregated bounded-loop attempts, costs, and stage trace.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReviewLoopMetrics {
-    producer_attempts: u32,
-    validation_attempts: u32,
-    reviewer_attempts: u32,
+    producer_attempts: usize,
+    validation_attempts: usize,
+    reviewer_attempts: usize,
     revisions: usize,
     cost: ReviewCost,
     stages: Vec<ReviewLoopStage>,
@@ -643,17 +714,17 @@ pub struct ReviewLoopMetrics {
 
 impl ReviewLoopMetrics {
     /// Returns producer callback attempts.
-    pub const fn producer_attempts(&self) -> u32 {
+    pub const fn producer_attempts(&self) -> usize {
         self.producer_attempts
     }
 
     /// Returns deterministic validator callback attempts.
-    pub const fn validation_attempts(&self) -> u32 {
+    pub const fn validation_attempts(&self) -> usize {
         self.validation_attempts
     }
 
     /// Returns isolated reviewer callback attempts.
-    pub const fn reviewer_attempts(&self) -> u32 {
+    pub const fn reviewer_attempts(&self) -> usize {
         self.reviewer_attempts
     }
 
@@ -820,6 +891,7 @@ where
 {
     validate_config(&config)?;
 
+    let tool_budget = ReviewerToolBudget::new(config.max_tool_calls);
     let mut metrics = ReviewLoopMetrics {
         producer_attempts: 1,
         validation_attempts: 0,
@@ -838,7 +910,10 @@ where
 
     loop {
         metrics.stages.push(ReviewLoopStage::Validate);
-        metrics.validation_attempts = metrics.validation_attempts.saturating_add(1);
+        let Some(validation_attempts) = metrics.validation_attempts.checked_add(1) else {
+            return Ok(abstain(metrics, ReviewLoopDiagnosticCode::BudgetExhausted));
+        };
+        metrics.validation_attempts = validation_attempts;
         let validation = validator(&candidate).map_err(ReviewLoopError::Validator)?;
 
         if !validation.is_valid() {
@@ -858,6 +933,7 @@ where
                 &mut reviser,
                 &config,
                 &mut metrics,
+                &tool_budget,
                 &mut candidate,
                 &validation,
                 &review,
@@ -873,7 +949,10 @@ where
         }
 
         metrics.stages.push(ReviewLoopStage::Reviewer);
-        metrics.reviewer_attempts = metrics.reviewer_attempts.saturating_add(1);
+        let Some(reviewer_attempts) = metrics.reviewer_attempts.checked_add(1) else {
+            return Ok(abstain(metrics, ReviewLoopDiagnosticCode::BudgetExhausted));
+        };
+        metrics.reviewer_attempts = reviewer_attempts;
         let request = ReviewerRequest {
             candidate: &candidate,
             validation: &validation,
@@ -892,10 +971,16 @@ where
                 },
                 boundary: config.execution_boundary.clone(),
                 reviewer_session_id: reviewer_session_id.clone(),
+                tool_budget: config
+                    .execution_boundary
+                    .as_ref()
+                    .map(|_| tool_budget.clone()),
             },
         };
         let response = reviewer(&request).map_err(ReviewLoopError::Reviewer)?;
-        metrics.cost = metrics.cost.saturating_add(response.cost());
+        if !record_response_cost(&mut metrics, response.cost(), &tool_budget) {
+            return Ok(abstain(metrics, ReviewLoopDiagnosticCode::BudgetExhausted));
+        }
         if budget_exhausted(&metrics, &config) {
             return Ok(abstain(metrics, ReviewLoopDiagnosticCode::BudgetExhausted));
         }
@@ -930,6 +1015,7 @@ where
                     &mut reviser,
                     &config,
                     &mut metrics,
+                    &tool_budget,
                     &mut candidate,
                     &validation,
                     &review,
@@ -940,7 +1026,10 @@ where
             }
             ReviewVerdict::Pass => {
                 metrics.stages.push(ReviewLoopStage::FinalValidate);
-                metrics.validation_attempts = metrics.validation_attempts.saturating_add(1);
+                let Some(validation_attempts) = metrics.validation_attempts.checked_add(1) else {
+                    return Ok(abstain(metrics, ReviewLoopDiagnosticCode::BudgetExhausted));
+                };
+                metrics.validation_attempts = validation_attempts;
                 let final_validation = validator(&candidate).map_err(ReviewLoopError::Validator)?;
                 if !final_validation.is_valid() {
                     return Ok(abstain(
@@ -1001,10 +1090,12 @@ fn validation_review<E>(validation: &ValidationReport) -> Result<ReviewResult, R
     .map_err(|_| ReviewLoopError::InvalidValidationReport)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn revise_candidate<X, E>(
     reviser: &mut X,
     config: &ReviewLoopConfig,
     metrics: &mut ReviewLoopMetrics,
+    tool_budget: &ReviewerToolBudget,
     candidate: &mut CandidateArtifact,
     validation: &ValidationReport,
     review: &ReviewResult,
@@ -1040,7 +1131,12 @@ where
         review,
     };
     let response = reviser(&request).map_err(ReviewLoopError::Reviser)?;
-    metrics.cost = metrics.cost.saturating_add(response.cost());
+    if !record_response_cost(metrics, response.cost(), tool_budget) {
+        return Ok(Some(abstain(
+            metrics.clone(),
+            ReviewLoopDiagnosticCode::BudgetExhausted,
+        )));
+    }
     if budget_exhausted(metrics, config) {
         return Ok(Some(abstain(
             metrics.clone(),
@@ -1104,7 +1200,10 @@ fn observe_defects(
             .any(|((_, previous_rank), (_, current_rank))| current_rank < previous_rank)
     });
     if same_codes && !severity_dropped {
-        *repeated_rounds = repeated_rounds.saturating_add(1);
+        let Some(next_rounds) = repeated_rounds.checked_add(1) else {
+            return true;
+        };
+        *repeated_rounds = next_rounds;
     } else {
         *repeated_rounds = 0;
     }
@@ -1128,6 +1227,24 @@ fn severity_rank(severity: crate::ReviewSeverity) -> u8 {
         crate::ReviewSeverity::Error => 2,
         crate::ReviewSeverity::Critical => 3,
     }
+}
+
+fn record_response_cost(
+    metrics: &mut ReviewLoopMetrics,
+    reported: ReviewCost,
+    tool_budget: &ReviewerToolBudget,
+) -> bool {
+    let Some(cost) = metrics
+        .cost
+        .checked_add(ReviewCost::new(reported.model_turns(), 0))
+    else {
+        return false;
+    };
+    let Some(tool_calls) = tool_budget.consumed() else {
+        return false;
+    };
+    metrics.cost = cost.with_tool_calls(tool_calls);
+    true
 }
 
 fn budget_exhausted(metrics: &ReviewLoopMetrics, config: &ReviewLoopConfig) -> bool {
@@ -1273,6 +1390,7 @@ mod tests {
             },
             &ReviewLoopConfig::default().with_max_revisions(usize::MAX),
             &mut metrics,
+            &ReviewerToolBudget::new(u64::MAX),
             &mut candidate,
             &validation,
             &review,
@@ -1288,5 +1406,135 @@ mod tests {
             Some(ReviewLoopDiagnosticCode::MaxRevisionsExceeded)
         );
         assert!(!called, "the saturated counter must block another revision");
+    }
+
+    #[test]
+    fn actual_reviewer_tool_calls_exhaust_budget_at_dispatch_boundary() {
+        use std::{
+            fs,
+            num::NonZeroU64,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+        };
+        use workflow_runtime::{
+            CapabilityIntersection, ChildSandbox, RunContext, RunId, RunLimits, RunSandbox,
+            ToolCallContext, ToolFlags, ToolHandler, ToolProvenance, ToolRegistration,
+            WorkdirManager,
+        };
+
+        struct CountingHandler {
+            calls: Arc<AtomicUsize>,
+            provenance: ToolProvenance,
+        }
+
+        impl ToolHandler for CountingHandler {
+            fn execute(
+                &self,
+                _sandbox: &ChildSandbox<'_>,
+                _context: &ToolCallContext,
+                _arguments: &Value,
+            ) -> Result<ToolEnvelope<Value>, workflow_runtime::ToolBridgeError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolEnvelope::success(
+                    serde_json::json!({"ok": true}),
+                    self.provenance.clone(),
+                ))
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "workflow-review-tool-budget-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("test root must be unique");
+        let run_id = RunId::new("tool-budget".to_owned()).expect("test run ID must be valid");
+        let manager = WorkdirManager::new(&root).expect("test root must be trusted");
+        let workdir = manager.allocate(&run_id).expect("workdir must allocate");
+        let one = NonZeroU64::new(1).expect("positive test limit");
+        let limits = RunLimits::new(one, one, one, one, one, one, one);
+        let sandbox = RunSandbox::new(RunContext::new(run_id, limits), workdir, [])
+            .expect("sandbox must construct");
+        let provenance = ToolProvenance::new("review.inspect", "1");
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let mut bridge = workflow_runtime::ToolBridge::new(sandbox);
+        let registration = ToolRegistration::for_types::<Value, Value>(
+            "inspect",
+            provenance.clone(),
+            ToolFlags::new(true, true, true),
+        )
+        .expect("test registration must be valid");
+        bridge
+            .register(
+                registration,
+                CountingHandler {
+                    calls: Arc::clone(&handler_calls),
+                    provenance,
+                },
+            )
+            .expect("test tool must register");
+        let boundary = ReviewerExecutionBoundary::new(
+            bridge,
+            CapabilityIntersection::all_for_tool("inspect", std::iter::empty()),
+        );
+
+        let mut reviewer_calls = 0;
+        let mut reviser_calls = 0;
+        let result = run_bounded_review_loop(
+            || Ok::<_, ()>(CandidateArtifact::new(b"seed".to_vec())),
+            |_| Ok(ValidationReport::valid()),
+            |request| {
+                reviewer_calls += 1;
+                assert!(
+                    request
+                        .authority()
+                        .invoke_tool("first", "inspect", serde_json::json!({}))
+                        .is_ok()
+                );
+                assert!(
+                    request
+                        .authority()
+                        .invoke_tool("second", "inspect", serde_json::json!({}))
+                        .is_ok()
+                );
+                assert!(
+                    request
+                        .authority()
+                        .invoke_tool("exhausted", "inspect", serde_json::json!({}))
+                        .is_err()
+                );
+                Ok(ReviewerResponse::new(
+                    ReviewResult::new(
+                        REVIEW_SCHEMA_VERSION_V1,
+                        ReviewVerdict::Pass,
+                        "pass".to_owned(),
+                        Vec::new(),
+                        1.0,
+                    )
+                    .expect("test review must be valid"),
+                    ReviewCost::new(1, 0),
+                ))
+            },
+            |_| {
+                reviser_calls += 1;
+                panic!("budget exhaustion must prevent reviser dispatch");
+            },
+            ReviewLoopConfig::default()
+                .with_max_tool_calls(2)
+                .with_read_only_tools(vec!["inspect".to_owned()])
+                .with_execution_boundary(boundary),
+        )
+        .expect("budget exhaustion must abstain, not error");
+
+        assert_eq!(
+            result.diagnostic().map(|diagnostic| diagnostic.code()),
+            Some(ReviewLoopDiagnosticCode::BudgetExhausted)
+        );
+        assert_eq!(result.metrics().cost().tool_calls(), 2);
+        assert_eq!(reviewer_calls, 1);
+        assert_eq!(reviser_calls, 0);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 2);
+        fs::remove_dir_all(root).expect("test root must clean up");
     }
 }
