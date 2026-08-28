@@ -6,6 +6,7 @@ mod bridge;
 mod bubblewrap;
 mod checkpoint;
 mod controller;
+mod effect_journal;
 mod event;
 mod execution;
 mod hot_reload;
@@ -42,6 +43,9 @@ pub use checkpoint::{
 };
 pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
+};
+pub use effect_journal::{
+    EffectCommit, EffectJournal, EffectJournalError, EffectJournalErrorKind, EffectKey,
 };
 pub use event::{
     EventIntegrityV1, ProtectedArtifactReferenceV1, WORKFLOW_RUNTIME_EVENT_SCHEMA_VERSION_V1,

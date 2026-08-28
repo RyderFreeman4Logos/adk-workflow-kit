@@ -3251,6 +3251,7 @@ name = "workflow-adk"
 version = "0.2.2"
 dependencies = [
  "adk-rust",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3339,6 +3340,7 @@ name = "workflowctl"
 version = "0.2.2"
 dependencies = [
  "clap",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

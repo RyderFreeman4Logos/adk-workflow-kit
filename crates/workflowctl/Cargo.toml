@@ -17,3 +17,6 @@ workflow-runtime = { path = "../workflow-runtime" }
 workflow-review = { path = "../workflow-review" }
 workflow-spec = { path = "../workflow-spec" }
 workflow-testkit = { path = "../workflow-testkit" }
+
+[dev-dependencies]
+libc = "=0.2.189"
