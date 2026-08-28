@@ -1,5 +1,6 @@
 use std::{
     num::NonZeroU64,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -459,6 +460,228 @@ fn underreported_callback_cost_cannot_bypass_model_turn_budget() {
         reviewer_calls, 0,
         "budget must block the next reviewer dispatch"
     );
+}
+
+#[test]
+fn pass_at_exact_model_budget_reaches_final_validation() {
+    let mut validation_calls = 0;
+    let result = run_bounded_review_loop(
+        || Ok::<_, &'static str>(artifact("candidate")),
+        |_| {
+            validation_calls += 1;
+            Ok(valid())
+        },
+        |_| {
+            Ok(ReviewerResponse::new(
+                pass().review().clone(),
+                ReviewCost::new(1, 0),
+            ))
+        },
+        |_| panic!("an exact-budget pass must not dispatch the reviser"),
+        config().with_max_model_turns(1),
+    )
+    .expect("an exact model-budget pass must publish");
+
+    assert!(matches!(result, ReviewLoopOutcome::Published { .. }));
+    assert_eq!(validation_calls, 2, "initial and final validation must run");
+    assert_eq!(result.metrics().cost().model_turns(), 1);
+}
+
+#[test]
+fn pass_at_exact_tool_budget_reaches_final_validation() {
+    let handler_calls = Arc::new(AtomicUsize::new(0));
+    let provenance = ToolProvenance::new("review.inspect", "1");
+    let registration = ToolRegistration::for_types::<serde_json::Value, serde_json::Value>(
+        "inspect",
+        provenance.clone(),
+        ToolFlags::new(true, true, true),
+    )
+    .expect("fixture registration");
+    let mut bridge = ToolBridge::new(reviewer_sandbox());
+    let calls = Arc::clone(&handler_calls);
+    bridge
+        .register(
+            registration,
+            move |_: &ChildSandbox<'_>,
+                  _: &ToolCallContext,
+                  _: &serde_json::Value|
+                  -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolEnvelope::success(
+                    json!({"ok": true}),
+                    provenance.clone(),
+                ))
+            },
+        )
+        .expect("fixture tool registration");
+    let boundary =
+        ReviewerExecutionBoundary::new(bridge, CapabilityIntersection::all_for_tool("inspect", []));
+    let mut validation_calls = 0;
+    let result = run_bounded_review_loop(
+        || Ok::<_, ToolBridgeError>(artifact("candidate")),
+        |_| {
+            validation_calls += 1;
+            Ok(valid())
+        },
+        |request| {
+            request
+                .authority()
+                .invoke_tool("exact-budget", "inspect", json!({}))
+                .expect("the exact tool budget must still permit the call");
+            Ok(ReviewerResponse::new(
+                pass().review().clone(),
+                ReviewCost::new(1, 0),
+            ))
+        },
+        |_| panic!("an exact-budget pass must not dispatch the reviser"),
+        config()
+            .with_max_tool_calls(1)
+            .with_read_only_tools(vec!["inspect".to_owned()])
+            .with_execution_boundary(boundary),
+    )
+    .expect("an exact tool-budget pass must publish");
+
+    assert!(matches!(result, ReviewLoopOutcome::Published { .. }));
+    assert_eq!(validation_calls, 2, "initial and final validation must run");
+    assert_eq!(result.metrics().cost().tool_calls(), 1);
+    assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn leaked_reviewer_authority_is_closed_when_reviewer_panics() {
+    let handler_calls = Arc::new(AtomicUsize::new(0));
+    let provenance = ToolProvenance::new("review.inspect", "1");
+    let registration = ToolRegistration::for_types::<serde_json::Value, serde_json::Value>(
+        "inspect",
+        provenance.clone(),
+        ToolFlags::new(true, true, true),
+    )
+    .expect("fixture registration");
+    let mut bridge = ToolBridge::new(reviewer_sandbox());
+    let calls = Arc::clone(&handler_calls);
+    bridge
+        .register(
+            registration,
+            move |_: &ChildSandbox<'_>,
+                  _: &ToolCallContext,
+                  _: &serde_json::Value|
+                  -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolEnvelope::success(
+                    json!({"ok": true}),
+                    provenance.clone(),
+                ))
+            },
+        )
+        .expect("fixture tool registration");
+    let boundary =
+        ReviewerExecutionBoundary::new(bridge, CapabilityIntersection::all_for_tool("inspect", []));
+    let leaked = Arc::new(Mutex::new(None));
+    let leaked_for_reviewer = Arc::clone(&leaked);
+
+    let panic_result = catch_unwind(AssertUnwindSafe(|| {
+        let _ = run_bounded_review_loop(
+            || Ok::<_, ToolBridgeError>(artifact("candidate")),
+            |_| Ok(valid()),
+            move |request| {
+                *leaked_for_reviewer.lock().expect("authority slot lock") =
+                    Some(request.authority().clone());
+                panic!("reviewer panic");
+            },
+            |_| panic!("the reviser must not run after reviewer panic"),
+            config()
+                .with_max_tool_calls(1)
+                .with_read_only_tools(vec!["inspect".to_owned()])
+                .with_execution_boundary(boundary),
+        );
+    }));
+    assert!(panic_result.is_err(), "reviewer panic must unwind");
+
+    let leaked = leaked
+        .lock()
+        .expect("authority slot lock")
+        .take()
+        .expect("reviewer must leak a clone for the regression test");
+    let error = leaked
+        .invoke_tool("after-panic", "inspect", json!({}))
+        .expect_err("authority must reject calls after reviewer panic");
+    assert_eq!(
+        error.kind(),
+        workflow_runtime::ToolBridgeErrorKind::CapabilityDenied
+    );
+    assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn reviewer_callback_error_exposes_settled_metrics() {
+    let handler_calls = Arc::new(AtomicUsize::new(0));
+    let provenance = ToolProvenance::new("review.inspect", "1");
+    let registration = ToolRegistration::for_types::<serde_json::Value, serde_json::Value>(
+        "inspect",
+        provenance.clone(),
+        ToolFlags::new(true, true, true),
+    )
+    .expect("fixture registration");
+    let mut bridge = ToolBridge::new(reviewer_sandbox());
+    let calls = Arc::clone(&handler_calls);
+    bridge
+        .register(
+            registration,
+            move |_: &ChildSandbox<'_>,
+                  _: &ToolCallContext,
+                  _: &serde_json::Value|
+                  -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolEnvelope::success(
+                    json!({"ok": true}),
+                    provenance.clone(),
+                ))
+            },
+        )
+        .expect("fixture tool registration");
+    let boundary =
+        ReviewerExecutionBoundary::new(bridge, CapabilityIntersection::all_for_tool("inspect", []));
+
+    let error = run_bounded_review_loop(
+        || Ok::<_, ToolBridgeError>(artifact("candidate")),
+        |_| Ok(valid()),
+        |request| {
+            request
+                .authority()
+                .invoke_tool("before-error", "inspect", json!({}))
+                .expect("the tool call must settle before the callback error");
+            Err(ToolBridgeError::new(
+                workflow_runtime::ToolBridgeErrorKind::HandlerFailed,
+            ))
+        },
+        |_| panic!("reviewer errors must not reach the reviser"),
+        config()
+            .with_max_tool_calls(2)
+            .with_read_only_tools(vec!["inspect".to_owned()])
+            .with_execution_boundary(boundary),
+    )
+    .expect_err("reviewer callback error must be returned");
+    let metrics = error.metrics().expect("reviewer errors must carry metrics");
+    assert_eq!(metrics.reviewer_attempts(), 1);
+    assert_eq!(metrics.cost().model_turns(), 1);
+    assert_eq!(metrics.cost().tool_calls(), 1);
+    assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn reviser_callback_error_exposes_settled_metrics() {
+    let error = run_bounded_review_loop(
+        || Ok::<_, &'static str>(artifact("candidate")),
+        |_| Ok(invalid("missing_evidence")),
+        |_| panic!("invalid candidates must not reach the reviewer"),
+        |_| Err::<RevisionResponse, _>("reviser failed"),
+        config(),
+    )
+    .expect_err("reviser callback error must be returned");
+    let metrics = error.metrics().expect("reviser errors must carry metrics");
+    assert_eq!(metrics.revisions(), 1);
+    assert_eq!(metrics.cost().model_turns(), 1);
+    assert_eq!(metrics.cost().tool_calls(), 0);
 }
 
 #[test]

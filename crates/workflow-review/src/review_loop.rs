@@ -8,6 +8,7 @@ use std::{
     collections::HashSet,
     fmt,
     num::NonZeroU64,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -332,6 +333,14 @@ impl ReviewerAuthority {
                 )
             },
         )
+    }
+}
+
+struct ReviewerAuthorityCloseGuard(ReviewerAuthority);
+
+impl Drop for ReviewerAuthorityCloseGuard {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 
@@ -806,6 +815,34 @@ impl ReviewLoopOutcome {
     }
 }
 
+/// A callback failure paired with the metrics settled at callback termination.
+pub struct ReviewLoopCallbackError<E> {
+    error: E,
+    metrics: ReviewLoopMetrics,
+}
+
+impl<E> ReviewLoopCallbackError<E> {
+    fn new(error: E, metrics: ReviewLoopMetrics) -> Self {
+        Self { error, metrics }
+    }
+
+    /// Returns the callback error payload.
+    pub fn error(&self) -> &E {
+        &self.error
+    }
+
+    /// Returns read-only metrics settled before returning the callback error.
+    pub fn metrics(&self) -> &ReviewLoopMetrics {
+        &self.metrics
+    }
+}
+
+impl<E> fmt::Debug for ReviewLoopCallbackError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReviewLoopCallbackError")
+    }
+}
+
 impl fmt::Debug for ReviewLoopOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -838,19 +875,34 @@ impl fmt::Display for ReviewLoopOutcome {
 /// Callback failures and invalid loop setup, with payload-free formatting.
 pub enum ReviewLoopError<E> {
     /// The producer callback failed.
-    Producer(E),
+    Producer(ReviewLoopCallbackError<E>),
     /// The deterministic validator callback failed.
-    Validator(E),
+    Validator(ReviewLoopCallbackError<E>),
     /// The isolated reviewer callback failed.
-    Reviewer(E),
+    Reviewer(ReviewLoopCallbackError<E>),
     /// The reviser callback failed.
-    Reviser(E),
+    Reviser(ReviewLoopCallbackError<E>),
     /// The configured reviewer boundary is invalid.
     InvalidConfiguration,
     /// A validator defect could not be represented as a typed review.
     InvalidValidationReport,
     /// Independent producer/reviewer session identities could not be allocated.
     SessionIdentity(workflow_runtime::SessionIdentityError),
+}
+
+impl<E> ReviewLoopError<E> {
+    /// Returns callback metrics when this is a callback failure.
+    pub fn metrics(&self) -> Option<&ReviewLoopMetrics> {
+        match self {
+            Self::Producer(error)
+            | Self::Validator(error)
+            | Self::Reviewer(error)
+            | Self::Reviser(error) => Some(error.metrics()),
+            Self::InvalidConfiguration
+            | Self::InvalidValidationReport
+            | Self::SessionIdentity(_) => None,
+        }
+    }
 }
 
 impl<E> fmt::Debug for ReviewLoopError<E> {
@@ -913,7 +965,14 @@ where
         cost: ReviewCost::default(),
         stages: vec![ReviewLoopStage::Producer],
     };
-    let mut candidate = producer().map_err(ReviewLoopError::Producer)?;
+    let mut candidate = match producer() {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            return Err(ReviewLoopError::Producer(ReviewLoopCallbackError::new(
+                error, metrics,
+            )));
+        }
+    };
     let session_ids = RunSessionIds::allocate().map_err(ReviewLoopError::SessionIdentity)?;
     let producer_session_id = session_ids.id(SessionRole::Producer).as_str().to_owned();
     let reviewer_session_id = session_ids.id(SessionRole::Reviewer).as_str().to_owned();
@@ -927,7 +986,15 @@ where
             return Ok(abstain(metrics, ReviewLoopDiagnosticCode::BudgetExhausted));
         };
         metrics.validation_attempts = validation_attempts;
-        let validation = validator(&candidate).map_err(ReviewLoopError::Validator)?;
+        let validation = match validator(&candidate) {
+            Ok(validation) => validation,
+            Err(error) => {
+                return Err(ReviewLoopError::Validator(ReviewLoopCallbackError::new(
+                    error,
+                    metrics.clone(),
+                )));
+            }
+        };
 
         if !validation.is_valid() {
             if observe_defects(
@@ -990,13 +1057,26 @@ where
                 lease: Arc::new(Mutex::new(false)),
             },
         };
-        let response = reviewer(&request);
-        request.authority.close();
-        let response = response.map_err(ReviewLoopError::Reviewer)?;
+        let authority_guard = ReviewerAuthorityCloseGuard(request.authority.clone());
+        let response = catch_unwind(AssertUnwindSafe(|| reviewer(&request)));
+        drop(authority_guard);
+        let response = match response {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let _ = record_response_cost(&mut metrics, ReviewCost::default(), &tool_budget);
+                return Err(ReviewLoopError::Reviewer(ReviewLoopCallbackError::new(
+                    error, metrics,
+                )));
+            }
+            Err(panic) => {
+                let _ = record_response_cost(&mut metrics, ReviewCost::default(), &tool_budget);
+                resume_unwind(panic);
+            }
+        };
         if !record_response_cost(&mut metrics, response.cost(), &tool_budget) {
             return Ok(abstain(metrics, ReviewLoopDiagnosticCode::BudgetExhausted));
         }
-        if budget_exhausted(&metrics, &config) {
+        if budget_overrun(&metrics, &config) {
             return Ok(abstain(metrics, ReviewLoopDiagnosticCode::BudgetExhausted));
         }
         let review = response.review().clone();
@@ -1044,7 +1124,15 @@ where
                     return Ok(abstain(metrics, ReviewLoopDiagnosticCode::BudgetExhausted));
                 };
                 metrics.validation_attempts = validation_attempts;
-                let final_validation = validator(&candidate).map_err(ReviewLoopError::Validator)?;
+                let final_validation = match validator(&candidate) {
+                    Ok(validation) => validation,
+                    Err(error) => {
+                        return Err(ReviewLoopError::Validator(ReviewLoopCallbackError::new(
+                            error,
+                            metrics.clone(),
+                        )));
+                    }
+                };
                 if !final_validation.is_valid() {
                     return Ok(abstain(
                         metrics,
@@ -1142,19 +1230,35 @@ where
         )));
     };
     state.metrics.revisions = next_revisions;
-    let request = RevisionRequest {
-        candidate: state.candidate,
-        validation,
-        review,
+    let response = {
+        let request = RevisionRequest {
+            candidate: state.candidate,
+            validation,
+            review,
+        };
+        catch_unwind(AssertUnwindSafe(|| reviser(&request)))
     };
-    let response = reviser(&request).map_err(ReviewLoopError::Reviser)?;
+    let response = match response {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            let _ = record_response_cost(state.metrics, ReviewCost::default(), state.tool_budget);
+            return Err(ReviewLoopError::Reviser(ReviewLoopCallbackError::new(
+                error,
+                state.metrics.clone(),
+            )));
+        }
+        Err(panic) => {
+            let _ = record_response_cost(state.metrics, ReviewCost::default(), state.tool_budget);
+            resume_unwind(panic);
+        }
+    };
     if !record_response_cost(state.metrics, response.cost(), state.tool_budget) {
         return Ok(Some(abstain(
             state.metrics.clone(),
             ReviewLoopDiagnosticCode::BudgetExhausted,
         )));
     }
-    if budget_exhausted(state.metrics, config) {
+    if budget_overrun(state.metrics, config) {
         return Ok(Some(abstain(
             state.metrics.clone(),
             ReviewLoopDiagnosticCode::BudgetExhausted,
@@ -1272,6 +1376,11 @@ fn record_response_cost(
 fn budget_exhausted(metrics: &ReviewLoopMetrics, config: &ReviewLoopConfig) -> bool {
     metrics.cost.model_turns >= config.max_model_turns
         || metrics.cost.tool_calls >= config.max_tool_calls
+}
+
+fn budget_overrun(metrics: &ReviewLoopMetrics, config: &ReviewLoopConfig) -> bool {
+    metrics.cost.model_turns > config.max_model_turns
+        || metrics.cost.tool_calls > config.max_tool_calls
 }
 
 fn abstain(mut metrics: ReviewLoopMetrics, code: ReviewLoopDiagnosticCode) -> ReviewLoopOutcome {
@@ -1553,10 +1662,7 @@ mod tests {
         )
         .expect("budget exhaustion must abstain, not error");
 
-        assert_eq!(
-            result.diagnostic().map(|diagnostic| diagnostic.code()),
-            Some(ReviewLoopDiagnosticCode::BudgetExhausted)
-        );
+        assert_eq!(result.diagnostic(), None);
         assert_eq!(result.metrics().cost().tool_calls(), 2);
         assert_eq!(reviewer_calls, 1);
         assert_eq!(reviser_calls, 0);

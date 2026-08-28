@@ -32,11 +32,11 @@ pub use package::{
 };
 
 pub use review_loop::{
-    CandidateArtifact, CandidateDigestError, ReviewCost, ReviewLoopConfig, ReviewLoopDiagnostic,
-    ReviewLoopDiagnosticCode, ReviewLoopError, ReviewLoopMetrics, ReviewLoopOutcome,
-    ReviewLoopStage, ReviewerAuthority, ReviewerExecutionBoundary, ReviewerRequest,
-    ReviewerResponse, RevisionRequest, RevisionResponse, SelectedEvidence, ValidationReport,
-    run_bounded_review_loop,
+    CandidateArtifact, CandidateDigestError, ReviewCost, ReviewLoopCallbackError, ReviewLoopConfig,
+    ReviewLoopDiagnostic, ReviewLoopDiagnosticCode, ReviewLoopError, ReviewLoopMetrics,
+    ReviewLoopOutcome, ReviewLoopStage, ReviewerAuthority, ReviewerExecutionBoundary,
+    ReviewerRequest, ReviewerResponse, RevisionRequest, RevisionResponse, SelectedEvidence,
+    ValidationReport, run_bounded_review_loop,
 };
 
 /// The only supported review schema version.
