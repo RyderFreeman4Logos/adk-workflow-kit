@@ -1,8 +1,8 @@
 use std::{
     num::NonZeroU64,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -218,6 +218,78 @@ fn reviewer_is_narrowed_to_an_isolated_read_only_request() {
     .expect("narrow reviewer request must complete");
     assert!(saw_request);
     assert!(matches!(result, ReviewLoopOutcome::Published { .. }));
+}
+
+#[test]
+fn leaked_reviewer_authority_is_closed_after_review_settles() {
+    let handler_calls = Arc::new(AtomicUsize::new(0));
+    let provenance = ToolProvenance::new("review.inspect", "1");
+    let registration = ToolRegistration::for_types::<serde_json::Value, serde_json::Value>(
+        "inspect",
+        provenance.clone(),
+        ToolFlags::new(true, true, true),
+    )
+    .expect("fixture registration");
+    let mut bridge = ToolBridge::new(reviewer_sandbox());
+    let calls = Arc::clone(&handler_calls);
+    bridge
+        .register(
+            registration,
+            move |_: &ChildSandbox<'_>,
+                  _: &ToolCallContext,
+                  _: &serde_json::Value|
+                  -> Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolEnvelope::success(
+                    json!({"ok": true}),
+                    provenance.clone(),
+                ))
+            },
+        )
+        .expect("fixture tool registration");
+    let boundary =
+        ReviewerExecutionBoundary::new(bridge, CapabilityIntersection::all_for_tool("inspect", []));
+    let leaked = Arc::new(Mutex::new(None));
+    let leaked_for_reviewer = Arc::clone(&leaked);
+
+    let result = run_bounded_review_loop(
+        || Ok::<_, ToolBridgeError>(artifact("candidate")),
+        |_| Ok(valid()),
+        move |request| {
+            *leaked_for_reviewer.lock().expect("authority slot lock") =
+                Some(request.authority().clone());
+            request
+                .authority()
+                .invoke_tool("in-review", "inspect", json!({}))
+                .expect("in-review tool call must execute");
+            Ok(ReviewerResponse::new(
+                pass().review().clone(),
+                ReviewCost::new(1, 0),
+            ))
+        },
+        |_| panic!("a passing review does not need a reviser"),
+        config()
+            .with_max_tool_calls(2)
+            .with_read_only_tools(vec!["inspect".to_owned()])
+            .with_execution_boundary(boundary),
+    )
+    .expect("review must publish");
+
+    assert_eq!(result.metrics().cost().tool_calls(), 1);
+    let leaked = leaked
+        .lock()
+        .expect("authority slot lock")
+        .take()
+        .expect("reviewer must leak a clone for the regression test");
+    let error = leaked
+        .invoke_tool("after-review", "inspect", json!({}))
+        .expect_err("closed authority must reject post-review calls");
+    assert_eq!(
+        error.kind(),
+        workflow_runtime::ToolBridgeErrorKind::CapabilityDenied
+    );
+    assert_eq!(result.metrics().cost().tool_calls(), 1);
+    assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

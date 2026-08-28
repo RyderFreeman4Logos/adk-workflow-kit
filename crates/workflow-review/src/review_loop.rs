@@ -252,6 +252,7 @@ pub struct ReviewerAuthority {
     boundary: Option<ReviewerExecutionBoundary>,
     reviewer_session_id: String,
     tool_budget: Option<ReviewerToolBudget>,
+    lease: Arc<Mutex<bool>>,
 }
 
 impl PartialEq for ReviewerAuthority {
@@ -265,6 +266,12 @@ impl PartialEq for ReviewerAuthority {
 impl Eq for ReviewerAuthority {}
 
 impl ReviewerAuthority {
+    fn close(&self) {
+        if let Ok(mut closed) = self.lease.lock() {
+            *closed = true;
+        }
+    }
+
     /// Reports that this authority can only inspect selected read-only tools.
     pub fn is_read_only(&self) -> bool {
         true
@@ -297,6 +304,12 @@ impl ReviewerAuthority {
         tool_name: impl Into<String>,
         arguments: Value,
     ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        let Ok(closed) = self.lease.lock() else {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
+        };
+        if *closed {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
+        }
         let tool_name = tool_name.into();
         if !self.read_only_tools.iter().any(|name| name == &tool_name) {
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
@@ -929,16 +942,15 @@ where
                 ));
             }
             let review = validation_review(&validation)?;
-            if let Some(outcome) = revise_candidate(
-                &mut reviser,
-                &config,
-                &mut metrics,
-                &tool_budget,
-                &mut candidate,
-                &validation,
-                &review,
-                &mut hashes,
-            )? {
+            let mut state = RevisionRunState {
+                candidate: &mut candidate,
+                metrics: &mut metrics,
+                tool_budget: &tool_budget,
+                hashes: &mut hashes,
+            };
+            if let Some(outcome) =
+                revise_candidate(&mut reviser, &config, &mut state, &validation, &review)?
+            {
                 return Ok(outcome);
             }
             continue;
@@ -975,9 +987,12 @@ where
                     .execution_boundary
                     .as_ref()
                     .map(|_| tool_budget.clone()),
+                lease: Arc::new(Mutex::new(false)),
             },
         };
-        let response = reviewer(&request).map_err(ReviewLoopError::Reviewer)?;
+        let response = reviewer(&request);
+        request.authority.close();
+        let response = response.map_err(ReviewLoopError::Reviewer)?;
         if !record_response_cost(&mut metrics, response.cost(), &tool_budget) {
             return Ok(abstain(metrics, ReviewLoopDiagnosticCode::BudgetExhausted));
         }
@@ -1011,16 +1026,15 @@ where
                 ));
             }
             ReviewVerdict::Revise => {
-                if let Some(outcome) = revise_candidate(
-                    &mut reviser,
-                    &config,
-                    &mut metrics,
-                    &tool_budget,
-                    &mut candidate,
-                    &validation,
-                    &review,
-                    &mut hashes,
-                )? {
+                let mut state = RevisionRunState {
+                    candidate: &mut candidate,
+                    metrics: &mut metrics,
+                    tool_budget: &tool_budget,
+                    hashes: &mut hashes,
+                };
+                if let Some(outcome) =
+                    revise_candidate(&mut reviser, &config, &mut state, &validation, &review)?
+                {
                     return Ok(outcome);
                 }
             }
@@ -1090,75 +1104,82 @@ fn validation_review<E>(validation: &ValidationReport) -> Result<ReviewResult, R
     .map_err(|_| ReviewLoopError::InvalidValidationReport)
 }
 
-#[allow(clippy::too_many_arguments)]
+struct RevisionRunState<'a> {
+    candidate: &'a mut CandidateArtifact,
+    metrics: &'a mut ReviewLoopMetrics,
+    tool_budget: &'a ReviewerToolBudget,
+    hashes: &'a mut Vec<String>,
+}
+
 fn revise_candidate<X, E>(
     reviser: &mut X,
     config: &ReviewLoopConfig,
-    metrics: &mut ReviewLoopMetrics,
-    tool_budget: &ReviewerToolBudget,
-    candidate: &mut CandidateArtifact,
+    state: &mut RevisionRunState<'_>,
     validation: &ValidationReport,
     review: &ReviewResult,
-    hashes: &mut Vec<String>,
 ) -> Result<Option<ReviewLoopOutcome>, ReviewLoopError<E>>
 where
     X: for<'a> FnMut(&'a RevisionRequest<'a>) -> Result<RevisionResponse, E>,
 {
-    if metrics.revisions >= config.max_revisions {
+    if state.metrics.revisions >= config.max_revisions {
         return Ok(Some(abstain(
-            metrics.clone(),
+            state.metrics.clone(),
             ReviewLoopDiagnosticCode::MaxRevisionsExceeded,
         )));
     }
-    if budget_exhausted(metrics, config) {
+    if budget_exhausted(state.metrics, config) {
         return Ok(Some(abstain(
-            metrics.clone(),
+            state.metrics.clone(),
             ReviewLoopDiagnosticCode::BudgetExhausted,
         )));
     }
 
-    metrics.stages.push(ReviewLoopStage::Reviser);
-    let Some(next_revisions) = metrics.revisions.checked_add(1) else {
+    state.metrics.stages.push(ReviewLoopStage::Reviser);
+    let Some(next_revisions) = state.metrics.revisions.checked_add(1) else {
         return Ok(Some(abstain(
-            metrics.clone(),
+            state.metrics.clone(),
             ReviewLoopDiagnosticCode::MaxRevisionsExceeded,
         )));
     };
-    metrics.revisions = next_revisions;
+    state.metrics.revisions = next_revisions;
     let request = RevisionRequest {
-        candidate,
+        candidate: state.candidate,
         validation,
         review,
     };
     let response = reviser(&request).map_err(ReviewLoopError::Reviser)?;
-    if !record_response_cost(metrics, response.cost(), tool_budget) {
+    if !record_response_cost(state.metrics, response.cost(), state.tool_budget) {
         return Ok(Some(abstain(
-            metrics.clone(),
+            state.metrics.clone(),
             ReviewLoopDiagnosticCode::BudgetExhausted,
         )));
     }
-    if budget_exhausted(metrics, config) {
+    if budget_exhausted(state.metrics, config) {
         return Ok(Some(abstain(
-            metrics.clone(),
+            state.metrics.clone(),
             ReviewLoopDiagnosticCode::BudgetExhausted,
         )));
     }
 
     let next = response.candidate().clone();
-    if config.stop_on_two_cycle && hashes.len() >= 2 && hashes[hashes.len() - 2] == next.sha256() {
+    if config.stop_on_two_cycle
+        && state.hashes.len() >= 2
+        && state.hashes[state.hashes.len() - 2] == next.sha256()
+    {
         return Ok(Some(abstain(
-            metrics.clone(),
+            state.metrics.clone(),
             ReviewLoopDiagnosticCode::OscillationDetected,
         )));
     }
-    if config.stop_on_repeated_output_hash && hashes.iter().any(|hash| hash == next.sha256()) {
+    if config.stop_on_repeated_output_hash && state.hashes.iter().any(|hash| hash == next.sha256())
+    {
         return Ok(Some(abstain(
-            metrics.clone(),
+            state.metrics.clone(),
             ReviewLoopDiagnosticCode::RepeatedOutputHash,
         )));
     }
-    hashes.push(next.sha256().to_owned());
-    *candidate = next;
+    state.hashes.push(next.sha256().to_owned());
+    *state.candidate = next;
     Ok(None)
 }
 
@@ -1380,6 +1401,13 @@ mod tests {
         let mut called = false;
         let mut hashes = vec![candidate.sha256().to_owned()];
 
+        let tool_budget = ReviewerToolBudget::new(u64::MAX);
+        let mut state = RevisionRunState {
+            candidate: &mut candidate,
+            metrics: &mut metrics,
+            tool_budget: &tool_budget,
+            hashes: &mut hashes,
+        };
         let result = revise_candidate(
             &mut |_| {
                 called = true;
@@ -1389,12 +1417,9 @@ mod tests {
                 ))
             },
             &ReviewLoopConfig::default().with_max_revisions(usize::MAX),
-            &mut metrics,
-            &ReviewerToolBudget::new(u64::MAX),
-            &mut candidate,
+            &mut state,
             &validation,
             &review,
-            &mut hashes,
         )
         .expect("counter overflow must abstain, not error");
 
