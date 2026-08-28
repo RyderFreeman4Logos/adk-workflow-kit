@@ -4,6 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use workflow_adk::execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1};
 use workflow_runtime::{CheckpointManifestV1, RunId, SqliteCheckpointStore};
@@ -96,6 +97,43 @@ fn resume_consumes_checkpoint_state_and_invokes_the_adk_graph() {
     assert!(after.len() > before.len());
     assert!(after.matches("\"kind\":\"node_started\"").count() > before_started);
     assert!(after.matches("\"kind\":\"workflow_completed\"").count() > before_completed);
+}
+
+#[test]
+fn resume_rejects_redacted_checkpoint_value_before_graph_invocation() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .unwrap();
+    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
+    let receipt =
+        ExecutionBackend::run(workflow, profile, json!({"request":"public"}), &root.0).unwrap();
+    let events_path = receipt.run_root().join("events.jsonl");
+    let before = fs::read(&events_path).unwrap();
+
+    let connection = Connection::open(receipt.run_root().join("checkpoint.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE kit_checkpoints SET state = ?1 WHERE run_id = ?2",
+            rusqlite::params![br#"{"step":"<redacted>"}"#, receipt.run_id()],
+        )
+        .unwrap();
+
+    let error = ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(fs::read(events_path).unwrap(), before);
 }
 
 #[test]

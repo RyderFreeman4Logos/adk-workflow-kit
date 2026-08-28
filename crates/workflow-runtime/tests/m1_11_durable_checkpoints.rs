@@ -150,7 +150,7 @@ fn durable_checkpoint_rejects_redacted_placeholder_state() {
         run_id,
         "node",
         1,
-        br#"{"api_token":"<redacted>","step":2}"#,
+        br#"{"state":{"steps":[{"value":"<redacted>"}],"<redacted>":"safe"}}"#,
         std::iter::empty::<String>(),
     )
     .expect_err("redacted state must not become executable checkpoint state");

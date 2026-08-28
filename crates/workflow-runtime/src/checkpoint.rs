@@ -9,7 +9,7 @@ use std::{
 use rusqlite::{Connection, Error as SqliteError, OptionalExtension, params};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
-use crate::{RunId, event::contains_sensitive_key};
+use crate::{REDACTION_MARKER, RunId, event::contains_sensitive_key};
 
 /// One durable execution checkpoint owned by an existing run identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -226,6 +226,17 @@ pub struct DurableCheckpointV1 {
     artifact_refs: Vec<String>,
 }
 
+fn contains_redaction_marker(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object
+            .iter()
+            .any(|(key, value)| key == REDACTION_MARKER || contains_redaction_marker(value)),
+        serde_json::Value::Array(values) => values.iter().any(contains_redaction_marker),
+        serde_json::Value::String(string) => string == REDACTION_MARKER,
+        _ => false,
+    }
+}
+
 impl DurableCheckpointV1 {
     /// Creates a bounded checkpoint carrying the latest event and artifact references.
     pub fn new<S, I, A>(
@@ -242,7 +253,7 @@ impl DurableCheckpointV1 {
     {
         let state = state.as_ref();
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(state)
-            && contains_sensitive_key(&value)
+            && (contains_sensitive_key(&value) || contains_redaction_marker(&value))
         {
             return Err(CheckpointError::new(CheckpointErrorKind::Unavailable));
         }
