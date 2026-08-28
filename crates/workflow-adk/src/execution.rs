@@ -6,13 +6,14 @@ use std::{
     num::NonZeroU64,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use adk_rust::graph::prelude::{ExecutionConfig, State};
+use adk_rust::graph::{Checkpoint, Checkpointer, GraphError};
 use adk_rust::{
     Agent, AgentCapabilities, Content, Event, EventStream, FunctionResponseData, InvocationContext,
     LlmRequest, Part, async_trait, futures::StreamExt as _,
@@ -44,8 +45,173 @@ use crate::{
 
 const MAX_STATE_BYTES: usize = 1024 * 1024;
 const ARTIFACT_LIMIT: u64 = 64 * 1024;
+const GRAPH_CONTINUATION_KEY: &str = "kit_graph_continuation_v1";
 static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
 type BoundTool = (String, Arc<AdkToolBridge<InMemoryArtifactStore>>);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GraphContinuationV1 {
+    schema_version: u8,
+    pending_nodes: Vec<String>,
+    step: usize,
+    retry: BTreeMap<String, u32>,
+    route_frontier: BTreeMap<String, Value>,
+    visits: BTreeMap<String, u64>,
+}
+
+impl GraphContinuationV1 {
+    fn from_checkpoint(checkpoint: &Checkpoint) -> Self {
+        let route_frontier = checkpoint
+            .state
+            .iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix("route:")
+                    .map(|node| (node.to_owned(), value.clone()))
+            })
+            .collect();
+        let visits = checkpoint
+            .state
+            .iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix("visits:")
+                    .zip(value.as_u64())
+                    .map(|(node, visits)| (node.to_owned(), visits))
+            })
+            .collect();
+        Self {
+            schema_version: 1,
+            pending_nodes: checkpoint.pending_nodes.clone(),
+            step: checkpoint.step,
+            retry: checkpoint
+                .attempts
+                .iter()
+                .map(|(node, attempts)| (node.clone(), *attempts))
+                .collect(),
+            route_frontier,
+            visits,
+        }
+    }
+
+    fn restore(
+        self,
+        state: &mut State,
+        run_id: &str,
+        nodes: &BTreeSet<String>,
+    ) -> Option<Checkpoint> {
+        if self.schema_version != 1
+            || self
+                .pending_nodes
+                .iter()
+                .chain(self.retry.keys())
+                .chain(self.route_frontier.keys())
+                .chain(self.visits.keys())
+                .any(|node| !nodes.contains(node))
+        {
+            return None;
+        }
+        for (node, route) in &self.route_frontier {
+            state.insert(format!("route:{node}"), route.clone());
+        }
+        for (node, visits) in &self.visits {
+            state.insert(format!("visits:{node}"), json!(visits));
+        }
+        let mut checkpoint = Checkpoint::new(run_id, state.clone(), self.step, self.pending_nodes);
+        checkpoint.attempts = self.retry.into_iter().collect();
+        Some(checkpoint)
+    }
+}
+
+#[derive(Default)]
+struct GraphCheckpointMemory(Mutex<Option<Checkpoint>>);
+
+impl GraphCheckpointMemory {
+    fn latest(&self) -> Option<Checkpoint> {
+        self.0.lock().ok()?.clone()
+    }
+
+    fn restore(&self, checkpoint: Checkpoint) -> bool {
+        self.0
+            .lock()
+            .map(|mut saved| *saved = Some(checkpoint))
+            .is_ok()
+    }
+}
+
+#[async_trait]
+impl Checkpointer for GraphCheckpointMemory {
+    async fn save(&self, checkpoint: &Checkpoint) -> Result<String, GraphError> {
+        *self
+            .0
+            .lock()
+            .map_err(|_| GraphError::Other("graph checkpoint unavailable".to_owned()))? =
+            Some(checkpoint.clone());
+        Ok(checkpoint.checkpoint_id.clone())
+    }
+
+    async fn load(&self, thread_id: &str) -> Result<Option<Checkpoint>, GraphError> {
+        Ok(self
+            .latest()
+            .filter(|checkpoint| checkpoint.thread_id == thread_id))
+    }
+
+    async fn load_by_id(&self, checkpoint_id: &str) -> Result<Option<Checkpoint>, GraphError> {
+        Ok(self
+            .latest()
+            .filter(|checkpoint| checkpoint.checkpoint_id == checkpoint_id))
+    }
+
+    async fn list(&self, thread_id: &str) -> Result<Vec<Checkpoint>, GraphError> {
+        Ok(self.load(thread_id).await?.into_iter().collect())
+    }
+
+    async fn delete(&self, thread_id: &str) -> Result<(), GraphError> {
+        if self
+            .latest()
+            .is_some_and(|checkpoint| checkpoint.thread_id == thread_id)
+        {
+            *self
+                .0
+                .lock()
+                .map_err(|_| GraphError::Other("graph checkpoint unavailable".to_owned()))? = None;
+        }
+        Ok(())
+    }
+}
+
+fn checkpoint_state(
+    mut state: State,
+    checkpoint: &Checkpoint,
+    prior_retry: Option<&BTreeMap<String, u32>>,
+) -> Result<State, ExecutionError> {
+    let mut continuation = GraphContinuationV1::from_checkpoint(checkpoint);
+    if let Some(prior_retry) = prior_retry {
+        for (node, attempts) in prior_retry {
+            continuation.retry.entry(node.clone()).or_insert(*attempts);
+        }
+    }
+    state.insert(
+        GRAPH_CONTINUATION_KEY.to_owned(),
+        serde_json::to_value(continuation)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?,
+    );
+    Ok(state)
+}
+
+fn restore_checkpoint_state(
+    state: &mut State,
+    run_id: &str,
+    nodes: BTreeSet<String>,
+) -> Result<Checkpoint, ExecutionError> {
+    let continuation = state
+        .remove(GRAPH_CONTINUATION_KEY)
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+    let continuation = serde_json::from_value::<GraphContinuationV1>(continuation)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+    continuation
+        .restore(state, run_id, &nodes)
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))
+}
 
 /// A validated runtime profile supplied to the reusable ADK executor.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -563,8 +729,15 @@ impl ExecutionBackend {
                         (node.id().as_str().to_owned(), agent)
                     })
                     .collect::<BTreeMap<_, _>>();
+                let continuation = Arc::new(GraphCheckpointMemory::default());
                 let graph = AdkGraphTranslator::new()
-                    .translate_profile(&compiled, &agents, transform_module.as_deref(), &input)
+                    .translate_profile_with_checkpointer(
+                        &compiled,
+                        &agents,
+                        transform_module.as_deref(),
+                        &input,
+                        Some(continuation.clone()),
+                    )
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
                 let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -578,6 +751,13 @@ impl ExecutionBackend {
                         artifacts,
                     ))
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
+                let state = checkpoint_state(
+                    state,
+                    &continuation
+                        .latest()
+                        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Adk))?,
+                    None,
+                )?;
                 state
                     .contains_key("terminal")
                     .then_some(state)
@@ -899,23 +1079,64 @@ impl ExecutionBackend {
                 (node.id().as_str().to_owned(), agent)
             })
             .collect::<BTreeMap<_, _>>();
+        let mut state = serde_json::from_slice::<State>(checkpoint.state())
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let nodes = compiled
+            .ir()
+            .nodes()
+            .iter()
+            .map(|node| node.id().as_str().to_owned())
+            .collect();
+        let restored = restore_checkpoint_state(&mut state, run_id, nodes)?;
+        let retry = restored
+            .attempts
+            .iter()
+            .map(|(node, attempts)| (node.clone(), *attempts))
+            .collect::<BTreeMap<_, _>>();
+        let continuation = Arc::new(GraphCheckpointMemory::default());
+        if !continuation.restore(restored.clone()) {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
         let graph = AdkGraphTranslator::new()
-            .translate_profile(&compiled, &agents, transform_module.as_deref(), &input)
+            .translate_profile_with_checkpointer(
+                &compiled,
+                &agents,
+                transform_module.as_deref(),
+                &input,
+                Some(continuation.clone()),
+            )
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let state = serde_json::from_slice::<State>(checkpoint.state())
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let recursion_limit = compiled
+            .ir()
+            .nodes()
+            .iter()
+            .filter_map(workflow_ir::IrNode::max_visits)
+            .map(|visits| visits as usize)
+            .sum::<usize>()
+            .max(50);
         let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let state = runtime
-            .block_on(graph.invoke_observed(
-                state,
-                ExecutionConfig::new(run_id).with_recursion_limit(50),
-                &mut mapper,
-                &mut artifacts,
-            ))
+            .block_on(
+                graph.invoke_observed(
+                    state,
+                    ExecutionConfig::new(run_id)
+                        .with_recursion_limit(recursion_limit)
+                        .with_resume_from(&restored.checkpoint_id),
+                    &mut mapper,
+                    &mut artifacts,
+                ),
+            )
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let state = checkpoint_state(
+            state,
+            &continuation
+                .latest()
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?,
+            Some(&retry),
+        )?;
         let state_bytes = serde_json::to_vec(&state)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let node_id = mapper

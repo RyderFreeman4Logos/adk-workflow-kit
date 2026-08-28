@@ -95,8 +95,92 @@ fn resume_consumes_checkpoint_state_and_invokes_the_adk_graph() {
     assert_eq!(resumed.run_id(), receipt.run_id());
     let after = fs::read_to_string(receipt.run_root().join("events.jsonl")).unwrap();
     assert!(after.len() > before.len());
-    assert!(after.matches("\"kind\":\"node_started\"").count() > before_started);
+    assert_eq!(
+        after.matches("\"kind\":\"node_started\"").count(),
+        before_started
+    );
     assert!(after.matches("\"kind\":\"workflow_completed\"").count() > before_completed);
+}
+
+#[test]
+fn resume_restores_pending_retry_route_frontier_and_visits_without_reexecuting_completed_side_effect()
+ {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .unwrap();
+    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
+    let receipt =
+        ExecutionBackend::run(workflow, profile, json!({"request":"public"}), &root.0).unwrap();
+    let events_path = receipt.run_root().join("events.jsonl");
+    let before = fs::read_to_string(&events_path).unwrap();
+    let checkpoint_path = receipt.run_root().join("checkpoint.sqlite");
+    let manifest: CheckpointManifestV1 = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("checkpoint-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let run_id = RunId::new(receipt.run_id().to_owned()).unwrap();
+    let store = SqliteCheckpointStore::open(&checkpoint_path, manifest).unwrap();
+    let checkpoint = store.load_latest(&run_id).unwrap().unwrap();
+    let mut state: Value = serde_json::from_slice(checkpoint.state()).unwrap();
+    state.as_object_mut().unwrap().remove("terminal");
+    state["route:start"] = json!("done");
+    state["visits:start"] = json!(2);
+    state["kit_graph_continuation_v1"] = json!({
+        "schema_version": 1,
+        "pending_nodes": ["done"],
+        "step": 2,
+        "retry": {"done": 1},
+        "route_frontier": {"start": "done"},
+        "visits": {"start": 2}
+    });
+    Connection::open(&checkpoint_path)
+        .unwrap()
+        .execute(
+            "UPDATE kit_checkpoints SET state = ?1 WHERE run_id = ?2",
+            rusqlite::params![serde_json::to_vec(&state).unwrap(), receipt.run_id()],
+        )
+        .unwrap();
+
+    ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap();
+
+    let after = fs::read_to_string(events_path).unwrap();
+    assert_eq!(
+        after.matches("\"node_id\":\"start\"").count(),
+        before.matches("\"node_id\":\"start\"").count()
+    );
+    let manifest: CheckpointManifestV1 = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("checkpoint-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let store = SqliteCheckpointStore::open(checkpoint_path, manifest).unwrap();
+    let state: Value =
+        serde_json::from_slice(store.load_latest(&run_id).unwrap().unwrap().state()).unwrap();
+    assert_eq!(state["kit_graph_continuation_v1"]["step"], json!(3));
+    assert_eq!(
+        state["kit_graph_continuation_v1"]["retry"]["done"],
+        json!(1)
+    );
+    assert_eq!(
+        state["kit_graph_continuation_v1"]["route_frontier"]["start"],
+        json!("done")
+    );
+    assert_eq!(
+        state["kit_graph_continuation_v1"]["visits"]["start"],
+        json!(2)
+    );
 }
 
 #[test]
@@ -318,7 +402,7 @@ fn resume_rejects_changed_profile_content_with_stable_profile_identity() {
 }
 
 #[test]
-fn resume_persists_artifact_references_from_reexecution() {
+fn resume_preserves_artifact_references_from_prior_execution() {
     let root = TestRoot::new();
     let profile = ExecutionProfileV1::parse(
         serde_json::to_vec(&json!({
