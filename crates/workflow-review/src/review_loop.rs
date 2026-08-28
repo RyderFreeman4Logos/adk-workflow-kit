@@ -1090,7 +1090,20 @@ fn observe_defects(
     if current.is_empty() {
         return false;
     }
-    if previous.as_ref() == Some(&current) {
+    let same_codes = previous.as_ref().is_some_and(|previous| {
+        previous.len() == current.len()
+            && previous
+                .iter()
+                .zip(&current)
+                .all(|((previous_code, _), (current_code, _))| previous_code == current_code)
+    });
+    let severity_dropped = previous.as_ref().is_some_and(|previous| {
+        previous
+            .iter()
+            .zip(&current)
+            .any(|((_, previous_rank), (_, current_rank))| current_rank < previous_rank)
+    });
+    if same_codes && !severity_dropped {
         *repeated_rounds = repeated_rounds.saturating_add(1);
     } else {
         *repeated_rounds = 0;
@@ -1140,6 +1153,92 @@ fn digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn severity_upgrade_preserves_repeated_defect_streak() {
+        let mut validation_calls = 0;
+        let result = run_bounded_review_loop(
+            || Ok::<_, ()>(CandidateArtifact::new(b"seed".to_vec())),
+            |_| {
+                validation_calls += 1;
+                let severity = match validation_calls {
+                    1 => crate::ReviewSeverity::Warning,
+                    2 => crate::ReviewSeverity::Error,
+                    _ => crate::ReviewSeverity::Error,
+                };
+                Ok(ValidationReport::invalid(vec![ReviewDefect::new(
+                    "R4-CLASS".to_owned(),
+                    severity,
+                    None,
+                    Vec::new(),
+                    "repair".to_owned(),
+                    None,
+                )]))
+            },
+            |_| panic!("reviewer must not run for invalid validation"),
+            |request| {
+                Ok(RevisionResponse::new(
+                    CandidateArtifact::new(
+                        format!("revision-{}", request.candidate().sha256()).into_bytes(),
+                    ),
+                    ReviewCost::default(),
+                ))
+            },
+            ReviewLoopConfig::default().with_max_same_defect_rounds(0),
+        )
+        .expect("severity upgrade should produce a typed abstain");
+
+        assert_eq!(
+            result.diagnostic().map(|diagnostic| diagnostic.code()),
+            Some(ReviewLoopDiagnosticCode::RepeatedDefectSet)
+        );
+        assert_eq!(validation_calls, 2);
+        assert_eq!(result.metrics().revisions(), 1);
+    }
+
+    #[test]
+    fn severity_drop_does_not_trigger_repeated_defect_streak() {
+        let mut validation_calls = 0;
+        let result = run_bounded_review_loop(
+            || Ok::<_, ()>(CandidateArtifact::new(b"seed".to_vec())),
+            |_| {
+                validation_calls += 1;
+                let severity = if validation_calls == 1 {
+                    crate::ReviewSeverity::Error
+                } else {
+                    crate::ReviewSeverity::Warning
+                };
+                Ok(ValidationReport::invalid(vec![ReviewDefect::new(
+                    "R4-CLASS".to_owned(),
+                    severity,
+                    None,
+                    Vec::new(),
+                    "repair".to_owned(),
+                    None,
+                )]))
+            },
+            |_| panic!("reviewer must not run for invalid validation"),
+            |request| {
+                Ok(RevisionResponse::new(
+                    CandidateArtifact::new(
+                        format!("revision-{}", request.candidate().sha256()).into_bytes(),
+                    ),
+                    ReviewCost::default(),
+                ))
+            },
+            ReviewLoopConfig::default()
+                .with_max_revisions(1)
+                .with_max_same_defect_rounds(0),
+        )
+        .expect("severity drop should continue the loop");
+
+        assert_eq!(
+            result.diagnostic().map(|diagnostic| diagnostic.code()),
+            Some(ReviewLoopDiagnosticCode::MaxRevisionsExceeded)
+        );
+        assert_eq!(validation_calls, 2);
+        assert_eq!(result.metrics().revisions(), 1);
+    }
 
     #[test]
     fn unrepresentable_max_revisions_fails_closed() {
