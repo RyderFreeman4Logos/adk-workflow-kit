@@ -512,7 +512,7 @@ pub struct ReviewLoopMetrics {
     producer_attempts: u32,
     validation_attempts: u32,
     reviewer_attempts: u32,
-    revisions: u32,
+    revisions: usize,
     cost: ReviewCost,
     stages: Vec<ReviewLoopStage>,
 }
@@ -534,7 +534,7 @@ impl ReviewLoopMetrics {
     }
 
     /// Returns reviser callback attempts.
-    pub const fn revisions(&self) -> u32 {
+    pub const fn revisions(&self) -> usize {
         self.revisions
     }
 
@@ -866,7 +866,7 @@ fn revise_candidate<X, E>(
 where
     X: for<'a> FnMut(&'a RevisionRequest<'a>) -> Result<RevisionResponse, E>,
 {
-    if metrics.revisions as usize >= config.max_revisions {
+    if metrics.revisions >= config.max_revisions {
         return Ok(Some(abstain(
             metrics.clone(),
             ReviewLoopDiagnosticCode::MaxRevisionsExceeded,
@@ -880,7 +880,13 @@ where
     }
 
     metrics.stages.push(ReviewLoopStage::Reviser);
-    metrics.revisions = metrics.revisions.saturating_add(1);
+    let Some(next_revisions) = metrics.revisions.checked_add(1) else {
+        return Ok(Some(abstain(
+            metrics.clone(),
+            ReviewLoopDiagnosticCode::MaxRevisionsExceeded,
+        )));
+    };
+    metrics.revisions = next_revisions;
     let request = RevisionRequest {
         candidate,
         validation,
@@ -982,4 +988,59 @@ fn abstain(mut metrics: ReviewLoopMetrics, code: ReviewLoopDiagnosticCode) -> Re
 
 fn digest(bytes: &[u8]) -> String {
     crate::hex(&Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unrepresentable_max_revisions_fails_closed() {
+        let mut metrics = ReviewLoopMetrics {
+            producer_attempts: 1,
+            validation_attempts: 1,
+            reviewer_attempts: 1,
+            revisions: usize::MAX,
+            cost: ReviewCost::default(),
+            stages: vec![ReviewLoopStage::Reviser],
+        };
+        let mut candidate = CandidateArtifact::new(b"candidate".to_vec());
+        let validation = ValidationReport::valid();
+        let review = ReviewResult::new(
+            crate::REVIEW_SCHEMA_VERSION_V1,
+            ReviewVerdict::Pass,
+            "bounded".to_owned(),
+            Vec::new(),
+            1.0,
+        )
+        .expect("test review must be valid");
+        let mut called = false;
+        let mut hashes = vec![candidate.sha256().to_owned()];
+
+        let result = revise_candidate(
+            &mut |_| {
+                called = true;
+                Ok::<_, ()>(RevisionResponse::new(
+                    CandidateArtifact::new(b"next".to_vec()),
+                    ReviewCost::default(),
+                ))
+            },
+            &ReviewLoopConfig::default().with_max_revisions(usize::MAX),
+            &mut metrics,
+            &mut candidate,
+            &validation,
+            &review,
+            &mut hashes,
+        )
+        .expect("counter overflow must abstain, not error");
+
+        assert_eq!(
+            result
+                .as_ref()
+                .and_then(ReviewLoopOutcome::diagnostic)
+                .map(|diagnostic| diagnostic.code()),
+            Some(ReviewLoopDiagnosticCode::MaxRevisionsExceeded)
+        );
+        assert!(!called, "the saturated counter must block another revision");
+    }
 }
