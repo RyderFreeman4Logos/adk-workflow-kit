@@ -368,11 +368,12 @@ fn oversized_node_output_reference_aggregate_remains_bounded_and_inspectable() {
 
     let output = run_adk(&workflow, &profile, &runs);
     assert!(
-        output.status.success(),
-        "large reference aggregate must still succeed, stderr={}",
+        !output.status.success(),
+        "large reference aggregate must fail closed, stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
     let receipt = json_stdout(&output);
+    assert_eq!(receipt["status"], "failed");
     let run_id = receipt["run_id"].as_str().expect("run ID must be text");
     let inspect = command_json(&[
         "--json",

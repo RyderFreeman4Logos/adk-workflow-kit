@@ -9,7 +9,7 @@ use std::{
 use rusqlite::{Connection, Error as SqliteError, OptionalExtension, params};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
-use crate::RunId;
+use crate::{RunId, redact_json_value};
 
 /// One durable execution checkpoint owned by an existing run identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -240,7 +240,10 @@ impl DurableCheckpointV1 {
         I: IntoIterator<Item = A>,
         A: Into<String>,
     {
-        let state = state.as_ref().to_vec();
+        let state = state.as_ref();
+        let state = serde_json::from_slice::<serde_json::Value>(state)
+            .map(|value| serde_json::to_vec(&redact_json_value(&value)).unwrap_or_default())
+            .unwrap_or_else(|_| state.to_vec());
         if state.is_empty() {
             return Err(CheckpointError::new(CheckpointErrorKind::EmptyState));
         }

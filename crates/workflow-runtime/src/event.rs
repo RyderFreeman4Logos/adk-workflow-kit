@@ -510,9 +510,14 @@ fn digest_json(value: &Value) -> Result<String, WorkflowRuntimeEventError> {
 
 /// Computes a JSON digest only after applying the runtime event sanitizer.
 pub fn redacted_json_digest(value: &Value) -> Result<String, WorkflowRuntimeEventError> {
+    digest_json(&redact_json_value(value))
+}
+
+/// Returns a sanitized JSON copy suitable for kit-owned persistence.
+pub fn redact_json_value(value: &Value) -> Value {
     let mut redacted = value.clone();
     sanitize_payload(&mut redacted);
-    digest_json(&redacted)
+    redacted
 }
 
 fn sanitize_payload(value: &mut Value) {

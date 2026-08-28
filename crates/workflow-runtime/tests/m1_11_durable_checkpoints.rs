@@ -4,6 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use rusqlite::Connection;
 use workflow_runtime::{
     CheckpointErrorKind, CheckpointManifestV1, DurableCheckpointV1, RunId, SqliteCheckpointStore,
 };
@@ -107,11 +108,24 @@ fn sqlite_checkpoint_rejects_corruption_and_unknown_versions() {
 fn sqlite_checkpoint_write_failure_is_typed_and_does_not_publish_state() {
     let root = TestRoot::new();
     let run_id = RunId::new("run-write-failure".to_owned()).unwrap();
-    let store = SqliteCheckpointStore::open(root.database(), manifest(&run_id)).unwrap();
-    let error =
-        DurableCheckpointV1::new(run_id.clone(), "node", 1, b"", std::iter::empty::<String>())
-            .unwrap_err();
-    assert_eq!(error.kind(), CheckpointErrorKind::EmptyState);
+    let mut store = SqliteCheckpointStore::open(root.database(), manifest(&run_id)).unwrap();
+    let connection = Connection::open(root.database()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_checkpoint BEFORE INSERT ON kit_checkpoints
+             BEGIN SELECT RAISE(ABORT, 'injected checkpoint write failure'); END;",
+        )
+        .unwrap();
+    let checkpoint = DurableCheckpointV1::new(
+        run_id.clone(),
+        "node",
+        1,
+        br#"{"state":"public"}"#,
+        std::iter::empty::<String>(),
+    )
+    .unwrap();
+    let error = store.save_checkpoint(checkpoint).unwrap_err();
+    assert_eq!(error.kind(), CheckpointErrorKind::Unavailable);
     assert_eq!(store.load_latest(&run_id).unwrap(), None);
 }
 
@@ -127,7 +141,7 @@ fn checkpoint_manifest_and_artifact_references_are_secret_free() {
                 run_id,
                 "node",
                 1,
-                b"public checkpoint state",
+                br#"{"api_token":"fixture-secret-value"}"#,
                 ["sha256:artifact"],
             )
             .unwrap(),
@@ -137,7 +151,7 @@ fn checkpoint_manifest_and_artifact_references_are_secret_free() {
     let bytes = fs::read(root.database()).unwrap();
     assert!(
         !bytes
-            .windows(b"secret-token".len())
-            .any(|window| window == b"secret-token")
+            .windows(b"fixture-secret-value".len())
+            .any(|window| window == b"fixture-secret-value")
     );
 }

@@ -55,6 +55,38 @@ impl WorkdirManager {
         self.materialize(run_id, &Materialization::default())
     }
 
+    /// Reopens one existing direct-child root for a resumed run.
+    pub fn reopen(
+        &self,
+        run_id: &RunId,
+        root: impl AsRef<Path>,
+    ) -> Result<RunWorkdir, WorkdirError> {
+        self.verify_base()?;
+        let root = root.as_ref();
+        if root.parent() != Some(self.base.as_path()) {
+            return Err(WorkdirError::new(WorkdirErrorKind::RootChanged));
+        }
+        let metadata = fs::symlink_metadata(root)
+            .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::RootChanged, error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(WorkdirError::new(WorkdirErrorKind::RootChanged));
+        }
+        let id = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| WorkdirError::new(WorkdirErrorKind::RootChanged))?;
+        Ok(RunWorkdir {
+            run_id: run_id.clone(),
+            id: WorkdirId(id.to_owned()),
+            root: root.to_path_buf(),
+            base: self.base.clone(),
+            base_identity: self.base_identity,
+            root_identity: Identity::from_metadata(&metadata),
+            active: true,
+        })
+    }
+
     /// Allocates a fresh root for `run_id`, materializing `materialization`
     /// into the immutable `input/`/`package/`/`skills/`/`refs/` directories and
     /// recording each blob's SHA-256 on the manifest.
