@@ -4,6 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use workflow_adk::TerminalOutcome;
 use workflow_testkit::conformance::{
     ConformanceStatus, documented_failure_matrix, write_conformance_report,
 };
@@ -19,7 +20,7 @@ fn report_path() -> PathBuf {
 }
 
 #[test]
-fn documented_failure_matrix_covers_all_required_fail_closed_classes() {
+fn documented_failure_matrix_covers_every_contract_probe_with_aggregate_target() {
     let matrix = documented_failure_matrix();
     let classes = matrix.iter().map(|entry| entry.class()).collect::<Vec<_>>();
     assert_eq!(
@@ -27,30 +28,98 @@ fn documented_failure_matrix_covers_all_required_fail_closed_classes() {
         [
             "model",
             "tool",
+            "graph",
+            "authorization",
             "checkpoint",
-            "artifact",
             "sandbox",
-            "graph"
         ]
     );
 
-    for required in [
-        "unknown route",
-        "denial",
-        "corruption",
-        "compatibility mismatch",
-        "semantic ID binding",
-        "illegal stage jump",
-        "digest/hash mismatch",
-        "closed diagnostics",
-    ] {
+    let required = [
+        ("model", "connection failure"),
+        ("model", "HTTP error"),
+        ("model", "invalid response"),
+        ("model", "malformed tool arguments"),
+        ("model", "empty response"),
+        ("model", "timeout"),
+        ("model", "context limit"),
+        ("model", "rate limit"),
+        ("model", "transient retry then success"),
+        ("model", "retry exhaustion"),
+        ("tool", "unknown tool"),
+        ("tool", "invalid arguments"),
+        ("tool", "typed empty result"),
+        ("tool", "timeout"),
+        ("tool", "output too large"),
+        ("tool", "sandbox denial"),
+        ("tool", "path denial"),
+        ("tool", "transient failure"),
+        ("tool", "side effect already committed"),
+        ("tool", "artifact store failure"),
+        ("graph", "undeclared route"),
+        ("graph", "missing node"),
+        ("graph", "unbounded cycle rejected before run"),
+        ("graph", "recursion/visit limit"),
+        ("graph", "fan-in state conflict"),
+        ("graph", "validator route mismatch"),
+        ("graph", "terminal node reached with invalid output"),
+        ("authorization", "capability absent"),
+        ("authorization", "caller scope absent"),
+        ("authorization", "skill requests forbidden tool"),
+        ("authorization", "approval denied"),
+        ("authorization", "approval call ID mismatch"),
+        ("authorization", "approval argument fingerprint mismatch"),
+        ("authorization", "approval expired"),
+        ("checkpoint", "checkpoint write failure"),
+        ("checkpoint", "malformed SQLite"),
+        ("checkpoint", "unknown manifest version"),
+        ("checkpoint", "workflow hash mismatch"),
+        ("checkpoint", "missing artifact"),
+        ("checkpoint", "tool implementation drift"),
+        ("checkpoint", "resume node no longer exists"),
+        ("checkpoint", "effect journal unavailable"),
+        ("checkpoint", "crash at each transaction boundary"),
+        ("sandbox", "backend unavailable"),
+        ("sandbox", "requested capability unsupported"),
+        ("sandbox", "filesystem escape attempt"),
+        ("sandbox", "network attempt"),
+        ("sandbox", "process spawn denied"),
+        ("sandbox", "memory/time/output limit"),
+        ("sandbox", "child skill script asks for wider authority"),
+    ];
+
+    for (class, probe) in required {
+        let entry = matrix
+            .iter()
+            .find(|entry| entry.class() == class)
+            .unwrap_or_else(|| panic!("missing documented class {class}"));
         assert!(
-            matrix
-                .iter()
-                .any(|entry| entry.probes().contains(&required)),
-            "{required} must be covered by a documented deterministic probe"
+            entry.probes().contains(&probe),
+            "{class} probe {probe:?} is name-only or missing"
+        );
+        assert!(
+            !entry.aggregate_targets().is_empty(),
+            "{class} has no executable aggregate target"
         );
     }
+}
+
+#[test]
+fn terminal_categories_are_closed_and_executable() {
+    assert_eq!(
+        TerminalOutcome::ALL.map(TerminalOutcome::as_str),
+        [
+            "completed",
+            "abstained",
+            "incomplete",
+            "failed",
+            "timed_out",
+            "cancelled",
+            "limit_exceeded",
+            "authorization_denied",
+            "incompatible_resume",
+        ]
+    );
 }
 
 #[test]

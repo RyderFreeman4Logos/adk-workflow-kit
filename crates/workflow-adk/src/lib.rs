@@ -170,6 +170,44 @@ impl VerbatimPlatformAdapter {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TerminalOutcome {
     Succeeded,
+    Abstained,
+    Incomplete,
+    Failed,
+    TimedOut,
+    Cancelled,
+    LimitExceeded,
+    AuthorizationDenied,
+    IncompatibleResume,
+}
+
+impl TerminalOutcome {
+    /// All closed terminal categories in their stable contract order.
+    pub const ALL: [Self; 9] = [
+        Self::Succeeded,
+        Self::Abstained,
+        Self::Incomplete,
+        Self::Failed,
+        Self::TimedOut,
+        Self::Cancelled,
+        Self::LimitExceeded,
+        Self::AuthorizationDenied,
+        Self::IncompatibleResume,
+    ];
+
+    /// Returns the stable terminal category spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "completed",
+            Self::Abstained => "abstained",
+            Self::Incomplete => "incomplete",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::LimitExceeded => "limit_exceeded",
+            Self::AuthorizationDenied => "authorization_denied",
+            Self::IncompatibleResume => "incompatible_resume",
+        }
+    }
 }
 
 /// A serializable description of a translated graph.
