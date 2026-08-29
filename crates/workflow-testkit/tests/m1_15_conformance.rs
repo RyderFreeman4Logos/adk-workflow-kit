@@ -2,13 +2,12 @@ use std::{
     collections::BTreeSet,
     fs,
     path::PathBuf,
+    process::Command,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use workflow_adk::TerminalOutcome;
-use workflow_testkit::conformance::{
-    ConformanceStatus, ConformanceSubgate, documented_failure_matrix, write_conformance_report,
-};
+use workflow_testkit::conformance::documented_failure_matrix;
 
 static NEXT_REPORT: AtomicU64 = AtomicU64::new(0);
 
@@ -18,14 +17,6 @@ fn report_path() -> PathBuf {
         std::process::id(),
         NEXT_REPORT.fetch_add(1, Ordering::Relaxed)
     ))
-}
-
-fn complete_probe_evidence(status: ConformanceStatus) -> Vec<ConformanceSubgate> {
-    documented_failure_matrix()
-        .iter()
-        .flat_map(|class| class.probes().iter())
-        .map(|probe| ConformanceSubgate::executed(probe.selector(), status))
-        .collect()
 }
 
 #[test]
@@ -199,113 +190,31 @@ fn terminal_categories_are_closed_and_executable() {
 }
 
 #[test]
-fn conformance_report_rejects_unexecuted_matrix_probes() {
+fn report_binary_rejects_caller_supplied_selector_only_passes() {
     let path = report_path();
-    let error = write_conformance_report(
-        &path,
-        "e9f6c6334491432c2b544209e3d303128239290b",
-        "8d9edb311ac60ca97dbcae5fdc23baad26f8a5f3",
-        ConformanceStatus::Pass,
-        &[ConformanceSubgate::new(
-            "just m1-15-test",
-            ConformanceStatus::Pass,
-        )],
-    )
-    .expect_err("a static matrix cannot prove unexecuted probes");
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    let evidence = path.with_extension("evidence");
+    let rows = documented_failure_matrix()
+        .iter()
+        .flat_map(|class| class.probes().iter())
+        .map(|probe| format!("PASS\t{}\n", probe.selector()))
+        .collect::<String>();
+    fs::write(&evidence, rows).expect("forged evidence fixture is writable");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_m1-15-report"))
+        .args([
+            path.as_os_str(),
+            "e9f6c6334491432c2b544209e3d303128239290b".as_ref(),
+            "8d9edb311ac60ca97dbcae5fdc23baad26f8a5f3".as_ref(),
+            "PASS".as_ref(),
+            evidence.as_os_str(),
+        ])
+        .output()
+        .expect("report binary starts");
+
+    assert!(
+        !output.status.success(),
+        "caller-provided selector/PASS rows must not produce a report"
+    );
     assert!(!path.exists(), "rejected report must not be written");
-}
-
-#[test]
-fn conformance_report_rejects_inconsistent_total_status() {
-    let error = write_conformance_report(
-        report_path(),
-        "e9f6c6334491432c2b544209e3d303128239290b",
-        "8d9edb311ac60ca97dbcae5fdc23baad26f8a5f3",
-        ConformanceStatus::Pass,
-        &[ConformanceSubgate::new(
-            "just m1-15-test",
-            ConformanceStatus::Fail,
-        )],
-    )
-    .expect_err("PASS must not contradict a failed subgate");
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-}
-
-#[test]
-fn conformance_report_rejects_missing_subgate_evidence() {
-    let error = write_conformance_report(
-        report_path(),
-        "e9f6c6334491432c2b544209e3d303128239290b",
-        "8d9edb311ac60ca97dbcae5fdc23baad26f8a5f3",
-        ConformanceStatus::Pass,
-        &[],
-    )
-    .expect_err("a conformance report without subgate evidence must fail");
-
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-}
-
-#[test]
-fn conformance_report_binds_every_executed_matrix_probe() {
-    let path = report_path();
-    let receipt = write_conformance_report(
-        &path,
-        "e9f6c6334491432c2b544209e3d303128239290b",
-        "8d9edb311ac60ca97dbcae5fdc23baad26f8a5f3",
-        ConformanceStatus::Pass,
-        &complete_probe_evidence(ConformanceStatus::Pass),
-    )
-    .expect("complete executed matrix must produce a report");
-
-    assert_eq!(receipt.status(), ConformanceStatus::Pass);
-    let report = fs::read_to_string(&path).expect("report must be readable");
-    assert_eq!(report.matches("  result: PASS\n").count(), 50);
-    fs::remove_file(path).expect("report cleanup");
-}
-
-#[test]
-fn conformance_report_rejects_unknown_or_duplicate_probe_evidence() {
-    let mut unknown = complete_probe_evidence(ConformanceStatus::Pass);
-    unknown[0] =
-        ConformanceSubgate::new("workflow-testkit --test unknown", ConformanceStatus::Pass);
-    let unknown = write_conformance_report(
-        report_path(),
-        "e9f6c6334491432c2b544209e3d303128239290b",
-        "8d9edb311ac60ca97dbcae5fdc23baad26f8a5f3",
-        ConformanceStatus::Pass,
-        &unknown,
-    )
-    .expect_err("unknown selector must fail closed");
-    assert_eq!(unknown.kind(), std::io::ErrorKind::InvalidInput);
-
-    let mut duplicate = complete_probe_evidence(ConformanceStatus::Pass);
-    duplicate.push(duplicate[0].clone());
-    let duplicate = write_conformance_report(
-        report_path(),
-        "e9f6c6334491432c2b544209e3d303128239290b",
-        "8d9edb311ac60ca97dbcae5fdc23baad26f8a5f3",
-        ConformanceStatus::Pass,
-        &duplicate,
-    )
-    .expect_err("duplicate selector must fail closed");
-    assert_eq!(duplicate.kind(), std::io::ErrorKind::InvalidInput);
-}
-
-#[test]
-fn conformance_report_rejects_caller_forged_selector_only_passes() {
-    let error = write_conformance_report(
-        report_path(),
-        "e9f6c6334491432c2b544209e3d303128239290b",
-        "8d9edb311ac60ca97dbcae5fdc23baad26f8a5f3",
-        ConformanceStatus::Pass,
-        &documented_failure_matrix()
-            .iter()
-            .flat_map(|class| class.probes().iter())
-            .map(|probe| ConformanceSubgate::new(probe.selector(), ConformanceStatus::Pass))
-            .collect::<Vec<_>>(),
-    )
-    .expect_err("selector/status strings are not execution receipts");
-
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    fs::remove_file(evidence).expect("forged evidence fixture cleanup");
 }

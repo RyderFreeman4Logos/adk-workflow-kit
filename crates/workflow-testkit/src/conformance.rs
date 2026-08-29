@@ -3,6 +3,7 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 /// One documented failure probe, its exact test selector, and fail-closed assertion.
@@ -385,125 +386,176 @@ impl ConformanceReceipt {
     }
 }
 
-/// One executed matrix probe recorded in the durable report.
+/// One receipt produced by the conformance execution layer.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConformanceSubgate {
-    selector: String,
+struct ConformanceSubgate {
+    selector: &'static str,
+    command: String,
+    fixture: String,
+    expected: &'static str,
+    observed: String,
+    test_count: usize,
+    exit_code: i32,
+    artifact_or_resume_path: Option<String>,
     status: ConformanceStatus,
-    verified: bool,
 }
 
-impl ConformanceSubgate {
-    /// Creates unverified caller input, which can never produce a report.
-    pub fn new(selector: impl Into<String>, status: ConformanceStatus) -> Self {
-        Self {
-            selector: selector.into(),
-            status,
-            verified: false,
-        }
-    }
+/// The verified execution receipts that a report writer may format.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConformanceExecution {
+    head: String,
+    tree: String,
+    subgates: Vec<ConformanceSubgate>,
+    status: ConformanceStatus,
+}
 
-    /// Marks an execution-layer result as eligible for report formatting.
-    pub fn executed(selector: impl Into<String>, status: ConformanceStatus) -> Self {
-        Self {
-            selector: selector.into(),
-            status,
-            verified: true,
-        }
-    }
-
-    /// Returns the exact executed selector.
-    pub fn selector(&self) -> &str {
-        &self.selector
-    }
-
-    /// Returns the command result.
+impl ConformanceExecution {
+    /// Returns the terminal status computed from the actual probe executions.
     pub const fn status(&self) -> ConformanceStatus {
         self.status
     }
 }
 
-/// Writes an auditable, checkout-bound conformance report.
-pub fn write_conformance_report(
-    path: impl AsRef<Path>,
-    head: &str,
-    tree: &str,
-    status: ConformanceStatus,
-    subgates: &[ConformanceSubgate],
-) -> io::Result<ConformanceReceipt> {
-    if !is_git_object_id(head) || !is_git_object_id(tree) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "conformance report requires full lowercase Git object IDs",
+/// Executes every documented probe through the Just-only test boundary.
+pub fn execute_conformance_matrix() -> io::Result<ConformanceExecution> {
+    let (head, tree) = checkout_identity()?;
+    let mut subgates = Vec::new();
+    for class in documented_failure_matrix() {
+        for probe in class.probes() {
+            subgates.push(execute_probe(*probe)?);
+        }
+    }
+    if checkout_identity()? != (head.clone(), tree.clone()) {
+        return Err(io::Error::other(
+            "conformance execution changed checkout identity",
         ));
     }
-
-    if subgates.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "conformance report requires subgate evidence",
-        ));
-    }
-    if subgates.iter().any(|subgate| !subgate.verified) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "conformance report only formats execution-layer receipts",
-        ));
-    }
-
-    let expected = documented_failure_matrix()
+    let status = if subgates
         .iter()
-        .flat_map(|class| class.probes().iter())
-        .map(|probe| probe.selector())
-        .collect::<std::collections::BTreeSet<_>>();
-    let executed = subgates
-        .iter()
-        .map(ConformanceSubgate::selector)
-        .collect::<std::collections::BTreeSet<_>>();
-    if executed.len() != subgates.len() || executed != expected {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "conformance report requires one executed result for every documented probe",
-        ));
-    }
-    let computed_status = if subgates
-        .iter()
-        .all(|subgate| subgate.status() == ConformanceStatus::Pass)
+        .all(|subgate| subgate.status == ConformanceStatus::Pass)
     {
         ConformanceStatus::Pass
     } else {
         ConformanceStatus::Fail
     };
-    if status != computed_status {
+    Ok(ConformanceExecution {
+        head,
+        tree,
+        subgates,
+        status,
+    })
+}
+
+fn execute_probe(probe: FailureProbe) -> io::Result<ConformanceSubgate> {
+    let output = Command::new("just")
+        .args(["conformance-probe", probe.selector()])
+        .output()?;
+    let output_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let test_count = output_text.matches("running 1 test").count();
+    let exit_code = output.status.code().unwrap_or(-1);
+    let status = if output.status.success() && test_count == 1 {
+        ConformanceStatus::Pass
+    } else {
+        ConformanceStatus::Fail
+    };
+    let fixture = fixture_path(probe.selector())?;
+    let artifact_or_resume_path = (probe.name().contains("artifact")
+        || probe.name().contains("resume"))
+    .then_some(fixture.clone());
+
+    Ok(ConformanceSubgate {
+        selector: probe.selector(),
+        command: format!("just conformance-probe {}", probe.selector()),
+        fixture,
+        expected: probe.expected_fail_closed_assertion(),
+        observed: format!("running {test_count} matching test(s)"),
+        test_count,
+        exit_code,
+        artifact_or_resume_path,
+        status,
+    })
+}
+
+fn fixture_path(selector: &str) -> io::Result<String> {
+    let mut fields = selector.split_ascii_whitespace();
+    let (Some(package), Some("--test"), Some(target), Some(_test), None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "conformance report status must match every executed probe result",
+            "conformance selector must name one package test and exact test function",
         ));
-    }
+    };
+    Ok(format!("crates/{package}/tests/{target}.rs"))
+}
 
+fn checkout_identity() -> io::Result<(String, String)> {
+    let head = git_object_id(&["rev-parse", "HEAD"])?;
+    let tree = git_object_id(&["write-tree"])?;
+    Ok((head, tree))
+}
+
+fn git_object_id(arguments: &[&str]) -> io::Result<String> {
+    let output = Command::new("git").args(arguments).output()?;
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if output.status.success() && is_git_object_id(&value) {
+        Ok(value)
+    } else {
+        Err(io::Error::other(
+            "conformance requires a stable Git identity",
+        ))
+    }
+}
+
+/// Writes an auditable, checkout-bound conformance report from verified receipts.
+pub fn write_conformance_report(
+    path: impl AsRef<Path>,
+    execution: &ConformanceExecution,
+) -> io::Result<ConformanceReceipt> {
     let path = path.as_ref().to_path_buf();
     let mut report = format!(
-        "# M1-15 ADK boundary/failure conformance\n\nstatus: {}\nhead: {head}\ntree: {tree}\nprobes:\n",
-        status.as_str()
+        "# M1-15 ADK boundary/failure conformance\n\nstatus: {}\nhead: {}\ntree: {}\nprobes:\n",
+        execution.status.as_str(),
+        execution.head,
+        execution.tree
     );
     for class in documented_failure_matrix() {
         for probe in class.probes() {
-            let result = subgates
+            let result = execution
+                .subgates
                 .iter()
-                .find(|subgate| subgate.selector() == probe.selector())
-                .expect("validated probe evidence is complete");
+                .find(|subgate| subgate.selector == probe.selector())
+                .expect("execution matrix contains every documented probe");
             report.push_str(&format!(
-                "- class: {}\n  probe: {}\n  selector: {}\n  assertion: {}\n  result: {}\n",
+                "- class: {}\n  probe: {}\n  command: {}\n  fixture: {}\n  expected: {}\n  observed: {}\n  test_count: {}\n  exit: {}\n  result: {}\n",
                 class.class(),
                 probe.name(),
-                probe.selector(),
-                probe.expected_fail_closed_assertion(),
-                result.status().as_str(),
+                result.command,
+                result.fixture,
+                result.expected,
+                result.observed,
+                result.test_count,
+                result.exit_code,
+                result.status.as_str(),
             ));
+            if let Some(path) = &result.artifact_or_resume_path {
+                report.push_str(&format!("  artifact_or_resume_path: {path}\n"));
+            }
         }
     }
     fs::write(&path, report)?;
-    Ok(ConformanceReceipt { path, status })
+    Ok(ConformanceReceipt {
+        path,
+        status: execution.status,
+    })
 }
 
 fn is_git_object_id(value: &str) -> bool {
