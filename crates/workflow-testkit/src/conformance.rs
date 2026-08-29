@@ -74,7 +74,7 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             "validator route mismatch",
             "terminal node reached with invalid output",
         ],
-        aggregate_targets: &["workflow-adk --test translation"],
+        aggregate_targets: &["workflow-adk --test translation fan_in_state_conflict_is_executable"],
     },
     FailureClass {
         class: "authorization",

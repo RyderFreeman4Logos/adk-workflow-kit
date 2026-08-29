@@ -105,6 +105,20 @@ fn documented_failure_matrix_covers_every_contract_probe_with_aggregate_target()
 }
 
 #[test]
+fn fan_in_state_conflict_requires_a_dedicated_executable_target() {
+    let graph = documented_failure_matrix()
+        .iter()
+        .find(|entry| entry.class() == "graph")
+        .expect("graph failure class is documented");
+
+    assert_eq!(
+        graph.aggregate_targets(),
+        &["workflow-adk --test translation fan_in_state_conflict_is_executable"],
+        "fan-in state conflict must reach its dedicated test body, not only a name-only target"
+    );
+}
+
+#[test]
 fn terminal_categories_are_closed_and_executable() {
     assert_eq!(
         TerminalOutcome::ALL.map(TerminalOutcome::as_str),

@@ -1,4 +1,4 @@
-use adk_rust::graph::prelude::{ExecutionConfig, State};
+use adk_rust::graph::prelude::{END, ExecutionConfig, GraphAgent, NodeOutput, START, State};
 use serde_json::json;
 use workflow_adk::events::AdkEventMapper;
 use workflow_adk::{AdkGraphTranslator, TerminalOutcome, TranslationError};
@@ -274,6 +274,32 @@ async fn bounded_cycle_honors_max_visits_not_adk_default() {
         !rendered.contains("50"),
         "must not rely on ADK default recursion_limit, got {rendered}"
     );
+}
+
+#[tokio::test]
+async fn fan_in_state_conflict_is_executable() {
+    let graph = GraphAgent::builder("fan-in-state-conflict")
+        .channels(&["shared"])
+        .node_fn("left", |_| async {
+            Ok(NodeOutput::new().with_update("shared", json!("left")))
+        })
+        .node_fn("right", |_| async {
+            Ok(NodeOutput::new().with_update("shared", json!("right")))
+        })
+        .node_fn("join", |_| async { Ok(NodeOutput::new()) })
+        .edge(START, "left")
+        .edge(START, "right")
+        .edge("left", "join")
+        .edge("right", "join")
+        .edge("join", END)
+        .build()
+        .expect("fan-in fixture graph builds");
+
+    let state = graph
+        .invoke(State::new(), ExecutionConfig::new("fan-in-conflict"))
+        .await
+        .expect("fan-in fixture executes");
+    assert_eq!(state.get("shared"), Some(&json!("right")));
 }
 
 #[tokio::test]
