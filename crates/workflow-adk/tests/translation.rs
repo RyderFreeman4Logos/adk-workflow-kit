@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use adk_rust::graph::prelude::{ExecutionConfig, State};
 use adk_rust::{
@@ -343,6 +349,77 @@ cases = { other = "join" }
 default = "join"
 "#;
 
+const ALTERNATING_ROUTE_FAN_IN: &str = r#"
+schema_version = 1
+[workflow]
+id = "alternating-route-fan-in"
+version = "1"
+entry = "select"
+[[nodes]]
+id = "select"
+kind = "agent"
+max_visits = 2
+[[nodes]]
+id = "left"
+kind = "agent"
+max_visits = 2
+[[nodes]]
+id = "right"
+kind = "agent"
+max_visits = 2
+[[nodes]]
+id = "join"
+kind = "agent"
+max_visits = 4
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "left"
+to = "join"
+[[edges]]
+from = "right"
+to = "join"
+[[routes]]
+from = "select"
+predicate = { id = "route-pred", version = "1" }
+cases = { left = "left", right = "right" }
+[[routes]]
+from = "join"
+predicate = { id = "route-pred", version = "1" }
+cases = { again = "select", done = "done" }
+"#;
+
+const EXCLUSIVE_ROUTE_FAN_IN: &str = r#"
+schema_version = 1
+[workflow]
+id = "exclusive-route-fan-in"
+version = "1"
+entry = "select"
+[[nodes]]
+id = "select"
+kind = "agent"
+[[nodes]]
+id = "left"
+kind = "agent"
+[[nodes]]
+id = "right"
+kind = "agent"
+[[nodes]]
+id = "join"
+kind = "terminal"
+[[edges]]
+from = "left"
+to = "join"
+[[edges]]
+from = "right"
+to = "join"
+[[routes]]
+from = "select"
+predicate = { id = "route-pred", version = "1" }
+cases = { left = "left", right = "right" }
+"#;
+
 const FAILURE_TERMINALS: &str = r#"
 schema_version = 1
 edges = []
@@ -417,6 +494,57 @@ fn state_agent(name: &str, state: serde_json::Value) -> Arc<dyn Agent> {
     Arc::new(StateAgent {
         name: name.to_owned(),
         response: json!({"state": state}).to_string(),
+    })
+}
+
+struct SequenceAgent {
+    name: String,
+    responses: Vec<String>,
+    next: AtomicUsize,
+}
+
+#[async_trait]
+impl Agent for SequenceAgent {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        "test route sequence"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &[]
+    }
+
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            shared_state: true,
+            ..AgentCapabilities::default()
+        }
+    }
+
+    async fn run(&self, _ctx: Arc<dyn InvocationContext>) -> adk_rust::Result<EventStream> {
+        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        let response = self
+            .responses
+            .get(index)
+            .or_else(|| self.responses.last())
+            .expect("route sequence has a response");
+        let mut event = Event::new(&self.name);
+        event.set_content(Content::new("assistant").with_text(response));
+        Ok(Box::pin(adk_rust::futures::stream::iter([Ok(event)])))
+    }
+}
+
+fn sequence_agent(name: &str, responses: &[&str]) -> Arc<dyn Agent> {
+    Arc::new(SequenceAgent {
+        name: name.to_owned(),
+        responses: responses
+            .iter()
+            .map(|response| (*response).to_owned())
+            .collect(),
+        next: AtomicUsize::new(0),
     })
 }
 
@@ -717,6 +845,94 @@ async fn route_fan_in_disjoint_key_writes_execute() {
         .expect("disjoint route fan-in writes are merged by the kit-owned join guard");
     assert_eq!(state.get("left"), Some(&json!("left")));
     assert_eq!(state.get("right"), Some(&json!("right")));
+}
+
+#[tokio::test]
+async fn bounded_alternating_exclusive_routes_consume_same_key_fan_in_provenance() {
+    let plan = compile_str_with_predicates(
+        "alternating-route-fan-in.workflow.toml",
+        ALTERNATING_ROUTE_FAN_IN,
+        &AnyPredicate,
+    )
+    .expect("bounded alternating fixture compiles");
+    let agents = BTreeMap::from([
+        (
+            "select".to_owned(),
+            sequence_agent("select", &["left", "right"]),
+        ),
+        (
+            "left".to_owned(),
+            state_agent("left", json!({"shared": "left"})),
+        ),
+        (
+            "right".to_owned(),
+            state_agent("right", json!({"shared": "right"})),
+        ),
+        (
+            "join".to_owned(),
+            sequence_agent("join", &["again", "done"]),
+        ),
+    ]);
+    let graph = AdkGraphTranslator::new()
+        .translate_with_agents(&plan, &agents)
+        .expect("bounded alternating fan-in translates");
+
+    let state = graph
+        .invoke(State::new(), ExecutionConfig::new("alternating-exclusive"))
+        .await
+        .expect("an earlier exclusive left visit must not conflict with the later right visit");
+    assert_eq!(state.get("shared"), Some(&json!("right")));
+    assert!(
+        state
+            .keys()
+            .all(|key| !key.starts_with("__workflow_fanin:")),
+        "internal fan-in provenance must not escape the completed join"
+    );
+}
+
+#[tokio::test]
+async fn exclusive_fan_in_checkpoint_state_resumes_without_stale_same_key_provenance() {
+    let plan = compile_str_with_predicates(
+        "exclusive-route-fan-in.workflow.toml",
+        EXCLUSIVE_ROUTE_FAN_IN,
+        &AnyPredicate,
+    )
+    .expect("exclusive checkpoint fixture compiles");
+    let agents = BTreeMap::from([
+        ("select".to_owned(), sequence_agent("select", &["unused"])),
+        (
+            "left".to_owned(),
+            state_agent("left", json!({"shared": "left"})),
+        ),
+        (
+            "right".to_owned(),
+            state_agent("right", json!({"shared": "right"})),
+        ),
+    ]);
+    let graph = AdkGraphTranslator::new()
+        .translate_with_agents(&plan, &agents)
+        .expect("exclusive checkpoint fan-in translates");
+
+    let mut checkpoint_state = State::new();
+    checkpoint_state.insert("route:select".to_owned(), json!("left"));
+    let checkpoint_state = graph
+        .invoke(checkpoint_state, ExecutionConfig::new("checkpoint-left"))
+        .await
+        .expect("left checkpoint visit succeeds");
+    assert!(
+        checkpoint_state
+            .keys()
+            .all(|key| !key.starts_with("__workflow_fanin:")),
+        "checkpoint state must not retain internal fan-in provenance"
+    );
+
+    let mut resumed_state = checkpoint_state;
+    resumed_state.insert("route:select".to_owned(), json!("right"));
+    let resumed_state = graph
+        .invoke(resumed_state, ExecutionConfig::new("resume-right"))
+        .await
+        .expect("resumed right visit succeeds without stale left provenance");
+    assert_eq!(resumed_state.get("shared"), Some(&json!("right")));
 }
 
 #[test]

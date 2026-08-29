@@ -344,7 +344,8 @@ const UNKNOWN_ROUTE_NODE_PREFIX: &str = "__workflow_unknown_route_";
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StateInputMapper;
 impl StateInputMapper {
-    pub fn map(&self, state: State) -> State {
+    pub fn map(&self, mut state: State) -> State {
+        state.retain(|key, _| !key.starts_with("__workflow_fanin:"));
         state
     }
 }
@@ -353,7 +354,8 @@ impl StateInputMapper {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StateOutputMapper;
 impl StateOutputMapper {
-    pub fn map(&self, state: State) -> State {
+    pub fn map(&self, mut state: State) -> State {
+        state.retain(|key, _| !key.starts_with("__workflow_fanin:"));
         state
     }
 }

@@ -12,7 +12,7 @@ use workflow_runtime::{
     CapabilityIntersection, RunContext, RunId, RunLimits, RunSandbox, SandboxCapability,
     ToolBridge, ToolBridgeErrorKind, WorkdirManager,
 };
-use workflow_testkit::conformance::documented_failure_matrix;
+use workflow_testkit::conformance::{documented_failure_matrix, semantic_failure_contracts};
 
 static NEXT_REPORT: AtomicU64 = AtomicU64::new(0);
 
@@ -127,6 +127,74 @@ fn documented_failure_matrix_binds_every_contract_probe_to_a_unique_selector_and
             .sum::<usize>(),
         "every documented probe must bind a unique test selector"
     );
+}
+
+#[test]
+fn matrix_receipts_are_bound_to_independent_semantic_test_contracts() {
+    let matrix = documented_failure_matrix();
+    let contracts = semantic_failure_contracts();
+    let probes = matrix
+        .iter()
+        .flat_map(|class| {
+            class
+                .probes()
+                .iter()
+                .map(move |probe| (class.class(), probe))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        contracts.len(),
+        probes.len(),
+        "every row needs one contract"
+    );
+    assert_eq!(
+        contracts
+            .iter()
+            .map(|contract| contract.selector())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        contracts.len(),
+        "semantic contracts must not reuse a selected test body"
+    );
+    for (class, probe) in probes {
+        let contract = contracts
+            .iter()
+            .find(|contract| contract.selector() == probe.selector())
+            .unwrap_or_else(|| {
+                panic!("{} / {} has no semantic test contract", class, probe.name())
+            });
+        assert_eq!(contract.failure_class(), class);
+        assert_eq!(contract.probe(), probe.name());
+        assert_eq!(
+            contract.asserted_fail_closed_outcome(),
+            probe.expected_fail_closed_assertion(),
+            "{} / {} must not mint a receipt from matrix metadata alone",
+            class,
+            probe.name()
+        );
+    }
+
+    let required = [
+        ("graph", "unbounded cycle rejected before run"),
+        ("authorization", "approval expired"),
+        ("checkpoint", "unknown manifest version"),
+        ("sandbox", "memory/time/output limit"),
+    ];
+    for (class, probe) in required {
+        let contract = contracts
+            .iter()
+            .find(|contract| contract.failure_class() == class && contract.probe() == probe)
+            .unwrap_or_else(|| panic!("missing dedicated semantic contract for {class} / {probe}"));
+        assert!(
+            contract.fixture_contract().contains(probe),
+            "{class} / {probe} contract must name the injected failure"
+        );
+        assert!(
+            !contract.fixture_contract().starts_with(contract.selector()),
+            "{class} / {probe} must use a dedicated fixture contract, not generated matrix metadata"
+        );
+    }
 }
 
 #[test]
@@ -245,16 +313,10 @@ fn conformance_probe_emits_structured_receipt() {
     let Ok(selector) = std::env::var("M1_15_PROBE_SELECTOR") else {
         return;
     };
-    let (class, probe) = documented_failure_matrix()
-        .iter()
-        .find_map(|class| {
-            class
-                .probes()
-                .iter()
-                .find(|probe| probe.selector() == selector)
-                .map(|probe| (class.class(), probe))
-        })
-        .expect("probe selector is documented");
+    let contract = semantic_failure_contracts()
+        .into_iter()
+        .find(|contract| contract.selector() == selector)
+        .expect("probe selector has a test-owned semantic contract");
     let output = Command::new("just")
         .args(["conformance-contract", &selector])
         .output()
@@ -283,9 +345,9 @@ fn conformance_probe_emits_structured_receipt() {
     println!(
         "M1_15_RECEIPT={}",
         serde_json::to_string(&json!({
-            "probe": probe.name(),
-            "failure_class": class,
-            "asserted_fail_closed_outcome": probe.expected_fail_closed_assertion(),
+            "probe": contract.probe(),
+            "failure_class": contract.failure_class(),
+            "asserted_fail_closed_outcome": contract.asserted_fail_closed_outcome(),
             "selector": selector,
             "test_count": test_count,
             "exit_code": output.status.code().unwrap_or(-1),

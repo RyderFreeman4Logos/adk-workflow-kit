@@ -180,8 +180,8 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             ),
             probe(
                 "unbounded cycle rejected before run",
-                "workflow-adk --test translation bounded_cycle_honors_max_visits_not_adk_default",
-                "the IR visit bound stops the cycle",
+                "workflow-adk --test translation unbounded_cycle_is_rejected_before_adk_translation",
+                "an unbounded cycle is rejected before ADK invocation",
             ),
             probe(
                 "recursion/visit limit",
@@ -240,18 +240,18 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             ),
             probe(
                 "approval call ID mismatch",
-                "workflow-runtime --test m1_07_tool_bridge approval_is_bound_to_call_id_arguments_actor_and_expiry",
-                "approval is bound to call identity",
+                "workflow-runtime --test m1_07_tool_bridge approval_call_id_mismatch_is_rejected",
+                "a mismatched call ID is rejected before dispatch",
             ),
             probe(
                 "approval argument fingerprint mismatch",
-                "workflow-testkit --test replay_contracts recorded_capability_expansion_is_rejected",
-                "recorded authority expansion is rejected",
+                "workflow-runtime --test m1_07_tool_bridge approval_argument_fingerprint_mismatch_is_rejected",
+                "a mismatched approval argument fingerprint is rejected",
             ),
             probe(
                 "approval expired",
-                "workflow-runtime --test policy_contracts zero_policy_layers_deny_by_default",
-                "missing active policy denies by default",
+                "workflow-runtime --test m1_07_tool_bridge expired_approval_is_rejected",
+                "an expired approval is rejected before dispatch",
             ),
         ],
     },
@@ -270,8 +270,8 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             ),
             probe(
                 "unknown manifest version",
-                "workflow-runtime --test m1_11_durable_checkpoints sqlite_checkpoint_rejects_manifest_identity_mismatch",
-                "manifest identity mismatch is rejected",
+                "workflow-runtime --test m1_11_durable_checkpoints sqlite_checkpoint_rejects_unknown_schema_version",
+                "an unsupported checkpoint schema version is rejected",
             ),
             probe(
                 "workflow hash mismatch",
@@ -310,8 +310,8 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
         probes: &[
             probe(
                 "backend unavailable",
-                "workflow-runtime --test bubblewrap_conformance check09_resource_limits_fail_closed_as_backend_selection_fails",
-                "backend selection fails closed under unavailable limits",
+                "workflow-runtime --test bubblewrap_backend_contracts bubblewrap_backend_without_process_spawn_fails_before_launch",
+                "backend selection fails before launch when process spawn is unavailable",
             ),
             probe(
                 "requested capability unsupported",
@@ -335,8 +335,8 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             ),
             probe(
                 "memory/time/output limit",
-                "workflow-runtime --test bubblewrap_backend_contracts bubblewrap_backend_rejects_an_unbounded_output_request_before_spawn",
-                "unbounded output is rejected before spawn",
+                "workflow-runtime --test bubblewrap_conformance memory_time_and_output_limits_are_enforced_or_fail_closed",
+                "memory and output limits fail closed and time limits terminate the process",
             ),
             probe(
                 "child skill script asks for wider authority",
@@ -350,6 +350,122 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
 /// Returns the M1-15 matrix wired by `just conformance` to deterministic selectors.
 pub const fn documented_failure_matrix() -> &'static [FailureClass] {
     &FAILURE_MATRIX
+}
+
+/// A test-owned semantic contract for one executable failure fixture.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SemanticFailureContract {
+    failure_class: String,
+    probe: String,
+    selector: String,
+    asserted_fail_closed_outcome: String,
+    fixture_contract: String,
+}
+
+impl SemanticFailureContract {
+    /// Returns the failure class injected by the selected test fixture.
+    pub fn failure_class(&self) -> &str {
+        &self.failure_class
+    }
+
+    /// Returns the named fault injected by the selected test fixture.
+    pub fn probe(&self) -> &str {
+        &self.probe
+    }
+
+    /// Returns the exact selector that executes this fixture.
+    pub fn selector(&self) -> &str {
+        &self.selector
+    }
+
+    /// Returns the fail-closed outcome asserted by the fixture.
+    pub fn asserted_fail_closed_outcome(&self) -> &str {
+        &self.asserted_fail_closed_outcome
+    }
+
+    /// Returns the fixture's semantic contract, independent of aggregate output formatting.
+    pub fn fixture_contract(&self) -> &str {
+        &self.fixture_contract
+    }
+}
+
+const SEMANTIC_FIXTURE_SELECTORS: [&str; 50] = [
+    "workflow-testkit --test contract scripted_mismatch_and_exhaustion_fail_without_responses",
+    "workflow-adk --test model_profiles provider_status_and_timeout_are_typed",
+    "workflow-testkit --test fault_injection invalid_output_fixture_fails_closed_without_echoing_bytes",
+    "workflow-runtime --test tool_contracts malformed_and_hostile_failure_data_fail_closed",
+    "workflow-testkit --test contract poisoned_script_state_fails_closed",
+    "workflow-testkit --test fault_injection timeout_fixture_fails_closed_with_typed_diagnostic",
+    "workflow-testkit --test fault_injection rate_limit_fixture_fails_closed_on_quota_exhaustion",
+    "workflow-testkit --test code_investigation synthetic_repo_has_expected_grounded_answer",
+    "workflow-testkit --test m1_15_conformance unknown_tool_fails_closed_before_dispatch",
+    "workflow-testkit --test sandbox_conformance hostile_requests_are_rejected_without_exposing_input",
+    "workflow-runtime --test tool_contracts success_empty_and_failure_round_trip_with_exact_provenance",
+    "workflow-runtime --test m1_07_tool_bridge handler_timeout_returns_before_the_registered_deadline_and_unblocks_bridge",
+    "workflow-testkit --test fault_injection output_flood_fixture_fails_closed_at_byte_ceiling",
+    "workflow-adk --test tool_bridge adk_adapter_denies_undeclared_filesystem_write",
+    "workflow-runtime --test sandbox_execution_contracts real_script_execution_rejects_traversal_and_absolute_paths",
+    "workflow-runtime --test m1_07_tool_bridge same_key_retry_after_timeout_reuses_the_in_flight_side_effect",
+    "workflow-testkit --test checkpoint_fixture kill_resume_fixture_does_not_duplicate_side_effect",
+    "workflow-runtime --test execution_contracts capability_denial_and_backend_failure_publish_no_artifact",
+    "workflow-adk --test translation unknown_route_fails_closed_with_project_diagnostic",
+    "workflow-adk --test translation resolved_plan_rejects_ir_hash_mismatch",
+    "workflow-adk --test translation unbounded_cycle_is_rejected_before_adk_translation",
+    "workflow-adk --test translation bounded_cycle_visit_budget_resets_for_each_invoke",
+    "workflow-adk --test translation fan_in_same_key_writes_fail_closed_before_merge",
+    "workflow-adk --test translation route_fan_in_same_key_writes_fail_closed_before_merge",
+    "workflow-adk --test translation route_fan_in_disjoint_key_writes_execute",
+    "workflow-adk --test translation conditional_plan_executes_cases_and_ir_default_fallback",
+    "workflow-adk --test translation terminal_outcome_maps_failure_terminals_without_success_fallback",
+    "workflow-runtime --test m1_07_tool_bridge capability_intersection_denies_forbidden_skill_before_handler",
+    "workflow-adk --test tool_bridge registered_tool_policy_denial_preserves_authorization_terminal_outcome",
+    "workflow-adk --test tool_bridge registered_script_rejects_capabilities_beyond_registration_before_spawn",
+    "workflow-runtime --test m1_07_tool_bridge caller_scope_and_approval_denial_stop_handler",
+    "workflow-runtime --test m1_07_tool_bridge approval_call_id_mismatch_is_rejected",
+    "workflow-runtime --test m1_07_tool_bridge approval_argument_fingerprint_mismatch_is_rejected",
+    "workflow-runtime --test m1_07_tool_bridge expired_approval_is_rejected",
+    "workflow-runtime --test m1_11_durable_checkpoints sqlite_checkpoint_write_failure_is_typed_and_does_not_publish_state",
+    "workflow-runtime --test m1_11_durable_checkpoints sqlite_checkpoint_rejects_corruption_and_unknown_versions",
+    "workflow-runtime --test m1_11_durable_checkpoints sqlite_checkpoint_rejects_unknown_schema_version",
+    "workflow-adk --test m1_11_execution_checkpoints resume_rejects_changed_profile_content_with_stable_profile_identity",
+    "workflow-adk --test m1_11_execution_checkpoints resume_rejects_missing_or_tampered_first_checkpoint_artifact_before_graph_invocation",
+    "workflow-adk --test m1_11_execution_checkpoints resume_rejects_same_workflow_identity_with_changed_canonical_content",
+    "workflow-adk --test m1_11_execution_checkpoints resume_rejects_missing_target_node_before_graph_invocation",
+    "workflow-runtime --test m1_12_effect_journal effect_journal_rejects_corrupt_database",
+    "workflowctl --test m1_12_destructive_resume sigkill_matrix_resumes_in_fresh_process_without_duplicate_effects",
+    "workflow-runtime --test bubblewrap_backend_contracts bubblewrap_backend_without_process_spawn_fails_before_launch",
+    "workflow-runtime --test sandbox_capabilities one_missing_class_returns_the_typed_error",
+    "workflow-runtime --test bubblewrap_conformance check11_symlink_escape_is_blocked",
+    "workflow-runtime --test bubblewrap_conformance check04_cannot_use_network_when_denied",
+    "workflow-adk --test tool_bridge registered_script_without_process_spawn_fails_before_backend_spawn",
+    "workflow-runtime --test bubblewrap_conformance memory_time_and_output_limits_are_enforced_or_fail_closed",
+    "workflow-adk --test tool_bridge adapter_registered_script_api_cannot_expand_child_capabilities",
+];
+
+/// Returns the executable fixture contracts used to mint conformance receipts.
+pub fn semantic_failure_contracts() -> Vec<SemanticFailureContract> {
+    documented_failure_matrix()
+        .iter()
+        .flat_map(|class| {
+            class.probes().iter().map(move |probe| {
+                assert!(
+                    SEMANTIC_FIXTURE_SELECTORS.contains(&probe.selector()),
+                    "every receipt selector must be independently admitted by its fixture contract"
+                );
+                SemanticFailureContract {
+                    failure_class: class.class().to_owned(),
+                    probe: probe.name().to_owned(),
+                    selector: probe.selector().to_owned(),
+                    asserted_fail_closed_outcome: probe.expected_fail_closed_assertion().to_owned(),
+                    fixture_contract: format!(
+                        "fixture injects {} and asserts {}",
+                        probe.name(),
+                        probe.expected_fail_closed_assertion()
+                    ),
+                }
+            })
+        })
+        .collect()
 }
 
 /// Final status emitted by the local aggregate command.
