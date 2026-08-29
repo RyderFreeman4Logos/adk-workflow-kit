@@ -395,7 +395,7 @@ to = "done"
 }
 
 #[test]
-fn resume_rejects_same_workflow_identity_with_changed_canonical_content() {
+fn workflow_hash_mismatch_fixture_rejects_changed_workflow_before_resume() {
     let root = TestRoot::new();
     let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
@@ -432,7 +432,7 @@ fn resume_rejects_same_workflow_identity_with_changed_canonical_content() {
 }
 
 #[test]
-fn resume_rejects_changed_profile_content_with_stable_profile_identity() {
+fn tool_implementation_drift_fixture_rejects_changed_profile_before_resume() {
     let root = TestRoot::new();
     let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../workflowctl/tests/fixtures/minimal.workflow.toml");

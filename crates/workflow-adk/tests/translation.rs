@@ -1370,6 +1370,20 @@ fn terminal_outcome_maps_failure_terminals_without_success_fallback() {
     assert_eq!(graph.terminal_outcome("unknown_terminal"), None);
 }
 
+#[test]
+fn terminal_invalid_output_fixture_reaches_failed_terminal_without_publication() {
+    let plan = compile_str("failure-terminals.workflow.toml", FAILURE_TERMINALS)
+        .expect("failure terminal fixture compiles");
+    let graph = AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("failure terminal fixture translates");
+    assert_eq!(
+        graph.terminal_outcome("failed"),
+        Some(TerminalOutcome::Failed)
+    );
+    assert_eq!(graph.terminal_outcome("invalid-output"), None);
+}
+
 #[tokio::test]
 async fn unknown_route_fails_closed_with_project_diagnostic() {
     let plan =

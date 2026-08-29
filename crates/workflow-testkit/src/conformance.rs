@@ -90,8 +90,8 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             ),
             probe(
                 "empty response",
-                "workflow-testkit --test contract poisoned_script_state_fails_closed",
-                "poisoned scripted state fails closed",
+                "workflow-testkit --test m1_15_conformance empty_response_fixture_injects_and_asserts_no_publication",
+                "an injected empty response fails closed without publication",
             ),
             probe(
                 "timeout",
@@ -110,13 +110,13 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             ),
             probe(
                 "transient retry then success",
-                "workflow-testkit --test code_investigation synthetic_repo_has_expected_grounded_answer",
-                "the deterministic trace records retry routes before publication",
+                "workflow-testkit --test m1_15_conformance transient_retry_then_success_fixture_records_attempts_before_publication",
+                "one transient failure retries once before the successful response is published",
             ),
             probe(
                 "retry exhaustion",
-                "workflow-testkit --test contract scripted_retry_exhaustion_fails_closed_without_a_response",
-                "retry exhaustion returns a model failure without a response",
+                "workflow-testkit --test m1_15_conformance retry_exhaustion_fixture_stops_after_retry_budget_without_publication",
+                "retry exhaustion stops at the configured attempt budget without publication",
             ),
         ],
     },
@@ -210,8 +210,8 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             ),
             probe(
                 "terminal node reached with invalid output",
-                "workflow-adk --test translation terminal_outcome_maps_failure_terminals_without_success_fallback",
-                "failure terminals do not fall back to success",
+                "workflow-adk --test translation terminal_invalid_output_fixture_reaches_failed_terminal_without_publication",
+                "invalid terminal output reaches the failed terminal without publication",
             ),
         ],
     },
@@ -275,8 +275,8 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             ),
             probe(
                 "workflow hash mismatch",
-                "workflow-adk --test m1_11_execution_checkpoints resume_rejects_changed_profile_content_with_stable_profile_identity",
-                "changed execution identity is rejected",
+                "workflow-adk --test m1_11_execution_checkpoints workflow_hash_mismatch_fixture_rejects_changed_workflow_before_resume",
+                "changed workflow content is rejected before resume publication",
             ),
             probe(
                 "missing artifact",
@@ -285,8 +285,8 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             ),
             probe(
                 "tool implementation drift",
-                "workflow-adk --test m1_11_execution_checkpoints resume_rejects_same_workflow_identity_with_changed_canonical_content",
-                "changed canonical workflow content is rejected",
+                "workflow-adk --test m1_11_execution_checkpoints tool_implementation_drift_fixture_rejects_changed_profile_before_resume",
+                "changed execution profile content is rejected before resume publication",
             ),
             probe(
                 "resume node no longer exists",
@@ -393,6 +393,9 @@ impl ConformanceReceipt {
 #[serde(deny_unknown_fields)]
 struct ProbeReceipt {
     selector: String,
+    class: String,
+    probe: String,
+    assertion: String,
     test_count: usize,
     exit_code: i32,
     result: String,
@@ -434,7 +437,7 @@ pub fn execute_conformance_matrix() -> io::Result<ConformanceExecution> {
     let mut subgates = Vec::new();
     for class in documented_failure_matrix() {
         for probe in class.probes() {
-            subgates.push(execute_probe(*probe)?);
+            subgates.push(execute_probe(class.class(), *probe)?);
         }
     }
     if checkout_identity()? != (head.clone(), tree.clone()) {
@@ -458,7 +461,7 @@ pub fn execute_conformance_matrix() -> io::Result<ConformanceExecution> {
     })
 }
 
-fn execute_probe(probe: FailureProbe) -> io::Result<ConformanceSubgate> {
+fn execute_probe(class: &str, probe: FailureProbe) -> io::Result<ConformanceSubgate> {
     let output = Command::new("just")
         .args(["conformance-probe", probe.selector()])
         .output()?;
@@ -479,6 +482,9 @@ fn execute_probe(probe: FailureProbe) -> io::Result<ConformanceSubgate> {
     let status = if output.status.success()
         && receipt.as_ref().is_some_and(|receipt| {
             receipt.selector == probe.selector()
+                && receipt.class == class
+                && receipt.probe == probe.name()
+                && receipt.assertion == probe.expected_fail_closed_assertion()
                 && receipt.test_count == 1
                 && receipt.exit_code == 0
                 && receipt.result == "PASS"
@@ -490,7 +496,7 @@ fn execute_probe(probe: FailureProbe) -> io::Result<ConformanceSubgate> {
     let fixture = fixture_path(probe.selector())?;
     let observed = receipt.map_or_else(
         || "test-owned receipt: absent or invalid".to_owned(),
-        |_| "test-owned receipt: exact fixture passed".to_owned(),
+        |_| "test-owned receipt: exact class/probe/assertion fixture passed".to_owned(),
     );
 
     Ok(ConformanceSubgate {

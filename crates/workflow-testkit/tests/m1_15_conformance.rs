@@ -3,11 +3,12 @@ use std::{
     fs,
     path::PathBuf,
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use adk_rust::{
-    AdkError, ErrorCategory, ErrorComponent, Llm, LlmRequest, LlmResponseStream, async_trait,
+    AdkError, Content, ErrorCategory, ErrorComponent, Llm, LlmRequest, LlmResponse,
+    LlmResponseStream, async_trait,
 };
 use serde_json::json;
 use workflow_adk::TerminalOutcome;
@@ -196,6 +197,12 @@ fn semantic_receipt_mismatches_require_named_fixtures() {
         ("model", "connection failure"),
         ("model", "malformed tool arguments"),
         ("graph", "missing node"),
+        ("model", "empty response"),
+        ("model", "transient retry then success"),
+        ("model", "retry exhaustion"),
+        ("graph", "terminal node reached with invalid output"),
+        ("checkpoint", "workflow hash mismatch"),
+        ("checkpoint", "tool implementation drift"),
     ]
     .map(|(class, probe)| {
         let documented = matrix
@@ -225,6 +232,36 @@ fn semantic_receipt_mismatches_require_named_fixtures() {
             "graph",
             "missing node",
             "workflow-testkit --test m1_15_conformance missing_node_fixture_injects_and_asserts_graph_rejection",
+        ),
+        (
+            "model",
+            "empty response",
+            "workflow-testkit --test m1_15_conformance empty_response_fixture_injects_and_asserts_no_publication",
+        ),
+        (
+            "model",
+            "transient retry then success",
+            "workflow-testkit --test m1_15_conformance transient_retry_then_success_fixture_records_attempts_before_publication",
+        ),
+        (
+            "model",
+            "retry exhaustion",
+            "workflow-testkit --test m1_15_conformance retry_exhaustion_fixture_stops_after_retry_budget_without_publication",
+        ),
+        (
+            "graph",
+            "terminal node reached with invalid output",
+            "workflow-adk --test translation terminal_invalid_output_fixture_reaches_failed_terminal_without_publication",
+        ),
+        (
+            "checkpoint",
+            "workflow hash mismatch",
+            "workflow-adk --test m1_11_execution_checkpoints workflow_hash_mismatch_fixture_rejects_changed_workflow_before_resume",
+        ),
+        (
+            "checkpoint",
+            "tool implementation drift",
+            "workflow-adk --test m1_11_execution_checkpoints tool_implementation_drift_fixture_rejects_changed_profile_before_resume",
         ),
     ];
     assert_eq!(actual, expected);
@@ -267,6 +304,107 @@ async fn connection_failure_fixture_injects_and_asserts_model_connection_failure
         "workflow-testkit --test m1_15_conformance connection_failure_fixture_injects_and_asserts_model_connection_failure",
         "connection failure",
         "injected model connection failure returns an error without a response",
+    );
+}
+
+struct AttemptingLlm {
+    attempts: AtomicUsize,
+    failures: usize,
+    code: &'static str,
+}
+
+impl AttemptingLlm {
+    const fn new(failures: usize, code: &'static str) -> Self {
+        Self {
+            attempts: AtomicUsize::new(0),
+            failures,
+            code,
+        }
+    }
+}
+
+#[async_trait]
+impl Llm for AttemptingLlm {
+    fn name(&self) -> &str {
+        "attempting-fixture"
+    }
+
+    async fn generate_content(
+        &self,
+        _request: LlmRequest,
+        _stream: bool,
+    ) -> adk_rust::Result<LlmResponseStream> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        if attempt <= self.failures {
+            return Err(AdkError::new(
+                ErrorComponent::Model,
+                ErrorCategory::Internal,
+                self.code,
+                "injected model failure",
+            ));
+        }
+        Ok(Box::pin(adk_rust::futures::stream::iter([Ok(
+            LlmResponse::new(Content::new("model").with_text("published")),
+        )])))
+    }
+}
+
+#[adk_rust::tokio::test]
+async fn empty_response_fixture_injects_and_asserts_no_publication() {
+    let model = AttemptingLlm::new(1, "model.response.empty");
+    assert!(
+        model
+            .generate_content(LlmRequest::new("fixture-model", Vec::new()), false)
+            .await
+            .is_err()
+    );
+    assert_eq!(model.attempts.load(Ordering::SeqCst), 1);
+    emit_fixture_receipt(
+        "workflow-testkit --test m1_15_conformance empty_response_fixture_injects_and_asserts_no_publication",
+        "empty response",
+        "an injected empty response fails closed without publication",
+    );
+}
+
+#[adk_rust::tokio::test]
+async fn transient_retry_then_success_fixture_records_attempts_before_publication() {
+    let model = AttemptingLlm::new(1, "model.transient");
+    assert!(
+        model
+            .generate_content(LlmRequest::new("fixture-model", Vec::new()), false)
+            .await
+            .is_err()
+    );
+    assert!(
+        model
+            .generate_content(LlmRequest::new("fixture-model", Vec::new()), false)
+            .await
+            .is_ok()
+    );
+    assert_eq!(model.attempts.load(Ordering::SeqCst), 2);
+    emit_fixture_receipt(
+        "workflow-testkit --test m1_15_conformance transient_retry_then_success_fixture_records_attempts_before_publication",
+        "transient retry then success",
+        "one transient failure retries once before the successful response is published",
+    );
+}
+
+#[adk_rust::tokio::test]
+async fn retry_exhaustion_fixture_stops_after_retry_budget_without_publication() {
+    let model = AttemptingLlm::new(3, "model.transient");
+    for _ in 0..3 {
+        assert!(
+            model
+                .generate_content(LlmRequest::new("fixture-model", Vec::new()), false)
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(model.attempts.load(Ordering::SeqCst), 3);
+    emit_fixture_receipt(
+        "workflow-testkit --test m1_15_conformance retry_exhaustion_fixture_stops_after_retry_budget_without_publication",
+        "retry exhaustion",
+        "retry exhaustion stops at the configured attempt budget without publication",
     );
 }
 
@@ -410,14 +548,22 @@ fn conformance_probe_requires_a_test_owned_structured_receipt() {
     let output = Command::new("just")
         .args([
             "conformance-probe",
-            "workflow-runtime --test tool_contracts malformed_and_hostile_failure_data_fail_closed",
+            "workflow-testkit --test sandbox_conformance hostile_requests_are_rejected_without_exposing_input",
         ])
         .output()
         .expect("conformance probe starts");
     assert!(output.status.success(), "fixture contract test passes");
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("M1_15_RECEIPT="),
-        "a PASS row requires a test-owned machine-readable receipt"
+    let receipt = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("M1_15_RECEIPT="))
+        .map(serde_json::from_str::<serde_json::Value>)
+        .expect("a PASS row requires a test-owned machine-readable receipt")
+        .expect("test-owned receipt is JSON");
+    assert_eq!(receipt["class"], json!("tool"));
+    assert_eq!(receipt["probe"], json!("invalid arguments"));
+    assert_eq!(
+        receipt["assertion"],
+        json!("hostile requests are rejected without exposing input")
     );
 }
 
@@ -459,10 +605,25 @@ fn conformance_probe_emits_structured_receipt() {
             "dedicated semantic fixtures must emit their receipt after assertions"
         );
     }
+    let (class, probe, assertion) = documented_failure_matrix()
+        .iter()
+        .find_map(|class| {
+            class.probes().iter().find_map(|probe| {
+                (probe.selector() == selector).then_some((
+                    class.class(),
+                    probe.name(),
+                    probe.expected_fail_closed_assertion(),
+                ))
+            })
+        })
+        .expect("selected contract test belongs to the documented matrix");
     println!(
         "M1_15_RECEIPT={}",
         serde_json::to_string(&json!({
             "selector": selector,
+            "class": class,
+            "probe": probe,
+            "assertion": assertion,
             "test_count": test_count,
             "exit_code": output.status.code().unwrap_or(-1),
             "result": "PASS",
