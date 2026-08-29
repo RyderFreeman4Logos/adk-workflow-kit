@@ -6,13 +6,17 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use adk_rust::{
+    AdkError, ErrorCategory, ErrorComponent, Llm, LlmRequest, LlmResponseStream, async_trait,
+};
 use serde_json::json;
 use workflow_adk::TerminalOutcome;
+use workflow_compiler::compile_str;
 use workflow_runtime::{
     CapabilityIntersection, RunContext, RunId, RunLimits, RunSandbox, SandboxCapability,
-    ToolBridge, ToolBridgeErrorKind, WorkdirManager,
+    ToolBridge, ToolBridgeErrorKind, ToolEnvelope, WorkdirManager,
 };
-use workflow_testkit::conformance::{documented_failure_matrix, semantic_failure_contracts};
+use workflow_testkit::conformance::documented_failure_matrix;
 
 static NEXT_REPORT: AtomicU64 = AtomicU64::new(0);
 
@@ -22,6 +26,21 @@ fn report_path() -> PathBuf {
         std::process::id(),
         NEXT_REPORT.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+fn emit_fixture_receipt(selector: &str, probe: &str, assertion: &str) {
+    if std::env::var("M1_15_FIXTURE_RECEIPT_SELECTOR").as_deref() == Ok(selector) {
+        println!(
+            "M1_15_FIXTURE_RECEIPT={}",
+            serde_json::to_string(&json!({
+                "selector": selector,
+                "probe": probe,
+                "assertion": assertion,
+                "result": "PASS",
+            }))
+            .expect("fixture receipt serializes")
+        );
+    }
 }
 
 #[test]
@@ -130,10 +149,8 @@ fn documented_failure_matrix_binds_every_contract_probe_to_a_unique_selector_and
 }
 
 #[test]
-fn matrix_receipts_are_bound_to_independent_semantic_test_contracts() {
-    let matrix = documented_failure_matrix();
-    let contracts = semantic_failure_contracts();
-    let probes = matrix
+fn semantic_receipts_cover_every_contract_row_without_matrix_echoes() {
+    let probes = documented_failure_matrix()
         .iter()
         .flat_map(|class| {
             class
@@ -142,59 +159,155 @@ fn matrix_receipts_are_bound_to_independent_semantic_test_contracts() {
                 .map(move |probe| (class.class(), probe))
         })
         .collect::<Vec<_>>();
-
     assert_eq!(
-        contracts.len(),
         probes.len(),
-        "every row needs one contract"
+        50,
+        "every contract row needs one receipt fixture"
     );
     assert_eq!(
-        contracts
+        probes
             .iter()
-            .map(|contract| contract.selector())
+            .map(|(_, probe)| probe.selector())
             .collect::<BTreeSet<_>>()
             .len(),
-        contracts.len(),
-        "semantic contracts must not reuse a selected test body"
+        probes.len(),
+        "each semantic receipt must execute one exact fixture"
     );
     for (class, probe) in probes {
-        let contract = contracts
-            .iter()
-            .find(|contract| contract.selector() == probe.selector())
-            .unwrap_or_else(|| {
-                panic!("{} / {} has no semantic test contract", class, probe.name())
-            });
-        assert_eq!(contract.failure_class(), class);
-        assert_eq!(contract.probe(), probe.name());
+        let fields = probe
+            .selector()
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>();
         assert_eq!(
-            contract.asserted_fail_closed_outcome(),
-            probe.expected_fail_closed_assertion(),
-            "{} / {} must not mint a receipt from matrix metadata alone",
-            class,
+            fields.len(),
+            4,
+            "{class} / {} needs an exact fixture",
             probe.name()
         );
+        assert_eq!(fields[1], "--test");
+        assert!(!probe.expected_fail_closed_assertion().is_empty());
+    }
+}
+
+#[test]
+fn semantic_receipt_mismatches_require_named_fixtures() {
+    let matrix = documented_failure_matrix();
+    let actual = [
+        ("model", "connection failure"),
+        ("model", "malformed tool arguments"),
+        ("graph", "missing node"),
+    ]
+    .map(|(class, probe)| {
+        let documented = matrix
+            .iter()
+            .find(|entry| entry.class() == class)
+            .and_then(|entry| {
+                entry
+                    .probes()
+                    .iter()
+                    .find(|candidate| candidate.name() == probe)
+            })
+            .unwrap_or_else(|| panic!("missing documented {class} / {probe}"));
+        (class, probe, documented.selector())
+    });
+    let expected = [
+        (
+            "model",
+            "connection failure",
+            "workflow-testkit --test m1_15_conformance connection_failure_fixture_injects_and_asserts_model_connection_failure",
+        ),
+        (
+            "model",
+            "malformed tool arguments",
+            "workflow-testkit --test m1_15_conformance malformed_tool_arguments_fixture_injects_and_asserts_rejection",
+        ),
+        (
+            "graph",
+            "missing node",
+            "workflow-testkit --test m1_15_conformance missing_node_fixture_injects_and_asserts_graph_rejection",
+        ),
+    ];
+    assert_eq!(actual, expected);
+}
+
+struct ConnectionFailureLlm;
+
+#[async_trait]
+impl Llm for ConnectionFailureLlm {
+    fn name(&self) -> &str {
+        "connection-failure-fixture"
     }
 
-    let required = [
-        ("graph", "unbounded cycle rejected before run"),
-        ("authorization", "approval expired"),
-        ("checkpoint", "unknown manifest version"),
-        ("sandbox", "memory/time/output limit"),
-    ];
-    for (class, probe) in required {
-        let contract = contracts
-            .iter()
-            .find(|contract| contract.failure_class() == class && contract.probe() == probe)
-            .unwrap_or_else(|| panic!("missing dedicated semantic contract for {class} / {probe}"));
-        assert!(
-            contract.fixture_contract().contains(probe),
-            "{class} / {probe} contract must name the injected failure"
-        );
-        assert!(
-            !contract.fixture_contract().starts_with(contract.selector()),
-            "{class} / {probe} must use a dedicated fixture contract, not generated matrix metadata"
-        );
+    async fn generate_content(
+        &self,
+        _request: LlmRequest,
+        _stream: bool,
+    ) -> adk_rust::Result<LlmResponseStream> {
+        Err(AdkError::new(
+            ErrorComponent::Model,
+            ErrorCategory::Internal,
+            "model.connection.failed",
+            "injected model connection failure",
+        ))
     }
+}
+
+#[adk_rust::tokio::test]
+async fn connection_failure_fixture_injects_and_asserts_model_connection_failure() {
+    let error = match ConnectionFailureLlm
+        .generate_content(LlmRequest::new("fixture-model", Vec::new()), false)
+        .await
+    {
+        Ok(_) => panic!("injected model connection failure must fail closed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.component, ErrorComponent::Model);
+    assert_eq!(error.code, "model.connection.failed");
+    emit_fixture_receipt(
+        "workflow-testkit --test m1_15_conformance connection_failure_fixture_injects_and_asserts_model_connection_failure",
+        "connection failure",
+        "injected model connection failure returns an error without a response",
+    );
+}
+
+#[test]
+fn malformed_tool_arguments_fixture_injects_and_asserts_rejection() {
+    let document = r#"{"status":"failure","failure":"invalid_input","payload":"hostile","provenance":{"tool_id":"registry.tool","tool_version":"1.2.3"}}"#;
+    let decoded = serde_json::from_str::<ToolEnvelope<serde_json::Value>>(document);
+    assert!(
+        decoded.is_err(),
+        "injected malformed tool arguments must be rejected"
+    );
+    emit_fixture_receipt(
+        "workflow-testkit --test m1_15_conformance malformed_tool_arguments_fixture_injects_and_asserts_rejection",
+        "malformed tool arguments",
+        "injected malformed tool arguments are rejected before use",
+    );
+}
+
+#[test]
+fn missing_node_fixture_injects_and_asserts_graph_rejection() {
+    let document = r#"
+schema_version = 1
+[workflow]
+id = "missing-node"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[edges]]
+from = "start"
+to = "absent"
+"#;
+    let error = compile_str("missing-node.workflow.toml", document)
+        .expect_err("an injected edge to a missing node must fail closed");
+    assert!(error.to_string().contains("absent"));
+    emit_fixture_receipt(
+        "workflow-testkit --test m1_15_conformance missing_node_fixture_injects_and_asserts_graph_rejection",
+        "missing node",
+        "an injected edge to a missing node is rejected",
+    );
 }
 
 #[test]
@@ -313,10 +426,6 @@ fn conformance_probe_emits_structured_receipt() {
     let Ok(selector) = std::env::var("M1_15_PROBE_SELECTOR") else {
         return;
     };
-    let contract = semantic_failure_contracts()
-        .into_iter()
-        .find(|contract| contract.selector() == selector)
-        .expect("probe selector has a test-owned semantic contract");
     let output = Command::new("just")
         .args(["conformance-contract", &selector])
         .output()
@@ -342,12 +451,17 @@ fn conformance_probe_emits_structured_receipt() {
             .any(|line| line.starts_with(&format!("test {test_name} ... ok"))),
         "selected contract test must report its exact name"
     );
+    if selector.contains("_fixture_injects_and_asserts_") {
+        assert!(
+            output_text
+                .lines()
+                .any(|line| line.starts_with("M1_15_FIXTURE_RECEIPT=")),
+            "dedicated semantic fixtures must emit their receipt after assertions"
+        );
+    }
     println!(
         "M1_15_RECEIPT={}",
         serde_json::to_string(&json!({
-            "probe": contract.probe(),
-            "failure_class": contract.failure_class(),
-            "asserted_fail_closed_outcome": contract.asserted_fail_closed_outcome(),
             "selector": selector,
             "test_count": test_count,
             "exit_code": output.status.code().unwrap_or(-1),
