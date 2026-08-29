@@ -137,6 +137,46 @@ fn kill_resume_inspect_and_replay_are_deterministic() {
 }
 
 #[test]
+fn every_legal_checkpoint_step_resumes_the_remaining_graph() {
+    let full = SyntheticInvestigation::new(FixtureRepo::synthetic())
+        .run_fake()
+        .expect("deterministic fake model should complete");
+    assert!(full.trace().stages().len() >= 4);
+
+    for step in 1..=full.trace().stages().len() {
+        let killed = SyntheticInvestigation::new(FixtureRepo::synthetic())
+            .run_until_kill(step)
+            .expect("every stage in the completed trace is a legal checkpoint");
+        let checkpoint = killed.checkpoint().expect("checkpoint");
+        let resumed = SyntheticInvestigation::new(FixtureRepo::synthetic())
+            .resume(checkpoint)
+            .unwrap_or_else(|error| panic!("step {step}: {error:?}"));
+
+        assert_eq!(
+            resumed.status(),
+            InvestigationStatus::Published,
+            "step {step}"
+        );
+        assert_eq!(resumed.answer(), full.answer(), "step {step}");
+        assert_eq!(
+            resumed.trace().stages(),
+            &full.trace().stages()[step..],
+            "resume must continue after the checkpoint prefix at step {step}"
+        );
+        assert!(resumed.trace().adk_graph_exercised(), "step {step}");
+    }
+}
+
+#[test]
+fn graph_model_calls_use_one_async_runtime_boundary() {
+    let source = include_str!("../src/code_investigation.rs");
+    assert!(source.contains("async fn fake_model_tool"));
+    assert!(!source.contains("std::thread::spawn"));
+    assert_eq!(source.matches("new_current_thread()").count(), 2);
+    assert_eq!(source.matches("runtime.block_on").count(), 2);
+}
+
+#[test]
 fn resume_rejects_a_forged_partial_trace_digest() {
     let investigation = SyntheticInvestigation::new(FixtureRepo::synthetic());
     let killed = investigation

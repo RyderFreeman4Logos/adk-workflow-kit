@@ -7,12 +7,12 @@ use std::{
     collections::BTreeMap,
     fmt,
     path::{Component, Path},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use adk_rust::{
     Agent, AgentCapabilities, Content, Event, EventStream, InvocationContext, Llm, LlmRequest,
-    LlmResponse, Part, async_trait, futures::StreamExt,
+    LlmResponse, Part, async_trait, futures::StreamExt, tokio::sync::Mutex,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1271,42 +1271,6 @@ impl SyntheticInvestigation {
         if step == 0 {
             return Err(InvestigationError::new(DiagnosticCode::CheckpointInvalid));
         }
-        if step <= 3 {
-            let _package = Self::fixture_package()?;
-            let snapshot = self.repo.snapshot();
-            compile_str_with_predicates(
-                "fixtures/code_investigation/workflow.toml",
-                FIXTURE_WORKFLOW,
-                &PredicateFixture,
-            )
-            .map_err(|_| InvestigationError::new(DiagnosticCode::SchemaInvalid))?;
-            let mut session = self.session();
-            let mut stages = vec![InvestigationStage::PrepareWorkspace.as_str().to_owned()];
-            let mut routes = vec!["prepare_workspace".to_owned()];
-            if step == 1 {
-                return killed_result(snapshot, stages, routes, Vec::new(), 0, step);
-            }
-            advance(&mut session, InvestigationStage::Planner, &mut stages);
-            routes.push("planner".to_owned());
-            if step == 2 {
-                return killed_result(snapshot, stages, routes, Vec::new(), 0, step);
-            }
-            advance(&mut session, InvestigationStage::SearchCode, &mut stages);
-            let selected_call = fake_model_tool("retry", Some("src"))
-                .ok_or_else(|| InvestigationError::new(DiagnosticCode::ModelFailed))?;
-            let tools = ReadOnlyTools::new(&snapshot);
-            tools
-                .search_code(&selected_call.query, selected_call.path.as_deref())
-                .map_err(|_| InvestigationError::new(DiagnosticCode::CoverageExhausted))?;
-            routes.push("search_code".to_owned());
-            let calls = vec![ToolCall {
-                tool: selected_call.tool,
-                route: "search_code".to_owned(),
-                query: selected_call.query,
-                path: selected_call.path,
-            }];
-            return killed_result(snapshot, stages, routes, calls, 1, step);
-        }
         let completed = self.run_fake()?;
         if step > completed.trace.stages.len() {
             return Err(InvestigationError::new(DiagnosticCode::CheckpointInvalid));
@@ -1428,12 +1392,6 @@ impl SyntheticInvestigation {
     }
 }
 
-fn advance(session: &mut InvestigationSession, next: InvestigationStage, stages: &mut Vec<String>) {
-    if session.advance(next).is_ok() {
-        stages.push(next.as_str().to_owned());
-    }
-}
-
 fn digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
@@ -1448,66 +1406,6 @@ fn checkpoint_for(
         step,
         state_digest: digest(format!("{}:{step}:{}", snapshot.id, trace.digest()).as_bytes()),
     }
-}
-
-fn tool_results_from_calls(
-    snapshot: &Snapshot,
-    calls: &[ToolCall],
-) -> Result<Vec<ToolResult>, InvestigationError> {
-    let tools = ReadOnlyTools::new(snapshot);
-    calls
-        .iter()
-        .map(|call| {
-            let output = match call.tool {
-                ReadOnlyTool::SearchCode => json!(
-                    tools
-                        .search_code(&call.query, call.path.as_deref())
-                        .map_err(|_| InvestigationError::new(DiagnosticCode::CoverageExhausted))?
-                ),
-                ReadOnlyTool::ReadSourceRange => {
-                    let path = call
-                        .path
-                        .as_deref()
-                        .ok_or_else(|| InvestigationError::new(DiagnosticCode::PathNotFound))?;
-                    let hit = tools
-                        .search_code(&call.query, Some("src"))?
-                        .into_iter()
-                        .find(|hit| hit.path() == path)
-                        .ok_or_else(|| InvestigationError::new(DiagnosticCode::PathNotFound))?;
-                    json!(tools.read_source_range(path, hit.line(), hit.line())?)
-                }
-                _ => json!(true),
-            };
-            Ok(ToolResult {
-                tool: call.tool,
-                route: call.route.clone(),
-                output,
-            })
-        })
-        .collect()
-}
-
-fn killed_result(
-    snapshot: Snapshot,
-    stages: Vec<String>,
-    routes: Vec<String>,
-    tool_calls: Vec<ToolCall>,
-    llm_requests: usize,
-    step: usize,
-) -> Result<InvestigationResult, InvestigationError> {
-    killed_from_trace(
-        snapshot.clone(),
-        InvestigationTrace {
-            stages,
-            routes,
-            tool_results: tool_results_from_calls(&snapshot, &tool_calls)?,
-            tool_calls,
-            llm_requests,
-            adk_graph_exercised: false,
-            adk_terminal: None,
-        },
-        step,
-    )
 }
 
 fn killed_from_trace(
@@ -1536,7 +1434,7 @@ struct ModelToolCall {
     path: Option<String>,
 }
 
-fn fake_model_tool(query: &str, path: Option<&str>) -> Option<ModelToolCall> {
+async fn fake_model_tool(query: &str, path: Option<&str>) -> Option<ModelToolCall> {
     let query = query.to_owned();
     let path = path.map(ToOwned::to_owned);
     let model = crate::ScriptedLlm::new(vec![crate::ScriptStep::new(
@@ -1555,39 +1453,31 @@ fn fake_model_tool(query: &str, path: Option<&str>) -> Option<ModelToolCall> {
             }],
         }),
     )]);
-    let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+    let mut stream = model
+        .generate_content(
+            LlmRequest::new("code-investigation-fake", Vec::new()),
+            false,
+        )
+        .await
         .ok()?;
-    runtime.block_on(async {
-        let mut stream = model
-            .generate_content(
-                LlmRequest::new("code-investigation-fake", Vec::new()),
-                false,
-            )
-            .await
-            .ok()?;
-        let response = stream.next().await?.ok()?;
-        response
-            .content?
-            .parts
-            .into_iter()
-            .find_map(|part| match part {
-                Part::FunctionCall { name, args, .. }
-                    if name == ReadOnlyTool::SearchCode.as_str() =>
-                {
-                    Some(ModelToolCall {
-                        tool: ReadOnlyTool::SearchCode,
-                        query: args.get("query")?.as_str()?.to_owned(),
-                        path: args
-                            .get("path")
-                            .and_then(serde_json::Value::as_str)
-                            .map(ToOwned::to_owned),
-                    })
-                }
-                _ => None,
-            })
-    })
+    let response = stream.next().await?.ok()?;
+    response
+        .content?
+        .parts
+        .into_iter()
+        .find_map(|part| match part {
+            Part::FunctionCall { name, args, .. } if name == ReadOnlyTool::SearchCode.as_str() => {
+                Some(ModelToolCall {
+                    tool: ReadOnlyTool::SearchCode,
+                    query: args.get("query")?.as_str()?.to_owned(),
+                    path: args
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned),
+                })
+            }
+            _ => None,
+        })
 }
 
 struct GraphExercise {
@@ -1611,8 +1501,45 @@ struct GraphRun {
     tool_results: Vec<ToolResult>,
     answer: Option<InvestigationAnswer>,
     error: Option<InvestigationError>,
-    resume_after: Option<usize>,
     prefix: Option<InvestigationTrace>,
+}
+
+fn restore_session(
+    mut session: InvestigationSession,
+    prefix: &InvestigationTrace,
+    resume_after: Option<usize>,
+) -> Result<InvestigationSession, InvestigationError> {
+    let step =
+        resume_after.ok_or_else(|| InvestigationError::new(DiagnosticCode::CheckpointInvalid))?;
+    if step == 0 || step != prefix.stages.len() {
+        return Err(InvestigationError::new(DiagnosticCode::CheckpointInvalid));
+    }
+    for (index, stage_name) in prefix.stages.iter().enumerate() {
+        let stage = match stage_name.as_str() {
+            "prepare_workspace" => InvestigationStage::PrepareWorkspace,
+            "planner" => InvestigationStage::Planner,
+            "search_code" => InvestigationStage::SearchCode,
+            "inspect_evidence" => InvestigationStage::InspectEvidence,
+            "coverage_decision" => InvestigationStage::CoverageDecision,
+            "draft" => InvestigationStage::Draft,
+            "grounding_validation" => InvestigationStage::GroundingValidation,
+            "review" => InvestigationStage::Review,
+            "revise" => InvestigationStage::Revise,
+            "publish" => InvestigationStage::Publish,
+            "abstain" => InvestigationStage::Abstain,
+            _ => return Err(InvestigationError::new(DiagnosticCode::CheckpointInvalid)),
+        };
+        if index == 0 {
+            if stage != InvestigationStage::PrepareWorkspace {
+                return Err(InvestigationError::new(DiagnosticCode::CheckpointInvalid));
+            }
+        } else {
+            session
+                .advance(stage)
+                .map_err(|_| InvestigationError::new(DiagnosticCode::CheckpointInvalid))?;
+        }
+    }
+    Ok(session)
 }
 
 impl GraphRun {
@@ -1621,23 +1548,14 @@ impl GraphRun {
         requested_verdict: ReviewVerdict,
         resume_after: Option<usize>,
         prefix: Option<&InvestigationTrace>,
-    ) -> Self {
+    ) -> Result<Self, InvestigationError> {
         let snapshot = investigation.repo.snapshot();
-        let mut session = investigation.session();
         let prefix = prefix.cloned();
-        if prefix.is_some() {
-            for stage in [
-                InvestigationStage::PrepareWorkspace,
-                InvestigationStage::Planner,
-                InvestigationStage::SearchCode,
-            ]
-            .into_iter()
-            .take(resume_after.unwrap_or(0))
-            {
-                let _ = session.advance(stage);
-            }
-        }
-        Self {
+        let session = prefix.as_ref().map_or_else(
+            || Ok(investigation.session()),
+            |prefix| restore_session(investigation.session(), prefix, resume_after),
+        )?;
+        Ok(Self {
             snapshot,
             session,
             investigation,
@@ -1648,19 +1566,30 @@ impl GraphRun {
             tool_results: Vec::new(),
             answer: None,
             error: None,
-            resume_after,
             prefix,
-        }
+        })
     }
 
-    fn execute(&mut self, node: &str) -> String {
-        if self.should_skip(node) {
-            return self.event(node, "skipped");
+    async fn execute(&mut self, node: &str) -> String {
+        if let Some(output) = self.skipped_output(node).map(str::to_owned) {
+            if node == "draft" && self.answer.is_none() {
+                match self
+                    .investigation
+                    .expected_answer(&ReadOnlyTools::new(&self.snapshot))
+                {
+                    Ok(answer) => self.answer = Some(answer),
+                    Err(error) => {
+                        self.error = Some(error);
+                        return self.event(node, "abstain");
+                    }
+                }
+            }
+            return self.event(node, &output);
         }
         if self.error.is_some() {
             return self.event(node, "abstain");
         }
-        let output = match self.execute_node(node) {
+        let output = match self.execute_node(node).await {
             Ok(output) => output,
             Err(error) => {
                 self.error = Some(error);
@@ -1676,49 +1605,20 @@ impl GraphRun {
         self.event(node, output)
     }
 
-    fn should_skip(&self, node: &str) -> bool {
-        match self.resume_after {
-            Some(1) => node == "prepare_workspace",
-            Some(2) => matches!(node, "prepare_workspace" | "planner"),
-            Some(3) => matches!(node, "prepare_workspace" | "planner" | "search_code"),
-            _ => false,
-        }
+    fn skipped_output(&self, node: &str) -> Option<&str> {
+        let prefix = self.prefix.as_ref()?;
+        prefix.routes.iter().find_map(|route| {
+            if route == node {
+                Some("skipped")
+            } else {
+                route
+                    .strip_prefix(node)
+                    .and_then(|route| route.strip_prefix(':'))
+            }
+        })
     }
 
-    fn event(&self, node: &str, output: &str) -> String {
-        let mut state = serde_json::Map::new();
-        let mut stages = self
-            .prefix
-            .as_ref()
-            .map_or_else(Vec::new, |trace| trace.stages.clone());
-        stages.extend(self.stages.iter().cloned());
-        let mut routes = self
-            .prefix
-            .as_ref()
-            .map_or_else(Vec::new, |trace| trace.routes.clone());
-        routes.extend(self.routes.iter().cloned());
-        let mut calls = self
-            .prefix
-            .as_ref()
-            .map_or_else(Vec::new, |trace| trace.tool_calls.clone());
-        calls.extend(self.calls.iter().cloned());
-        let mut tool_results = self
-            .prefix
-            .as_ref()
-            .map_or_else(Vec::new, |trace| trace.tool_results.clone());
-        tool_results.extend(self.tool_results.iter().cloned());
-        state.insert("investigation:stages".to_owned(), json!(stages));
-        state.insert("investigation:routes".to_owned(), json!(routes));
-        state.insert("investigation:tool_calls".to_owned(), json!(calls));
-        state.insert("investigation:tool_results".to_owned(), json!(tool_results));
-        if let Some(answer) = &self.answer {
-            state.insert("investigation:answer".to_owned(), json!(answer));
-        }
-        state.insert(format!("route:{node}"), json!(output));
-        json!({"output": output, "state": state}).to_string()
-    }
-
-    fn execute_node(&mut self, node: &str) -> Result<&'static str, InvestigationError> {
+    async fn execute_node(&mut self, node: &str) -> Result<&'static str, InvestigationError> {
         match node {
             "prepare_workspace" => {
                 self.stages
@@ -1730,7 +1630,7 @@ impl GraphRun {
                 Ok("planned")
             }
             "search_code" => {
-                self.search("retry", "search_code")?;
+                self.search("retry", "search_code").await?;
                 Ok("searched")
             }
             "inspect_evidence" => {
@@ -1742,7 +1642,7 @@ impl GraphRun {
                 Ok("insufficient")
             }
             "retry_search_code" => {
-                self.search("pub", "retry_search_code")?;
+                self.search("pub", "retry_search_code").await?;
                 Ok("searched")
             }
             "retry_inspect_evidence" => {
@@ -1791,15 +1691,49 @@ impl GraphRun {
         }
     }
 
+    fn event(&self, node: &str, output: &str) -> String {
+        let mut state = serde_json::Map::new();
+        let mut stages = self
+            .prefix
+            .as_ref()
+            .map_or_else(Vec::new, |trace| trace.stages.clone());
+        stages.extend(self.stages.iter().cloned());
+        let mut routes = self
+            .prefix
+            .as_ref()
+            .map_or_else(Vec::new, |trace| trace.routes.clone());
+        routes.extend(self.routes.iter().cloned());
+        let mut calls = self
+            .prefix
+            .as_ref()
+            .map_or_else(Vec::new, |trace| trace.tool_calls.clone());
+        calls.extend(self.calls.iter().cloned());
+        let mut tool_results = self
+            .prefix
+            .as_ref()
+            .map_or_else(Vec::new, |trace| trace.tool_results.clone());
+        tool_results.extend(self.tool_results.iter().cloned());
+        state.insert("investigation:stages".to_owned(), json!(stages));
+        state.insert("investigation:routes".to_owned(), json!(routes));
+        state.insert("investigation:tool_calls".to_owned(), json!(calls));
+        state.insert("investigation:tool_results".to_owned(), json!(tool_results));
+        if let Some(answer) = &self.answer {
+            state.insert("investigation:answer".to_owned(), json!(answer));
+        }
+        state.insert(format!("route:{node}"), json!(output));
+        json!({"output": output, "state": state}).to_string()
+    }
+
     fn advance(&mut self, next: InvestigationStage) -> Result<(), InvestigationError> {
         self.session.advance(next)?;
         self.stages.push(next.as_str().to_owned());
         Ok(())
     }
 
-    fn search(&mut self, query: &str, route: &str) -> Result<(), InvestigationError> {
+    async fn search(&mut self, query: &str, route: &str) -> Result<(), InvestigationError> {
         self.advance(InvestigationStage::SearchCode)?;
         let selected_call = fake_model_tool(query, Some("src"))
+            .await
             .ok_or_else(|| InvestigationError::new(DiagnosticCode::ModelFailed))?;
         let hits = ReadOnlyTools::new(&self.snapshot)
             .search_code(&selected_call.query, selected_call.path.as_deref())
@@ -1855,7 +1789,9 @@ impl GraphRun {
             "abstain" => InvestigationStage::Abstain,
             _ => return Err(InvestigationError::new(DiagnosticCode::GraphFailed)),
         };
-        self.advance(terminal_stage)?;
+        if self.session.current() != terminal_stage {
+            self.advance(terminal_stage)?;
+        }
         Ok(GraphExercise {
             terminal: terminal.to_owned(),
             routes: self.routes.clone(),
@@ -1895,15 +1831,7 @@ impl Agent for GraphRouteAgent {
     }
 
     async fn run(&self, _context: Arc<dyn InvocationContext>) -> adk_rust::Result<EventStream> {
-        let run = Arc::clone(&self.run);
-        let name = self.name.clone();
-        let output = std::thread::spawn(move || {
-            run.lock()
-                .map(|mut run| run.execute(&name))
-                .unwrap_or_else(|_| "abstain".to_owned())
-        })
-        .join()
-        .unwrap_or_else(|_| "abstain".to_owned());
+        let output = self.run.lock().await.execute(&self.name).await;
         let mut event = Event::new(&self.name);
         event.set_content(Content::new("assistant").with_text(output));
         Ok(Box::pin(adk_rust::futures::stream::iter([Ok(event)])))
@@ -1927,7 +1855,7 @@ fn run_investigation_graph(
         requested_verdict,
         resume_after,
         prefix,
-    )));
+    )?));
     let agents: BTreeMap<String, Arc<dyn Agent>> = [
         "prepare_workspace",
         "planner",
@@ -1960,25 +1888,27 @@ fn run_investigation_graph(
         .enable_all()
         .build()
         .map_err(|_| InvestigationError::new(DiagnosticCode::GraphFailed))?;
-    let state = runtime
-        .block_on(async {
-            graph
-                .invoke(
-                    adk_rust::graph::prelude::State::new(),
-                    adk_rust::graph::prelude::ExecutionConfig::new("code-investigation"),
-                )
-                .await
-        })
-        .map_err(|_| InvestigationError::new(DiagnosticCode::GraphFailed))?;
+    let (state, mut exercise) = runtime.block_on(async {
+        let state = graph
+            .invoke(
+                adk_rust::graph::prelude::State::new(),
+                adk_rust::graph::prelude::ExecutionConfig::new("code-investigation"),
+            )
+            .await
+            .map_err(|_| InvestigationError::new(DiagnosticCode::GraphFailed))?;
+        let terminal = state
+            .get("terminal")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| InvestigationError::new(DiagnosticCode::GraphFailed))?
+            .to_owned();
+        let exercise = run.lock().await.finish(&terminal)?;
+        Ok::<_, InvestigationError>((state, exercise))
+    })?;
     let terminal = state
         .get("terminal")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| InvestigationError::new(DiagnosticCode::GraphFailed))?
         .to_owned();
-    let mut exercise = run
-        .lock()
-        .map_err(|_| InvestigationError::new(DiagnosticCode::GraphFailed))?
-        .finish(&terminal)?;
     let mut routes: Vec<String> = state
         .get("investigation:routes")
         .cloned()
@@ -2149,7 +2079,19 @@ impl LiveDogfood {
                 };
             }
         };
-        if attempt_live_kit_repo(&worker).is_ok() {
+        let runtime = match adk_rust::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                return LiveResult {
+                    status: LiveStatus::Abstained,
+                    diagnostic: Some(InvestigationError::new(DiagnosticCode::ModelFailed)),
+                };
+            }
+        };
+        if runtime.block_on(attempt_live_kit_repo(&worker)).is_ok() {
             LiveResult {
                 status: LiveStatus::Published,
                 diagnostic: None,
@@ -2163,7 +2105,7 @@ impl LiveDogfood {
     }
 }
 
-fn attempt_live_kit_repo(
+async fn attempt_live_kit_repo(
     worker: &workflow_adk::model_profiles::ModelBinding,
 ) -> Result<(), InvestigationError> {
     let snapshot = FixtureRepo::kit_repo().snapshot();
@@ -2174,28 +2116,22 @@ fn attempt_live_kit_repo(
         .next()
         .ok_or_else(|| InvestigationError::new(DiagnosticCode::PathNotFound))?;
     let evidence = tools.read_source_range(hit.path(), hit.line(), hit.line())?;
-    let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+    let mut stream = worker
+        .generate_content(
+            LlmRequest::new(
+                "code-investigation-live",
+                vec![Content::new("user").with_text(evidence.snippet())],
+            ),
+            false,
+        )
+        .await
         .map_err(|_| InvestigationError::new(DiagnosticCode::ModelFailed))?;
-    runtime.block_on(async {
-        let mut stream = worker
-            .generate_content(
-                LlmRequest::new(
-                    "code-investigation-live",
-                    vec![Content::new("user").with_text(evidence.snippet())],
-                ),
-                false,
-            )
-            .await
-            .map_err(|_| InvestigationError::new(DiagnosticCode::ModelFailed))?;
-        stream
-            .next()
-            .await
-            .ok_or_else(|| InvestigationError::new(DiagnosticCode::ModelFailed))?
-            .map_err(|_| InvestigationError::new(DiagnosticCode::ModelFailed))?;
-        Ok(())
-    })
+    stream
+        .next()
+        .await
+        .ok_or_else(|| InvestigationError::new(DiagnosticCode::ModelFailed))?
+        .map_err(|_| InvestigationError::new(DiagnosticCode::ModelFailed))?;
+    Ok(())
 }
 
 #[cfg(test)]
