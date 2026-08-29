@@ -6,7 +6,10 @@ use std::{
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use workflow_adk::execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1};
+use workflow_adk::{
+    TerminalOutcome,
+    execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1},
+};
 use workflow_runtime::{CheckpointManifestV1, RunId, SqliteCheckpointStore};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -184,7 +187,7 @@ fn resume_restores_pending_retry_route_frontier_and_visits_without_reexecuting_c
 }
 
 #[test]
-fn resume_rejects_truncated_events_before_graph_invocation() {
+fn resume_failures_map_to_incompatible_terminal_outcome() {
     let root = TestRoot::new();
     let profile = ExecutionProfileV1::parse(
         br#"{
@@ -226,6 +229,10 @@ fn resume_rejects_truncated_events_before_graph_invocation() {
 
     let error = ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(
+        error.terminal_outcome(),
+        TerminalOutcome::IncompatibleResume
+    );
     assert_eq!(fs::read(&events_path).unwrap(), truncated_events);
 
     let manifest: CheckpointManifestV1 = serde_json::from_slice(
@@ -368,6 +375,10 @@ fn resume_rejects_same_workflow_identity_with_changed_canonical_content() {
 
     let error = ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(
+        error.terminal_outcome(),
+        TerminalOutcome::IncompatibleResume
+    );
 }
 
 #[test]

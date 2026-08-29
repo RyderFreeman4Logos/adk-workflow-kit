@@ -42,10 +42,22 @@ m1-03-green:
 m1-15-test:
     {{_io}} cargo +1.98.0 test -p workflow-testkit --test m1_15_conformance --locked
 
+# Focused M1-15 production-boundary translation tests.
+m1-15-translation:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test translation --locked
+
+# Focused M1-15 ToolBridge authorization tests.
+m1-15-tool-bridge:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test m1_07_tool_bridge --locked
+
+# Focused M1-15 checkpoint terminal-mapping tests.
+m1-15-checkpoint:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test m1_11_execution_checkpoints --locked
+
 # Network-free M1-15 aggregate: adapter graph/events, approval, tool+sandbox, fault injection,
 # checkpoint/resume (including destructive SIGKILL), artifact integrity, and its report contract.
 conformance:
-    report="${CONFORMANCE_REPORT:-target/m1-15-conformance.md}"; head="$(git rev-parse HEAD)"; tree="$(git write-tree)"; mkdir -p "$(dirname "$report")"; status=PASS; {{_io}} cargo +1.98.0 test -p workflow-adk --test translation --locked || status=FAIL; {{_io}} cargo +1.98.0 test -p workflow-adk --test translation fan_in_state_conflict_is_executable --locked || status=FAIL; {{_io}} cargo +1.98.0 test -p workflow-adk --test events --locked || status=FAIL; {{_io}} cargo +1.98.0 test -p workflow-adk --test tool_bridge --locked || status=FAIL; {{_io}} cargo +1.98.0 test -p workflow-runtime --test m1_07_tool_bridge --locked || status=FAIL; {{_io}} cargo +1.98.0 test -p workflow-testkit --test fault_injection --locked || status=FAIL; {{_io}} cargo +1.98.0 test -p workflow-testkit --test code_investigation --locked || status=FAIL; {{_io}} cargo +1.98.0 test -p workflow-adk --test m1_11_execution_checkpoints --locked || status=FAIL; {{_io}} cargo +1.98.0 test -p workflowctl --test m1_10_adk_run --locked || status=FAIL; {{_io}} cargo +1.98.0 test -p workflowctl --test m1_12_destructive_resume --locked || status=FAIL; {{_io}} cargo +1.98.0 test -p workflow-testkit --test m1_15_conformance --locked || status=FAIL; {{_io}} cargo +1.98.0 run -p workflow-testkit --bin m1-15-report --locked -- "$report" "$head" "$tree" "$status"; test "$status" = PASS
+    report="${CONFORMANCE_REPORT:-target/m1-15-conformance.md}"; head="$(git rev-parse HEAD)"; tree="$(git write-tree)"; mkdir -p "$(dirname "$report")"; status=PASS; evidence="$(mktemp)"; trap 'rm -f "$evidence"' EXIT; run() { command="$1"; shift; if "$@"; then result=PASS; else result=FAIL; status=FAIL; fi; printf '%s\t%s\n' "$result" "$command" >> "$evidence"; }; run "ionice -c 3 cargo +1.98.0 test -p workflow-adk --test translation --locked" {{_io}} cargo +1.98.0 test -p workflow-adk --test translation --locked; run "ionice -c 3 cargo +1.98.0 test -p workflow-adk --test translation fan_in_state_conflict_is_executable --locked" {{_io}} cargo +1.98.0 test -p workflow-adk --test translation fan_in_state_conflict_is_executable --locked; run "ionice -c 3 cargo +1.98.0 test -p workflow-adk --test events --locked" {{_io}} cargo +1.98.0 test -p workflow-adk --test events --locked; run "ionice -c 3 cargo +1.98.0 test -p workflow-adk --test tool_bridge --locked" {{_io}} cargo +1.98.0 test -p workflow-adk --test tool_bridge --locked; run "ionice -c 3 cargo +1.98.0 test -p workflow-runtime --test m1_07_tool_bridge --locked" {{_io}} cargo +1.98.0 test -p workflow-runtime --test m1_07_tool_bridge --locked; run "ionice -c 3 cargo +1.98.0 test -p workflow-testkit --test fault_injection --locked" {{_io}} cargo +1.98.0 test -p workflow-testkit --test fault_injection --locked; run "ionice -c 3 cargo +1.98.0 test -p workflow-testkit --test code_investigation --locked" {{_io}} cargo +1.98.0 test -p workflow-testkit --test code_investigation --locked; run "ionice -c 3 cargo +1.98.0 test -p workflow-adk --test m1_11_execution_checkpoints --locked" {{_io}} cargo +1.98.0 test -p workflow-adk --test m1_11_execution_checkpoints --locked; run "ionice -c 3 cargo +1.98.0 test -p workflowctl --test m1_10_adk_run --locked" {{_io}} cargo +1.98.0 test -p workflowctl --test m1_10_adk_run --locked; run "ionice -c 3 cargo +1.98.0 test -p workflowctl --test m1_12_destructive_resume --locked" {{_io}} cargo +1.98.0 test -p workflowctl --test m1_12_destructive_resume --locked; run "ionice -c 3 cargo +1.98.0 test -p workflow-testkit --test m1_15_conformance --locked" {{_io}} cargo +1.98.0 test -p workflow-testkit --test m1_15_conformance --locked; {{_io}} cargo +1.98.0 run -p workflow-testkit --bin m1-15-report --locked -- "$report" "$head" "$tree" "$status" "$evidence"; test "$status" = PASS
 
 # Opt in without inspecting credentials; the M1-14 dogfood either completes or safely abstains.
 conformance-live:

@@ -233,6 +233,50 @@ fn capability_intersection_denies_forbidden_skill_before_handler() {
 }
 
 #[test]
+fn caller_scope_and_approval_denial_stop_handler() {
+    let calls = Arc::new(Mutex::new(0));
+    let mut bridge = bridge(
+        registration(ToolFlags::new(false, true, true))
+            .with_idempotency(ToolIdempotency::StableKey),
+        FixtureTool {
+            calls: Arc::clone(&calls),
+            payload: json!("must not execute"),
+        },
+    );
+    let mut artifacts =
+        InMemoryArtifactStore::new(NonZeroU64::new(4096).unwrap(), NonZeroU64::new(16).unwrap());
+    let call = ToolCall::new("fixture", "denied", "actor-1", json!({}));
+
+    assert_eq!(
+        bridge
+            .invoke(
+                call.clone(),
+                &authority(&["fixture"]).with_caller_scopes(std::iter::empty::<String>()),
+                Some(&ApprovalLedger::new()),
+                Duration::from_secs(1),
+                &mut artifacts,
+            )
+            .expect_err("missing caller scope must deny before dispatch")
+            .kind(),
+        ToolBridgeErrorKind::CapabilityDenied
+    );
+    assert_eq!(
+        bridge
+            .invoke(
+                call,
+                &authority(&["fixture"]),
+                Some(&ApprovalLedger::new()),
+                Duration::from_secs(1),
+                &mut artifacts,
+            )
+            .expect_err("missing approval must deny before dispatch")
+            .kind(),
+        ToolBridgeErrorKind::ApprovalDenied
+    );
+    assert_eq!(*calls.lock().expect("fixture lock"), 0);
+}
+
+#[test]
 fn tool_bridge_narrows_each_handler_to_effective_capabilities() {
     let write_denied = Arc::new(Mutex::new(None));
     let mut bridge = bridge(

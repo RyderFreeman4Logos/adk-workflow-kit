@@ -1,13 +1,20 @@
-use std::{env, path::PathBuf, process::ExitCode};
+use std::{env, fs, path::PathBuf, process::ExitCode};
 
-use workflow_testkit::conformance::{ConformanceStatus, write_conformance_report};
+use workflow_testkit::conformance::{
+    ConformanceStatus, ConformanceSubgate, write_conformance_report,
+};
 
 fn main() -> ExitCode {
     let mut args = env::args_os().skip(1);
     let Some(path) = args.next().map(PathBuf::from) else {
         return usage();
     };
-    let (Some(head), Some(tree), Some(status)) = (args.next(), args.next(), args.next()) else {
+    let (Some(head), Some(tree), Some(status), Some(evidence)) = (
+        args.next(),
+        args.next(),
+        args.next(),
+        args.next().map(PathBuf::from),
+    ) else {
         return usage();
     };
     if args.next().is_some() {
@@ -19,8 +26,21 @@ fn main() -> ExitCode {
     let (Some(head), Some(tree)) = (head.to_str(), tree.to_str()) else {
         return usage();
     };
+    let Ok(evidence) = fs::read_to_string(evidence) else {
+        return ExitCode::from(1);
+    };
+    let mut subgates = Vec::new();
+    for line in evidence.lines() {
+        let Some((result, command)) = line.split_once('\t') else {
+            return ExitCode::from(1);
+        };
+        let Some(result) = parse_status(result) else {
+            return ExitCode::from(1);
+        };
+        subgates.push(ConformanceSubgate::new(command, result));
+    }
 
-    match write_conformance_report(&path, head, tree, status) {
+    match write_conformance_report(&path, head, tree, status, &subgates) {
         Ok(receipt) => {
             println!(
                 "M1-15 conformance report: {} {}",

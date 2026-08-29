@@ -5,7 +5,8 @@ pub mod execution;
 pub mod model_profiles;
 pub mod tool_bridge;
 
-use std::collections::BTreeMap;
+use crate::execution::{ExecutionError, ExecutionErrorKind};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -24,6 +25,7 @@ use workflow_compiler::{CompiledPlan, ResolvedRuntimePlan};
 use workflow_ir::IrNodeKind;
 use workflow_runtime::{
     PureTransformBackend, PureTransformRequest, RequestedCapabilities, SandboxCapability,
+    ToolBridgeErrorKind,
 };
 
 const MAX_PATH_BYTES: usize = 256;
@@ -208,6 +210,31 @@ impl TerminalOutcome {
             Self::IncompatibleResume => "incompatible_resume",
         }
     }
+
+    /// Projects a real ToolBridge policy denial to the closed terminal vocabulary.
+    pub const fn from_tool_bridge_error(kind: ToolBridgeErrorKind) -> Self {
+        match kind {
+            ToolBridgeErrorKind::CapabilityDenied | ToolBridgeErrorKind::ApprovalDenied => {
+                Self::AuthorizationDenied
+            }
+            _ => Self::Failed,
+        }
+    }
+
+    /// Projects a resume compatibility or corruption failure to its terminal outcome.
+    pub const fn from_execution_error(kind: ExecutionErrorKind) -> Self {
+        match kind {
+            ExecutionErrorKind::InvalidRunState => Self::IncompatibleResume,
+            _ => Self::Failed,
+        }
+    }
+}
+
+impl ExecutionError {
+    /// Returns the closed terminal outcome for this real execution failure.
+    pub const fn terminal_outcome(&self) -> TerminalOutcome {
+        TerminalOutcome::from_execution_error(self.kind())
+    }
 }
 
 /// A serializable description of a translated graph.
@@ -237,6 +264,9 @@ pub enum TranslationError {
         plan_ir_hash: String,
         ir_hash: String,
     },
+    FanInStateConflict {
+        node: String,
+    },
 }
 
 impl fmt::Display for TranslationError {
@@ -252,6 +282,9 @@ impl fmt::Display for TranslationError {
             }
             Self::ResolvedPlanMismatch { .. } => {
                 write!(f, "graph translation rejected resolved plan mismatch")
+            }
+            Self::FanInStateConflict { node } => {
+                write!(f, "graph translation rejected state fan-in at {node:?}")
             }
         }
     }
@@ -546,7 +579,11 @@ impl AdkGraph {
             .terminals
             .iter()
             .any(|terminal| terminal == id)
-            .then_some(TerminalOutcome::Succeeded)
+            .then_some(match id {
+                "authorization_denied" => TerminalOutcome::AuthorizationDenied,
+                "incompatible_resume" => TerminalOutcome::IncompatibleResume,
+                _ => TerminalOutcome::Succeeded,
+            })
     }
 }
 
@@ -692,6 +729,43 @@ impl AdkGraphTranslator {
                     target: target.as_str().to_owned(),
                 });
             }
+        }
+        let mut incoming = BTreeMap::new();
+        let mut outgoing = BTreeMap::new();
+        for edge in ir.edges() {
+            incoming
+                .entry(edge.to().as_str())
+                .or_insert_with(Vec::new)
+                .push(edge.from().as_str());
+            outgoing
+                .entry(edge.from().as_str())
+                .or_insert_with(Vec::new)
+                .push(edge.to().as_str());
+        }
+        for route in ir.routes() {
+            let targets = outgoing
+                .entry(route.from().as_str())
+                .or_insert_with(Vec::new);
+            targets.extend(route.cases().iter().map(|case| case.target().as_str()));
+            if let Some(target) = route.default() {
+                targets.push(target.as_str());
+            }
+        }
+        if let Some(node) = incoming.iter().find_map(|(node, predecessors)| {
+            predecessors
+                .iter()
+                .enumerate()
+                .find_map(|(index, predecessor)| {
+                    predecessors[index + 1..].iter().find_map(|other| {
+                        (!graph_path_exists(predecessor, other, &outgoing)
+                            && !graph_path_exists(other, predecessor, &outgoing))
+                        .then_some(*node)
+                    })
+                })
+        }) {
+            return Err(TranslationError::FanInStateConflict {
+                node: node.to_owned(),
+            });
         }
         let visit_bound = ir_visit_bound(ir);
         let recursion_limit = visit_bound.unwrap_or(50);
@@ -962,6 +1036,26 @@ fn visit_bound_from_error(error: &GraphError) -> Option<usize> {
         .next()?
         .parse()
         .ok()
+}
+
+fn graph_path_exists<'a>(
+    start: &'a str,
+    target: &str,
+    outgoing: &BTreeMap<&'a str, Vec<&'a str>>,
+) -> bool {
+    let mut pending = vec![start];
+    let mut seen = BTreeSet::new();
+    while let Some(node) = pending.pop() {
+        if node == target {
+            return true;
+        }
+        if seen.insert(node)
+            && let Some(next) = outgoing.get(node)
+        {
+            pending.extend(next.iter().copied());
+        }
+    }
+    false
 }
 
 fn canonical_ir_hash(ir: &workflow_ir::WorkflowIr) -> String {

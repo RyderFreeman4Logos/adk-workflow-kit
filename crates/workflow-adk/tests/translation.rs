@@ -1,4 +1,4 @@
-use adk_rust::graph::prelude::{END, ExecutionConfig, GraphAgent, NodeOutput, START, State};
+use adk_rust::graph::prelude::{ExecutionConfig, State};
 use serde_json::json;
 use workflow_adk::events::AdkEventMapper;
 use workflow_adk::{AdkGraphTranslator, TerminalOutcome, TranslationError};
@@ -145,6 +145,50 @@ predicate = { id = "route-pred", version = "1" }
 cases = { left = "left" }
 "#;
 
+const FAN_IN_CONFLICT: &str = r#"
+schema_version = 1
+[workflow]
+id = "fan-in-conflict"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "left"
+kind = "agent"
+[[nodes]]
+id = "right"
+kind = "agent"
+[[nodes]]
+id = "join"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "left"
+[[edges]]
+from = "start"
+to = "right"
+[[edges]]
+from = "left"
+to = "join"
+[[edges]]
+from = "right"
+to = "join"
+"#;
+
+const FAILURE_TERMINALS: &str = r#"
+schema_version = 1
+edges = []
+[workflow]
+id = "failure-terminals"
+version = "1"
+entry = "authorization_denied"
+[[nodes]]
+id = "authorization_denied"
+kind = "terminal"
+"#;
+
 struct AnyPredicate;
 
 impl PredicateRegistry for AnyPredicate {
@@ -276,30 +320,37 @@ async fn bounded_cycle_honors_max_visits_not_adk_default() {
     );
 }
 
-#[tokio::test]
-async fn fan_in_state_conflict_is_executable() {
-    let graph = GraphAgent::builder("fan-in-state-conflict")
-        .channels(&["shared"])
-        .node_fn("left", |_| async {
-            Ok(NodeOutput::new().with_update("shared", json!("left")))
-        })
-        .node_fn("right", |_| async {
-            Ok(NodeOutput::new().with_update("shared", json!("right")))
-        })
-        .node_fn("join", |_| async { Ok(NodeOutput::new()) })
-        .edge(START, "left")
-        .edge(START, "right")
-        .edge("left", "join")
-        .edge("right", "join")
-        .edge("join", END)
-        .build()
-        .expect("fan-in fixture graph builds");
+#[test]
+fn fan_in_state_conflict_is_executable() {
+    let plan = compile_str("fan-in-conflict.workflow.toml", FAN_IN_CONFLICT)
+        .expect("fan-in fixture compiles");
+    assert!(
+        AdkGraphTranslator::new().translate(&plan).is_err(),
+        "the kit translation boundary must reject a shared-state fan-in before ADK can pick a last writer"
+    );
+}
 
-    let state = graph
-        .invoke(State::new(), ExecutionConfig::new("fan-in-conflict"))
-        .await
-        .expect("fan-in fixture executes");
-    assert_eq!(state.get("shared"), Some(&json!("right")));
+#[test]
+fn terminal_outcome_maps_failure_terminals_without_success_fallback() {
+    let plan = compile_str("failure-terminals.workflow.toml", FAILURE_TERMINALS)
+        .expect("failure terminal fixture compiles");
+    let graph = AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("failure terminal fixture translates");
+    assert_eq!(
+        graph.terminal_outcome("authorization_denied"),
+        Some(TerminalOutcome::AuthorizationDenied)
+    );
+    let incompatible = FAILURE_TERMINALS.replace("authorization_denied", "incompatible_resume");
+    let incompatible = compile_str("incompatible-resume.workflow.toml", &incompatible)
+        .expect("incompatible resume terminal fixture compiles");
+    let incompatible = AdkGraphTranslator::new()
+        .translate(&incompatible)
+        .expect("incompatible resume terminal fixture translates");
+    assert_eq!(
+        incompatible.terminal_outcome("incompatible_resume"),
+        Some(TerminalOutcome::IncompatibleResume)
+    );
 }
 
 #[tokio::test]

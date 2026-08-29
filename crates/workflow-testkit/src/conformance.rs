@@ -87,7 +87,9 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             "approval argument fingerprint mismatch",
             "approval expired",
         ],
-        aggregate_targets: &["workflow-runtime --test m1_07_tool_bridge"],
+        aggregate_targets: &[
+            "workflow-runtime --test m1_07_tool_bridge caller_scope_and_approval_denial_stop_handler",
+        ],
     },
     FailureClass {
         class: "checkpoint",
@@ -102,7 +104,9 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             "effect journal unavailable",
             "crash at each transaction boundary",
         ],
-        aggregate_targets: &["workflow-adk --test m1_11_execution_checkpoints"],
+        aggregate_targets: &[
+            "workflow-adk --test m1_11_execution_checkpoints resume_failures_map_to_incompatible_terminal_outcome",
+        ],
     },
     FailureClass {
         class: "sandbox",
@@ -160,12 +164,40 @@ impl ConformanceReceipt {
     }
 }
 
+/// One executed aggregate subgate recorded in the durable report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConformanceSubgate {
+    command: String,
+    status: ConformanceStatus,
+}
+
+impl ConformanceSubgate {
+    /// Binds the exact invoked command to its terminal result.
+    pub fn new(command: impl Into<String>, status: ConformanceStatus) -> Self {
+        Self {
+            command: command.into(),
+            status,
+        }
+    }
+
+    /// Returns the exact invoked command.
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    /// Returns the command result.
+    pub const fn status(&self) -> ConformanceStatus {
+        self.status
+    }
+}
+
 /// Writes an auditable, checkout-bound conformance report.
 pub fn write_conformance_report(
     path: impl AsRef<Path>,
     head: &str,
     tree: &str,
     status: ConformanceStatus,
+    subgates: &[ConformanceSubgate],
 ) -> io::Result<ConformanceReceipt> {
     if !is_git_object_id(head) || !is_git_object_id(tree) {
         return Err(io::Error::new(
@@ -174,14 +206,26 @@ pub fn write_conformance_report(
         ));
     }
 
+    if subgates.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conformance report requires subgate evidence",
+        ));
+    }
+
     let path = path.as_ref().to_path_buf();
-    fs::write(
-        &path,
-        format!(
-            "# M1-15 ADK boundary/failure conformance\n\nstatus: {}\nhead: {head}\ntree: {tree}\n",
-            status.as_str()
-        ),
-    )?;
+    let mut report = format!(
+        "# M1-15 ADK boundary/failure conformance\n\nstatus: {}\nhead: {head}\ntree: {tree}\nsubgates:\n",
+        status.as_str()
+    );
+    for subgate in subgates {
+        report.push_str(&format!(
+            "- command: {}\n  result: {}\n",
+            subgate.command(),
+            subgate.status().as_str()
+        ));
+    }
+    fs::write(&path, report)?;
     Ok(ConformanceReceipt { path, status })
 }
 

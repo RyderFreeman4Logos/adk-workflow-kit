@@ -6,7 +6,7 @@ use std::{
 
 use workflow_adk::TerminalOutcome;
 use workflow_testkit::conformance::{
-    ConformanceStatus, documented_failure_matrix, write_conformance_report,
+    ConformanceStatus, ConformanceSubgate, documented_failure_matrix, write_conformance_report,
 };
 
 static NEXT_REPORT: AtomicU64 = AtomicU64::new(0);
@@ -119,6 +119,33 @@ fn fan_in_state_conflict_requires_a_dedicated_executable_target() {
 }
 
 #[test]
+fn failure_matrix_uses_production_boundary_selectors() {
+    let matrix = documented_failure_matrix();
+    let authorization = matrix
+        .iter()
+        .find(|entry| entry.class() == "authorization")
+        .expect("authorization failure class is documented");
+    assert_eq!(
+        authorization.aggregate_targets(),
+        &[
+            "workflow-runtime --test m1_07_tool_bridge caller_scope_and_approval_denial_stop_handler",
+        ],
+        "authorization must name the production denial selector, not its whole test binary"
+    );
+
+    let checkpoint = matrix
+        .iter()
+        .find(|entry| entry.class() == "checkpoint")
+        .expect("checkpoint failure class is documented");
+    assert!(
+        checkpoint
+            .aggregate_targets()
+            .contains(&"workflow-adk --test m1_11_execution_checkpoints resume_failures_map_to_incompatible_terminal_outcome"),
+        "resume compatibility requires an executable terminal-outcome selector"
+    );
+}
+
+#[test]
 fn terminal_categories_are_closed_and_executable() {
     assert_eq!(
         TerminalOutcome::ALL.map(TerminalOutcome::as_str),
@@ -144,6 +171,10 @@ fn conformance_report_binds_exact_checkout_identity_and_status() {
         "e9f6c6334491432c2b544209e3d303128239290b",
         "8d9edb311ac60ca97dbcae5fdc23baad26f8a5f3",
         ConformanceStatus::Pass,
+        &[ConformanceSubgate::new(
+            "just m1-15-test",
+            ConformanceStatus::Pass,
+        )],
     )
     .expect("report must be written");
 
@@ -153,6 +184,24 @@ fn conformance_report_binds_exact_checkout_identity_and_status() {
     assert!(report.contains("status: PASS"));
     assert!(report.contains("head: e9f6c6334491432c2b544209e3d303128239290b"));
     assert!(report.contains("tree: 8d9edb311ac60ca97dbcae5fdc23baad26f8a5f3"));
+    assert!(
+        report.contains("subgates:\n- command: just m1-15-test\n  result: PASS"),
+        "reports must retain each subgate command and result"
+    );
 
     fs::remove_file(path).expect("report cleanup");
+}
+
+#[test]
+fn conformance_report_rejects_missing_subgate_evidence() {
+    let error = write_conformance_report(
+        report_path(),
+        "e9f6c6334491432c2b544209e3d303128239290b",
+        "8d9edb311ac60ca97dbcae5fdc23baad26f8a5f3",
+        ConformanceStatus::Pass,
+        &[],
+    )
+    .expect_err("a conformance report without subgate evidence must fail");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
