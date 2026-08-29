@@ -388,6 +388,75 @@ fn approval_is_bound_to_call_id_arguments_actor_and_expiry() {
 }
 
 #[test]
+fn approval_call_id_mismatch_is_rejected() {
+    let arguments = json!({"value": 1});
+    let approval = ApprovalLedger::new().grant(
+        "fixture",
+        "call-1",
+        &arguments,
+        "actor-1",
+        Duration::from_secs(10),
+    );
+    assert!(
+        approval
+            .authorize(
+                "fixture",
+                "call-2",
+                &arguments,
+                "actor-1",
+                Duration::from_secs(1)
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn approval_argument_fingerprint_mismatch_is_rejected() {
+    let arguments = json!({"value": 1});
+    let approval = ApprovalLedger::new().grant(
+        "fixture",
+        "call-1",
+        &arguments,
+        "actor-1",
+        Duration::from_secs(10),
+    );
+    assert!(
+        approval
+            .authorize(
+                "fixture",
+                "call-1",
+                &json!({"value": 2}),
+                "actor-1",
+                Duration::from_secs(1)
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn expired_approval_is_rejected() {
+    let arguments = json!({"value": 1});
+    let approval = ApprovalLedger::new().grant(
+        "fixture",
+        "call-1",
+        &arguments,
+        "actor-1",
+        Duration::from_secs(10),
+    );
+    assert!(
+        approval
+            .authorize(
+                "fixture",
+                "call-1",
+                &arguments,
+                "actor-1",
+                Duration::from_secs(11)
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn large_output_is_paged_as_bounded_preview_with_consumable_artifact_handle() {
     let calls = Arc::new(Mutex::new(0));
     let payload = json!({ "message": "a".repeat(256) });

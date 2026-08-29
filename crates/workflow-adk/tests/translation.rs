@@ -65,6 +65,26 @@ from = "loop"
 to = "done"
 "#;
 
+const UNBOUNDED_CYCLE: &str = r#"
+schema_version = 1
+[workflow]
+id = "unbounded-cycle"
+version = "1"
+entry = "loop"
+[[nodes]]
+id = "loop"
+kind = "action"
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "loop"
+to = "loop"
+[[edges]]
+from = "loop"
+to = "done"
+"#;
+
 const BOUNDED_INVOKE: &str = r#"
 schema_version = 1
 [workflow]
@@ -652,6 +672,16 @@ async fn bounded_cycle_honors_max_visits_not_adk_default() {
     assert!(
         !rendered.contains("50"),
         "must not rely on ADK default recursion_limit, got {rendered}"
+    );
+}
+
+#[test]
+fn unbounded_cycle_is_rejected_before_adk_translation() {
+    let error = compile_str("unbounded-cycle.workflow.toml", UNBOUNDED_CYCLE)
+        .expect_err("an unbounded cycle must be rejected before ADK translation");
+    assert!(
+        error.to_string().contains("cycle"),
+        "unbounded-cycle diagnostic must name the rejected cycle: {error}"
     );
 }
 

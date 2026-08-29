@@ -105,6 +105,19 @@ fn sqlite_checkpoint_rejects_corruption_and_unknown_versions() {
 }
 
 #[test]
+fn sqlite_checkpoint_rejects_unknown_schema_version() {
+    let root = TestRoot::new();
+    let run_id = RunId::new("run-unknown-schema".to_owned()).unwrap();
+    let unknown = manifest(&run_id).with_schema_version(2);
+    let error = SqliteCheckpointStore::open(root.database(), unknown).unwrap_err();
+    assert_eq!(error.kind(), CheckpointErrorKind::UnknownVersion);
+    assert_eq!(
+        error.to_string(),
+        "checkpoint schema version is unsupported"
+    );
+}
+
+#[test]
 fn sqlite_checkpoint_write_failure_is_typed_and_does_not_publish_state() {
     let root = TestRoot::new();
     let run_id = RunId::new("run-write-failure".to_owned()).unwrap();

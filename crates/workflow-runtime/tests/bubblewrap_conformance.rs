@@ -412,6 +412,35 @@ fn check09_resource_limits_fail_closed_as_backend_selection_fails() {
 }
 
 #[test]
+fn memory_time_and_output_limits_are_enforced_or_fail_closed() {
+    let fixture = Fixture::new();
+    let timeout = request(
+        &fixture.workdir,
+        "sleep 60",
+        &[SandboxCapability::ProcessSpawn],
+    )
+    .with_wall_time(300);
+    let receipt = backend()
+        .execute(&timeout)
+        .expect("time-limited process must launch for cancellation");
+    assert!(
+        !receipt.exit_success(),
+        "time limit must terminate the process"
+    );
+
+    for capability in [SandboxCapability::Memory, SandboxCapability::OutputBytes] {
+        let fixture = Fixture::new();
+        let request = request(&fixture.workdir, "true", &[capability]);
+        match backend().execute(&request) {
+            Err(BubblewrapError::Capabilities(unsatisfied)) => {
+                assert!(unsatisfied.missing().contains(&capability));
+            }
+            other => panic!("expected {capability:?} to fail closed, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn check10_cancellation_leaves_no_surviving_process() {
     // Timeout-driven cancellation uses the same kill path as explicit
     // cancellation; require a PID/start-time witness before checking liveness.

@@ -82,6 +82,30 @@ fn bubblewrap_backend_rejects_forged_network_capability_before_spawn() {
 }
 
 #[test]
+fn bubblewrap_backend_without_process_spawn_fails_before_launch() {
+    let (_base, workdir) = workdir();
+    let backend = LinuxBubblewrapBackend::new(BackendCapabilities::new([]));
+    let request = BubblewrapRequest::new(
+        String::from("true"),
+        &workdir,
+        BTreeMap::new(),
+        RequestedCapabilities::new([SandboxCapability::ProcessSpawn]),
+    )
+    .expect("capability request must be valid");
+
+    match backend.execute(&request) {
+        Err(workflow_runtime::BubblewrapError::Capabilities(unsatisfied)) => {
+            assert!(
+                unsatisfied
+                    .missing()
+                    .contains(&SandboxCapability::ProcessSpawn)
+            );
+        }
+        other => panic!("expected process-spawn capability failure, got {other:?}"),
+    }
+}
+
+#[test]
 fn bubblewrap_backend_rejects_an_unbounded_output_request_before_spawn() {
     let (_base, workdir) = workdir();
     let backend = LinuxBubblewrapBackend::new(BackendCapabilities::new([
