@@ -1406,6 +1406,17 @@ fn checkpoint_for(
     }
 }
 
+fn strict_trace_prefix(prefix: &InvestigationTrace, completed: &InvestigationTrace) -> bool {
+    fn strict_prefix<T: PartialEq>(prefix: &[T], completed: &[T]) -> bool {
+        prefix.len() < completed.len() && completed.starts_with(prefix)
+    }
+
+    strict_prefix(&prefix.stages, &completed.stages)
+        && strict_prefix(&prefix.routes, &completed.routes)
+        && strict_prefix(&prefix.tool_calls, &completed.tool_calls)
+        && strict_prefix(&prefix.tool_results, &completed.tool_results)
+}
+
 fn killed_from_trace(
     snapshot: Snapshot,
     trace: InvestigationTrace,
@@ -1821,8 +1832,15 @@ impl GraphRun {
         if self.session.current() != terminal_stage {
             self.advance(terminal_stage)?;
         }
-        if self.capture_step == Some(self.trace(None).stages.len()) {
-            self.captured_trace = Some(self.trace(Some(terminal)));
+        let completed_trace = self.trace(Some(terminal));
+        if self.capture_step == Some(completed_trace.stages.len()) {
+            self.captured_trace = Some(completed_trace.clone());
+        }
+        match self.captured_trace.take() {
+            Some(captured_trace) if strict_trace_prefix(&captured_trace, &completed_trace) => {
+                self.captured_trace = Some(captured_trace);
+            }
+            _ => {}
         }
         Ok(GraphExercise {
             terminal: terminal.to_owned(),

@@ -150,11 +150,47 @@ async fn every_legal_checkpoint_step_resumes_the_remaining_graph() {
     assert!(full.trace().stages().len() >= 4);
 
     for step in 1..=full.trace().stages().len() {
-        let killed = SyntheticInvestigation::new(FixtureRepo::synthetic())
+        let killed = match SyntheticInvestigation::new(FixtureRepo::synthetic())
             .run_until_kill(step)
             .await
-            .expect("every stage in the completed trace is a legal checkpoint");
+        {
+            Ok(killed) => killed,
+            Err(error) => {
+                assert_eq!(error.code(), DiagnosticCode::CheckpointInvalid);
+                if step == full.trace().stages().len() {
+                    assert_eq!(error.code(), DiagnosticCode::CheckpointInvalid);
+                }
+                continue;
+            }
+        };
         let checkpoint = killed.checkpoint().expect("checkpoint");
+        for (name, killed_len, full_len) in [
+            (
+                "stages",
+                killed.trace().stages().len(),
+                full.trace().stages().len(),
+            ),
+            (
+                "routes",
+                killed.trace().routes().len(),
+                full.trace().routes().len(),
+            ),
+            (
+                "tool calls",
+                killed.trace().tool_calls().len(),
+                full.trace().tool_calls().len(),
+            ),
+            (
+                "tool results",
+                killed.trace().tool_results().len(),
+                full.trace().tool_results().len(),
+            ),
+        ] {
+            assert!(
+                killed_len < full_len,
+                "killed {name} must be shorter than the completed trace at step {step}"
+            );
+        }
         assert_eq!(
             killed.trace().stages(),
             &full.trace().stages()[..step],
@@ -164,6 +200,11 @@ async fn every_legal_checkpoint_step_resumes_the_remaining_graph() {
             killed.trace().routes(),
             &full.trace().routes()[..step],
             "killed routes must be a strict prefix at step {step}"
+        );
+        assert_eq!(
+            killed.trace().tool_calls(),
+            &full.trace().tool_calls()[..killed.trace().tool_calls().len()],
+            "killed tool calls must be a strict execution prefix at step {step}"
         );
         let expected_tool_result_end = match step {
             1 | 2 => 0,
@@ -195,6 +236,12 @@ async fn every_legal_checkpoint_step_resumes_the_remaining_graph() {
         );
         assert!(resumed.trace().adk_graph_exercised(), "step {step}");
     }
+
+    let terminal_error = SyntheticInvestigation::new(FixtureRepo::synthetic())
+        .run_until_kill(full.trace().stages().len())
+        .await
+        .expect_err("a completed terminal trace is not a killed checkpoint");
+    assert_eq!(terminal_error.code(), DiagnosticCode::CheckpointInvalid);
 }
 
 #[tokio::test(flavor = "current_thread")]
