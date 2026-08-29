@@ -223,7 +223,7 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             ),
             probe(
                 "caller scope absent",
-                "workflow-adk --test tool_bridge real_tool_bridge_policy_denial_projects_authorization_terminal_outcome",
+                "workflow-adk --test tool_bridge registered_tool_policy_denial_preserves_authorization_terminal_outcome",
                 "a real denial exposes AuthorizationDenied with zero effects",
             ),
             probe(

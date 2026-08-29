@@ -157,7 +157,7 @@ fn failure_matrix_uses_production_boundary_selectors() {
         .expect("caller scope denial is documented");
     assert_eq!(
         caller_scope.selector(),
-        "workflow-adk --test tool_bridge real_tool_bridge_policy_denial_projects_authorization_terminal_outcome",
+        "workflow-adk --test tool_bridge registered_tool_policy_denial_preserves_authorization_terminal_outcome",
         "authorization must name the production denial selector, not its whole test binary"
     );
 
