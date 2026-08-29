@@ -6,6 +6,8 @@ use std::{
     process::Command,
 };
 
+use serde::Deserialize;
+
 /// One documented failure probe, its exact test selector, and fail-closed assertion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FailureProbe {
@@ -83,8 +85,8 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             ),
             probe(
                 "malformed tool arguments",
-                "workflow-runtime --test m1_07_tool_bridge typed_output_schema_rejects_wrong_handler_wire_payload",
-                "the boundary rejects an invalid wire payload",
+                "workflow-runtime --test tool_contracts malformed_and_hostile_failure_data_fail_closed",
+                "malformed tool data is rejected before use",
             ),
             probe(
                 "empty response",
@@ -113,8 +115,8 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
         probes: &[
             probe(
                 "unknown tool",
-                "workflow-runtime --test m1_07_tool_bridge handler_forged_paging_metadata_is_rejected_and_unreadable",
-                "untrusted tool metadata is rejected and unreadable",
+                "workflow-testkit --test m1_15_conformance unknown_tool_fails_closed_before_dispatch",
+                "an unregistered tool is rejected before dispatch",
             ),
             probe(
                 "invalid arguments",
@@ -123,8 +125,8 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             ),
             probe(
                 "typed empty result",
-                "workflow-runtime --test m1_07_tool_bridge large_output_is_paged_as_bounded_preview_with_consumable_artifact_handle",
-                "tool output remains a typed bounded envelope",
+                "workflow-runtime --test tool_contracts success_empty_and_failure_round_trip_with_exact_provenance",
+                "an explicit typed empty result preserves exact provenance",
             ),
             probe(
                 "timeout",
@@ -386,6 +388,19 @@ impl ConformanceReceipt {
     }
 }
 
+/// One machine-readable, test-owned receipt emitted after a selected probe passes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeReceipt {
+    probe: String,
+    failure_class: String,
+    asserted_fail_closed_outcome: String,
+    selector: String,
+    test_count: usize,
+    exit_code: i32,
+    result: String,
+}
+
 /// One receipt produced by the conformance execution layer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConformanceSubgate {
@@ -422,7 +437,7 @@ pub fn execute_conformance_matrix() -> io::Result<ConformanceExecution> {
     let mut subgates = Vec::new();
     for class in documented_failure_matrix() {
         for probe in class.probes() {
-            subgates.push(execute_probe(*probe)?);
+            subgates.push(execute_probe(class.class(), *probe)?);
         }
     }
     if checkout_identity()? != (head.clone(), tree.clone()) {
@@ -446,7 +461,7 @@ pub fn execute_conformance_matrix() -> io::Result<ConformanceExecution> {
     })
 }
 
-fn execute_probe(probe: FailureProbe) -> io::Result<ConformanceSubgate> {
+fn execute_probe(class: &str, probe: FailureProbe) -> io::Result<ConformanceSubgate> {
     let output = Command::new("just")
         .args(["conformance-probe", probe.selector()])
         .output()?;
@@ -455,30 +470,47 @@ fn execute_probe(probe: FailureProbe) -> io::Result<ConformanceSubgate> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let test_count = output_text.matches("running 1 test").count();
-    let test_name = probe
-        .selector()
-        .split_ascii_whitespace()
-        .nth(3)
-        .expect("failure matrix selectors name one exact test");
-    let test_passed = output_text
+    let receipts = output_text
         .lines()
-        .any(|line| line.starts_with(&format!("test {test_name} ... ok")));
+        .filter_map(|line| line.strip_prefix("M1_15_RECEIPT="))
+        .map(serde_json::from_str::<ProbeReceipt>)
+        .collect::<Result<Vec<_>, _>>();
+    let receipt = receipts.ok().and_then(|mut receipts| {
+        (receipts.len() == 1).then(|| receipts.pop().expect("one receipt"))
+    });
     let exit_code = output.status.code().unwrap_or(-1);
-    let status = if output.status.success() && test_count == 1 && test_passed {
+    let status = if output.status.success()
+        && receipt.as_ref().is_some_and(|receipt| {
+            receipt.probe == probe.name()
+                && receipt.failure_class == class
+                && receipt.asserted_fail_closed_outcome == probe.expected_fail_closed_assertion()
+                && receipt.selector == probe.selector()
+                && receipt.test_count == 1
+                && receipt.exit_code == 0
+                && receipt.result == "PASS"
+        }) {
         ConformanceStatus::Pass
     } else {
         ConformanceStatus::Fail
     };
     let fixture = fixture_path(probe.selector())?;
+    let observed = receipt.map_or_else(
+        || "test-owned receipt: absent or invalid".to_owned(),
+        |receipt| {
+            format!(
+                "test-owned receipt: {} / {}",
+                receipt.failure_class, receipt.asserted_fail_closed_outcome
+            )
+        },
+    );
 
     Ok(ConformanceSubgate {
         selector: probe.selector(),
         command: format!("just conformance-probe {}", probe.selector()),
         fixture,
         expected: probe.expected_fail_closed_assertion(),
-        observed: format!("test {test_name}: {}", status.as_str()),
-        test_count,
+        observed,
+        test_count: usize::from(status == ConformanceStatus::Pass),
         exit_code,
         artifact_or_resume_path: None,
         status,

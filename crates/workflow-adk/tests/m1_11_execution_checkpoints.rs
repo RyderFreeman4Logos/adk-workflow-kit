@@ -626,3 +626,48 @@ fn resume_does_not_advance_checkpoint_when_event_persistence_fails() {
     assert_eq!(checkpoint_after, checkpoint_before);
     assert_eq!(fs::read(events_path).unwrap(), events_before);
 }
+
+#[test]
+fn execution_graph_preserves_authorization_denial_before_handler_effect() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "tool": {
+                "name": "protected-tool",
+                "result": {"ok": true},
+                "required_scopes": ["scope.denied"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .unwrap();
+    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
+
+    let error =
+        ExecutionBackend::run(workflow, profile, json!({"request":"public"}), &root.0).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::AuthorizationDenied);
+    assert_eq!(
+        error.terminal_outcome(),
+        TerminalOutcome::AuthorizationDenied
+    );
+
+    for entry in fs::read_dir(&root.0).unwrap().filter_map(Result::ok) {
+        let effects = entry.path().join("effects.sqlite");
+        if effects.is_file() {
+            let connection = Connection::open(effects).unwrap();
+            let count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM kit_effects", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+    }
+}

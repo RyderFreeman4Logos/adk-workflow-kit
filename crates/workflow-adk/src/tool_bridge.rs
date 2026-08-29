@@ -52,6 +52,21 @@ impl ToolExecutionError {
     }
 }
 
+pub(crate) fn project_tool_execution_error(error: ToolExecutionError) -> AdkError {
+    let (category, code) = match error.terminal_outcome() {
+        TerminalOutcome::AuthorizationDenied => {
+            (ErrorCategory::Forbidden, "tool.bridge.authorization_denied")
+        }
+        _ => (ErrorCategory::Internal, "tool.bridge.failed"),
+    };
+    AdkError::new(
+        ErrorComponent::Tool,
+        category,
+        code,
+        format!("{code}: {error}"),
+    )
+}
+
 impl From<ToolBridgeError> for ToolExecutionError {
     fn from(error: ToolBridgeError) -> Self {
         Self {
@@ -360,15 +375,7 @@ where
             state: Arc::clone(&self.state),
         }
         .invoke(call)
-        .map_err(|error| {
-            let (category, code) = match error.terminal_outcome() {
-                TerminalOutcome::AuthorizationDenied => {
-                    (ErrorCategory::Forbidden, "tool.bridge.authorization_denied")
-                }
-                _ => (ErrorCategory::Internal, "tool.bridge.failed"),
-            };
-            AdkError::new(ErrorComponent::Tool, category, code, error.to_string())
-        })?;
+        .map_err(project_tool_execution_error)?;
         serde_json::to_value(result).map_err(|error| {
             AdkError::new(
                 ErrorComponent::Tool,

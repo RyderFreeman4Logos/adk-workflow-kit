@@ -6,7 +6,12 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use serde_json::json;
 use workflow_adk::TerminalOutcome;
+use workflow_runtime::{
+    CapabilityIntersection, RunContext, RunId, RunLimits, RunSandbox, SandboxCapability,
+    ToolBridge, ToolBridgeErrorKind, WorkdirManager,
+};
 use workflow_testkit::conformance::documented_failure_matrix;
 
 static NEXT_REPORT: AtomicU64 = AtomicU64::new(0);
@@ -217,4 +222,122 @@ fn report_binary_rejects_caller_supplied_selector_only_passes() {
     );
     assert!(!path.exists(), "rejected report must not be written");
     fs::remove_file(evidence).expect("forged evidence fixture cleanup");
+}
+
+#[test]
+fn conformance_probe_requires_a_test_owned_structured_receipt() {
+    let output = Command::new("just")
+        .args([
+            "conformance-probe",
+            "workflow-runtime --test tool_contracts malformed_and_hostile_failure_data_fail_closed",
+        ])
+        .output()
+        .expect("conformance probe starts");
+    assert!(output.status.success(), "fixture contract test passes");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("M1_15_RECEIPT="),
+        "a PASS row requires a test-owned machine-readable receipt"
+    );
+}
+
+#[test]
+fn conformance_probe_emits_structured_receipt() {
+    let Ok(selector) = std::env::var("M1_15_PROBE_SELECTOR") else {
+        return;
+    };
+    let (class, probe) = documented_failure_matrix()
+        .iter()
+        .find_map(|class| {
+            class
+                .probes()
+                .iter()
+                .find(|probe| probe.selector() == selector)
+                .map(|probe| (class.class(), probe))
+        })
+        .expect("probe selector is documented");
+    let output = Command::new("just")
+        .args(["conformance-contract", &selector])
+        .output()
+        .expect("selected contract test starts");
+    let output_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let test_name = selector
+        .split_ascii_whitespace()
+        .nth(3)
+        .expect("documented selector names one exact test");
+    let test_count = output_text.matches("running 1 test").count();
+    assert!(output.status.success(), "selected contract test must pass");
+    assert_eq!(
+        test_count, 1,
+        "selected contract test must run exactly once"
+    );
+    assert!(
+        output_text
+            .lines()
+            .any(|line| line.starts_with(&format!("test {test_name} ... ok"))),
+        "selected contract test must report its exact name"
+    );
+    println!(
+        "M1_15_RECEIPT={}",
+        serde_json::to_string(&json!({
+            "probe": probe.name(),
+            "failure_class": class,
+            "asserted_fail_closed_outcome": probe.expected_fail_closed_assertion(),
+            "selector": selector,
+            "test_count": test_count,
+            "exit_code": output.status.code().unwrap_or(-1),
+            "result": "PASS",
+        }))
+        .expect("receipt serializes")
+    );
+}
+
+fn unknown_tool_sandbox() -> RunSandbox {
+    let root = std::env::temp_dir().join(format!(
+        "workflow-m1-15-unknown-tool-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).expect("fixture root exists");
+    let context = RunContext::new(
+        RunId::new("m1-15-unknown-tool".to_owned()).expect("fixture run ID"),
+        RunLimits::new(
+            std::num::NonZeroU64::new(1).unwrap(),
+            std::num::NonZeroU64::new(1).unwrap(),
+            std::num::NonZeroU64::new(1).unwrap(),
+            std::num::NonZeroU64::new(1_000).unwrap(),
+            std::num::NonZeroU64::new(1_000).unwrap(),
+            std::num::NonZeroU64::new(1_000).unwrap(),
+            std::num::NonZeroU64::new(1_000).unwrap(),
+        ),
+    );
+    let workdir = WorkdirManager::new(root)
+        .expect("fixture base is trusted")
+        .allocate(context.run_id())
+        .expect("fixture workdir allocates");
+    RunSandbox::new(context, workdir, [SandboxCapability::FilesystemRead])
+        .expect("fixture sandbox binds")
+}
+
+#[test]
+fn unknown_tool_fails_closed_before_dispatch() {
+    let bridge = ToolBridge::new(unknown_tool_sandbox());
+    let authority = CapabilityIntersection::new(
+        std::iter::empty::<SandboxCapability>(),
+        std::iter::empty::<&str>(),
+        std::iter::empty::<&str>(),
+        std::iter::empty::<&str>(),
+        std::iter::empty::<&str>(),
+        std::iter::empty::<&str>(),
+        std::iter::empty::<SandboxCapability>(),
+    );
+    assert_eq!(
+        bridge
+            .preflight("not-registered", &json!({}), &authority)
+            .expect_err("unknown tool must fail before dispatch")
+            .kind(),
+        ToolBridgeErrorKind::UnknownTool
+    );
 }

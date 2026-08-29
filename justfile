@@ -59,8 +59,12 @@ m1-15-checkpoint:
     {{_io}} cargo +1.98.0 test -p workflow-adk --test m1_11_execution_checkpoints --locked
 
 # Run one static matrix selector through the Just-only Cargo boundary.
+conformance-contract selector:
+    set -- {{selector}}; test "$#" -eq 4; test "$2" = --test; env -u M1_15_PROBE_SELECTOR {{_io}} cargo +1.98.0 test -p "$1" --test "$3" "$4" --locked -- --exact
+
+# Run a selected contract through its test-owned structured receipt boundary.
 conformance-probe selector:
-    set -- {{selector}}; test "$#" -eq 4; test "$2" = --test; {{_io}} cargo +1.98.0 test -p "$1" --test "$3" "$4" --locked -- --exact
+    set -- {{selector}}; test "$#" -eq 4; test "$2" = --test; M1_15_PROBE_SELECTOR="{{selector}}" {{_io}} cargo +1.98.0 test -p workflow-testkit --test m1_15_conformance conformance_probe_emits_structured_receipt --locked -- --exact --nocapture
 
 # Network-free M1-15 aggregate: the report binary executes and formats verified receipts.
 conformance:

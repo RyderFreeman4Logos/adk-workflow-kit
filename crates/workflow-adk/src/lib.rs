@@ -240,6 +240,7 @@ impl TerminalOutcome {
     pub const fn from_execution_error(kind: ExecutionErrorKind) -> Self {
         match kind {
             ExecutionErrorKind::InvalidRunState => Self::IncompatibleResume,
+            ExecutionErrorKind::AuthorizationDenied => Self::AuthorizationDenied,
             _ => Self::Failed,
         }
     }
@@ -308,6 +309,7 @@ pub enum AdkGraphError {
     RecursionLimit { steps: usize },
     VisitBound { max_visits: usize },
     Observation(events::AdkEventMappingErrorKind),
+    AuthorizationDenied,
     Failed,
 }
 
@@ -327,6 +329,7 @@ impl fmt::Display for AdkGraphError {
                 write!(f, "visit bound exceeded: max_visits={max_visits}")
             }
             Self::Observation(_) => write!(f, "ADK event observation failed"),
+            Self::AuthorizationDenied => write!(f, "authorization denied"),
             Self::Failed => write!(f, "graph execution failed"),
         }
     }
@@ -406,6 +409,9 @@ impl AdkGraph {
             }
             Err(error) => {
                 if let GraphError::NodeExecutionFailed { node, message } = &error {
+                    if message.contains("tool.bridge.authorization_denied") {
+                        return Err(AdkGraphError::AuthorizationDenied);
+                    }
                     if let Some(target) = self.fan_in_guard_nodes.get(node)
                         && let Some(key) = message.strip_prefix("workflow fan-in conflict: ")
                     {
@@ -464,7 +470,17 @@ impl AdkGraph {
         let mut stream = Box::pin(self.graph.stream(state, config, StreamMode::Custom));
         let mut output = None;
         while let Some(item) = stream.next().await {
-            match item.map_err(|_| AdkGraphError::Failed)? {
+            match item.map_err(|error| {
+                if matches!(
+                    &error,
+                    GraphError::NodeExecutionFailed { message, .. }
+                        if message.contains("tool.bridge.authorization_denied")
+                ) {
+                    AdkGraphError::AuthorizationDenied
+                } else {
+                    AdkGraphError::Failed
+                }
+            })? {
                 StreamEvent::NodeStart { node, step } => {
                     mapper
                         .map_stream_observation(
@@ -543,6 +559,9 @@ impl AdkGraph {
                         .map_err(|error| AdkGraphError::Observation(error.kind()))?;
                 }
                 StreamEvent::Error { message, node } => {
+                    if message.contains("tool.bridge.authorization_denied") {
+                        return Err(AdkGraphError::AuthorizationDenied);
+                    }
                     mapper
                         .map_stream_observation(
                             node,
