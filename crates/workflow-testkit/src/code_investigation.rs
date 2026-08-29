@@ -1234,7 +1234,8 @@ impl SyntheticInvestigation {
         .map_err(|_| InvestigationError::new(DiagnosticCode::SchemaInvalid))?;
         let _canonical_ir_hash = plan.ir().canonical_hash();
 
-        let graph = run_investigation_graph(self.clone(), requested_verdict, None, None).await?;
+        let graph =
+            run_investigation_graph(self.clone(), requested_verdict, None, None, None).await?;
         let status = match graph.terminal.as_str() {
             "publish" => InvestigationStatus::Published,
             "abstain" => InvestigationStatus::Abstained,
@@ -1274,22 +1275,14 @@ impl SyntheticInvestigation {
         if step == 0 {
             return Err(InvestigationError::new(DiagnosticCode::CheckpointInvalid));
         }
-        let completed = self.run_fake().await?;
-        if step > completed.trace.stages.len() {
-            return Err(InvestigationError::new(DiagnosticCode::CheckpointInvalid));
-        }
-        let snapshot = completed.snapshot;
-        let mut trace = completed.trace;
-        trace.stages.truncate(step);
-        trace.routes.truncate(step);
-        let routes = trace.routes.clone();
-        trace
-            .tool_calls
-            .retain(|call| routes.iter().any(|route| route == call.route()));
-        trace.llm_requests = usize::from(!trace.tool_calls.is_empty());
-        trace.adk_graph_exercised = false;
-        trace.adk_terminal = None;
-        killed_from_trace(snapshot, trace, step)
+        let _package = Self::fixture_package()?;
+        let graph =
+            run_investigation_graph(self.clone(), ReviewVerdict::Pass, None, None, Some(step))
+                .await?;
+        let trace = graph
+            .captured_trace
+            .ok_or_else(|| InvestigationError::new(DiagnosticCode::CheckpointInvalid))?;
+        killed_from_trace(graph.snapshot, trace, step)
     }
 
     /// Resumes from a checkpoint as a fresh, stateless process would.
@@ -1306,6 +1299,7 @@ impl SyntheticInvestigation {
             ReviewVerdict::Pass,
             Some(checkpoint.step),
             Some(&expected.trace),
+            None,
         )
         .await?;
         let answer = graph
@@ -1492,6 +1486,7 @@ struct GraphExercise {
     stages: Vec<String>,
     calls: Vec<ToolCall>,
     tool_results: Vec<ToolResult>,
+    captured_trace: Option<InvestigationTrace>,
 }
 
 struct GraphRun {
@@ -1506,6 +1501,8 @@ struct GraphRun {
     answer: Option<InvestigationAnswer>,
     error: Option<InvestigationError>,
     prefix: Option<InvestigationTrace>,
+    capture_step: Option<usize>,
+    captured_trace: Option<InvestigationTrace>,
 }
 
 fn restore_session(
@@ -1552,6 +1549,7 @@ impl GraphRun {
         requested_verdict: ReviewVerdict,
         resume_after: Option<usize>,
         prefix: Option<&InvestigationTrace>,
+        capture_step: Option<usize>,
     ) -> Result<Self, InvestigationError> {
         let snapshot = investigation.repo.snapshot();
         let prefix = prefix.cloned();
@@ -1571,6 +1569,8 @@ impl GraphRun {
             answer: None,
             error: None,
             prefix,
+            capture_step,
+            captured_trace: None,
         })
     }
 
@@ -1695,8 +1695,7 @@ impl GraphRun {
         }
     }
 
-    fn event(&self, node: &str, output: &str) -> String {
-        let mut state = serde_json::Map::new();
+    fn trace(&self, terminal: Option<&str>) -> InvestigationTrace {
         let mut stages = self
             .prefix
             .as_ref()
@@ -1707,20 +1706,46 @@ impl GraphRun {
             .as_ref()
             .map_or_else(Vec::new, |trace| trace.routes.clone());
         routes.extend(self.routes.iter().cloned());
-        let mut calls = self
+        if let Some(terminal) = terminal {
+            routes.push(terminal.to_owned());
+        }
+        let mut tool_calls = self
             .prefix
             .as_ref()
             .map_or_else(Vec::new, |trace| trace.tool_calls.clone());
-        calls.extend(self.calls.iter().cloned());
+        tool_calls.extend(self.calls.iter().cloned());
         let mut tool_results = self
             .prefix
             .as_ref()
             .map_or_else(Vec::new, |trace| trace.tool_results.clone());
         tool_results.extend(self.tool_results.iter().cloned());
-        state.insert("investigation:stages".to_owned(), json!(stages));
-        state.insert("investigation:routes".to_owned(), json!(routes));
-        state.insert("investigation:tool_calls".to_owned(), json!(calls));
-        state.insert("investigation:tool_results".to_owned(), json!(tool_results));
+        InvestigationTrace {
+            llm_requests: usize::from(!tool_calls.is_empty()),
+            stages,
+            routes,
+            tool_calls,
+            tool_results,
+            adk_graph_exercised: false,
+            adk_terminal: None,
+        }
+    }
+
+    fn event(&mut self, node: &str, output: &str) -> String {
+        let trace = self.trace(None);
+        if self.capture_step == Some(trace.stages.len()) {
+            self.captured_trace = Some(trace.clone());
+        }
+        let mut state = serde_json::Map::new();
+        state.insert("investigation:stages".to_owned(), json!(trace.stages));
+        state.insert("investigation:routes".to_owned(), json!(trace.routes));
+        state.insert(
+            "investigation:tool_calls".to_owned(),
+            json!(trace.tool_calls),
+        );
+        state.insert(
+            "investigation:tool_results".to_owned(),
+            json!(trace.tool_results),
+        );
         if let Some(answer) = &self.answer {
             state.insert("investigation:answer".to_owned(), json!(answer));
         }
@@ -1796,6 +1821,9 @@ impl GraphRun {
         if self.session.current() != terminal_stage {
             self.advance(terminal_stage)?;
         }
+        if self.capture_step == Some(self.trace(None).stages.len()) {
+            self.captured_trace = Some(self.trace(Some(terminal)));
+        }
         Ok(GraphExercise {
             terminal: terminal.to_owned(),
             routes: self.routes.clone(),
@@ -1804,6 +1832,7 @@ impl GraphRun {
             stages: self.stages.clone(),
             calls: self.calls.clone(),
             tool_results: self.tool_results.clone(),
+            captured_trace: self.captured_trace.take(),
         })
     }
 }
@@ -1847,6 +1876,7 @@ async fn run_investigation_graph(
     requested_verdict: ReviewVerdict,
     resume_after: Option<usize>,
     prefix: Option<&InvestigationTrace>,
+    capture_step: Option<usize>,
 ) -> Result<GraphExercise, InvestigationError> {
     let plan = compile_str_with_predicates(
         "fixtures/code_investigation/workflow.toml",
@@ -1859,6 +1889,7 @@ async fn run_investigation_graph(
         requested_verdict,
         resume_after,
         prefix,
+        capture_step,
     )?));
     let agents: BTreeMap<String, Arc<dyn Agent>> = [
         "prepare_workspace",

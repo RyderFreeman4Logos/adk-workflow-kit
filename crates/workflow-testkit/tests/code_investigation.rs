@@ -155,6 +155,28 @@ async fn every_legal_checkpoint_step_resumes_the_remaining_graph() {
             .await
             .expect("every stage in the completed trace is a legal checkpoint");
         let checkpoint = killed.checkpoint().expect("checkpoint");
+        assert_eq!(
+            killed.trace().stages(),
+            &full.trace().stages()[..step],
+            "killed stages must be a strict prefix at step {step}"
+        );
+        assert_eq!(
+            killed.trace().routes(),
+            &full.trace().routes()[..step],
+            "killed routes must be a strict prefix at step {step}"
+        );
+        let expected_tool_result_end = match step {
+            1 | 2 => 0,
+            3 => 1,
+            4 | 5 => 3,
+            6 => 4,
+            _ => 6,
+        };
+        assert_eq!(
+            killed.trace().tool_results(),
+            &full.trace().tool_results()[..expected_tool_result_end],
+            "killed tool results must be a strict execution prefix at step {step}"
+        );
         let resumed = SyntheticInvestigation::new(FixtureRepo::synthetic())
             .resume(checkpoint)
             .await
