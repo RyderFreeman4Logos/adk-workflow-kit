@@ -852,7 +852,26 @@ impl AdkGraphTranslator {
         let fan_in = incoming
             .into_iter()
             .filter_map(|(target, sources)| {
-                (sources.len() > 1).then_some((target, sources.into_iter().collect::<Vec<_>>()))
+                let sources = sources
+                    .iter()
+                    .filter(|source| {
+                        sources.iter().any(|other| {
+                            source != &other
+                                && !can_reach_before_target(source, other, &target)
+                                && !can_reach_before_target(other, source, &target)
+                        })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let has_diverging_predecessor = ids.iter().any(|writer| {
+                    sources
+                        .iter()
+                        .filter(|source| can_reach_before_target(writer, source, &target))
+                        .take(2)
+                        .count()
+                        > 1
+                });
+                (sources.len() > 1 && has_diverging_predecessor).then_some((target, sources))
             })
             .collect::<BTreeMap<_, _>>();
         let mut fan_in_targets_by_source = BTreeMap::<String, Vec<(String, String)>>::new();
