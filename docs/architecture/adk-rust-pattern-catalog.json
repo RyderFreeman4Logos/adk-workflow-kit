@@ -1,0 +1,382 @@
+{
+  "schema_version": 1,
+  "catalog": {
+    "name": "adk-rust-pattern-catalog",
+    "version": "0.1.0",
+    "updated": "2026-08-29",
+    "repository": "https://github.com/RyderFreeman4Logos/adk-workflow-kit",
+    "license": "Apache-2.0",
+    "adk_rust": {
+      "requirement": "=2.1.0",
+      "version": "2.1.0",
+      "commit": "993126f18b8038123efe98566d4e058bd69c0f4e",
+      "license": "Apache-2.0",
+      "cargo_lock": {
+        "package": "adk-rust",
+        "version": "2.1.0",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "b5244ddd601fb2f9a9671a2407312d8c25914b211381e6e6bf62e0b8eadba72e"
+      }
+    },
+    "policy": {
+      "official_baseline": "tagged ADK-Rust v2.1.0",
+      "third_party_rule": "version-independent patterns only",
+      "no_copied_adk_types": true,
+      "constraints": [
+        "no GitHub Actions or hosted CI",
+        "no M1 expansion",
+        "no new focused issues without demonstrated in-repo need"
+      ]
+    }
+  },
+  "official": [
+    {
+      "id": "official-structured-output-after-stream",
+      "name": "Parse structured output after stream completion",
+      "class": "adopt",
+      "value": "high",
+      "version": "2.1.0",
+      "commit": "993126f18b8038123efe98566d4e058bd69c0f4e",
+      "license": "Apache-2.0",
+      "compatibility": "adk-rust-2.x",
+      "source_paths": [
+        "docs/official_docs/agents/llm-agent.md",
+        "docs/official_docs/tools/schema-normalization.md",
+        "examples/output_schema_agent/src/main.rs"
+      ],
+      "source_links": [
+        "https://github.com/zavora-ai/adk-rust/blob/993126f18b8038123efe98566d4e058bd69c0f4e/docs/official_docs/agents/llm-agent.md",
+        "https://github.com/zavora-ai/adk-rust/blob/993126f18b8038123efe98566d4e058bd69c0f4e/docs/official_docs/tools/schema-normalization.md",
+        "https://github.com/zavora-ai/adk-rust/blob/993126f18b8038123efe98566d4e058bd69c0f4e/examples/output_schema_agent/src/main.rs"
+      ],
+      "tests": {
+        "upstream_paths": [],
+        "in_repo": ["just pattern-catalog-test"]
+      },
+      "security_assumptions": [
+        "The host validates the final typed value and never treats an early state delta as proof of schema validity.",
+        "Schema repair remains bounded and malformed output fails closed."
+      ],
+      "rationale": "The repository already has typed workflow and review boundaries; this keeps model output outside the authoritative reducer until validation succeeds.",
+      "in_repo_need": "workflow-review and workflow-testkit require deterministic, fail-closed structured outcomes."
+    },
+    {
+      "id": "official-bounded-sequential-review",
+      "name": "Bounded sequential draft and review stages",
+      "class": "adopt",
+      "value": "high",
+      "version": "2.1.0",
+      "commit": "993126f18b8038123efe98566d4e058bd69c0f4e",
+      "license": "Apache-2.0",
+      "compatibility": "adk-rust-2.x",
+      "source_paths": [
+        "docs/official_docs/agents/workflow-agents.md",
+        "examples/functional_workflow/src/main.rs"
+      ],
+      "source_links": [
+        "https://github.com/zavora-ai/adk-rust/blob/993126f18b8038123efe98566d4e058bd69c0f4e/docs/official_docs/agents/workflow-agents.md",
+        "https://github.com/zavora-ai/adk-rust/blob/993126f18b8038123efe98566d4e058bd69c0f4e/examples/functional_workflow/src/main.rs"
+      ],
+      "tests": {
+        "upstream_paths": [],
+        "in_repo": ["just pattern-catalog-test"]
+      },
+      "security_assumptions": [
+        "Each stage receives only the bounded state allowed by the workflow contract.",
+        "A later review stage cannot turn an incomplete or invalid prior stage into success."
+      ],
+      "rationale": "A sequential workflow agent is the smallest ADK primitive for the repository's existing draft-review-revise and validation flows.",
+      "in_repo_need": "workflow-compiler and workflow-review already model ordered stages and typed review verdicts."
+    },
+    {
+      "id": "official-deterministic-graph-routing",
+      "name": "Deterministic graph routing with explicit terminal states",
+      "class": "adopt",
+      "value": "high",
+      "version": "2.1.0",
+      "commit": "993126f18b8038123efe98566d4e058bd69c0f4e",
+      "license": "Apache-2.0",
+      "compatibility": "adk-rust-2.x",
+      "source_paths": [
+        "docs/official_docs/agents/graph-agents.md",
+        "examples/graph_goto_routing/src/main.rs"
+      ],
+      "source_links": [
+        "https://github.com/zavora-ai/adk-rust/blob/993126f18b8038123efe98566d4e058bd69c0f4e/docs/official_docs/agents/graph-agents.md",
+        "https://github.com/zavora-ai/adk-rust/blob/993126f18b8038123efe98566d4e058bd69c0f4e/examples/graph_goto_routing/src/main.rs"
+      ],
+      "tests": {
+        "upstream_paths": [],
+        "in_repo": ["just pattern-catalog-test"]
+      },
+      "security_assumptions": [
+        "Only declared edges and typed state transitions are reachable.",
+        "Cancellation, budget exhaustion, and invalid routing remain explicit non-success outcomes."
+      ],
+      "rationale": "The graph primitive maps to existing workflow IR routing without copying ADK implementation types across the public boundary.",
+      "in_repo_need": "workflow-ir and workflow-runtime already enforce declared routes, bounded cycles, and terminal mapping."
+    },
+    {
+      "id": "official-checkpoint-artifact-boundary",
+      "name": "Checkpoint state through an artifact boundary",
+      "class": "wrap",
+      "value": "high",
+      "version": "2.1.0",
+      "commit": "993126f18b8038123efe98566d4e058bd69c0f4e",
+      "license": "Apache-2.0",
+      "compatibility": "adk-rust-2.x",
+      "source_paths": [
+        "docs/official_docs/artifacts/artifacts.md",
+        "examples/delta_checkpoints/src/main.rs"
+      ],
+      "source_links": [
+        "https://github.com/zavora-ai/adk-rust/blob/993126f18b8038123efe98566d4e058bd69c0f4e/docs/official_docs/artifacts/artifacts.md",
+        "https://github.com/zavora-ai/adk-rust/blob/993126f18b8038123efe98566d4e058bd69c0f4e/examples/delta_checkpoints/src/main.rs"
+      ],
+      "tests": {
+        "upstream_paths": [],
+        "in_repo": ["just pattern-catalog-test"]
+      },
+      "security_assumptions": [
+        "Artifact identity, content hashes, and retention policy remain owned by the host boundary.",
+        "ADK state is never treated as an ACL or source-of-truth replacement."
+      ],
+      "rationale": "ADK artifacts can carry execution material, while the existing repository owns durable hashes, locks, and replay semantics.",
+      "in_repo_need": "workflow-testkit and workflow-runtime already expose artifact and checkpoint contracts that need an orchestration adapter."
+    },
+    {
+      "id": "official-tool-authorization-wrapper",
+      "name": "Allowlisted tool authorization wrapper",
+      "class": "wrap",
+      "value": "high",
+      "version": "2.1.0",
+      "commit": "993126f18b8038123efe98566d4e058bd69c0f4e",
+      "license": "Apache-2.0",
+      "compatibility": "adk-rust-2.x",
+      "source_paths": ["docs/official_docs/security/tool-authorization.md"],
+      "source_links": [
+        "https://github.com/zavora-ai/adk-rust/blob/993126f18b8038123efe98566d4e058bd69c0f4e/docs/official_docs/security/tool-authorization.md"
+      ],
+      "tests": {
+        "upstream_paths": [],
+        "in_repo": ["just pattern-catalog-test"]
+      },
+      "security_assumptions": [
+        "Authorization is checked by the host allowlist before dispatch.",
+        "ADK tool declarations do not grant filesystem, network, or secret access by themselves."
+      ],
+      "rationale": "The repository already has capability intersection and ToolBridge authorization; ADK tools must be wrapped rather than trusted directly.",
+      "in_repo_need": "workflow-runtime and workflow-testkit require an allowlisted typed tool envelope at the ADK boundary."
+    },
+    {
+      "id": "official-arbitrary-code-action",
+      "name": "Unrestricted arbitrary code action",
+      "class": "reject",
+      "value": "low",
+      "version": "2.1.0",
+      "commit": "993126f18b8038123efe98566d4e058bd69c0f4e",
+      "license": "Apache-2.0",
+      "compatibility": "adk-rust-2.x",
+      "source_paths": ["examples/action_nodes/src/scenarios/code_node.rs"],
+      "source_links": [
+        "https://github.com/zavora-ai/adk-rust/blob/993126f18b8038123efe98566d4e058bd69c0f4e/examples/action_nodes/src/scenarios/code_node.rs"
+      ],
+      "tests": {
+        "upstream_paths": [],
+        "in_repo": ["just pattern-catalog-test"]
+      },
+      "security_assumptions": [
+        "A general code action would violate the repository's sandbox and capability policy unless separately admitted.",
+        "No model-controlled code execution is enabled by catalog membership."
+      ],
+      "rationale": "The example is useful evidence that the upstream surface exists, not evidence that arbitrary code is safe for this repository.",
+      "in_repo_need": "No demonstrated M1-M2 need exists for arbitrary code execution; the secure sandbox boundary is already explicit."
+    },
+    {
+      "id": "official-generic-host-shell",
+      "name": "Generic host shell tool",
+      "class": "reject",
+      "value": "low",
+      "version": "2.1.0",
+      "commit": "993126f18b8038123efe98566d4e058bd69c0f4e",
+      "license": "Apache-2.0",
+      "compatibility": "adk-rust-2.x",
+      "source_paths": ["examples/streaming_bash/src/main.rs"],
+      "source_links": [
+        "https://github.com/zavora-ai/adk-rust/blob/993126f18b8038123efe98566d4e058bd69c0f4e/examples/streaming_bash/src/main.rs"
+      ],
+      "tests": {
+        "upstream_paths": [],
+        "in_repo": ["just pattern-catalog-test"]
+      },
+      "security_assumptions": [
+        "A host shell is not an allowlisted read-only service and must not receive model-controlled arguments.",
+        "The catalog does not weaken per-run workdir, network, or process containment."
+      ],
+      "rationale": "A generic shell would bypass the repository's typed tool and sandbox contracts and is explicitly outside the default product boundary.",
+      "in_repo_need": "No demonstrated in-repo need requires a generic host shell tool."
+    },
+    {
+      "id": "official-distributed-a2a-first",
+      "name": "Distributed A2A orchestration as a default",
+      "class": "reject",
+      "value": "low",
+      "version": "2.1.0",
+      "commit": "993126f18b8038123efe98566d4e058bd69c0f4e",
+      "license": "Apache-2.0",
+      "compatibility": "adk-rust-2.x",
+      "source_paths": [
+        "docs/official_docs/a2a/getting-started.md",
+        "examples/a2a_quickstart/src/main.rs"
+      ],
+      "source_links": [
+        "https://github.com/zavora-ai/adk-rust/blob/993126f18b8038123efe98566d4e058bd69c0f4e/docs/official_docs/a2a/getting-started.md",
+        "https://github.com/zavora-ai/adk-rust/blob/993126f18b8038123efe98566d4e058bd69c0f4e/examples/a2a_quickstart/src/main.rs"
+      ],
+      "tests": {
+        "upstream_paths": [],
+        "in_repo": ["just pattern-catalog-test"]
+      },
+      "security_assumptions": [
+        "Remote trust, authentication, and network policy cannot be inferred from A2A support alone.",
+        "No network service is added to the default workflow runtime."
+      ],
+      "rationale": "A2A is a later compatibility target; adding distributed orchestration now would expand M1/M2 scope without a demonstrated need.",
+      "in_repo_need": "The current repository executes bounded local workflows and has no accepted remote-agent requirement."
+    },
+    {
+      "id": "official-managed-runtime-default",
+      "name": "Managed runtime and hosted execution",
+      "class": "research",
+      "value": "medium",
+      "version": "2.1.0",
+      "commit": "993126f18b8038123efe98566d4e058bd69c0f4e",
+      "license": "Apache-2.0",
+      "compatibility": "adk-rust-2.x",
+      "source_paths": ["docs/official_docs/managed-agents/runtime.md"],
+      "source_links": [
+        "https://github.com/zavora-ai/adk-rust/blob/993126f18b8038123efe98566d4e058bd69c0f4e/docs/official_docs/managed-agents/runtime.md"
+      ],
+      "tests": {
+        "upstream_paths": [],
+        "in_repo": ["just pattern-catalog-test"]
+      },
+      "security_assumptions": [
+        "Hosted execution would require a separate identity, tenancy, network, and retention review.",
+        "Research status does not expose managed-runtime credentials or endpoints."
+      ],
+      "rationale": "The upstream documentation is worth tracking, but it is not needed for the local, per-run runtime contract.",
+      "in_repo_need": "No demonstrated M2 need requires a hosted managed-agent runtime."
+    }
+  ],
+  "third_party": [
+    {
+      "id": "third-party-wrapper-parity-session",
+      "name": "Application wrapper with fresh sessions and parity tests",
+      "class": "wrap",
+      "value": "high",
+      "version": "adk-rust 1.0.0",
+      "commit": "14795aede71219f6abfbe1f9c03924239137b62f",
+      "license": "Apache-2.0",
+      "compatibility": "version-independent",
+      "source_paths": [
+        "docs/superpowers/specs/2026-07-22-adk-rust-core-migration-design.md",
+        "crates/core/src/entheai_agent.rs"
+      ],
+      "source_links": [
+        "https://github.com/entropy-om/entheai/blob/14795aede71219f6abfbe1f9c03924239137b62f/docs/superpowers/specs/2026-07-22-adk-rust-core-migration-design.md",
+        "https://github.com/entropy-om/entheai/blob/14795aede71219f6abfbe1f9c03924239137b62f/crates/core/src/entheai_agent.rs"
+      ],
+      "tests": {
+        "upstream_paths": [],
+        "in_repo": ["just pattern-catalog-test"]
+      },
+      "security_assumptions": [
+        "The application wrapper owns permission checks and does not leak ADK types into durable records.",
+        "Fresh sessions and parity tests are required before changing runtime behavior."
+      ],
+      "rationale": "This is evidence for an adapter and parity strategy, not for copying Entheai implementation code or depending on its 1.x API.",
+      "in_repo_need": "workflow-adk already exists as a compatibility boundary and needs behavior-preserving adapter evidence."
+    },
+    {
+      "id": "third-party-versioned-stage-flow",
+      "name": "Versioned serializable stages with explicit routing",
+      "class": "adapt",
+      "value": "high",
+      "version": "adk-rust 1.0.0",
+      "commit": "72b47f225e7ee7b74d0a4bbced79357e70f55bd1",
+      "license": "MIT",
+      "compatibility": "version-independent",
+      "source_paths": [
+        "Cargo.toml",
+        "crates/cowork-core/src/config_definition/flow_definition.rs"
+      ],
+      "source_links": [
+        "https://github.com/sopaco/cowork-forge/blob/72b47f225e7ee7b74d0a4bbced79357e70f55bd1/Cargo.toml",
+        "https://github.com/sopaco/cowork-forge/blob/72b47f225e7ee7b74d0a4bbced79357e70f55bd1/crates/cowork-core/src/config_definition/flow_definition.rs"
+      ],
+      "tests": {
+        "upstream_paths": [],
+        "in_repo": ["just pattern-catalog-test"]
+      },
+      "security_assumptions": [
+        "Configuration is parsed and validated before execution.",
+        "Hooks and human gates remain explicit policy boundaries rather than implicit actor behavior."
+      ],
+      "rationale": "The serializable flow/stage split aligns with workflow-spec and workflow-compiler while avoiding an unconstrained actor-critic default.",
+      "in_repo_need": "The repository already needs versioned workflow definitions and explicit stage routing for durable compilation."
+    },
+    {
+      "id": "third-party-deterministic-spec-verifier",
+      "name": "Deterministic verifier wrapped as an agent boundary",
+      "class": "adapt",
+      "value": "medium",
+      "version": "adk-rust 0.9.1",
+      "commit": "781fe2de8e7b638c28b5236642e5541c81b3f3eb",
+      "license": "MIT",
+      "compatibility": "version-independent",
+      "source_paths": [
+        "crates/portail-agents/src/ci/spec_verify.rs",
+        "crates/portail-agents/src/ci/runner.rs"
+      ],
+      "source_links": [
+        "https://github.com/peterlodri-sec/portail/blob/781fe2de8e7b638c28b5236642e5541c81b3f3eb/crates/portail-agents/src/ci/spec_verify.rs",
+        "https://github.com/peterlodri-sec/portail/blob/781fe2de8e7b638c28b5236642e5541c81b3f3eb/crates/portail-agents/src/ci/runner.rs"
+      ],
+      "tests": {
+        "upstream_paths": [],
+        "in_repo": ["just pattern-catalog-test"]
+      },
+      "security_assumptions": [
+        "The verifier is deterministic and fail-closed before any model or schedule side effect.",
+        "The pre-1.0 dependency is evidence only; no API compatibility is inferred."
+      ],
+      "rationale": "The separation of deterministic checks from orchestration matches the repository's compiler and review contracts.",
+      "in_repo_need": "workflow-testkit already validates replay, evidence, and state digests before accepting a result."
+    },
+    {
+      "id": "third-party-multi-channel-gateway-default",
+      "name": "Broad multi-channel gateway as the default runtime",
+      "class": "reject",
+      "value": "low",
+      "version": "adk-rust 1.0.0",
+      "commit": "66a21999a89c7e921b45f8e360e691d3e09b4444",
+      "license": "Apache-2.0",
+      "compatibility": "version-independent",
+      "source_paths": ["Cargo.toml"],
+      "source_links": [
+        "https://github.com/zavora-ai/adk-gateway/blob/66a21999a89c7e921b45f8e360e691d3e09b4444/Cargo.toml"
+      ],
+      "tests": {
+        "upstream_paths": [],
+        "in_repo": ["just pattern-catalog-test"]
+      },
+      "security_assumptions": [
+        "Multiple channels, providers, and network listeners require independent threat and tenancy review.",
+        "A third-party gateway manifest is not proof that those defaults are safe here."
+      ],
+      "rationale": "The gateway is useful deferred evidence for fallback, sessions, and health concerns, but its broad surface conflicts with the local bounded runtime scope.",
+      "in_repo_need": "No demonstrated in-repo need requires a multi-channel gateway or hosted control panel."
+    }
+  ]
+}

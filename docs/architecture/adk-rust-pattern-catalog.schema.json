@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/RyderFreeman4Logos/adk-workflow-kit/blob/feat/m2-01-pattern-catalog/docs/architecture/adk-rust-pattern-catalog.schema.json",
+  "title": "ADK-Rust pattern catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "catalog", "official", "third_party"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "catalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "repository", "license", "adk_rust", "policy"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "updated": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+        "repository": {"type": "string", "pattern": "^https://github\\.com/"},
+        "license": {"type": "string", "minLength": 1},
+        "adk_rust": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["requirement", "version", "commit", "license", "cargo_lock"],
+          "properties": {
+            "requirement": {"type": "string", "const": "=2.1.0"},
+            "version": {"type": "string", "const": "2.1.0"},
+            "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "license": {"type": "string", "const": "Apache-2.0"},
+            "cargo_lock": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["package", "version", "source", "checksum"],
+              "properties": {
+                "package": {"type": "string", "const": "adk-rust"},
+                "version": {"type": "string", "const": "2.1.0"},
+                "source": {"type": "string", "const": "registry+https://github.com/rust-lang/crates.io-index"},
+                "checksum": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              }
+            }
+          }
+        },
+        "policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["official_baseline", "third_party_rule", "no_copied_adk_types", "constraints"],
+          "properties": {
+            "official_baseline": {"type": "string", "const": "tagged ADK-Rust v2.1.0"},
+            "third_party_rule": {"type": "string", "const": "version-independent patterns only"},
+            "no_copied_adk_types": {"type": "boolean", "const": true},
+            "constraints": {
+              "type": "array",
+              "minItems": 3,
+              "items": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
+    "official": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/record"}},
+    "third_party": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/record"}}
+  },
+  "$defs": {
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "name", "class", "value", "version", "commit", "license",
+        "compatibility", "source_paths", "source_links", "tests",
+        "security_assumptions", "rationale", "in_repo_need"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+        "name": {"type": "string", "minLength": 1},
+        "class": {"type": "string", "enum": ["adopt", "wrap", "adapt", "research", "reject"]},
+        "value": {"type": "string", "enum": ["high", "medium", "low"]},
+        "version": {"type": "string", "minLength": 1},
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "license": {"type": "string", "minLength": 1},
+        "compatibility": {"type": "string", "enum": ["adk-rust-2.x", "version-independent", "deferred"]},
+        "source_paths": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "source_links": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^https://github\\.com/.+/(blob|raw)/[0-9a-f]{40}/.+$"}},
+        "tests": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["upstream_paths", "in_repo"],
+          "properties": {
+            "upstream_paths": {"type": "array", "items": {"type": "string"}},
+            "in_repo": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+          }
+        },
+        "security_assumptions": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "rationale": {"type": "string", "minLength": 1},
+        "in_repo_need": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

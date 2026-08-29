@@ -64,6 +64,10 @@ m1-16-test:
     {{_io}} cargo +1.98.0 test -p workflowctl --test cli_contracts --locked
     {{_io}} cargo +1.98.0 test -p workflowctl --test skill_commands --locked
 
+# Validate the machine-readable ADK-Rust pattern catalog.
+pattern-catalog-test:
+    python3 scripts/test_pattern_catalog.py
+
 # Run one static matrix selector through the Just-only Cargo boundary.
 conformance-contract selector:
     set -- {{selector}}; test "$#" -eq 4; test "$2" = --test; M1_15_FIXTURE_RECEIPT_SELECTOR="{{selector}}" env -u M1_15_PROBE_SELECTOR {{_io}} cargo +1.98.0 test -p "$1" --test "$3" "$4" --locked -- --exact --nocapture
