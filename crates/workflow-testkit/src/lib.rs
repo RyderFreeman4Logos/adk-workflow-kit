@@ -2,6 +2,7 @@
 
 mod bench;
 pub mod code_investigation;
+pub mod conformance;
 mod eval;
 mod non_progress;
 mod replay;
