@@ -112,9 +112,9 @@ test-release-local:
 check-branch:
     scripts/local-gates.sh check-branch
 
-pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit test-local-gates
+pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit pattern-catalog-test test-local-gates
 
-_quality-gates: fmt-check check clippy dependency-audit test test-local-gates
+_quality-gates: fmt-check check clippy dependency-audit pattern-catalog-test test test-local-gates
 
 quality-gates:
     scripts/local-gates.sh produce
