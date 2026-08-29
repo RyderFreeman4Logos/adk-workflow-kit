@@ -197,7 +197,7 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             ),
             probe(
                 "fan-in state conflict",
-                "workflow-adk --test translation fan_in_state_conflict_is_executable",
+                "workflow-adk --test translation fan_in_shared_state_without_merge_policy_is_rejected",
                 "shared-state fan-in is rejected before execution",
             ),
             probe(
@@ -385,25 +385,25 @@ impl ConformanceReceipt {
     }
 }
 
-/// One executed aggregate subgate recorded in the durable report.
+/// One executed matrix probe recorded in the durable report.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConformanceSubgate {
-    command: String,
+    selector: String,
     status: ConformanceStatus,
 }
 
 impl ConformanceSubgate {
-    /// Binds the exact invoked command to its terminal result.
-    pub fn new(command: impl Into<String>, status: ConformanceStatus) -> Self {
+    /// Binds the exact executed selector to its terminal result.
+    pub fn new(selector: impl Into<String>, status: ConformanceStatus) -> Self {
         Self {
-            command: command.into(),
+            selector: selector.into(),
             status,
         }
     }
 
-    /// Returns the exact invoked command.
-    pub fn command(&self) -> &str {
-        &self.command
+    /// Returns the exact executed selector.
+    pub fn selector(&self) -> &str {
+        &self.selector
     }
 
     /// Returns the command result.
@@ -434,27 +434,54 @@ pub fn write_conformance_report(
         ));
     }
 
-    let path = path.as_ref().to_path_buf();
-    let mut report = format!(
-        "# M1-15 ADK boundary/failure conformance\n\nstatus: {}\nhead: {head}\ntree: {tree}\nsubgates:\n",
-        status.as_str()
-    );
-    for subgate in subgates {
-        report.push_str(&format!(
-            "- command: {}\n  result: {}\n",
-            subgate.command(),
-            subgate.status().as_str()
+    let expected = documented_failure_matrix()
+        .iter()
+        .flat_map(|class| class.probes().iter())
+        .map(|probe| probe.selector())
+        .collect::<std::collections::BTreeSet<_>>();
+    let executed = subgates
+        .iter()
+        .map(ConformanceSubgate::selector)
+        .collect::<std::collections::BTreeSet<_>>();
+    if executed.len() != subgates.len() || executed != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conformance report requires one executed result for every documented probe",
         ));
     }
-    report.push_str("probes:\n");
+    let computed_status = if subgates
+        .iter()
+        .all(|subgate| subgate.status() == ConformanceStatus::Pass)
+    {
+        ConformanceStatus::Pass
+    } else {
+        ConformanceStatus::Fail
+    };
+    if status != computed_status {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conformance report status must match every executed probe result",
+        ));
+    }
+
+    let path = path.as_ref().to_path_buf();
+    let mut report = format!(
+        "# M1-15 ADK boundary/failure conformance\n\nstatus: {}\nhead: {head}\ntree: {tree}\nprobes:\n",
+        status.as_str()
+    );
     for class in documented_failure_matrix() {
         for probe in class.probes() {
+            let result = subgates
+                .iter()
+                .find(|subgate| subgate.selector() == probe.selector())
+                .expect("validated probe evidence is complete");
             report.push_str(&format!(
-                "- class: {}\n  probe: {}\n  selector: {}\n  assertion: {}\n",
+                "- class: {}\n  probe: {}\n  selector: {}\n  assertion: {}\n  result: {}\n",
                 class.class(),
                 probe.name(),
                 probe.selector(),
                 probe.expected_fail_closed_assertion(),
+                result.status().as_str(),
             ));
         }
     }

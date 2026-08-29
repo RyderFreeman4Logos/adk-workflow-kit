@@ -1,14 +1,26 @@
 use std::{env, fs, path::PathBuf, process::ExitCode};
 
 use workflow_testkit::conformance::{
-    ConformanceStatus, ConformanceSubgate, write_conformance_report,
+    ConformanceStatus, ConformanceSubgate, documented_failure_matrix, write_conformance_report,
 };
 
 fn main() -> ExitCode {
     let mut args = env::args_os().skip(1);
-    let Some(path) = args.next().map(PathBuf::from) else {
+    let Some(first) = args.next() else {
         return usage();
     };
+    if first == "--selectors" {
+        if args.next().is_some() {
+            return usage();
+        }
+        for class in documented_failure_matrix() {
+            for probe in class.probes() {
+                println!("{}", probe.selector());
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    let path = PathBuf::from(first);
     let (Some(head), Some(tree), Some(status), Some(evidence)) = (
         args.next(),
         args.next(),
@@ -47,7 +59,10 @@ fn main() -> ExitCode {
                 receipt.path().display(),
                 receipt.status().as_str()
             );
-            ExitCode::SUCCESS
+            match receipt.status() {
+                ConformanceStatus::Pass => ExitCode::SUCCESS,
+                ConformanceStatus::Fail => ExitCode::from(1),
+            }
         }
         Err(error) => {
             eprintln!("M1-15 conformance report failed: {error}");

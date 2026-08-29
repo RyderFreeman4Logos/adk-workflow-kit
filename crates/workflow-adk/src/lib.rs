@@ -211,6 +211,21 @@ impl TerminalOutcome {
         }
     }
 
+    fn from_stable_id(id: &str) -> Option<Self> {
+        match id {
+            "completed" => Some(Self::Succeeded),
+            "abstained" => Some(Self::Abstained),
+            "incomplete" => Some(Self::Incomplete),
+            "failed" => Some(Self::Failed),
+            "timed_out" => Some(Self::TimedOut),
+            "cancelled" => Some(Self::Cancelled),
+            "limit_exceeded" => Some(Self::LimitExceeded),
+            "authorization_denied" => Some(Self::AuthorizationDenied),
+            "incompatible_resume" => Some(Self::IncompatibleResume),
+            _ => None,
+        }
+    }
+
     /// Projects a real ToolBridge policy denial to the closed terminal vocabulary.
     pub const fn from_tool_bridge_error(kind: ToolBridgeErrorKind) -> Self {
         match kind {
@@ -579,11 +594,8 @@ impl AdkGraph {
             .terminals
             .iter()
             .any(|terminal| terminal == id)
-            .then_some(match id {
-                "authorization_denied" => TerminalOutcome::AuthorizationDenied,
-                "incompatible_resume" => TerminalOutcome::IncompatibleResume,
-                _ => TerminalOutcome::Succeeded,
-            })
+            .then(|| TerminalOutcome::from_stable_id(id))
+            .flatten()
     }
 }
 
@@ -751,18 +763,21 @@ impl AdkGraphTranslator {
                 targets.push(target.as_str());
             }
         }
-        if let Some(node) = incoming.iter().find_map(|(node, predecessors)| {
-            predecessors
-                .iter()
-                .enumerate()
-                .find_map(|(index, predecessor)| {
-                    predecessors[index + 1..].iter().find_map(|other| {
-                        (!graph_path_exists(predecessor, other, &outgoing)
-                            && !graph_path_exists(other, predecessor, &outgoing))
-                        .then_some(*node)
+        let has_declared_shared_state = ir.state().is_some_and(|state| !state.keys().is_empty());
+        if has_declared_shared_state
+            && let Some(node) = incoming.iter().find_map(|(node, predecessors)| {
+                predecessors
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, predecessor)| {
+                        predecessors[index + 1..].iter().find_map(|other| {
+                            (!graph_path_exists(predecessor, other, &outgoing)
+                                && !graph_path_exists(other, predecessor, &outgoing))
+                            .then_some(*node)
+                        })
                     })
-                })
-        }) {
+            })
+        {
             return Err(TranslationError::FanInStateConflict {
                 node: node.to_owned(),
             });

@@ -145,10 +145,10 @@ predicate = { id = "route-pred", version = "1" }
 cases = { left = "left" }
 "#;
 
-const FAN_IN_CONFLICT: &str = r#"
+const FAN_IN_WITHOUT_SHARED_STATE: &str = r#"
 schema_version = 1
 [workflow]
-id = "fan-in-conflict"
+id = "fan-in-without-shared-state"
 version = "1"
 entry = "start"
 [[nodes]]
@@ -175,6 +175,45 @@ to = "join"
 [[edges]]
 from = "right"
 to = "join"
+"#;
+
+const FAN_IN_SHARED_STATE: &str = r#"
+schema_version = 1
+[workflow]
+id = "fan-in-shared-state"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "left"
+kind = "agent"
+[[nodes]]
+id = "right"
+kind = "agent"
+[[nodes]]
+id = "join"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "left"
+[[edges]]
+from = "start"
+to = "right"
+[[edges]]
+from = "left"
+to = "join"
+[[edges]]
+from = "right"
+to = "join"
+[state]
+schema_id = "shared-state"
+schema_version = "1"
+required_keys = ["shared"]
+[state.keys.shared]
+schema_id = "shared"
+schema_version = "1"
 "#;
 
 const FAILURE_TERMINALS: &str = r#"
@@ -235,7 +274,8 @@ async fn translates_and_executes_sequential_plan_through_adk() {
     assert_eq!(state.get("terminal"), Some(&json!("done")));
     assert_eq!(
         graph.terminal_outcome("done"),
-        Some(TerminalOutcome::Succeeded)
+        None,
+        "arbitrary terminal node IDs are not stable terminal outcomes"
     );
 }
 
@@ -321,12 +361,27 @@ async fn bounded_cycle_honors_max_visits_not_adk_default() {
 }
 
 #[test]
-fn fan_in_state_conflict_is_executable() {
-    let plan = compile_str("fan-in-conflict.workflow.toml", FAN_IN_CONFLICT)
-        .expect("fan-in fixture compiles");
+fn fan_in_without_shared_state_translates() {
+    let plan = compile_str(
+        "fan-in-without-shared-state.workflow.toml",
+        FAN_IN_WITHOUT_SHARED_STATE,
+    )
+    .expect("state-free fan-in fixture compiles");
+    AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("a join without shared state must translate");
+}
+
+#[test]
+fn fan_in_shared_state_without_merge_policy_is_rejected() {
+    let plan = compile_str("fan-in-shared-state.workflow.toml", FAN_IN_SHARED_STATE)
+        .expect("shared-state fan-in fixture compiles");
     assert!(
-        AdkGraphTranslator::new().translate(&plan).is_err(),
-        "the kit translation boundary must reject a shared-state fan-in before ADK can pick a last writer"
+        matches!(
+            AdkGraphTranslator::new().translate(&plan),
+            Err(TranslationError::FanInStateConflict { .. })
+        ),
+        "a shared-state fan-in without a merge policy must be rejected"
     );
 }
 
@@ -337,20 +392,17 @@ fn terminal_outcome_maps_failure_terminals_without_success_fallback() {
     let graph = AdkGraphTranslator::new()
         .translate(&plan)
         .expect("failure terminal fixture translates");
-    assert_eq!(
-        graph.terminal_outcome("authorization_denied"),
-        Some(TerminalOutcome::AuthorizationDenied)
-    );
-    let incompatible = FAILURE_TERMINALS.replace("authorization_denied", "incompatible_resume");
-    let incompatible = compile_str("incompatible-resume.workflow.toml", &incompatible)
-        .expect("incompatible resume terminal fixture compiles");
-    let incompatible = AdkGraphTranslator::new()
-        .translate(&incompatible)
-        .expect("incompatible resume terminal fixture translates");
-    assert_eq!(
-        incompatible.terminal_outcome("incompatible_resume"),
-        Some(TerminalOutcome::IncompatibleResume)
-    );
+    for expected in TerminalOutcome::ALL {
+        let id = expected.as_str();
+        let fixture = FAILURE_TERMINALS.replace("authorization_denied", id);
+        let plan = compile_str("failure-terminals.workflow.toml", &fixture)
+            .expect("failure terminal fixture compiles");
+        let graph = AdkGraphTranslator::new()
+            .translate(&plan)
+            .expect("failure terminal fixture translates");
+        assert_eq!(graph.terminal_outcome(id), Some(expected), "{id}");
+    }
+    assert_eq!(graph.terminal_outcome("unknown_terminal"), None);
 }
 
 #[tokio::test]
