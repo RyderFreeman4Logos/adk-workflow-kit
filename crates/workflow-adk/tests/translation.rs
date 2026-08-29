@@ -1372,7 +1372,8 @@ fn terminal_outcome_maps_failure_terminals_without_success_fallback() {
 
 #[test]
 fn terminal_invalid_output_fixture_reaches_failed_terminal_without_publication() {
-    let plan = compile_str("failure-terminals.workflow.toml", FAILURE_TERMINALS)
+    let fixture = FAILURE_TERMINALS.replace("authorization_denied", "failed");
+    let plan = compile_str("failure-terminals.workflow.toml", &fixture)
         .expect("failure terminal fixture compiles");
     let graph = AdkGraphTranslator::new()
         .translate(&plan)
