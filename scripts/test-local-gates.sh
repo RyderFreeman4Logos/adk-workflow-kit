@@ -102,9 +102,9 @@ fi
 ((assertions += 2))
 
 justfile_contract="$(<"$repo_root/justfile")"
-if [[ "$justfile_contract" != *'pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit test-local-gates'* ||
-    "$justfile_contract" != *'_quality-gates: fmt-check check clippy dependency-audit test test-local-gates'* ]]; then
-    printf 'FAIL frequent quality gates do not invoke dependency-audit\n' >&2
+if [[ "$justfile_contract" != *'pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit pattern-catalog-test test-local-gates'* ||
+    "$justfile_contract" != *'_quality-gates: fmt-check check clippy dependency-audit pattern-catalog-test test test-local-gates'* ]]; then
+    printf 'FAIL frequent quality gates omit the pattern-catalog-test contract\n' >&2
     exit 1
 fi
 ((assertions += 1))
