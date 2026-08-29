@@ -197,7 +197,7 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             ),
             probe(
                 "fan-in state conflict",
-                "workflow-adk --test translation fan_in_shared_state_without_merge_policy_is_rejected",
+                "workflow-adk --test translation fan_in_same_key_writes_fail_closed_before_merge",
                 "shared-state fan-in is rejected before execution",
             ),
             probe(
@@ -287,7 +287,7 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
             ),
             probe(
                 "resume node no longer exists",
-                "workflow-adk --test m1_11_execution_checkpoints resume_failures_map_to_incompatible_terminal_outcome",
+                "workflow-adk --test m1_11_execution_checkpoints resume_rejects_missing_target_node_before_graph_invocation",
                 "invalid resume state maps to IncompatibleResume",
             ),
             probe(
@@ -390,14 +390,25 @@ impl ConformanceReceipt {
 pub struct ConformanceSubgate {
     selector: String,
     status: ConformanceStatus,
+    verified: bool,
 }
 
 impl ConformanceSubgate {
-    /// Binds the exact executed selector to its terminal result.
+    /// Creates unverified caller input, which can never produce a report.
     pub fn new(selector: impl Into<String>, status: ConformanceStatus) -> Self {
         Self {
             selector: selector.into(),
             status,
+            verified: false,
+        }
+    }
+
+    /// Marks an execution-layer result as eligible for report formatting.
+    pub fn executed(selector: impl Into<String>, status: ConformanceStatus) -> Self {
+        Self {
+            selector: selector.into(),
+            status,
+            verified: true,
         }
     }
 
@@ -431,6 +442,12 @@ pub fn write_conformance_report(
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "conformance report requires subgate evidence",
+        ));
+    }
+    if subgates.iter().any(|subgate| !subgate.verified) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conformance report only formats execution-layer receipts",
         ));
     }
 

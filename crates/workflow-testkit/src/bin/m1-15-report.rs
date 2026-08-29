@@ -49,7 +49,7 @@ fn main() -> ExitCode {
         let Some(result) = parse_status(result) else {
             return ExitCode::from(1);
         };
-        subgates.push(ConformanceSubgate::new(command, result));
+        subgates.push(ConformanceSubgate::executed(command, result));
     }
 
     match write_conformance_report(&path, head, tree, status, &subgates) {

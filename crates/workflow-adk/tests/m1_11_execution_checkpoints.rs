@@ -187,7 +187,7 @@ fn resume_restores_pending_retry_route_frontier_and_visits_without_reexecuting_c
 }
 
 #[test]
-fn resume_failures_map_to_incompatible_terminal_outcome() {
+fn truncated_events_resume_maps_to_incompatible_terminal_outcome() {
     let root = TestRoot::new();
     let profile = ExecutionProfileV1::parse(
         br#"{
@@ -245,6 +245,56 @@ fn resume_failures_map_to_incompatible_terminal_outcome() {
         checkpoint_before
     );
     assert_eq!(fs::read(checkpoint_path).unwrap(), checkpoint_bytes_before);
+}
+
+#[test]
+fn resume_rejects_missing_target_node_before_graph_invocation() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .unwrap();
+    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
+    let receipt =
+        ExecutionBackend::run(workflow, profile, json!({"request":"public"}), &root.0).unwrap();
+    let events_path = receipt.run_root().join("events.jsonl");
+    let before = fs::read(&events_path).unwrap();
+    let checkpoint_path = receipt.run_root().join("checkpoint.sqlite");
+    let manifest: CheckpointManifestV1 = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("checkpoint-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let run_id = RunId::new(receipt.run_id().to_owned()).unwrap();
+    let store = SqliteCheckpointStore::open(&checkpoint_path, manifest).unwrap();
+    let checkpoint = store.load_latest(&run_id).unwrap().expect("checkpoint");
+    let mut state: Value = serde_json::from_slice(checkpoint.state()).unwrap();
+    state["kit_graph_continuation_v1"]["pending_nodes"] = json!(["removed-node"]);
+    Connection::open(&checkpoint_path)
+        .unwrap()
+        .execute(
+            "UPDATE kit_checkpoints SET state = ?1 WHERE run_id = ?2",
+            rusqlite::params![serde_json::to_vec(&state).unwrap(), receipt.run_id()],
+        )
+        .unwrap();
+
+    let error = ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(
+        error.terminal_outcome(),
+        TerminalOutcome::IncompatibleResume
+    );
+    assert_eq!(fs::read(events_path).unwrap(), before);
 }
 
 #[test]

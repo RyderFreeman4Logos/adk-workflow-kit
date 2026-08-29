@@ -1,4 +1,9 @@
+use std::{collections::BTreeMap, sync::Arc};
+
 use adk_rust::graph::prelude::{ExecutionConfig, State};
+use adk_rust::{
+    Agent, AgentCapabilities, Content, Event, EventStream, InvocationContext, async_trait,
+};
 use serde_json::json;
 use workflow_adk::events::AdkEventMapper;
 use workflow_adk::{AdkGraphTranslator, TerminalOutcome, TranslationError};
@@ -295,6 +300,46 @@ impl RuntimePlanRegistry for AnyRuntimeBinding {
     }
 }
 
+struct StateAgent {
+    name: String,
+    response: String,
+}
+
+#[async_trait]
+impl Agent for StateAgent {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        "test state writer"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &[]
+    }
+
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            shared_state: true,
+            ..AgentCapabilities::default()
+        }
+    }
+
+    async fn run(&self, _ctx: Arc<dyn InvocationContext>) -> adk_rust::Result<EventStream> {
+        let mut event = Event::new(&self.name);
+        event.set_content(Content::new("assistant").with_text(&self.response));
+        Ok(Box::pin(adk_rust::futures::stream::iter([Ok(event)])))
+    }
+}
+
+fn state_agent(name: &str, state: serde_json::Value) -> Arc<dyn Agent> {
+    Arc::new(StateAgent {
+        name: name.to_owned(),
+        response: json!({"state": state}).to_string(),
+    })
+}
+
 fn resolved_plan(ir: &workflow_ir::WorkflowIr, capabilities: CapabilitySet) -> ResolvedRuntimePlan {
     let mut request = RuntimePlanRequest::from_ir(ir).with_model("fake-model", "1");
     request.set_capabilities(capabilities.clone());
@@ -412,6 +457,66 @@ fn fan_in_without_shared_state_translates() {
     AdkGraphTranslator::new()
         .translate(&plan)
         .expect("a join without shared state must translate");
+}
+
+#[tokio::test]
+async fn fan_in_same_key_writes_fail_closed_before_merge() {
+    let plan = compile_str(
+        "fan-in-same-key-writes.workflow.toml",
+        FAN_IN_DECLARED_STATE_WITH_ZERO_WRITES,
+    )
+    .expect("fixture compiles");
+    let agents = BTreeMap::from([
+        (
+            "left".to_owned(),
+            state_agent("left", json!({"shared": "left"})),
+        ),
+        (
+            "right".to_owned(),
+            state_agent("right", json!({"shared": "right"})),
+        ),
+    ]);
+    let graph = AdkGraphTranslator::new()
+        .translate_with_agents(&plan, &agents)
+        .expect("translation defers dynamic write-set validation until invocation");
+
+    let error = graph
+        .invoke(State::new(), ExecutionConfig::new("fan-in-overlap"))
+        .await
+        .expect_err("same-key branch writes require an explicit merge policy");
+    assert_eq!(
+        error.to_string(),
+        "fan-in state conflict at \"join\" for key \"shared\""
+    );
+}
+
+#[tokio::test]
+async fn fan_in_disjoint_key_writes_execute() {
+    let plan = compile_str(
+        "fan-in-disjoint-key-writes.workflow.toml",
+        FAN_IN_DECLARED_STATE_WITH_DISJOINT_KEYS,
+    )
+    .expect("fixture compiles");
+    let agents = BTreeMap::from([
+        (
+            "left".to_owned(),
+            state_agent("left", json!({"left": "left"})),
+        ),
+        (
+            "right".to_owned(),
+            state_agent("right", json!({"right": "right"})),
+        ),
+    ]);
+    let graph = AdkGraphTranslator::new()
+        .translate_with_agents(&plan, &agents)
+        .expect("disjoint write fixture translates");
+
+    let state = graph
+        .invoke(State::new(), ExecutionConfig::new("fan-in-disjoint"))
+        .await
+        .expect("disjoint writes are merged by the kit-owned join guard");
+    assert_eq!(state.get("left"), Some(&json!("left")));
+    assert_eq!(state.get("right"), Some(&json!("right")));
 }
 
 #[test]

@@ -24,7 +24,7 @@ fn complete_probe_evidence(status: ConformanceStatus) -> Vec<ConformanceSubgate>
     documented_failure_matrix()
         .iter()
         .flat_map(|class| class.probes().iter())
-        .map(|probe| ConformanceSubgate::new(probe.selector(), status))
+        .map(|probe| ConformanceSubgate::executed(probe.selector(), status))
         .collect()
 }
 
@@ -147,7 +147,7 @@ fn fan_in_state_conflict_requires_a_dedicated_executable_target() {
 
     assert_eq!(
         probe.selector(),
-        "workflow-adk --test translation fan_in_shared_state_without_merge_policy_is_rejected",
+        "workflow-adk --test translation fan_in_same_key_writes_fail_closed_before_merge",
         "fan-in state conflict must reach its dedicated test body"
     );
 }
@@ -176,7 +176,7 @@ fn failure_matrix_uses_production_boundary_selectors() {
         .expect("checkpoint failure class is documented");
     assert!(checkpoint.probes().iter().any(|probe| {
         probe.selector()
-            == "workflow-adk --test m1_11_execution_checkpoints resume_failures_map_to_incompatible_terminal_outcome"
+            == "workflow-adk --test m1_11_execution_checkpoints resume_rejects_missing_target_node_before_graph_invocation"
     }));
 }
 
@@ -290,4 +290,22 @@ fn conformance_report_rejects_unknown_or_duplicate_probe_evidence() {
     )
     .expect_err("duplicate selector must fail closed");
     assert_eq!(duplicate.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn conformance_report_rejects_caller_forged_selector_only_passes() {
+    let error = write_conformance_report(
+        report_path(),
+        "e9f6c6334491432c2b544209e3d303128239290b",
+        "8d9edb311ac60ca97dbcae5fdc23baad26f8a5f3",
+        ConformanceStatus::Pass,
+        &documented_failure_matrix()
+            .iter()
+            .flat_map(|class| class.probes().iter())
+            .map(|probe| ConformanceSubgate::new(probe.selector(), ConformanceStatus::Pass))
+            .collect::<Vec<_>>(),
+    )
+    .expect_err("selector/status strings are not execution receipts");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
