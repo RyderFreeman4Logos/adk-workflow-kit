@@ -3,6 +3,7 @@ use std::{
     num::NonZeroU64,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
 };
 
 use serde_json::{Value, json};
@@ -12,9 +13,10 @@ use workflow_compiler::{
     SkillRuntimeManifest,
 };
 use workflow_runtime::{
-    CapabilityIntersection, InMemoryArtifactStore, Materialization, RunContext, RunId, RunLimits,
-    RunSandbox, SandboxCapability, SandboxExecutionError, ToolBridgeErrorKind, ToolCall,
-    ToolEnvelope, ToolFlags, ToolProvenance, ToolRegistration, WorkdirManager,
+    CapabilityIntersection, ChildSandbox, InMemoryArtifactStore, Materialization, RunContext,
+    RunId, RunLimits, RunSandbox, SandboxCapability, SandboxExecutionError, ToolBridge,
+    ToolBridgeError, ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolEnvelope, ToolFlags,
+    ToolHandler, ToolProvenance, ToolRegistration, WorkdirManager,
 };
 
 const SCRIPT: &[u8] = b"import json, sys\nfrom pathlib import Path\nvalue = json.load(sys.stdin)['value']\nPath('adapter-marker').write_text('sandbox')\nprint(json.dumps({'value': value}))\n";
@@ -146,6 +148,25 @@ fn registration(capabilities: &[SandboxCapability]) -> ToolRegistration {
     )
     .expect("fixture registration")
     .with_required_capabilities(capabilities.iter().copied())
+}
+
+struct CountingTool {
+    calls: Arc<Mutex<u32>>,
+}
+
+impl ToolHandler for CountingTool {
+    fn execute(
+        &self,
+        _sandbox: &ChildSandbox<'_>,
+        _context: &ToolCallContext,
+        _arguments: &Value,
+    ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        *self.calls.lock().expect("fixture lock") += 1;
+        Ok(ToolEnvelope::success(
+            json!("effect"),
+            ToolProvenance::new("skill.adapter", "1.0.0"),
+        ))
+    }
 }
 
 fn adapter(
@@ -465,4 +486,59 @@ fn lock_bound_output_schema_rejects_invalid_script_stdout() {
         0,
         "schema-invalid stdout must not publish staged output"
     );
+}
+
+#[test]
+fn real_tool_bridge_policy_denial_projects_authorization_terminal_outcome() {
+    let base = TestBase::new();
+    let capabilities = [SandboxCapability::FilesystemRead];
+    let calls = Arc::new(Mutex::new(0));
+    let mut bridge = ToolBridge::new(sandbox(
+        &base,
+        "adapter-terminal-denial",
+        READ_ONLY_SCRIPT,
+        capabilities.to_vec(),
+    ));
+    bridge
+        .register(
+            registration(&capabilities).with_required_scopes(["script:invoke"]),
+            CountingTool {
+                calls: Arc::clone(&calls),
+            },
+        )
+        .expect("fixture bridge registers");
+    let authority = CapabilityIntersection::new(
+        capabilities,
+        ["script"],
+        ["script"],
+        std::iter::empty::<String>(),
+        ["script"],
+        ["script"],
+        capabilities,
+    );
+    let adapter = AdkToolBridge::new(
+        bridge,
+        authority,
+        None,
+        InMemoryArtifactStore::new(
+            NonZeroU64::new(4_096).expect("positive"),
+            NonZeroU64::new(1_024).expect("positive"),
+        ),
+    );
+
+    let error = adapter
+        .invoke(ToolCall::new(
+            "script",
+            "denied-call",
+            "actor-1",
+            json!({ "value": "blocked" }),
+        ))
+        .expect_err("missing caller scope must deny before the handler effect");
+
+    assert_eq!(error.kind(), ToolBridgeErrorKind::CapabilityDenied);
+    assert_eq!(
+        error.terminal_outcome(),
+        workflow_adk::TerminalOutcome::AuthorizationDenied
+    );
+    assert_eq!(*calls.lock().expect("fixture lock"), 0);
 }

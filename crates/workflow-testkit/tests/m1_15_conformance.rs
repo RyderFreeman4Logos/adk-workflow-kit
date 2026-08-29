@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
@@ -20,7 +21,7 @@ fn report_path() -> PathBuf {
 }
 
 #[test]
-fn documented_failure_matrix_covers_every_contract_probe_with_aggregate_target() {
+fn documented_failure_matrix_binds_every_contract_probe_to_a_unique_selector_and_assertion() {
     let matrix = documented_failure_matrix();
     let classes = matrix.iter().map(|entry| entry.class()).collect::<Vec<_>>();
     assert_eq!(
@@ -88,20 +89,40 @@ fn documented_failure_matrix_covers_every_contract_probe_with_aggregate_target()
         ("sandbox", "child skill script asks for wider authority"),
     ];
 
-    for (class, probe) in required {
+    for (class, name) in required {
         let entry = matrix
             .iter()
             .find(|entry| entry.class() == class)
             .unwrap_or_else(|| panic!("missing documented class {class}"));
+        let probe = entry
+            .probes()
+            .iter()
+            .find(|probe| probe.name() == name)
+            .unwrap_or_else(|| panic!("{class} probe {name:?} is missing"));
         assert!(
-            entry.probes().contains(&probe),
-            "{class} probe {probe:?} is name-only or missing"
+            probe.selector().starts_with("workflow-")
+                || probe.selector().starts_with("workflowctl"),
+            "{class} probe {name:?} needs an exact package test selector"
         );
         assert!(
-            !entry.aggregate_targets().is_empty(),
-            "{class} has no executable aggregate target"
+            !probe.expected_fail_closed_assertion().is_empty(),
+            "{class} probe {name:?} needs its fail-closed assertion"
         );
     }
+
+    let selectors = matrix
+        .iter()
+        .flat_map(|class| class.probes())
+        .map(|probe| probe.selector())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        selectors.len(),
+        matrix
+            .iter()
+            .map(|class| class.probes().len())
+            .sum::<usize>(),
+        "every documented probe must bind a unique test selector"
+    );
 }
 
 #[test]
@@ -110,11 +131,16 @@ fn fan_in_state_conflict_requires_a_dedicated_executable_target() {
         .iter()
         .find(|entry| entry.class() == "graph")
         .expect("graph failure class is documented");
+    let probe = graph
+        .probes()
+        .iter()
+        .find(|probe| probe.name() == "fan-in state conflict")
+        .expect("fan-in probe is documented");
 
     assert_eq!(
-        graph.aggregate_targets(),
-        &["workflow-adk --test translation fan_in_state_conflict_is_executable"],
-        "fan-in state conflict must reach its dedicated test body, not only a name-only target"
+        probe.selector(),
+        "workflow-adk --test translation fan_in_state_conflict_is_executable",
+        "fan-in state conflict must reach its dedicated test body"
     );
 }
 
@@ -125,11 +151,14 @@ fn failure_matrix_uses_production_boundary_selectors() {
         .iter()
         .find(|entry| entry.class() == "authorization")
         .expect("authorization failure class is documented");
+    let caller_scope = authorization
+        .probes()
+        .iter()
+        .find(|probe| probe.name() == "caller scope absent")
+        .expect("caller scope denial is documented");
     assert_eq!(
-        authorization.aggregate_targets(),
-        &[
-            "workflow-runtime --test m1_07_tool_bridge caller_scope_and_approval_denial_stop_handler",
-        ],
+        caller_scope.selector(),
+        "workflow-adk --test tool_bridge real_tool_bridge_policy_denial_projects_authorization_terminal_outcome",
         "authorization must name the production denial selector, not its whole test binary"
     );
 
@@ -137,12 +166,10 @@ fn failure_matrix_uses_production_boundary_selectors() {
         .iter()
         .find(|entry| entry.class() == "checkpoint")
         .expect("checkpoint failure class is documented");
-    assert!(
-        checkpoint
-            .aggregate_targets()
-            .contains(&"workflow-adk --test m1_11_execution_checkpoints resume_failures_map_to_incompatible_terminal_outcome"),
-        "resume compatibility requires an executable terminal-outcome selector"
-    );
+    assert!(checkpoint.probes().iter().any(|probe| {
+        probe.selector()
+            == "workflow-adk --test m1_11_execution_checkpoints resume_failures_map_to_incompatible_terminal_outcome"
+    }));
 }
 
 #[test]
@@ -164,7 +191,7 @@ fn terminal_categories_are_closed_and_executable() {
 }
 
 #[test]
-fn conformance_report_binds_exact_checkout_identity_and_status() {
+fn conformance_report_binds_exact_checkout_identity_status_and_probe_selectors() {
     let path = report_path();
     let receipt = write_conformance_report(
         &path,
@@ -187,6 +214,12 @@ fn conformance_report_binds_exact_checkout_identity_and_status() {
     assert!(
         report.contains("subgates:\n- command: just m1-15-test\n  result: PASS"),
         "reports must retain each subgate command and result"
+    );
+    assert!(
+        report.contains(
+            "selector: workflow-adk --test translation fan_in_state_conflict_is_executable"
+        ) && report.contains("assertion: shared-state fan-in is rejected before execution"),
+        "reports must retain each documented probe selector and assertion"
     );
 
     fs::remove_file(path).expect("report cleanup");

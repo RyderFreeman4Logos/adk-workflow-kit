@@ -46,6 +46,10 @@ m1-15-test:
 m1-15-translation:
     {{_io}} cargo +1.98.0 test -p workflow-adk --test translation --locked
 
+# Focused M1-15 production ToolBridge terminal-outcome tests.
+m1-15-adk-tool-bridge:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test tool_bridge --locked
+
 # Focused M1-15 ToolBridge authorization tests.
 m1-15-tool-bridge:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test m1_07_tool_bridge --locked
