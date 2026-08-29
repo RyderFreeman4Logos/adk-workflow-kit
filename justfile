@@ -64,6 +64,13 @@ m1-16-test:
     {{_io}} cargo +1.98.0 test -p workflowctl --test cli_contracts --locked
     {{_io}} cargo +1.98.0 test -p workflowctl --test skill_commands --locked
 
+# TDD evidence for the #187 recipes-consumer create/no-create decision.
+m2-02-red:
+    python3 scripts/test_m2_02_recipes_consumer.py
+
+m2-02-green:
+    python3 scripts/test_m2_02_recipes_consumer.py
+
 # Validate the machine-readable ADK-Rust pattern catalog.
 pattern-catalog-test:
     python3 scripts/test_pattern_catalog.py
