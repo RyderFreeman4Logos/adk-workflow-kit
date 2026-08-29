@@ -263,6 +263,50 @@ schema_id = "right"
 schema_version = "1"
 "#;
 
+const MULTI_HOP_FAN_IN: &str = r#"
+schema_version = 1
+[workflow]
+id = "multi-hop-fan-in"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "left_writer"
+kind = "agent"
+[[nodes]]
+id = "right_writer"
+kind = "agent"
+[[nodes]]
+id = "left_relay"
+kind = "action"
+[[nodes]]
+id = "right_relay"
+kind = "action"
+[[nodes]]
+id = "join"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "left_writer"
+[[edges]]
+from = "start"
+to = "right_writer"
+[[edges]]
+from = "left_writer"
+to = "left_relay"
+[[edges]]
+from = "right_writer"
+to = "right_relay"
+[[edges]]
+from = "left_relay"
+to = "join"
+[[edges]]
+from = "right_relay"
+to = "join"
+"#;
+
 const ROUTE_FAN_IN: &str = r#"
 schema_version = 1
 [workflow]
@@ -551,6 +595,66 @@ async fn fan_in_disjoint_key_writes_execute() {
         .invoke(State::new(), ExecutionConfig::new("fan-in-disjoint"))
         .await
         .expect("disjoint writes are merged by the kit-owned join guard");
+    assert_eq!(state.get("left"), Some(&json!("left")));
+    assert_eq!(state.get("right"), Some(&json!("right")));
+}
+
+#[tokio::test]
+async fn multi_hop_fan_in_same_key_writes_fail_closed_before_merge() {
+    let plan =
+        compile_str("multi-hop-fan-in.workflow.toml", MULTI_HOP_FAN_IN).expect("fixture compiles");
+    let agents = BTreeMap::from([
+        (
+            "left_writer".to_owned(),
+            state_agent("left_writer", json!({"shared": "left"})),
+        ),
+        (
+            "right_writer".to_owned(),
+            state_agent("right_writer", json!({"shared": "right"})),
+        ),
+    ]);
+    let graph = AdkGraphTranslator::new()
+        .translate_with_agents(&plan, &agents)
+        .expect("multi-hop fan-in translates");
+
+    let error = graph
+        .invoke(
+            State::new(),
+            ExecutionConfig::new("multi-hop-fan-in-overlap"),
+        )
+        .await
+        .expect_err("same-key writer provenance must reach the downstream join guard");
+    assert_eq!(
+        error.to_string(),
+        "fan-in state conflict at \"join\" for key \"shared\""
+    );
+}
+
+#[tokio::test]
+async fn multi_hop_fan_in_disjoint_key_writes_execute() {
+    let plan =
+        compile_str("multi-hop-fan-in.workflow.toml", MULTI_HOP_FAN_IN).expect("fixture compiles");
+    let agents = BTreeMap::from([
+        (
+            "left_writer".to_owned(),
+            state_agent("left_writer", json!({"left": "left"})),
+        ),
+        (
+            "right_writer".to_owned(),
+            state_agent("right_writer", json!({"right": "right"})),
+        ),
+    ]);
+    let graph = AdkGraphTranslator::new()
+        .translate_with_agents(&plan, &agents)
+        .expect("multi-hop fan-in translates");
+
+    let state = graph
+        .invoke(
+            State::new(),
+            ExecutionConfig::new("multi-hop-fan-in-disjoint"),
+        )
+        .await
+        .expect("disjoint writer provenance must reach the downstream join guard");
     assert_eq!(state.get("left"), Some(&json!("left")));
     assert_eq!(state.get("right"), Some(&json!("right")));
 }

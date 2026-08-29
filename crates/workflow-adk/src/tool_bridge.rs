@@ -361,12 +361,13 @@ where
         }
         .invoke(call)
         .map_err(|error| {
-            AdkError::new(
-                ErrorComponent::Tool,
-                ErrorCategory::Internal,
-                "tool.bridge.failed",
-                error.to_string(),
-            )
+            let (category, code) = match error.terminal_outcome() {
+                TerminalOutcome::AuthorizationDenied => {
+                    (ErrorCategory::Forbidden, "tool.bridge.authorization_denied")
+                }
+                _ => (ErrorCategory::Internal, "tool.bridge.failed"),
+            };
+            AdkError::new(ErrorComponent::Tool, category, code, error.to_string())
         })?;
         serde_json::to_value(result).map_err(|error| {
             AdkError::new(

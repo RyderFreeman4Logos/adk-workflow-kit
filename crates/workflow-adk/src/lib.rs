@@ -781,13 +781,26 @@ impl AdkGraphTranslator {
                 (sources.len() > 1).then_some((target, sources))
             })
             .collect::<BTreeMap<_, _>>();
-        let mut fan_in_targets_by_source = BTreeMap::<String, Vec<String>>::new();
-        for (target, sources) in &fan_in {
-            for source in sources {
-                fan_in_targets_by_source
-                    .entry(source.clone())
-                    .or_default()
-                    .push(target.clone());
+        let mut fan_in_targets_by_source = BTreeMap::<String, Vec<(String, String)>>::new();
+        for node in ir.nodes() {
+            if node.kind() != IrNodeKind::Agent {
+                continue;
+            }
+            let writer = node.id().as_str();
+            for (target, sources) in &fan_in {
+                let mut provenance = sources
+                    .iter()
+                    .filter(|source| can_reach(writer, source))
+                    .cloned();
+                let Some(source) = provenance.next() else {
+                    continue;
+                };
+                if provenance.next().is_none() {
+                    fan_in_targets_by_source
+                        .entry(writer.to_owned())
+                        .or_default()
+                        .push((target.clone(), source));
+                }
             }
         }
         if !ids.contains(ir.entry_node_id().as_str()) {
@@ -905,10 +918,10 @@ impl AdkGraphTranslator {
                                     .map(|(key, value)| (key.clone(), value.clone())),
                             );
                         } else {
-                            for target in &fan_in_targets {
+                            for (target, source) in &fan_in_targets {
                                 output.extend(state.iter().map(|(key, value)| {
                                     (
-                                        format!("__workflow_fanin:{target}:{id}:{key}"),
+                                        format!("__workflow_fanin:{target}:{source}:{key}"),
                                         value.clone(),
                                     )
                                 }));

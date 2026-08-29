@@ -6,6 +6,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use adk_rust::{
+    CallbackContext, Content, ErrorCategory, EventActions, MemoryEntry, ReadonlyContext,
+    ToolContext, async_trait,
+};
 use serde_json::{Value, json};
 use workflow_adk::tool_bridge::{AdkToolBridge, RegisteredSkillScript};
 use workflow_compiler::{
@@ -166,6 +170,59 @@ impl ToolHandler for CountingTool {
             json!("effect"),
             ToolProvenance::new("skill.adapter", "1.0.0"),
         ))
+    }
+}
+
+struct RegisteredToolContext {
+    actions: Mutex<EventActions>,
+    content: Content,
+}
+
+#[async_trait]
+impl ReadonlyContext for RegisteredToolContext {
+    fn invocation_id(&self) -> &str {
+        "tool-bridge-invocation"
+    }
+    fn agent_name(&self) -> &str {
+        "tool-bridge-test"
+    }
+    fn user_id(&self) -> &str {
+        "actor-1"
+    }
+    fn app_name(&self) -> &str {
+        "tool-bridge-test"
+    }
+    fn session_id(&self) -> &str {
+        "tool-bridge-session"
+    }
+    fn branch(&self) -> &str {
+        ""
+    }
+    fn user_content(&self) -> &Content {
+        &self.content
+    }
+}
+
+#[async_trait]
+impl CallbackContext for RegisteredToolContext {
+    fn artifacts(&self) -> Option<Arc<dyn adk_rust::Artifacts>> {
+        None
+    }
+}
+
+#[async_trait]
+impl ToolContext for RegisteredToolContext {
+    fn function_call_id(&self) -> &str {
+        "denied-call"
+    }
+    fn actions(&self) -> EventActions {
+        self.actions.lock().expect("fixture lock").clone()
+    }
+    fn set_actions(&self, actions: EventActions) {
+        *self.actions.lock().expect("fixture lock") = actions;
+    }
+    async fn search_memory(&self, _query: &str) -> adk_rust::Result<Vec<MemoryEntry>> {
+        Ok(Vec::new())
     }
 }
 
@@ -488,8 +545,8 @@ fn lock_bound_output_schema_rejects_invalid_script_stdout() {
     );
 }
 
-#[test]
-fn real_tool_bridge_policy_denial_projects_authorization_terminal_outcome() {
+#[tokio::test]
+async fn registered_tool_policy_denial_preserves_authorization_terminal_outcome() {
     let base = TestBase::new();
     let capabilities = [SandboxCapability::FilesystemRead];
     let calls = Arc::new(Mutex::new(0));
@@ -527,18 +584,19 @@ fn real_tool_bridge_policy_denial_projects_authorization_terminal_outcome() {
     );
 
     let error = adapter
-        .invoke(ToolCall::new(
-            "script",
-            "denied-call",
-            "actor-1",
+        .tool("script")
+        .expect("registered ADK tool exists")
+        .execute(
+            Arc::new(RegisteredToolContext {
+                actions: Mutex::new(EventActions::default()),
+                content: Content::new("user"),
+            }),
             json!({ "value": "blocked" }),
-        ))
+        )
+        .await
         .expect_err("missing caller scope must deny before the handler effect");
 
-    assert_eq!(error.kind(), ToolBridgeErrorKind::CapabilityDenied);
-    assert_eq!(
-        error.terminal_outcome(),
-        workflow_adk::TerminalOutcome::AuthorizationDenied
-    );
+    assert_eq!(error.category, ErrorCategory::Forbidden);
+    assert_eq!(error.code, "tool.bridge.authorization_denied");
     assert_eq!(*calls.lock().expect("fixture lock"), 0);
 }

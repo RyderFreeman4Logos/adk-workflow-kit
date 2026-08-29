@@ -97,11 +97,6 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
                 "timeout produces a typed diagnostic",
             ),
             probe(
-                "context limit",
-                "workflow-runtime --test run_contracts malformed_results_fail_closed",
-                "invalid bounded results fail closed",
-            ),
-            probe(
                 "rate limit",
                 "workflow-testkit --test fault_injection rate_limit_fixture_fails_closed_on_quota_exhaustion",
                 "quota exhaustion produces a typed diagnostic",
@@ -110,11 +105,6 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
                 "transient retry then success",
                 "workflow-testkit --test code_investigation synthetic_repo_has_expected_grounded_answer",
                 "the deterministic trace records retry routes before publication",
-            ),
-            probe(
-                "retry exhaustion",
-                "workflow-testkit --test contract real_llm_agent_executes_the_scripted_tool_loop",
-                "the scripted loop preserves its bounded execution contract",
             ),
         ],
     },
@@ -200,6 +190,16 @@ const FAILURE_MATRIX: [FailureClass; 6] = [
                 "fan-in state conflict",
                 "workflow-adk --test translation fan_in_same_key_writes_fail_closed_before_merge",
                 "shared-state fan-in is rejected before execution",
+            ),
+            probe(
+                "route fan-in same-key state conflict",
+                "workflow-adk --test translation route_fan_in_same_key_writes_fail_closed_before_merge",
+                "same-key predicate-route fan-in is rejected before merge",
+            ),
+            probe(
+                "route fan-in disjoint-key state success",
+                "workflow-adk --test translation route_fan_in_disjoint_key_writes_execute",
+                "disjoint predicate-route writes execute through the guarded join",
             ),
             probe(
                 "validator route mismatch",
@@ -456,26 +456,31 @@ fn execute_probe(probe: FailureProbe) -> io::Result<ConformanceSubgate> {
         String::from_utf8_lossy(&output.stderr)
     );
     let test_count = output_text.matches("running 1 test").count();
+    let test_name = probe
+        .selector()
+        .split_ascii_whitespace()
+        .nth(3)
+        .expect("failure matrix selectors name one exact test");
+    let test_passed = output_text
+        .lines()
+        .any(|line| line.starts_with(&format!("test {test_name} ... ok")));
     let exit_code = output.status.code().unwrap_or(-1);
-    let status = if output.status.success() && test_count == 1 {
+    let status = if output.status.success() && test_count == 1 && test_passed {
         ConformanceStatus::Pass
     } else {
         ConformanceStatus::Fail
     };
     let fixture = fixture_path(probe.selector())?;
-    let artifact_or_resume_path = (probe.name().contains("artifact")
-        || probe.name().contains("resume"))
-    .then_some(fixture.clone());
 
     Ok(ConformanceSubgate {
         selector: probe.selector(),
         command: format!("just conformance-probe {}", probe.selector()),
         fixture,
         expected: probe.expected_fail_closed_assertion(),
-        observed: format!("running {test_count} matching test(s)"),
+        observed: format!("test {test_name}: {}", status.as_str()),
         test_count,
         exit_code,
-        artifact_or_resume_path,
+        artifact_or_resume_path: None,
         status,
     })
 }
@@ -498,8 +503,16 @@ fn fixture_path(selector: &str) -> io::Result<String> {
 }
 
 fn checkout_identity() -> io::Result<(String, String)> {
+    let status = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()?;
+    if !status.status.success() || !status.stdout.is_empty() {
+        return Err(io::Error::other(
+            "conformance requires a clean tracked and product-untracked working tree",
+        ));
+    }
     let head = git_object_id(&["rev-parse", "HEAD"])?;
-    let tree = git_object_id(&["write-tree"])?;
+    let tree = git_object_id(&["rev-parse", "HEAD^{tree}"])?;
     Ok((head, tree))
 }
 
@@ -546,9 +559,13 @@ pub fn write_conformance_report(
                 result.exit_code,
                 result.status.as_str(),
             ));
-            if let Some(path) = &result.artifact_or_resume_path {
-                report.push_str(&format!("  artifact_or_resume_path: {path}\n"));
-            }
+            let artifact_or_resume_path = result
+                .artifact_or_resume_path
+                .as_deref()
+                .unwrap_or("absent");
+            report.push_str(&format!(
+                "  artifact_or_resume_path: {artifact_or_resume_path}\n"
+            ));
         }
     }
     fs::write(&path, report)?;
