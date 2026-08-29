@@ -683,8 +683,24 @@ impl AdkGraphTranslator {
                                 .content()
                                 .and_then(|content| content.parts.first()?.text())
                         })
-                        .map_or_else(|| json!(true), |text| json!(text));
-                    std::collections::HashMap::from([(format!("node:{id}"), value)])
+                        .map_or_else(
+                            || json!(true),
+                            |text| serde_json::from_str(text).unwrap_or_else(|_| json!(text)),
+                        );
+                    let mut output = std::collections::HashMap::new();
+                    let node_value = value
+                        .get("output")
+                        .cloned()
+                        .unwrap_or_else(|| value.clone());
+                    if let Some(state) = value.get("state").and_then(serde_json::Value::as_object) {
+                        output.extend(
+                            state
+                                .iter()
+                                .map(|(key, value)| (key.clone(), value.clone())),
+                        );
+                    }
+                    output.insert(format!("node:{id}"), node_value);
+                    output
                 }));
             } else {
                 let terminal = node.kind() == IrNodeKind::Terminal;

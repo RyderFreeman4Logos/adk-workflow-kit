@@ -62,6 +62,16 @@ fn synthetic_repo_has_expected_grounded_answer() {
             && call.route() == "inspect_evidence"
             && call.path() == Some("src/retry.rs")
     }));
+    let trace = serde_json::to_value(result.trace()).expect("trace is serializable");
+    let tool_results = trace["tool_results"]
+        .as_array()
+        .expect("graph state must retain tool results");
+    assert!(!tool_results.is_empty());
+    assert!(tool_results.iter().any(|result| {
+        result["tool"] == serde_json::json!("SearchCode")
+            && result["route"] == serde_json::json!("search_code")
+            && result["output"][0]["path"] == serde_json::json!("src/retry.rs")
+    }));
 }
 
 #[test]
@@ -114,6 +124,7 @@ fn kill_resume_inspect_and_replay_are_deterministic() {
         resumed.trace().routes().first().map(String::as_str),
         Some("inspect_evidence")
     );
+    assert!(resumed.trace().adk_graph_exercised());
     assert!(resumed.trace().tool_calls().iter().any(|call| {
         call.tool() == ReadOnlyTool::SearchCode
             && call.route() == "retry_search_code"
@@ -168,14 +179,14 @@ fn review_loop_publishes_from_structured_pass_verdict() {
             .trace()
             .routes()
             .iter()
-            .any(|route| route == "review_loop_pass")
+            .any(|route| route == "review:pass")
     );
     assert!(
         !result
             .trace()
             .routes()
             .iter()
-            .any(|route| route == "revise")
+            .any(|route| route == "review_loop_pass" || route == "revise")
     );
 }
 
