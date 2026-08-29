@@ -104,6 +104,22 @@ async fn scripted_mismatch_and_exhaustion_fail_without_responses() {
 }
 
 #[adk_rust::tokio::test]
+async fn scripted_retry_exhaustion_fails_closed_without_a_response() {
+    let exhausted = ScriptedLlm::new(Vec::new());
+    let error = must_fail(
+        exhausted
+            .generate_content(LlmRequest::new("scripted-llm", Vec::new()), false)
+            .await,
+    );
+    assert_eq!(error.component, ErrorComponent::Model);
+    assert_eq!(error.code, "model.scripted.exhausted");
+    assert_eq!(
+        exhausted.requests().expect("requests are recorded").len(),
+        1
+    );
+}
+
+#[adk_rust::tokio::test]
 async fn poisoned_script_state_fails_closed() {
     let scripted = ScriptedLlm::new(vec![ScriptStep::new(
         |_| panic!("poison scripted state"),
