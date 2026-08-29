@@ -3,8 +3,13 @@ use std::{
     num::NonZeroU64,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
 };
 
+use adk_rust::{
+    CallbackContext, Content, ErrorCategory, EventActions, MemoryEntry, ReadonlyContext,
+    ToolContext, async_trait,
+};
 use serde_json::{Value, json};
 use workflow_adk::tool_bridge::{AdkToolBridge, RegisteredSkillScript};
 use workflow_compiler::{
@@ -12,9 +17,10 @@ use workflow_compiler::{
     SkillRuntimeManifest,
 };
 use workflow_runtime::{
-    CapabilityIntersection, InMemoryArtifactStore, Materialization, RunContext, RunId, RunLimits,
-    RunSandbox, SandboxCapability, SandboxExecutionError, ToolBridgeErrorKind, ToolCall,
-    ToolEnvelope, ToolFlags, ToolProvenance, ToolRegistration, WorkdirManager,
+    CapabilityIntersection, ChildSandbox, InMemoryArtifactStore, Materialization, RunContext,
+    RunId, RunLimits, RunSandbox, SandboxCapability, SandboxExecutionError, ToolBridge,
+    ToolBridgeError, ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolEnvelope, ToolFlags,
+    ToolHandler, ToolProvenance, ToolRegistration, WorkdirManager,
 };
 
 const SCRIPT: &[u8] = b"import json, sys\nfrom pathlib import Path\nvalue = json.load(sys.stdin)['value']\nPath('adapter-marker').write_text('sandbox')\nprint(json.dumps({'value': value}))\n";
@@ -146,6 +152,78 @@ fn registration(capabilities: &[SandboxCapability]) -> ToolRegistration {
     )
     .expect("fixture registration")
     .with_required_capabilities(capabilities.iter().copied())
+}
+
+struct CountingTool {
+    calls: Arc<Mutex<u32>>,
+}
+
+impl ToolHandler for CountingTool {
+    fn execute(
+        &self,
+        _sandbox: &ChildSandbox<'_>,
+        _context: &ToolCallContext,
+        _arguments: &Value,
+    ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        *self.calls.lock().expect("fixture lock") += 1;
+        Ok(ToolEnvelope::success(
+            json!("effect"),
+            ToolProvenance::new("skill.adapter", "1.0.0"),
+        ))
+    }
+}
+
+struct RegisteredToolContext {
+    actions: Mutex<EventActions>,
+    content: Content,
+}
+
+#[async_trait]
+impl ReadonlyContext for RegisteredToolContext {
+    fn invocation_id(&self) -> &str {
+        "tool-bridge-invocation"
+    }
+    fn agent_name(&self) -> &str {
+        "tool-bridge-test"
+    }
+    fn user_id(&self) -> &str {
+        "actor-1"
+    }
+    fn app_name(&self) -> &str {
+        "tool-bridge-test"
+    }
+    fn session_id(&self) -> &str {
+        "tool-bridge-session"
+    }
+    fn branch(&self) -> &str {
+        ""
+    }
+    fn user_content(&self) -> &Content {
+        &self.content
+    }
+}
+
+#[async_trait]
+impl CallbackContext for RegisteredToolContext {
+    fn artifacts(&self) -> Option<Arc<dyn adk_rust::Artifacts>> {
+        None
+    }
+}
+
+#[async_trait]
+impl ToolContext for RegisteredToolContext {
+    fn function_call_id(&self) -> &str {
+        "denied-call"
+    }
+    fn actions(&self) -> EventActions {
+        self.actions.lock().expect("fixture lock").clone()
+    }
+    fn set_actions(&self, actions: EventActions) {
+        *self.actions.lock().expect("fixture lock") = actions;
+    }
+    async fn search_memory(&self, _query: &str) -> adk_rust::Result<Vec<MemoryEntry>> {
+        Ok(Vec::new())
+    }
 }
 
 fn adapter(
@@ -465,4 +543,60 @@ fn lock_bound_output_schema_rejects_invalid_script_stdout() {
         0,
         "schema-invalid stdout must not publish staged output"
     );
+}
+
+#[tokio::test]
+async fn registered_tool_policy_denial_preserves_authorization_terminal_outcome() {
+    let base = TestBase::new();
+    let capabilities = [SandboxCapability::FilesystemRead];
+    let calls = Arc::new(Mutex::new(0));
+    let mut bridge = ToolBridge::new(sandbox(
+        &base,
+        "adapter-terminal-denial",
+        READ_ONLY_SCRIPT,
+        capabilities.to_vec(),
+    ));
+    bridge
+        .register(
+            registration(&capabilities).with_required_scopes(["script:invoke"]),
+            CountingTool {
+                calls: Arc::clone(&calls),
+            },
+        )
+        .expect("fixture bridge registers");
+    let authority = CapabilityIntersection::new(
+        capabilities,
+        ["script"],
+        ["script"],
+        std::iter::empty::<String>(),
+        ["script"],
+        ["script"],
+        capabilities,
+    );
+    let adapter = AdkToolBridge::new(
+        bridge,
+        authority,
+        None,
+        InMemoryArtifactStore::new(
+            NonZeroU64::new(4_096).expect("positive"),
+            NonZeroU64::new(1_024).expect("positive"),
+        ),
+    );
+
+    let error = adapter
+        .tool("script")
+        .expect("registered ADK tool exists")
+        .execute(
+            Arc::new(RegisteredToolContext {
+                actions: Mutex::new(EventActions::default()),
+                content: Content::new("user"),
+            }),
+            json!({ "value": "blocked" }),
+        )
+        .await
+        .expect_err("missing caller scope must deny before the handler effect");
+
+    assert_eq!(error.category, ErrorCategory::Forbidden);
+    assert_eq!(error.code, "tool.bridge.authorization_denied");
+    assert_eq!(*calls.lock().expect("fixture lock"), 0);
 }

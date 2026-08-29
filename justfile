@@ -38,6 +38,42 @@ m1-03-red:
 m1-03-green:
     {{_io}} cargo +1.98.0 test -p workflow-compiler --test runtime_plan --locked
 
+# Focused M1-15 conformance contract tests.
+m1-15-test:
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --test m1_15_conformance --locked
+
+# Focused M1-15 production-boundary translation tests.
+m1-15-translation:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test translation --locked
+
+# Focused M1-15 production ToolBridge terminal-outcome tests.
+m1-15-adk-tool-bridge:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test tool_bridge --locked
+
+# Focused M1-15 ToolBridge authorization tests.
+m1-15-tool-bridge:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test m1_07_tool_bridge --locked
+
+# Focused M1-15 checkpoint terminal-mapping tests.
+m1-15-checkpoint:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test m1_11_execution_checkpoints --locked
+
+# Run one static matrix selector through the Just-only Cargo boundary.
+conformance-contract selector:
+    set -- {{selector}}; test "$#" -eq 4; test "$2" = --test; M1_15_FIXTURE_RECEIPT_SELECTOR="{{selector}}" env -u M1_15_PROBE_SELECTOR {{_io}} cargo +1.98.0 test -p "$1" --test "$3" "$4" --locked -- --exact --nocapture
+
+# Run a selected contract through its test-owned structured receipt boundary.
+conformance-probe selector:
+    set -- {{selector}}; test "$#" -eq 4; test "$2" = --test; M1_15_PROBE_SELECTOR="{{selector}}" {{_io}} cargo +1.98.0 test -p workflow-testkit --test m1_15_conformance conformance_probe_emits_structured_receipt --locked -- --exact --nocapture
+
+# Network-free M1-15 aggregate: the report binary executes and formats verified receipts.
+conformance:
+    report="${CONFORMANCE_REPORT:-target/m1-15-conformance.md}"; mkdir -p "$(dirname "$report")"; {{_io}} cargo +1.98.0 run -p workflow-testkit --bin m1-15-report --locked -- "$report"
+
+# Opt in without inspecting credentials; the M1-14 dogfood either completes or safely abstains.
+conformance-live:
+    if test "${WORKFLOW_KIT_M1_15_LIVE:-0}" != 1; then echo "M1-15 live dogfood: SKIP (set WORKFLOW_KIT_M1_15_LIVE=1 to opt in)"; exit 0; fi; {{_io}} cargo +1.98.0 run -p workflow-testkit --bin m1-15-live --locked
+
 lock:
     {{_io}} cargo generate-lockfile
 

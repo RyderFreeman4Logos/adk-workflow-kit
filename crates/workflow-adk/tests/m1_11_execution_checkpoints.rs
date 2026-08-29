@@ -6,7 +6,10 @@ use std::{
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use workflow_adk::execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1};
+use workflow_adk::{
+    TerminalOutcome,
+    execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1},
+};
 use workflow_runtime::{CheckpointManifestV1, RunId, SqliteCheckpointStore};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -184,7 +187,7 @@ fn resume_restores_pending_retry_route_frontier_and_visits_without_reexecuting_c
 }
 
 #[test]
-fn resume_rejects_truncated_events_before_graph_invocation() {
+fn truncated_events_resume_maps_to_incompatible_terminal_outcome() {
     let root = TestRoot::new();
     let profile = ExecutionProfileV1::parse(
         br#"{
@@ -226,6 +229,10 @@ fn resume_rejects_truncated_events_before_graph_invocation() {
 
     let error = ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(
+        error.terminal_outcome(),
+        TerminalOutcome::IncompatibleResume
+    );
     assert_eq!(fs::read(&events_path).unwrap(), truncated_events);
 
     let manifest: CheckpointManifestV1 = serde_json::from_slice(
@@ -238,6 +245,56 @@ fn resume_rejects_truncated_events_before_graph_invocation() {
         checkpoint_before
     );
     assert_eq!(fs::read(checkpoint_path).unwrap(), checkpoint_bytes_before);
+}
+
+#[test]
+fn resume_rejects_missing_target_node_before_graph_invocation() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .unwrap();
+    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
+    let receipt =
+        ExecutionBackend::run(workflow, profile, json!({"request":"public"}), &root.0).unwrap();
+    let events_path = receipt.run_root().join("events.jsonl");
+    let before = fs::read(&events_path).unwrap();
+    let checkpoint_path = receipt.run_root().join("checkpoint.sqlite");
+    let manifest: CheckpointManifestV1 = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("checkpoint-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let run_id = RunId::new(receipt.run_id().to_owned()).unwrap();
+    let store = SqliteCheckpointStore::open(&checkpoint_path, manifest).unwrap();
+    let checkpoint = store.load_latest(&run_id).unwrap().expect("checkpoint");
+    let mut state: Value = serde_json::from_slice(checkpoint.state()).unwrap();
+    state["kit_graph_continuation_v1"]["pending_nodes"] = json!(["removed-node"]);
+    Connection::open(&checkpoint_path)
+        .unwrap()
+        .execute(
+            "UPDATE kit_checkpoints SET state = ?1 WHERE run_id = ?2",
+            rusqlite::params![serde_json::to_vec(&state).unwrap(), receipt.run_id()],
+        )
+        .unwrap();
+
+    let error = ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(
+        error.terminal_outcome(),
+        TerminalOutcome::IncompatibleResume
+    );
+    assert_eq!(fs::read(events_path).unwrap(), before);
 }
 
 #[test]
@@ -338,7 +395,7 @@ to = "done"
 }
 
 #[test]
-fn resume_rejects_same_workflow_identity_with_changed_canonical_content() {
+fn workflow_hash_mismatch_fixture_rejects_changed_workflow_before_resume() {
     let root = TestRoot::new();
     let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
@@ -368,10 +425,14 @@ fn resume_rejects_same_workflow_identity_with_changed_canonical_content() {
 
     let error = ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(
+        error.terminal_outcome(),
+        TerminalOutcome::IncompatibleResume
+    );
 }
 
 #[test]
-fn resume_rejects_changed_profile_content_with_stable_profile_identity() {
+fn tool_implementation_drift_fixture_rejects_changed_profile_before_resume() {
     let root = TestRoot::new();
     let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
@@ -564,4 +625,49 @@ fn resume_does_not_advance_checkpoint_when_event_persistence_fails() {
     let checkpoint_after = store.load_latest(&run_id).unwrap().unwrap();
     assert_eq!(checkpoint_after, checkpoint_before);
     assert_eq!(fs::read(events_path).unwrap(), events_before);
+}
+
+#[test]
+fn execution_graph_preserves_authorization_denial_before_handler_effect() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "tool": {
+                "name": "protected-tool",
+                "result": {"ok": true},
+                "required_scopes": ["scope.denied"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .unwrap();
+    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
+
+    let error =
+        ExecutionBackend::run(workflow, profile, json!({"request":"public"}), &root.0).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::AuthorizationDenied);
+    assert_eq!(
+        error.terminal_outcome(),
+        TerminalOutcome::AuthorizationDenied
+    );
+
+    for entry in fs::read_dir(&root.0).unwrap().filter_map(Result::ok) {
+        let effects = entry.path().join("effects.sqlite");
+        if effects.is_file() {
+            let connection = Connection::open(effects).unwrap();
+            let count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM kit_effects", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+    }
 }

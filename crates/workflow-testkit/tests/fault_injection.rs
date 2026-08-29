@@ -14,8 +14,8 @@ use workflow_runtime::{
     RunContext, RunController, RunId, RunLimitKind, RunLimits, RunTerminalCause, RunTimeoutKind,
 };
 use workflow_testkit::{
-    FakeTool, FakeToolRegistry, FaultDiagnostic, FaultSignal, ScriptedLlm, inject_invalid_output,
-    inject_output_flood, inject_rate_limit, inject_timeout,
+    FakeTool, FakeToolRegistry, FaultDiagnostic, FaultSignal, ScriptedLlm, inject_context_limit,
+    inject_invalid_output, inject_output_flood, inject_rate_limit, inject_timeout,
 };
 
 /// One relaxed 7-ceiling run limit set; individual ceilings are overridden per fixture.
@@ -172,6 +172,16 @@ async fn rate_limit_fixture_fails_closed_on_quota_exhaustion() {
     assert_eq!(
         diagnostic.to_string(),
         "injected fault: quota exhausted (model turns)"
+    );
+}
+
+#[test]
+fn context_limit_fixture_fails_closed_without_retaining_request_content() {
+    let diagnostic = inject_context_limit(4_097, 4_096);
+    assert_eq!(diagnostic.signal(), FaultSignal::ContextLimit);
+    assert_eq!(
+        diagnostic.to_string(),
+        "injected fault: context limit exceeded"
     );
 }
 

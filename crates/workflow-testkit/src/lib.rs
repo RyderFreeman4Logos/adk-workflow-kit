@@ -2,6 +2,7 @@
 
 mod bench;
 pub mod code_investigation;
+pub mod conformance;
 mod eval;
 mod non_progress;
 mod replay;
@@ -128,6 +129,8 @@ pub enum FaultSignal {
     Timeout(RunTimeoutKind),
     /// A host-enforced count or byte ceiling was reached.
     RateLimit(RunLimitKind),
+    /// A model request exceeded its declared context ceiling.
+    ContextLimit,
     /// A bounded output payload could not be decoded.
     InvalidOutput,
     /// A tool output stream crossed its byte ceiling.
@@ -173,6 +176,9 @@ impl fmt::Display for FaultDiagnostic {
                     limit_name(kind)
                 )
             }
+            FaultSignal::ContextLimit => {
+                formatter.write_str("injected fault: context limit exceeded")
+            }
             FaultSignal::InvalidOutput => formatter.write_str("injected fault: invalid output"),
             FaultSignal::OutputFlood { accepted_bytes } => write!(
                 formatter,
@@ -190,6 +196,7 @@ impl fmt::Debug for FaultSignal {
         match self {
             Self::Timeout(kind) => formatter.debug_tuple("Timeout").field(kind).finish(),
             Self::RateLimit(kind) => formatter.debug_tuple("RateLimit").field(kind).finish(),
+            Self::ContextLimit => formatter.write_str("ContextLimit"),
             Self::InvalidOutput => formatter.write_str("InvalidOutput"),
             Self::OutputFlood { accepted_bytes } => formatter
                 .debug_struct("OutputByteCeiling")
@@ -245,6 +252,15 @@ pub fn inject_rate_limit(controller: &mut RunController<'_>, elapsed: Duration) 
             _ => FaultDiagnostic::new(FaultSignal::InjectionPreconditionFailed),
         },
         Ok(()) => FaultDiagnostic::new(FaultSignal::InjectionPreconditionFailed),
+    }
+}
+
+/// Injects a model context-limit rejection without retaining request content.
+pub fn inject_context_limit(request_tokens: usize, maximum_tokens: usize) -> FaultDiagnostic {
+    if request_tokens > maximum_tokens {
+        FaultDiagnostic::new(FaultSignal::ContextLimit)
+    } else {
+        FaultDiagnostic::new(FaultSignal::InjectionPreconditionFailed)
     }
 }
 

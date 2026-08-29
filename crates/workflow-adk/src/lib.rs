@@ -5,9 +5,13 @@ pub mod execution;
 pub mod model_profiles;
 pub mod tool_bridge;
 
-use std::collections::BTreeMap;
+use crate::execution::{ExecutionError, ExecutionErrorKind};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use adk_rust::graph::Checkpointer;
 use adk_rust::graph::prelude::{
@@ -24,6 +28,7 @@ use workflow_compiler::{CompiledPlan, ResolvedRuntimePlan};
 use workflow_ir::IrNodeKind;
 use workflow_runtime::{
     PureTransformBackend, PureTransformRequest, RequestedCapabilities, SandboxCapability,
+    ToolBridgeErrorKind,
 };
 
 const MAX_PATH_BYTES: usize = 256;
@@ -170,6 +175,85 @@ impl VerbatimPlatformAdapter {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TerminalOutcome {
     Succeeded,
+    Abstained,
+    Incomplete,
+    Failed,
+    TimedOut,
+    Cancelled,
+    LimitExceeded,
+    AuthorizationDenied,
+    IncompatibleResume,
+}
+
+impl TerminalOutcome {
+    /// All closed terminal categories in their stable contract order.
+    pub const ALL: [Self; 9] = [
+        Self::Succeeded,
+        Self::Abstained,
+        Self::Incomplete,
+        Self::Failed,
+        Self::TimedOut,
+        Self::Cancelled,
+        Self::LimitExceeded,
+        Self::AuthorizationDenied,
+        Self::IncompatibleResume,
+    ];
+
+    /// Returns the stable terminal category spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "completed",
+            Self::Abstained => "abstained",
+            Self::Incomplete => "incomplete",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::LimitExceeded => "limit_exceeded",
+            Self::AuthorizationDenied => "authorization_denied",
+            Self::IncompatibleResume => "incompatible_resume",
+        }
+    }
+
+    fn from_stable_id(id: &str) -> Option<Self> {
+        match id {
+            "completed" => Some(Self::Succeeded),
+            "abstained" => Some(Self::Abstained),
+            "incomplete" => Some(Self::Incomplete),
+            "failed" => Some(Self::Failed),
+            "timed_out" => Some(Self::TimedOut),
+            "cancelled" => Some(Self::Cancelled),
+            "limit_exceeded" => Some(Self::LimitExceeded),
+            "authorization_denied" => Some(Self::AuthorizationDenied),
+            "incompatible_resume" => Some(Self::IncompatibleResume),
+            _ => None,
+        }
+    }
+
+    /// Projects a real ToolBridge policy denial to the closed terminal vocabulary.
+    pub const fn from_tool_bridge_error(kind: ToolBridgeErrorKind) -> Self {
+        match kind {
+            ToolBridgeErrorKind::CapabilityDenied | ToolBridgeErrorKind::ApprovalDenied => {
+                Self::AuthorizationDenied
+            }
+            _ => Self::Failed,
+        }
+    }
+
+    /// Projects a resume compatibility or corruption failure to its terminal outcome.
+    pub const fn from_execution_error(kind: ExecutionErrorKind) -> Self {
+        match kind {
+            ExecutionErrorKind::InvalidRunState => Self::IncompatibleResume,
+            ExecutionErrorKind::AuthorizationDenied => Self::AuthorizationDenied,
+            _ => Self::Failed,
+        }
+    }
+}
+
+impl ExecutionError {
+    /// Returns the closed terminal outcome for this real execution failure.
+    pub const fn terminal_outcome(&self) -> TerminalOutcome {
+        TerminalOutcome::from_execution_error(self.kind())
+    }
 }
 
 /// A serializable description of a translated graph.
@@ -224,9 +308,12 @@ impl std::error::Error for TranslationError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdkGraphError {
     UnknownRoute { from: String, selector: String },
+    FanInConflict { target: String, key: String },
     RecursionLimit { steps: usize },
     VisitBound { max_visits: usize },
     Observation(events::AdkEventMappingErrorKind),
+    AuthorizationDenied,
+    InvalidOutput { node: String },
     Failed,
 }
 
@@ -236,6 +323,9 @@ impl fmt::Display for AdkGraphError {
             Self::UnknownRoute { from, selector } => {
                 write!(f, "unknown route from {from:?} selector {selector:?}")
             }
+            Self::FanInConflict { target, key } => {
+                write!(f, "fan-in state conflict at {target:?} for key {key:?}")
+            }
             Self::RecursionLimit { steps } => {
                 write!(f, "recursion limit exceeded: {steps} steps")
             }
@@ -243,6 +333,8 @@ impl fmt::Display for AdkGraphError {
                 write!(f, "visit bound exceeded: max_visits={max_visits}")
             }
             Self::Observation(_) => write!(f, "ADK event observation failed"),
+            Self::AuthorizationDenied => write!(f, "authorization denied"),
+            Self::InvalidOutput { node } => write!(f, "invalid output from node {node:?}"),
             Self::Failed => write!(f, "graph execution failed"),
         }
     }
@@ -257,7 +349,8 @@ const UNKNOWN_ROUTE_NODE_PREFIX: &str = "__workflow_unknown_route_";
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StateInputMapper;
 impl StateInputMapper {
-    pub fn map(&self, state: State) -> State {
+    pub fn map(&self, mut state: State) -> State {
+        state.retain(|key, _| !key.starts_with("__workflow_fanin:"));
         state
     }
 }
@@ -266,7 +359,8 @@ impl StateInputMapper {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StateOutputMapper;
 impl StateOutputMapper {
-    pub fn map(&self, state: State) -> State {
+    pub fn map(&self, mut state: State) -> State {
+        state.retain(|key, _| !key.starts_with("__workflow_fanin:"));
         state
     }
 }
@@ -287,6 +381,8 @@ pub struct AdkGraph {
     recursion_limit: usize,
     visit_bound: Option<usize>,
     unknown_route_nodes: BTreeMap<String, String>,
+    fan_in_guard_nodes: BTreeMap<String, String>,
+    agent_nodes: BTreeSet<String>,
     plan_binding: Option<PlanBinding>,
 }
 
@@ -310,7 +406,7 @@ impl AdkGraph {
                 );
         }
         match self.graph.invoke(state, config).await {
-            Ok(state) => Ok(self.output.map(state)),
+            Ok(state) => self.validate_output(self.output.map(state)),
             Err(GraphError::RecursionLimitExceeded(steps))
                 if self.visit_bound == Some(limit) && steps == limit =>
             {
@@ -320,14 +416,26 @@ impl AdkGraph {
                 Err(AdkGraphError::RecursionLimit { steps })
             }
             Err(error) => {
-                if let GraphError::NodeExecutionFailed { node, message } = &error
-                    && let Some(from) = self.unknown_route_nodes.get(node)
-                    && let Some(selector) = message.strip_prefix(UNKNOWN_ROUTE_ERROR_PREFIX)
-                {
-                    return Err(AdkGraphError::UnknownRoute {
-                        from: from.clone(),
-                        selector: selector.to_owned(),
-                    });
+                if let GraphError::NodeExecutionFailed { node, message } = &error {
+                    if message.contains("tool.bridge.authorization_denied") {
+                        return Err(AdkGraphError::AuthorizationDenied);
+                    }
+                    if let Some(target) = self.fan_in_guard_nodes.get(node)
+                        && let Some(key) = message.strip_prefix("workflow fan-in conflict: ")
+                    {
+                        return Err(AdkGraphError::FanInConflict {
+                            target: target.clone(),
+                            key: key.to_owned(),
+                        });
+                    }
+                    if let Some(from) = self.unknown_route_nodes.get(node)
+                        && let Some(selector) = message.strip_prefix(UNKNOWN_ROUTE_ERROR_PREFIX)
+                    {
+                        return Err(AdkGraphError::UnknownRoute {
+                            from: from.clone(),
+                            selector: selector.to_owned(),
+                        });
+                    }
                 }
                 let visit_bound = visit_bound_from_error(&error);
                 match error {
@@ -370,7 +478,17 @@ impl AdkGraph {
         let mut stream = Box::pin(self.graph.stream(state, config, StreamMode::Custom));
         let mut output = None;
         while let Some(item) = stream.next().await {
-            match item.map_err(|_| AdkGraphError::Failed)? {
+            match item.map_err(|error| {
+                if matches!(
+                    &error,
+                    GraphError::NodeExecutionFailed { message, .. }
+                        if message.contains("tool.bridge.authorization_denied")
+                ) {
+                    AdkGraphError::AuthorizationDenied
+                } else {
+                    AdkGraphError::Failed
+                }
+            })? {
                 StreamEvent::NodeStart { node, step } => {
                     mapper
                         .map_stream_observation(
@@ -407,11 +525,15 @@ impl AdkGraph {
                             events::AdkEventMappingErrorKind::InvalidObservation,
                         )
                     })?;
+                    if event.content().is_none() {
+                        return Err(AdkGraphError::InvalidOutput { node });
+                    }
                     mapper
                         .map_adk_event(node, event, artifacts)
                         .map_err(|error| AdkGraphError::Observation(error.kind()))?;
                 }
                 StreamEvent::Done { state, total_steps } => {
+                    let state = self.validate_output(self.output.map(state))?;
                     mapper
                         .map_stream_observation(
                             None,
@@ -449,6 +571,9 @@ impl AdkGraph {
                         .map_err(|error| AdkGraphError::Observation(error.kind()))?;
                 }
                 StreamEvent::Error { message, node } => {
+                    if message.contains("tool.bridge.authorization_denied") {
+                        return Err(AdkGraphError::AuthorizationDenied);
+                    }
                     mapper
                         .map_stream_observation(
                             node,
@@ -473,9 +598,7 @@ impl AdkGraph {
                 }
             }
         }
-        output
-            .map(|state| self.output.map(state))
-            .ok_or(AdkGraphError::Failed)
+        output.ok_or(AdkGraphError::Failed)
     }
 
     pub fn summary(&self) -> &GraphSummary {
@@ -508,7 +631,21 @@ impl AdkGraph {
             .terminals
             .iter()
             .any(|terminal| terminal == id)
-            .then_some(TerminalOutcome::Succeeded)
+            .then(|| TerminalOutcome::from_stable_id(id))
+            .flatten()
+    }
+
+    fn validate_output(&self, state: State) -> Result<State, AdkGraphError> {
+        match self.agent_nodes.iter().find(|id| {
+            state
+                .get(&format!("node:{id}"))
+                .and_then(|value| value.get("__workflow_invalid_output"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        }) {
+            Some(node) => Err(AdkGraphError::InvalidOutput { node: node.clone() }),
+            None => Ok(state),
+        }
     }
 }
 
@@ -520,6 +657,64 @@ pub struct AdkGraphTranslator;
 struct ProfileNodeBackend {
     module: Option<Arc<[u8]>>,
     input: Value,
+}
+
+struct FanInCheckpointer {
+    inner: Arc<dyn Checkpointer>,
+}
+
+fn strip_consumed_fan_in_provenance(
+    mut checkpoint: adk_rust::graph::Checkpoint,
+) -> adk_rust::graph::Checkpoint {
+    checkpoint
+        .state
+        .retain(|key, value| !key.starts_with("__workflow_fanin:") || !value.is_null());
+    checkpoint
+}
+
+#[async_trait]
+impl Checkpointer for FanInCheckpointer {
+    async fn save(&self, checkpoint: &adk_rust::graph::Checkpoint) -> Result<String, GraphError> {
+        self.inner
+            .save(&strip_consumed_fan_in_provenance(checkpoint.clone()))
+            .await
+    }
+
+    async fn load(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<adk_rust::graph::Checkpoint>, GraphError> {
+        Ok(self
+            .inner
+            .load(thread_id)
+            .await?
+            .map(strip_consumed_fan_in_provenance))
+    }
+
+    async fn load_by_id(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<adk_rust::graph::Checkpoint>, GraphError> {
+        Ok(self
+            .inner
+            .load_by_id(checkpoint_id)
+            .await?
+            .map(strip_consumed_fan_in_provenance))
+    }
+
+    async fn list(&self, thread_id: &str) -> Result<Vec<adk_rust::graph::Checkpoint>, GraphError> {
+        Ok(self
+            .inner
+            .list(thread_id)
+            .await?
+            .into_iter()
+            .map(strip_consumed_fan_in_provenance)
+            .collect())
+    }
+
+    async fn delete(&self, thread_id: &str) -> Result<(), GraphError> {
+        self.inner.delete(thread_id).await
+    }
 }
 
 impl AdkGraphTranslator {
@@ -551,8 +746,8 @@ impl AdkGraphTranslator {
         self.translate_profile_with_checkpointer(plan, agents, module, input, None)
     }
 
-    /// Translates a profile graph with a runtime-local ADK checkpointer.
-    pub(crate) fn translate_profile_with_checkpointer(
+    /// Translates a profile graph with a caller-owned checkpoint store.
+    pub fn translate_profile_with_checkpointer(
         &self,
         plan: &CompiledPlan,
         agents: &BTreeMap<String, Arc<dyn Agent>>,
@@ -624,6 +819,101 @@ impl AdkGraphTranslator {
     ) -> Result<AdkGraph, TranslationError> {
         let ids: std::collections::BTreeSet<&str> =
             ir.nodes().iter().map(|node| node.id().as_str()).collect();
+        let mut incoming = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut successors = BTreeMap::<String, BTreeSet<String>>::new();
+        for edge in ir.edges() {
+            incoming
+                .entry(edge.to().as_str().to_owned())
+                .or_default()
+                .insert(edge.from().as_str().to_owned());
+            successors
+                .entry(edge.from().as_str().to_owned())
+                .or_default()
+                .insert(edge.to().as_str().to_owned());
+        }
+        for route in ir.routes() {
+            for target in route
+                .cases()
+                .iter()
+                .map(|case| case.target())
+                .chain(route.default())
+            {
+                incoming
+                    .entry(target.as_str().to_owned())
+                    .or_default()
+                    .insert(route.from().as_str().to_owned());
+                successors
+                    .entry(route.from().as_str().to_owned())
+                    .or_default()
+                    .insert(target.as_str().to_owned());
+            }
+        }
+        let can_reach_before_target = |from: &str, to: &str, target: &str| {
+            let mut pending = vec![from];
+            let mut visited = BTreeSet::new();
+            while let Some(node) = pending.pop() {
+                if !visited.insert(node) {
+                    continue;
+                }
+                if node == to {
+                    return true;
+                }
+                if node == target {
+                    continue;
+                }
+                if let Some(targets) = successors.get(node) {
+                    pending.extend(targets.iter().map(String::as_str));
+                }
+            }
+            false
+        };
+        let fan_in = incoming
+            .into_iter()
+            .filter_map(|(target, sources)| {
+                let sources = sources
+                    .iter()
+                    .filter(|source| {
+                        sources.iter().any(|other| {
+                            source != &other
+                                && !can_reach_before_target(source, other, &target)
+                                && !can_reach_before_target(other, source, &target)
+                        })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let has_diverging_predecessor = ids.iter().any(|writer| {
+                    sources
+                        .iter()
+                        .filter(|source| can_reach_before_target(writer, source, &target))
+                        .take(2)
+                        .count()
+                        > 1
+                });
+                (sources.len() > 1 && has_diverging_predecessor).then_some((target, sources))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut fan_in_targets_by_source = BTreeMap::<String, Vec<(String, String)>>::new();
+        for node in ir.nodes() {
+            if node.kind() != IrNodeKind::Agent {
+                continue;
+            }
+            let writer = node.id().as_str();
+            for (target, sources) in &fan_in {
+                let mut provenance = sources
+                    .iter()
+                    .filter(|source| can_reach_before_target(writer, source, target))
+                    .cloned();
+                let Some(source) = provenance.next() else {
+                    continue;
+                };
+                if provenance.next().is_none() {
+                    fan_in_targets_by_source
+                        .entry(writer.to_owned())
+                        .or_default()
+                        .push((target.clone(), source));
+                }
+            }
+        }
         if !ids.contains(ir.entry_node_id().as_str()) {
             return Err(TranslationError::MissingEntry {
                 node: ir.entry_node_id().as_str().to_owned(),
@@ -660,13 +950,58 @@ impl AdkGraphTranslator {
         let mut builder = GraphAgent::builder(ir.workflow_id().as_str())
             .channels(&["terminal"])
             .recursion_limit(recursion_limit);
+        let mut fan_in_guard_nodes = BTreeMap::new();
+        for (target, sources) in &fan_in {
+            let guard = format!("__workflow_fanin_guard_{target}");
+            let target_for_guard = target.clone();
+            let sources_for_guard = sources.clone();
+            builder = builder.node_fn(&guard, move |context| {
+                let target = target_for_guard.clone();
+                let sources = sources_for_guard.clone();
+                async move {
+                    let mut writes = BTreeMap::new();
+                    let mut provenance = Vec::new();
+                    for source in sources {
+                        let prefix = format!("__workflow_fanin:{target}:{source}:");
+                        for (state_key, value) in &context.state {
+                            if let Some(generation_and_key) = state_key.strip_prefix(&prefix)
+                                && let Some((_generation, key)) = generation_and_key.split_once(':')
+                                && !value.is_null()
+                            {
+                                if writes.insert(key.to_owned(), value.clone()).is_some() {
+                                    return Err(GraphError::Other(format!(
+                                        "workflow fan-in conflict: {key}"
+                                    )));
+                                }
+                                provenance.push(state_key.clone());
+                            }
+                        }
+                    }
+                    let mut output = NodeOutput::new();
+                    for (key, value) in writes {
+                        output = output.with_update(&key, value);
+                    }
+                    for key in provenance {
+                        output = output.with_update(&key, Value::Null);
+                    }
+                    Ok(output)
+                }
+            });
+            fan_in_guard_nodes.insert(guard, target.clone());
+        }
+        let fan_in_guards_by_target = fan_in_guard_nodes
+            .iter()
+            .map(|(guard, target)| (target.clone(), guard.clone()))
+            .collect::<BTreeMap<_, _>>();
         let mut terminals = Vec::new();
+        let mut agent_nodes = BTreeSet::new();
         let mut order = Vec::new();
         let mut unknown_route_nodes = BTreeMap::new();
         for node in ir.nodes() {
             let id = node.id().as_str().to_owned();
             order.push(id.clone());
             if node.kind() == IrNodeKind::Agent {
+                agent_nodes.insert(id.clone());
                 let agent: Arc<dyn Agent> = match agents {
                     Some(agents) => agents
                         .get(&id)
@@ -674,6 +1009,19 @@ impl AdkGraphTranslator {
                         .ok_or_else(|| TranslationError::MissingAgent { node: id.clone() })?,
                     None => Arc::new(DeterministicAgent::new(id.clone())),
                 };
+                let fan_in_targets = fan_in_targets_by_source
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default();
+                let fan_in_generations = fan_in_targets
+                    .iter()
+                    .map(|(target, source)| {
+                        (
+                            (target.clone(), source.clone()),
+                            Arc::new(AtomicUsize::new(0)),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
                 builder = builder.node(AgentNode::new(agent).with_output_mapper(move |events| {
                     let value = events
                         .iter()
@@ -684,7 +1032,7 @@ impl AdkGraphTranslator {
                                 .and_then(|content| content.parts.first()?.text())
                         })
                         .map_or_else(
-                            || json!(true),
+                            || json!({ "__workflow_invalid_output": true }),
                             |text| serde_json::from_str(text).unwrap_or_else(|_| json!(text)),
                         );
                     let mut output = std::collections::HashMap::new();
@@ -693,11 +1041,28 @@ impl AdkGraphTranslator {
                         .cloned()
                         .unwrap_or_else(|| value.clone());
                     if let Some(state) = value.get("state").and_then(serde_json::Value::as_object) {
-                        output.extend(
-                            state
-                                .iter()
-                                .map(|(key, value)| (key.clone(), value.clone())),
-                        );
+                        if fan_in_targets.is_empty() {
+                            output.extend(
+                                state
+                                    .iter()
+                                    .map(|(key, value)| (key.clone(), value.clone())),
+                            );
+                        } else {
+                            for (target, source) in &fan_in_targets {
+                                let generation = fan_in_generations
+                                    .get(&(target.clone(), source.clone()))
+                                    .expect("fan-in generation exists for each target")
+                                    .fetch_add(1, Ordering::Relaxed);
+                                output.extend(state.iter().map(|(key, value)| {
+                                    (
+                                        format!(
+                                            "__workflow_fanin:{target}:{source}:{generation}:{key}"
+                                        ),
+                                        value.clone(),
+                                    )
+                                }));
+                            }
+                        }
                     }
                     output.insert(format!("node:{id}"), node_value);
                     output
@@ -771,7 +1136,13 @@ impl AdkGraphTranslator {
         }
         builder = builder.edge(START, ir.entry_node_id().as_str());
         for edge in ir.edges() {
-            builder = builder.edge(edge.from().as_str(), edge.to().as_str());
+            let target = fan_in_guards_by_target
+                .get(edge.to().as_str())
+                .map_or_else(|| edge.to().as_str(), String::as_str);
+            builder = builder.edge(edge.from().as_str(), target);
+        }
+        for (guard, target) in &fan_in_guard_nodes {
+            builder = builder.edge(guard, target);
         }
         let mut unknown_route_index = 0;
         for route in ir.routes() {
@@ -812,13 +1183,19 @@ impl AdkGraphTranslator {
                 unknown_route_nodes.insert(unknown_route_node.clone(), from.clone());
                 Some(unknown_route_node)
             };
+            let guarded_target = |target: &str| {
+                fan_in_guards_by_target
+                    .get(target)
+                    .cloned()
+                    .unwrap_or_else(|| target.to_owned())
+            };
             let mut cases: Vec<(&'static str, &'static str)> = route
                 .cases()
                 .iter()
                 .map(|case| {
                     (
                         Box::leak(case.key().to_owned().into_boxed_str()) as &'static str,
-                        Box::leak(case.target().as_str().to_owned().into_boxed_str())
+                        Box::leak(guarded_target(case.target().as_str()).into_boxed_str())
                             as &'static str,
                     )
                 })
@@ -826,7 +1203,7 @@ impl AdkGraphTranslator {
             if let Some(default) = route.default() {
                 cases.push((
                     IR_DEFAULT_KEY,
-                    Box::leak(default.as_str().to_owned().into_boxed_str()) as &'static str,
+                    Box::leak(guarded_target(default.as_str()).into_boxed_str()) as &'static str,
                 ));
             }
             if let Some(unknown_route_node) = &unknown_route_node {
@@ -856,7 +1233,9 @@ impl AdkGraphTranslator {
             builder = builder.edge(terminal, END);
         }
         if let Some(checkpointer) = checkpointer {
-            builder = builder.checkpointer_arc(checkpointer);
+            builder = builder.checkpointer_arc(Arc::new(FanInCheckpointer {
+                inner: checkpointer,
+            }));
         }
         let graph = builder
             .build()
@@ -875,6 +1254,8 @@ impl AdkGraphTranslator {
             recursion_limit,
             visit_bound,
             unknown_route_nodes,
+            fan_in_guard_nodes,
+            agent_nodes,
             plan_binding,
         })
     }

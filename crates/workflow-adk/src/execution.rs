@@ -35,13 +35,13 @@ use workflow_runtime::{
 use workflow_spec::{SourcePath, read_bounded_regular_file};
 
 use crate::{
-    AdkGraphTranslator,
+    AdkGraphError, AdkGraphTranslator,
     events::{AdkEventMapper, AdkRuntimeObservationKindV1, AdkRuntimeObservationV1},
     model_profiles::{
         CredentialBroker, CredentialHandle, FakeModelProfile, ModelBinding, ModelProfileRegistry,
         OpenAiCompatibleProfile,
     },
-    tool_bridge::AdkToolBridge,
+    tool_bridge::{AdkToolBridge, project_tool_execution_error},
 };
 
 const MAX_STATE_BYTES: usize = 1024 * 1024;
@@ -250,6 +250,8 @@ struct ToolWire {
     result: Value,
     #[serde(default)]
     required_capabilities: Vec<String>,
+    #[serde(default)]
+    required_scopes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -487,7 +489,7 @@ impl Agent for ProfileAgent {
                     context.user_id(),
                     self.input.clone(),
                 ))
-                .map_err(|error| adk_rust::AdkError::tool(error.to_string()))?;
+                .map_err(project_tool_execution_error)?;
             let mut completed = Event::new(context.invocation_id());
             completed.set_content(Content {
                 role: "function".to_owned(),
@@ -570,6 +572,7 @@ pub enum ExecutionErrorKind {
     Model,
     Tool,
     Adk,
+    AuthorizationDenied,
     Persistence,
     RunNotFound,
     InvalidRunState,
@@ -815,7 +818,14 @@ impl ExecutionBackend {
                         &mut mapper,
                         artifacts,
                     ))
-                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
+                    .map_err(|error| {
+                        ExecutionError::new(match error {
+                            AdkGraphError::AuthorizationDenied => {
+                                ExecutionErrorKind::AuthorizationDenied
+                            }
+                            _ => ExecutionErrorKind::Adk,
+                        })
+                    })?;
                 let state = checkpoint_state(
                     state,
                     &continuation
@@ -1361,7 +1371,8 @@ fn build_tool(
         ToolFlags::new(true, true, true),
     )
     .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?
-    .with_required_capabilities(required_capabilities.iter().copied());
+    .with_required_capabilities(required_capabilities.iter().copied())
+    .with_required_scopes(tool.required_scopes.iter().cloned());
     let mut bridge = ToolBridge::new(sandbox);
     bridge
         .register(

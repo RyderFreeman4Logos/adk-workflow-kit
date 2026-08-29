@@ -3,8 +3,13 @@
 //! ADK values are kept at this boundary. Registrations, approvals, and
 //! envelopes remain workflow-runtime contracts.
 
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+
+use crate::TerminalOutcome;
 
 use adk_rust::{
     AdkError, CallbackContext, Content, ErrorCategory, ErrorComponent, ReadonlyContext, Result,
@@ -27,6 +32,57 @@ struct BridgeState<S> {
     artifacts: Mutex<S>,
     started: Instant,
 }
+
+/// A real ToolBridge execution failure with its project-owned terminal outcome.
+#[derive(Debug)]
+pub struct ToolExecutionError {
+    error: ToolBridgeError,
+    terminal_outcome: TerminalOutcome,
+}
+
+impl ToolExecutionError {
+    /// Returns the original policy or execution failure kind.
+    pub fn kind(&self) -> workflow_runtime::ToolBridgeErrorKind {
+        self.error.kind()
+    }
+
+    /// Returns the terminal outcome exposed to tool-execution callers.
+    pub const fn terminal_outcome(&self) -> TerminalOutcome {
+        self.terminal_outcome
+    }
+}
+
+pub(crate) fn project_tool_execution_error(error: ToolExecutionError) -> AdkError {
+    let (category, code) = match error.terminal_outcome() {
+        TerminalOutcome::AuthorizationDenied => {
+            (ErrorCategory::Forbidden, "tool.bridge.authorization_denied")
+        }
+        _ => (ErrorCategory::Internal, "tool.bridge.failed"),
+    };
+    AdkError::new(
+        ErrorComponent::Tool,
+        category,
+        code,
+        format!("{code}: {error}"),
+    )
+}
+
+impl From<ToolBridgeError> for ToolExecutionError {
+    fn from(error: ToolBridgeError) -> Self {
+        Self {
+            terminal_outcome: TerminalOutcome::from_tool_bridge_error(error.kind()),
+            error,
+        }
+    }
+}
+
+impl fmt::Display for ToolExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ToolExecutionError {}
 
 /// One lock-bound Skill script exposed to an ADK tool registration.
 pub struct RegisteredSkillScript {
@@ -162,20 +218,26 @@ where
     pub fn invoke(
         &self,
         call: ToolCall,
-    ) -> std::result::Result<ToolEnvelope<serde_json::Value>, ToolBridgeError> {
+    ) -> std::result::Result<ToolEnvelope<serde_json::Value>, ToolExecutionError> {
         let mut bridge = self.state.bridge.lock().map_err(|_| {
-            ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed)
+            ToolExecutionError::from(ToolBridgeError::new(
+                workflow_runtime::ToolBridgeErrorKind::HandlerFailed,
+            ))
         })?;
         let mut artifacts = self.state.artifacts.lock().map_err(|_| {
-            ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed)
+            ToolExecutionError::from(ToolBridgeError::new(
+                workflow_runtime::ToolBridgeErrorKind::HandlerFailed,
+            ))
         })?;
-        bridge.invoke(
-            call,
-            &self.state.authority,
-            self.state.approvals.as_ref(),
-            self.state.started.elapsed(),
-            &mut *artifacts,
-        )
+        bridge
+            .invoke(
+                call,
+                &self.state.authority,
+                self.state.approvals.as_ref(),
+                self.state.started.elapsed(),
+                &mut *artifacts,
+            )
+            .map_err(ToolExecutionError::from)
     }
 
     /// Returns every registered tool in deterministic name order.
@@ -313,14 +375,7 @@ where
             state: Arc::clone(&self.state),
         }
         .invoke(call)
-        .map_err(|error| {
-            AdkError::new(
-                ErrorComponent::Tool,
-                ErrorCategory::Internal,
-                "tool.bridge.failed",
-                error.to_string(),
-            )
-        })?;
+        .map_err(project_tool_execution_error)?;
         serde_json::to_value(result).map_err(|error| {
             AdkError::new(
                 ErrorComponent::Tool,
