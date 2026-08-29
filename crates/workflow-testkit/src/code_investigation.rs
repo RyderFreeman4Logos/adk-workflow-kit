@@ -1407,14 +1407,17 @@ fn checkpoint_for(
 }
 
 fn strict_trace_prefix(prefix: &InvestigationTrace, completed: &InvestigationTrace) -> bool {
+    fn is_prefix<T: PartialEq>(prefix: &[T], completed: &[T]) -> bool {
+        completed.starts_with(prefix)
+    }
     fn strict_prefix<T: PartialEq>(prefix: &[T], completed: &[T]) -> bool {
-        prefix.len() < completed.len() && completed.starts_with(prefix)
+        is_prefix(prefix, completed) && prefix.len() < completed.len()
     }
 
     strict_prefix(&prefix.stages, &completed.stages)
         && strict_prefix(&prefix.routes, &completed.routes)
-        && strict_prefix(&prefix.tool_calls, &completed.tool_calls)
-        && strict_prefix(&prefix.tool_results, &completed.tool_results)
+        && is_prefix(&prefix.tool_calls, &completed.tool_calls)
+        && is_prefix(&prefix.tool_results, &completed.tool_results)
 }
 
 fn killed_from_trace(

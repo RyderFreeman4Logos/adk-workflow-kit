@@ -149,20 +149,13 @@ async fn every_legal_checkpoint_step_resumes_the_remaining_graph() {
         .expect("deterministic fake model should complete");
     assert!(full.trace().stages().len() >= 4);
 
-    for step in 1..=full.trace().stages().len() {
-        let killed = match SyntheticInvestigation::new(FixtureRepo::synthetic())
+    let mut saw_plateaued_tools = false;
+    for step in 1..full.trace().stages().len() {
+        let killed = SyntheticInvestigation::new(FixtureRepo::synthetic())
             .run_until_kill(step)
             .await
-        {
-            Ok(killed) => killed,
-            Err(error) => {
-                assert_eq!(error.code(), DiagnosticCode::CheckpointInvalid);
-                if step == full.trace().stages().len() {
-                    assert_eq!(error.code(), DiagnosticCode::CheckpointInvalid);
-                }
-                continue;
-            }
-        };
+            .unwrap_or_else(|error| panic!("step {step}: {error:?}"));
+        assert_eq!(killed.status(), InvestigationStatus::Killed, "step {step}");
         let checkpoint = killed.checkpoint().expect("checkpoint");
         for (name, killed_len, full_len) in [
             (
@@ -187,9 +180,16 @@ async fn every_legal_checkpoint_step_resumes_the_remaining_graph() {
             ),
         ] {
             assert!(
-                killed_len < full_len,
-                "killed {name} must be shorter than the completed trace at step {step}"
+                killed_len <= full_len,
+                "killed {name} must not exceed the completed trace at step {step}"
             );
+        }
+        if killed.trace().tool_calls().len() == full.trace().tool_calls().len()
+            && killed.trace().tool_results().len() == full.trace().tool_results().len()
+        {
+            saw_plateaued_tools = true;
+            assert!(killed.trace().stages().len() < full.trace().stages().len());
+            assert!(killed.trace().routes().len() < full.trace().routes().len());
         }
         assert_eq!(
             killed.trace().stages(),
@@ -204,7 +204,7 @@ async fn every_legal_checkpoint_step_resumes_the_remaining_graph() {
         assert_eq!(
             killed.trace().tool_calls(),
             &full.trace().tool_calls()[..killed.trace().tool_calls().len()],
-            "killed tool calls must be a strict execution prefix at step {step}"
+            "killed tool calls must be an execution prefix at step {step}"
         );
         let expected_tool_result_end = match step {
             1 | 2 => 0,
@@ -216,7 +216,7 @@ async fn every_legal_checkpoint_step_resumes_the_remaining_graph() {
         assert_eq!(
             killed.trace().tool_results(),
             &full.trace().tool_results()[..expected_tool_result_end],
-            "killed tool results must be a strict execution prefix at step {step}"
+            "killed tool results must be an execution prefix at step {step}"
         );
         let resumed = SyntheticInvestigation::new(FixtureRepo::synthetic())
             .resume(checkpoint)
@@ -236,6 +236,10 @@ async fn every_legal_checkpoint_step_resumes_the_remaining_graph() {
         );
         assert!(resumed.trace().adk_graph_exercised(), "step {step}");
     }
+    assert!(
+        saw_plateaued_tools,
+        "at least one non-terminal checkpoint must have plateaued tools"
+    );
 
     let terminal_error = SyntheticInvestigation::new(FixtureRepo::synthetic())
         .run_until_kill(full.trace().stages().len())
