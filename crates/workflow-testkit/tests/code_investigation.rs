@@ -223,6 +223,23 @@ fn fixture_package_resources_load_with_workflow() {
     assert_eq!(package.resource_count(), 6);
 }
 
+#[test]
+fn investigation_paths_do_not_suppress_warnings() {
+    let forbidden_attribute = concat!("#", "[allow");
+    let fixture = FixtureRepo::synthetic();
+    assert!(
+        fixture
+            .search_code(forbidden_attribute, Some("src"))
+            .expect("fixture source search should succeed")
+            .is_empty(),
+        "code-investigation fixture must not contain warning suppressions"
+    );
+    assert!(
+        !include_str!("../src/code_investigation.rs").contains(forbidden_attribute),
+        "production investigation path must not contain warning suppressions"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn review_loop_publishes_from_structured_pass_verdict() {
     let result = SyntheticInvestigation::new(FixtureRepo::synthetic())

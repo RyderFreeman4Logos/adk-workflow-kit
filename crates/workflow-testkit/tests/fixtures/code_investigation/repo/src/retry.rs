@@ -22,7 +22,6 @@ pub fn misleading_retry_name() -> &'static str {
     "not a retry implementation"
 }
 
-#[allow(dead_code)]
 fn dead_code_helper() -> u8 {
     99
 }
