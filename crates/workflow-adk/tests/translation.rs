@@ -177,10 +177,10 @@ from = "right"
 to = "join"
 "#;
 
-const FAN_IN_SHARED_STATE: &str = r#"
+const FAN_IN_DECLARED_STATE_WITH_ZERO_WRITES: &str = r#"
 schema_version = 1
 [workflow]
-id = "fan-in-shared-state"
+id = "fan-in-declared-state-with-zero-writes"
 version = "1"
 entry = "start"
 [[nodes]]
@@ -213,6 +213,48 @@ schema_version = "1"
 required_keys = ["shared"]
 [state.keys.shared]
 schema_id = "shared"
+schema_version = "1"
+"#;
+
+const FAN_IN_DECLARED_STATE_WITH_DISJOINT_KEYS: &str = r#"
+schema_version = 1
+[workflow]
+id = "fan-in-declared-state-with-disjoint-keys"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "left"
+kind = "agent"
+[[nodes]]
+id = "right"
+kind = "agent"
+[[nodes]]
+id = "join"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "left"
+[[edges]]
+from = "start"
+to = "right"
+[[edges]]
+from = "left"
+to = "join"
+[[edges]]
+from = "right"
+to = "join"
+[state]
+schema_id = "disjoint-state"
+schema_version = "1"
+required_keys = ["left", "right"]
+[state.keys.left]
+schema_id = "left"
+schema_version = "1"
+[state.keys.right]
+schema_id = "right"
 schema_version = "1"
 "#;
 
@@ -373,16 +415,27 @@ fn fan_in_without_shared_state_translates() {
 }
 
 #[test]
-fn fan_in_shared_state_without_merge_policy_is_rejected() {
-    let plan = compile_str("fan-in-shared-state.workflow.toml", FAN_IN_SHARED_STATE)
-        .expect("shared-state fan-in fixture compiles");
-    assert!(
-        matches!(
-            AdkGraphTranslator::new().translate(&plan),
-            Err(TranslationError::FanInStateConflict { .. })
-        ),
-        "a shared-state fan-in without a merge policy must be rejected"
-    );
+fn fan_in_declared_state_with_zero_writes_translates() {
+    let plan = compile_str(
+        "fan-in-declared-state-with-zero-writes.workflow.toml",
+        FAN_IN_DECLARED_STATE_WITH_ZERO_WRITES,
+    )
+    .expect("declared-state fixture compiles");
+    AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("a state declaration is not fan-in write-conflict evidence");
+}
+
+#[test]
+fn fan_in_declared_state_with_disjoint_keys_translates() {
+    let plan = compile_str(
+        "fan-in-declared-state-with-disjoint-keys.workflow.toml",
+        FAN_IN_DECLARED_STATE_WITH_DISJOINT_KEYS,
+    )
+    .expect("declared-state fixture compiles");
+    AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("disjoint declared keys are not fan-in write-conflict evidence");
 }
 
 #[test]

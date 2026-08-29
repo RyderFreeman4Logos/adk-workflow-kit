@@ -6,7 +6,7 @@ pub mod model_profiles;
 pub mod tool_bridge;
 
 use crate::execution::{ExecutionError, ExecutionErrorKind};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -279,9 +279,6 @@ pub enum TranslationError {
         plan_ir_hash: String,
         ir_hash: String,
     },
-    FanInStateConflict {
-        node: String,
-    },
 }
 
 impl fmt::Display for TranslationError {
@@ -297,9 +294,6 @@ impl fmt::Display for TranslationError {
             }
             Self::ResolvedPlanMismatch { .. } => {
                 write!(f, "graph translation rejected resolved plan mismatch")
-            }
-            Self::FanInStateConflict { node } => {
-                write!(f, "graph translation rejected state fan-in at {node:?}")
             }
         }
     }
@@ -742,46 +736,6 @@ impl AdkGraphTranslator {
                 });
             }
         }
-        let mut incoming = BTreeMap::new();
-        let mut outgoing = BTreeMap::new();
-        for edge in ir.edges() {
-            incoming
-                .entry(edge.to().as_str())
-                .or_insert_with(Vec::new)
-                .push(edge.from().as_str());
-            outgoing
-                .entry(edge.from().as_str())
-                .or_insert_with(Vec::new)
-                .push(edge.to().as_str());
-        }
-        for route in ir.routes() {
-            let targets = outgoing
-                .entry(route.from().as_str())
-                .or_insert_with(Vec::new);
-            targets.extend(route.cases().iter().map(|case| case.target().as_str()));
-            if let Some(target) = route.default() {
-                targets.push(target.as_str());
-            }
-        }
-        let has_declared_shared_state = ir.state().is_some_and(|state| !state.keys().is_empty());
-        if has_declared_shared_state
-            && let Some(node) = incoming.iter().find_map(|(node, predecessors)| {
-                predecessors
-                    .iter()
-                    .enumerate()
-                    .find_map(|(index, predecessor)| {
-                        predecessors[index + 1..].iter().find_map(|other| {
-                            (!graph_path_exists(predecessor, other, &outgoing)
-                                && !graph_path_exists(other, predecessor, &outgoing))
-                            .then_some(*node)
-                        })
-                    })
-            })
-        {
-            return Err(TranslationError::FanInStateConflict {
-                node: node.to_owned(),
-            });
-        }
         let visit_bound = ir_visit_bound(ir);
         let recursion_limit = visit_bound.unwrap_or(50);
         let mut builder = GraphAgent::builder(ir.workflow_id().as_str())
@@ -1051,26 +1005,6 @@ fn visit_bound_from_error(error: &GraphError) -> Option<usize> {
         .next()?
         .parse()
         .ok()
-}
-
-fn graph_path_exists<'a>(
-    start: &'a str,
-    target: &str,
-    outgoing: &BTreeMap<&'a str, Vec<&'a str>>,
-) -> bool {
-    let mut pending = vec![start];
-    let mut seen = BTreeSet::new();
-    while let Some(node) = pending.pop() {
-        if node == target {
-            return true;
-        }
-        if seen.insert(node)
-            && let Some(next) = outgoing.get(node)
-        {
-            pending.extend(next.iter().copied());
-        }
-    }
-    false
 }
 
 fn canonical_ir_hash(ir: &workflow_ir::WorkflowIr) -> String {
