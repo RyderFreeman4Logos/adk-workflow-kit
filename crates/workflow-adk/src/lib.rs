@@ -719,16 +719,30 @@ impl AdkGraphTranslator {
     ) -> Result<AdkGraph, TranslationError> {
         let ids: std::collections::BTreeSet<&str> =
             ir.nodes().iter().map(|node| node.id().as_str()).collect();
-        let mut incoming = BTreeMap::<String, Vec<String>>::new();
+        let mut incoming = BTreeMap::<String, std::collections::BTreeSet<String>>::new();
         for edge in ir.edges() {
             incoming
                 .entry(edge.to().as_str().to_owned())
                 .or_default()
-                .push(edge.from().as_str().to_owned());
+                .insert(edge.from().as_str().to_owned());
+        }
+        for route in ir.routes() {
+            for target in route
+                .cases()
+                .iter()
+                .map(|case| case.target())
+                .chain(route.default())
+            {
+                incoming
+                    .entry(target.as_str().to_owned())
+                    .or_default()
+                    .insert(route.from().as_str().to_owned());
+            }
         }
         let fan_in = incoming
             .into_iter()
             .filter(|(_, sources)| sources.len() > 1)
+            .map(|(target, sources)| (target, sources.into_iter().collect::<Vec<_>>()))
             .collect::<BTreeMap<_, _>>();
         let mut fan_in_targets_by_source = BTreeMap::<String, Vec<String>>::new();
         for (target, sources) in &fan_in {
@@ -806,6 +820,10 @@ impl AdkGraphTranslator {
             });
             fan_in_guard_nodes.insert(guard, target.clone());
         }
+        let fan_in_guards_by_target = fan_in_guard_nodes
+            .iter()
+            .map(|(guard, target)| (target.clone(), guard.clone()))
+            .collect::<BTreeMap<_, _>>();
         let mut terminals = Vec::new();
         let mut order = Vec::new();
         let mut unknown_route_nodes = BTreeMap::new();
@@ -932,12 +950,9 @@ impl AdkGraphTranslator {
         }
         builder = builder.edge(START, ir.entry_node_id().as_str());
         for edge in ir.edges() {
-            let target = fan_in_guard_nodes
-                .iter()
-                .find_map(|(guard, joined)| {
-                    (joined == edge.to().as_str()).then_some(guard.as_str())
-                })
-                .unwrap_or_else(|| edge.to().as_str());
+            let target = fan_in_guards_by_target
+                .get(edge.to().as_str())
+                .map_or_else(|| edge.to().as_str(), String::as_str);
             builder = builder.edge(edge.from().as_str(), target);
         }
         for (guard, target) in &fan_in_guard_nodes {
@@ -982,13 +997,19 @@ impl AdkGraphTranslator {
                 unknown_route_nodes.insert(unknown_route_node.clone(), from.clone());
                 Some(unknown_route_node)
             };
+            let guarded_target = |target: &str| {
+                fan_in_guards_by_target
+                    .get(target)
+                    .cloned()
+                    .unwrap_or_else(|| target.to_owned())
+            };
             let mut cases: Vec<(&'static str, &'static str)> = route
                 .cases()
                 .iter()
                 .map(|case| {
                     (
                         Box::leak(case.key().to_owned().into_boxed_str()) as &'static str,
-                        Box::leak(case.target().as_str().to_owned().into_boxed_str())
+                        Box::leak(guarded_target(case.target().as_str()).into_boxed_str())
                             as &'static str,
                     )
                 })
@@ -996,7 +1017,7 @@ impl AdkGraphTranslator {
             if let Some(default) = route.default() {
                 cases.push((
                     IR_DEFAULT_KEY,
-                    Box::leak(default.as_str().to_owned().into_boxed_str()) as &'static str,
+                    Box::leak(guarded_target(default.as_str()).into_boxed_str()) as &'static str,
                 ));
             }
             if let Some(unknown_route_node) = &unknown_route_node {

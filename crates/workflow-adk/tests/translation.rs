@@ -263,6 +263,42 @@ schema_id = "right"
 schema_version = "1"
 "#;
 
+const ROUTE_FAN_IN: &str = r#"
+schema_version = 1
+[workflow]
+id = "route-fan-in"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "left"
+kind = "agent"
+[[nodes]]
+id = "right"
+kind = "agent"
+[[nodes]]
+id = "join"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "left"
+[[edges]]
+from = "start"
+to = "right"
+[[routes]]
+from = "left"
+predicate = { id = "route-pred", version = "1" }
+cases = { join = "join" }
+default = "join"
+[[routes]]
+from = "right"
+predicate = { id = "route-pred", version = "1" }
+cases = { other = "join" }
+default = "join"
+"#;
+
 const FAILURE_TERMINALS: &str = r#"
 schema_version = 1
 edges = []
@@ -515,6 +551,66 @@ async fn fan_in_disjoint_key_writes_execute() {
         .invoke(State::new(), ExecutionConfig::new("fan-in-disjoint"))
         .await
         .expect("disjoint writes are merged by the kit-owned join guard");
+    assert_eq!(state.get("left"), Some(&json!("left")));
+    assert_eq!(state.get("right"), Some(&json!("right")));
+}
+
+#[tokio::test]
+async fn route_fan_in_same_key_writes_fail_closed_before_merge() {
+    let plan =
+        compile_str_with_predicates("route-fan-in.workflow.toml", ROUTE_FAN_IN, &AnyPredicate)
+            .expect("fixture compiles");
+    let agents = BTreeMap::from([
+        (
+            "left".to_owned(),
+            state_agent("left", json!({"shared": "left"})),
+        ),
+        (
+            "right".to_owned(),
+            state_agent("right", json!({"shared": "right"})),
+        ),
+    ]);
+    let graph = AdkGraphTranslator::new()
+        .translate_with_agents(&plan, &agents)
+        .expect("route fan-in translates");
+    let mut state = State::new();
+    state.insert("route:left".to_owned(), json!("join"));
+
+    let error = graph
+        .invoke(state, ExecutionConfig::new("route-fan-in-overlap"))
+        .await
+        .expect_err("same-key route fan-in writes require an explicit merge policy");
+    assert_eq!(
+        error.to_string(),
+        "fan-in state conflict at \"join\" for key \"shared\""
+    );
+}
+
+#[tokio::test]
+async fn route_fan_in_disjoint_key_writes_execute() {
+    let plan =
+        compile_str_with_predicates("route-fan-in.workflow.toml", ROUTE_FAN_IN, &AnyPredicate)
+            .expect("fixture compiles");
+    let agents = BTreeMap::from([
+        (
+            "left".to_owned(),
+            state_agent("left", json!({"left": "left"})),
+        ),
+        (
+            "right".to_owned(),
+            state_agent("right", json!({"right": "right"})),
+        ),
+    ]);
+    let graph = AdkGraphTranslator::new()
+        .translate_with_agents(&plan, &agents)
+        .expect("route fan-in translates");
+    let mut state = State::new();
+    state.insert("route:left".to_owned(), json!("join"));
+
+    let state = graph
+        .invoke(state, ExecutionConfig::new("route-fan-in-disjoint"))
+        .await
+        .expect("disjoint route fan-in writes are merged by the kit-owned join guard");
     assert_eq!(state.get("left"), Some(&json!("left")));
     assert_eq!(state.get("right"), Some(&json!("right")));
 }
