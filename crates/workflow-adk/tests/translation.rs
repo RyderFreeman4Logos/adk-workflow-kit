@@ -370,47 +370,6 @@ cases = { other = "join" }
 default = "join"
 "#;
 
-const ALTERNATING_ROUTE_FAN_IN: &str = r#"
-schema_version = 1
-[workflow]
-id = "alternating-route-fan-in"
-version = "1"
-entry = "select"
-[[nodes]]
-id = "select"
-kind = "agent"
-max_visits = 2
-[[nodes]]
-id = "left"
-kind = "agent"
-max_visits = 2
-[[nodes]]
-id = "right"
-kind = "agent"
-max_visits = 2
-[[nodes]]
-id = "join"
-kind = "agent"
-max_visits = 4
-[[nodes]]
-id = "done"
-kind = "terminal"
-[[edges]]
-from = "left"
-to = "join"
-[[edges]]
-from = "right"
-to = "join"
-[[routes]]
-from = "select"
-predicate = { id = "route-pred", version = "1" }
-cases = { left = "left", right = "right" }
-[[routes]]
-from = "join"
-predicate = { id = "route-pred", version = "1" }
-cases = { again = "select", done = "done" }
-"#;
-
 const EXCLUSIVE_ROUTE_FAN_IN: &str = r#"
 schema_version = 1
 [workflow]
@@ -879,18 +838,15 @@ async fn route_fan_in_disjoint_key_writes_execute() {
 }
 
 #[tokio::test]
-async fn bounded_alternating_exclusive_routes_consume_same_key_fan_in_provenance() {
+async fn exclusive_fan_in_activations_traverse_the_guard_without_cross_activation_conflict() {
     let plan = compile_str_with_predicates(
-        "alternating-route-fan-in.workflow.toml",
-        ALTERNATING_ROUTE_FAN_IN,
+        "exclusive-route-fan-in.workflow.toml",
+        EXCLUSIVE_ROUTE_FAN_IN,
         &AnyPredicate,
     )
-    .expect("bounded alternating fixture compiles");
+    .expect("exclusive fixture compiles");
     let agents = BTreeMap::from([
-        (
-            "select".to_owned(),
-            sequence_agent("select", &["left", "right"]),
-        ),
+        ("select".to_owned(), sequence_agent("select", &["unused"])),
         (
             "left".to_owned(),
             state_agent("left", json!({"shared": "left"})),
@@ -899,26 +855,51 @@ async fn bounded_alternating_exclusive_routes_consume_same_key_fan_in_provenance
             "right".to_owned(),
             state_agent("right", json!({"shared": "right"})),
         ),
-        (
-            "join".to_owned(),
-            sequence_agent("join", &["again", "done"]),
-        ),
     ]);
+    let checkpointer = Arc::new(MemoryCheckpointer::default());
     let graph = AdkGraphTranslator::new()
-        .translate_with_agents(&plan, &agents)
-        .expect("bounded alternating fan-in translates");
-
-    let state = graph
-        .invoke(State::new(), ExecutionConfig::new("alternating-exclusive"))
-        .await
-        .expect("an earlier exclusive left visit must not conflict with the later right visit");
-    assert_eq!(state.get("shared"), Some(&json!("right")));
-    assert!(
-        state
-            .keys()
-            .all(|key| !key.starts_with("__workflow_fanin:")),
-        "internal fan-in provenance must not escape the completed join"
+        .translate_profile_with_checkpointer(
+            &plan,
+            &agents,
+            None,
+            &json!({}),
+            Some(checkpointer.clone()),
+        )
+        .expect("exclusive fan-in translates");
+    let mut artifacts = InMemoryArtifactStore::new(
+        std::num::NonZeroU64::new(64 * 1024).unwrap(),
+        std::num::NonZeroU64::new(64 * 1024).unwrap(),
     );
+
+    for (activation, branch, expected) in [("left", "left", "left"), ("right", "right", "right")] {
+        let mut state = State::new();
+        state.insert("route:select".to_owned(), json!(branch));
+        let mut mapper =
+            AdkEventMapper::new(format!("exclusive-{activation}"), "exclusive-route-fan-in")
+                .expect("event mapper starts");
+        let state = graph
+            .invoke_observed(
+                state,
+                ExecutionConfig::new(&format!("exclusive-{activation}")),
+                &mut mapper,
+                &mut artifacts,
+            )
+            .await
+            .expect("each exclusive activation reaches the join guard");
+        assert_eq!(state.get("shared"), Some(&json!(expected)));
+        let checkpoint = checkpointer
+            .load(&format!("exclusive-{activation}"))
+            .await
+            .expect("test Checkpointer loads")
+            .expect("each activation saves a checkpoint");
+        assert!(
+            checkpoint
+                .state
+                .keys()
+                .all(|key| !key.starts_with("__workflow_fanin:")),
+            "completed join provenance must not cross into the next activation"
+        );
+    }
 }
 
 #[tokio::test]

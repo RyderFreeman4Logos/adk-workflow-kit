@@ -846,7 +846,18 @@ impl AdkGraphTranslator {
         let fan_in = incoming
             .into_iter()
             .filter_map(|(target, sources)| {
-                (sources.len() > 1).then(|| (target, sources.into_iter().collect::<Vec<_>>()))
+                let sources = sources
+                    .iter()
+                    .filter(|source| {
+                        sources.iter().any(|other| {
+                            source != &other
+                                && !can_reach(source, other)
+                                && !can_reach(other, source)
+                        })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (sources.len() > 1).then_some((target, sources))
             })
             .collect::<BTreeMap<_, _>>();
         let mut fan_in_targets_by_source = BTreeMap::<String, Vec<(String, String)>>::new();
@@ -856,13 +867,6 @@ impl AdkGraphTranslator {
             }
             let writer = node.id().as_str();
             for (target, sources) in &fan_in {
-                if sources.iter().any(|source| source == writer) {
-                    fan_in_targets_by_source
-                        .entry(writer.to_owned())
-                        .or_default()
-                        .push((target.clone(), writer.to_owned()));
-                    continue;
-                }
                 let mut provenance = sources
                     .iter()
                     .filter(|source| can_reach(writer, source))
