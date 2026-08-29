@@ -1,0 +1,121 @@
+schema_version = 1
+
+[workflow]
+id = "code.investigation"
+version = "1"
+entry = "prepare_workspace"
+
+[[nodes]]
+id = "prepare_workspace"
+kind = "agent"
+[[nodes]]
+id = "planner"
+kind = "agent"
+[[nodes]]
+id = "search_code"
+kind = "agent"
+[[nodes]]
+id = "inspect_evidence"
+kind = "agent"
+[[nodes]]
+id = "coverage_decision"
+kind = "agent"
+[[nodes]]
+id = "retry_search_code"
+kind = "agent"
+[[nodes]]
+id = "retry_inspect_evidence"
+kind = "agent"
+[[nodes]]
+id = "retry_coverage_decision"
+kind = "agent"
+[[nodes]]
+id = "draft"
+kind = "agent"
+[[nodes]]
+id = "grounding_validation"
+kind = "agent"
+max_visits = 32
+[[nodes]]
+id = "review"
+kind = "agent"
+max_visits = 32
+[[nodes]]
+id = "revise"
+kind = "agent"
+max_visits = 32
+[[nodes]]
+id = "publish"
+kind = "terminal"
+[[nodes]]
+id = "abstain"
+kind = "terminal"
+
+[[resources]]
+path = "skills/code-investigation/SKILL.md"
+sha256 = "sha256:c4adb08d04aa18d9f870310301d4782a5ea2c5344d024fd4136bab5ffb4fc189"
+
+[[resources]]
+path = "prompts/planner.md"
+sha256 = "sha256:88514865356dc67787a99259300895827f21cbaab0c7b42f0add7fef3d2ec325"
+
+[[resources]]
+path = "prompts/reviewer.md"
+sha256 = "sha256:632f3f0af5d7c5454696e9bac01f9e2849bbd99b7cf44ca316bcde284c93bce7"
+
+[[resources]]
+path = "prompts/reviser.md"
+sha256 = "sha256:0493c534da1c066f01d23e87a3426f0ec2184e80ae5f7e25e2b16db6c9a72142"
+
+[[resources]]
+path = "schemas/investigation-input.json"
+sha256 = "sha256:079e99957548044be0471e22c626114585d9edc01991cc178175145ab745b397"
+
+[[resources]]
+path = "schemas/investigation-output.json"
+sha256 = "sha256:373e0b3773fc555083922d63e745efd1c22822680ce0a111ced8c6a80828f764"
+
+[[edges]]
+from = "prepare_workspace"
+to = "planner"
+[[edges]]
+from = "planner"
+to = "search_code"
+[[edges]]
+from = "search_code"
+to = "inspect_evidence"
+[[edges]]
+from = "inspect_evidence"
+to = "coverage_decision"
+[[edges]]
+from = "retry_search_code"
+to = "retry_inspect_evidence"
+[[edges]]
+from = "retry_inspect_evidence"
+to = "retry_coverage_decision"
+[[edges]]
+from = "draft"
+to = "grounding_validation"
+[[edges]]
+from = "revise"
+to = "grounding_validation"
+
+[[routes]]
+from = "coverage_decision"
+predicate = { id = "coverage.decision@v1", version = "1.0.0" }
+cases = { insufficient = "retry_search_code", sufficient = "draft", impossible = "abstain" }
+
+[[routes]]
+from = "retry_coverage_decision"
+predicate = { id = "coverage.decision@v1", version = "1.0.0" }
+cases = { insufficient = "abstain", sufficient = "draft", impossible = "abstain" }
+
+[[routes]]
+from = "grounding_validation"
+predicate = { id = "grounding.verdict@v1", version = "1.0.0" }
+cases = { invalid = "revise", valid = "review", abstain = "abstain" }
+
+[[routes]]
+from = "review"
+predicate = { id = "review.verdict@v1", version = "1.0.0" }
+cases = { pass = "publish", revise = "revise", abstain = "abstain" }
