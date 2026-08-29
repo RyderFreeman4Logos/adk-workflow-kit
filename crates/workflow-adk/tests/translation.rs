@@ -7,6 +7,7 @@ use std::{
 };
 
 use adk_rust::graph::prelude::{ExecutionConfig, State};
+use adk_rust::graph::{Checkpointer, MemoryCheckpointer};
 use adk_rust::{
     Agent, AgentCapabilities, Content, Event, EventStream, InvocationContext, async_trait,
 };
@@ -963,6 +964,82 @@ async fn exclusive_fan_in_checkpoint_state_resumes_without_stale_same_key_proven
         .await
         .expect("resumed right visit succeeds without stale left provenance");
     assert_eq!(resumed_state.get("shared"), Some(&json!("right")));
+}
+
+#[tokio::test]
+async fn exclusive_fan_in_checkpoints_consume_provenance_before_real_resume() {
+    let plan = compile_str_with_predicates(
+        "exclusive-route-fan-in.workflow.toml",
+        EXCLUSIVE_ROUTE_FAN_IN,
+        &AnyPredicate,
+    )
+    .expect("exclusive checkpoint fixture compiles");
+    let agents = BTreeMap::from([
+        ("select".to_owned(), sequence_agent("select", &["left"])),
+        (
+            "left".to_owned(),
+            state_agent("left", json!({"shared": "left"})),
+        ),
+        (
+            "right".to_owned(),
+            state_agent("right", json!({"shared": "right"})),
+        ),
+    ]);
+    let checkpointer = Arc::new(MemoryCheckpointer::default());
+    let graph = AdkGraphTranslator::new()
+        .translate_profile_with_checkpointer(
+            &plan,
+            &agents,
+            None,
+            &json!({}),
+            Some(checkpointer.clone()),
+        )
+        .expect("exclusive checkpoint fan-in translates");
+    let mut mapper = AdkEventMapper::new("checkpoint-left", "exclusive-route-fan-in").unwrap();
+    let mut artifacts = InMemoryArtifactStore::new(
+        std::num::NonZeroU64::new(64 * 1024).unwrap(),
+        std::num::NonZeroU64::new(64 * 1024).unwrap(),
+    );
+
+    let state = graph
+        .invoke_observed(
+            State::new(),
+            ExecutionConfig::new("checkpoint-left"),
+            &mut mapper,
+            &mut artifacts,
+        )
+        .await
+        .expect("exclusive left activation succeeds");
+    assert_eq!(state.get("shared"), Some(&json!("left")));
+    let checkpoint = checkpointer
+        .load("checkpoint-left")
+        .await
+        .expect("test Checkpointer loads")
+        .expect("graph saves a checkpoint through the real Checkpointer");
+    assert!(
+        checkpoint
+            .state
+            .keys()
+            .all(|key| !key.starts_with("__workflow_fanin:")),
+        "completed join provenance must not enter durable checkpoint state"
+    );
+
+    let mut resumed_mapper = AdkEventMapper::resume(
+        "checkpoint-left",
+        "exclusive-route-fan-in",
+        mapper.events().to_vec(),
+    )
+    .expect("event mapper resumes");
+    let resumed = graph
+        .invoke_observed(
+            State::new(),
+            ExecutionConfig::new("checkpoint-left").with_resume_from(&checkpoint.checkpoint_id),
+            &mut resumed_mapper,
+            &mut artifacts,
+        )
+        .await
+        .expect("durable checkpoint resumes without fan-in provenance");
+    assert_eq!(resumed.get("shared"), Some(&json!("left")));
 }
 
 #[test]

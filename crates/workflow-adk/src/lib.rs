@@ -638,6 +638,64 @@ struct ProfileNodeBackend {
     input: Value,
 }
 
+struct FanInCheckpointer {
+    inner: Arc<dyn Checkpointer>,
+}
+
+fn strip_fan_in_provenance(
+    mut checkpoint: adk_rust::graph::Checkpoint,
+) -> adk_rust::graph::Checkpoint {
+    checkpoint
+        .state
+        .retain(|key, _| !key.starts_with("__workflow_fanin:"));
+    checkpoint
+}
+
+#[async_trait]
+impl Checkpointer for FanInCheckpointer {
+    async fn save(&self, checkpoint: &adk_rust::graph::Checkpoint) -> Result<String, GraphError> {
+        self.inner
+            .save(&strip_fan_in_provenance(checkpoint.clone()))
+            .await
+    }
+
+    async fn load(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<adk_rust::graph::Checkpoint>, GraphError> {
+        Ok(self
+            .inner
+            .load(thread_id)
+            .await?
+            .map(strip_fan_in_provenance))
+    }
+
+    async fn load_by_id(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<adk_rust::graph::Checkpoint>, GraphError> {
+        Ok(self
+            .inner
+            .load_by_id(checkpoint_id)
+            .await?
+            .map(strip_fan_in_provenance))
+    }
+
+    async fn list(&self, thread_id: &str) -> Result<Vec<adk_rust::graph::Checkpoint>, GraphError> {
+        Ok(self
+            .inner
+            .list(thread_id)
+            .await?
+            .into_iter()
+            .map(strip_fan_in_provenance)
+            .collect())
+    }
+
+    async fn delete(&self, thread_id: &str) -> Result<(), GraphError> {
+        self.inner.delete(thread_id).await
+    }
+}
+
 impl AdkGraphTranslator {
     pub const fn new() -> Self {
         Self
@@ -667,8 +725,8 @@ impl AdkGraphTranslator {
         self.translate_profile_with_checkpointer(plan, agents, module, input, None)
     }
 
-    /// Translates a profile graph with a runtime-local ADK checkpointer.
-    pub(crate) fn translate_profile_with_checkpointer(
+    /// Translates a profile graph with a caller-owned checkpoint store.
+    pub fn translate_profile_with_checkpointer(
         &self,
         plan: &CompiledPlan,
         agents: &BTreeMap<String, Arc<dyn Agent>>,
@@ -788,18 +846,7 @@ impl AdkGraphTranslator {
         let fan_in = incoming
             .into_iter()
             .filter_map(|(target, sources)| {
-                let sources = sources
-                    .iter()
-                    .filter(|source| {
-                        sources.iter().any(|other| {
-                            source != &other
-                                && !can_reach(source, other)
-                                && !can_reach(other, source)
-                        })
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                (sources.len() > 1).then_some((target, sources))
+                (sources.len() > 1).then(|| (target, sources.into_iter().collect::<Vec<_>>()))
             })
             .collect::<BTreeMap<_, _>>();
         let mut fan_in_targets_by_source = BTreeMap::<String, Vec<(String, String)>>::new();
@@ -809,6 +856,13 @@ impl AdkGraphTranslator {
             }
             let writer = node.id().as_str();
             for (target, sources) in &fan_in {
+                if sources.iter().any(|source| source == writer) {
+                    fan_in_targets_by_source
+                        .entry(writer.to_owned())
+                        .or_default()
+                        .push((target.clone(), writer.to_owned()));
+                    continue;
+                }
                 let mut provenance = sources
                     .iter()
                     .filter(|source| can_reach(writer, source))
@@ -870,21 +924,28 @@ impl AdkGraphTranslator {
                 let sources = sources_for_guard.clone();
                 async move {
                     let mut writes = BTreeMap::new();
+                    let mut provenance = Vec::new();
                     for source in sources {
                         let prefix = format!("__workflow_fanin:{target}:{source}:");
                         for (state_key, value) in &context.state {
                             if let Some(key) = state_key.strip_prefix(&prefix)
-                                && writes.insert(key.to_owned(), value.clone()).is_some()
+                                && !value.is_null()
                             {
-                                return Err(GraphError::Other(format!(
-                                    "workflow fan-in conflict: {key}"
-                                )));
+                                if writes.insert(key.to_owned(), value.clone()).is_some() {
+                                    return Err(GraphError::Other(format!(
+                                        "workflow fan-in conflict: {key}"
+                                    )));
+                                }
+                                provenance.push(state_key.clone());
                             }
                         }
                     }
                     let mut output = NodeOutput::new();
                     for (key, value) in writes {
                         output = output.with_update(&key, value);
+                    }
+                    for key in provenance {
+                        output = output.with_update(&key, Value::Null);
                     }
                     Ok(output)
                 }
@@ -1118,7 +1179,9 @@ impl AdkGraphTranslator {
             builder = builder.edge(terminal, END);
         }
         if let Some(checkpointer) = checkpointer {
-            builder = builder.checkpointer_arc(checkpointer);
+            builder = builder.checkpointer_arc(Arc::new(FanInCheckpointer {
+                inner: checkpointer,
+            }));
         }
         let graph = builder
             .build()
