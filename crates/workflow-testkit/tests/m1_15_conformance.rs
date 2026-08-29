@@ -3,9 +3,15 @@ use std::{
     fs,
     path::PathBuf,
     process::Command,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
+use adk_rust::graph::prelude::{END, ExecutionConfig, GraphError, NodeOutput, START, State};
+use adk_rust::graph::{StateGraph, retry::RetryPolicy};
 use adk_rust::{
     AdkError, Content, ErrorCategory, ErrorComponent, Llm, LlmRequest, LlmResponse,
     LlmResponseStream, async_trait,
@@ -29,14 +35,17 @@ fn report_path() -> PathBuf {
     ))
 }
 
-fn emit_fixture_receipt(selector: &str, probe: &str, assertion: &str) {
+fn emit_fixture_receipt(class: &str, selector: &str, probe: &str, assertion: &str) {
     if std::env::var("M1_15_FIXTURE_RECEIPT_SELECTOR").as_deref() == Ok(selector) {
         println!(
             "M1_15_FIXTURE_RECEIPT={}",
             serde_json::to_string(&json!({
                 "selector": selector,
+                "class": class,
                 "probe": probe,
                 "assertion": assertion,
+                "test_count": 1,
+                "exit_code": 0,
                 "result": "PASS",
             }))
             .expect("fixture receipt serializes")
@@ -301,6 +310,7 @@ async fn connection_failure_fixture_injects_and_asserts_model_connection_failure
     assert_eq!(error.component, ErrorComponent::Model);
     assert_eq!(error.code, "model.connection.failed");
     emit_fixture_receipt(
+        "model",
         "workflow-testkit --test m1_15_conformance connection_failure_fixture_injects_and_asserts_model_connection_failure",
         "connection failure",
         "injected model connection failure returns an error without a response",
@@ -360,6 +370,7 @@ async fn empty_response_fixture_injects_and_asserts_no_publication() {
     );
     assert_eq!(model.attempts.load(Ordering::SeqCst), 1);
     emit_fixture_receipt(
+        "model",
         "workflow-testkit --test m1_15_conformance empty_response_fixture_injects_and_asserts_no_publication",
         "empty response",
         "an injected empty response fails closed without publication",
@@ -368,21 +379,38 @@ async fn empty_response_fixture_injects_and_asserts_no_publication() {
 
 #[adk_rust::tokio::test]
 async fn transient_retry_then_success_fixture_records_attempts_before_publication() {
-    let model = AttemptingLlm::new(1, "model.transient");
-    assert!(
-        model
-            .generate_content(LlmRequest::new("fixture-model", Vec::new()), false)
-            .await
-            .is_err()
-    );
-    assert!(
-        model
-            .generate_content(LlmRequest::new("fixture-model", Vec::new()), false)
-            .await
-            .is_ok()
-    );
-    assert_eq!(model.attempts.load(Ordering::SeqCst), 2);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&attempts);
+    let graph = StateGraph::with_channels(&["publication"])
+        .add_node_fn("model", move |_context| {
+            let counter = Arc::clone(&counter);
+            async move {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(GraphError::Other(
+                        "injected transient model failure".to_owned(),
+                    ));
+                }
+                Ok(NodeOutput::new().with_update("publication", json!("published")))
+            }
+        })
+        .add_edge(START, "model")
+        .add_edge("model", END)
+        .compile()
+        .expect("production retry graph compiles")
+        .with_node_retry(
+            "model",
+            RetryPolicy::new(2)
+                .with_initial_delay(Duration::ZERO)
+                .with_jitter(0.0),
+        );
+    let state = graph
+        .invoke(State::new(), ExecutionConfig::new("transient-retry"))
+        .await
+        .expect("the ADK retry owner publishes only after retry success");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(state.get("publication"), Some(&json!("published")));
     emit_fixture_receipt(
+        "model",
         "workflow-testkit --test m1_15_conformance transient_retry_then_success_fixture_records_attempts_before_publication",
         "transient retry then success",
         "one transient failure retries once before the successful response is published",
@@ -391,17 +419,38 @@ async fn transient_retry_then_success_fixture_records_attempts_before_publicatio
 
 #[adk_rust::tokio::test]
 async fn retry_exhaustion_fixture_stops_after_retry_budget_without_publication() {
-    let model = AttemptingLlm::new(3, "model.transient");
-    for _ in 0..3 {
-        assert!(
-            model
-                .generate_content(LlmRequest::new("fixture-model", Vec::new()), false)
-                .await
-                .is_err()
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&attempts);
+    let graph = StateGraph::with_channels(&["publication"])
+        .add_node_fn("model", move |_context| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(GraphError::Other(
+                    "injected transient model failure".to_owned(),
+                ))
+            }
+        })
+        .add_edge(START, "model")
+        .add_edge("model", END)
+        .compile()
+        .expect("production retry graph compiles")
+        .with_node_retry(
+            "model",
+            RetryPolicy::new(3)
+                .with_initial_delay(Duration::ZERO)
+                .with_jitter(0.0),
         );
-    }
-    assert_eq!(model.attempts.load(Ordering::SeqCst), 3);
+    assert!(
+        graph
+            .invoke(State::new(), ExecutionConfig::new("retry-exhaustion"))
+            .await
+            .is_err(),
+        "retry exhaustion must fail before the publication update"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
     emit_fixture_receipt(
+        "model",
         "workflow-testkit --test m1_15_conformance retry_exhaustion_fixture_stops_after_retry_budget_without_publication",
         "retry exhaustion",
         "retry exhaustion stops at the configured attempt budget without publication",
@@ -417,6 +466,7 @@ fn malformed_tool_arguments_fixture_injects_and_asserts_rejection() {
         "injected malformed tool arguments must be rejected"
     );
     emit_fixture_receipt(
+        "tool",
         "workflow-testkit --test m1_15_conformance malformed_tool_arguments_fixture_injects_and_asserts_rejection",
         "malformed tool arguments",
         "injected malformed tool arguments are rejected before use",
@@ -442,6 +492,7 @@ to = "absent"
         .expect_err("an injected edge to a missing node must fail closed");
     assert!(error.to_string().contains("absent"));
     emit_fixture_receipt(
+        "graph",
         "workflow-testkit --test m1_15_conformance missing_node_fixture_injects_and_asserts_graph_rejection",
         "missing node",
         "an injected edge to a missing node is rejected",
@@ -597,13 +648,34 @@ fn conformance_probe_emits_structured_receipt() {
             .any(|line| line.starts_with(&format!("test {test_name} ... ok"))),
         "selected contract test must report its exact name"
     );
-    if selector.contains("_fixture_injects_and_asserts_") {
-        assert!(
-            output_text
-                .lines()
-                .any(|line| line.starts_with("M1_15_FIXTURE_RECEIPT=")),
-            "dedicated semantic fixtures must emit their receipt after assertions"
+    let fixture_receipts = output_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("M1_15_FIXTURE_RECEIPT="))
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("fixture-owned receipts are JSON");
+    if !fixture_receipts.is_empty() {
+        assert_eq!(
+            fixture_receipts.len(),
+            1,
+            "a selected fixture emits exactly one receipt after its assertions"
         );
+        let receipt = fixture_receipts
+            .into_iter()
+            .next()
+            .expect("one fixture receipt");
+        assert_eq!(receipt["selector"], json!(selector));
+        assert!(receipt["class"].is_string());
+        assert!(receipt["probe"].is_string());
+        assert!(receipt["assertion"].is_string());
+        assert_eq!(receipt["test_count"], json!(1));
+        assert_eq!(receipt["exit_code"], json!(0));
+        assert_eq!(receipt["result"], json!("PASS"));
+        println!(
+            "M1_15_RECEIPT={}",
+            serde_json::to_string(&receipt).expect("fixture receipt serializes")
+        );
+        return;
     }
     let (class, probe, assertion) = documented_failure_matrix()
         .iter()

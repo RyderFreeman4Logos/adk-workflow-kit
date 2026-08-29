@@ -313,6 +313,7 @@ pub enum AdkGraphError {
     VisitBound { max_visits: usize },
     Observation(events::AdkEventMappingErrorKind),
     AuthorizationDenied,
+    InvalidOutput { node: String },
     Failed,
 }
 
@@ -333,6 +334,7 @@ impl fmt::Display for AdkGraphError {
             }
             Self::Observation(_) => write!(f, "ADK event observation failed"),
             Self::AuthorizationDenied => write!(f, "authorization denied"),
+            Self::InvalidOutput { node } => write!(f, "invalid output from node {node:?}"),
             Self::Failed => write!(f, "graph execution failed"),
         }
     }
@@ -380,6 +382,7 @@ pub struct AdkGraph {
     visit_bound: Option<usize>,
     unknown_route_nodes: BTreeMap<String, String>,
     fan_in_guard_nodes: BTreeMap<String, String>,
+    agent_nodes: BTreeSet<String>,
     plan_binding: Option<PlanBinding>,
 }
 
@@ -403,7 +406,7 @@ impl AdkGraph {
                 );
         }
         match self.graph.invoke(state, config).await {
-            Ok(state) => Ok(self.output.map(state)),
+            Ok(state) => self.validate_output(self.output.map(state)),
             Err(GraphError::RecursionLimitExceeded(steps))
                 if self.visit_bound == Some(limit) && steps == limit =>
             {
@@ -522,11 +525,15 @@ impl AdkGraph {
                             events::AdkEventMappingErrorKind::InvalidObservation,
                         )
                     })?;
+                    if event.content().is_none() {
+                        return Err(AdkGraphError::InvalidOutput { node });
+                    }
                     mapper
                         .map_adk_event(node, event, artifacts)
                         .map_err(|error| AdkGraphError::Observation(error.kind()))?;
                 }
                 StreamEvent::Done { state, total_steps } => {
+                    let state = self.validate_output(self.output.map(state))?;
                     mapper
                         .map_stream_observation(
                             None,
@@ -591,9 +598,7 @@ impl AdkGraph {
                 }
             }
         }
-        output
-            .map(|state| self.output.map(state))
-            .ok_or(AdkGraphError::Failed)
+        output.ok_or(AdkGraphError::Failed)
     }
 
     pub fn summary(&self) -> &GraphSummary {
@@ -628,6 +633,19 @@ impl AdkGraph {
             .any(|terminal| terminal == id)
             .then(|| TerminalOutcome::from_stable_id(id))
             .flatten()
+    }
+
+    fn validate_output(&self, state: State) -> Result<State, AdkGraphError> {
+        match self.agent_nodes.iter().find(|id| {
+            state
+                .get(&format!("node:{id}"))
+                .and_then(|value| value.get("__workflow_invalid_output"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        }) {
+            Some(node) => Err(AdkGraphError::InvalidOutput { node: node.clone() }),
+            None => Ok(state),
+        }
     }
 }
 
@@ -976,12 +994,14 @@ impl AdkGraphTranslator {
             .map(|(guard, target)| (target.clone(), guard.clone()))
             .collect::<BTreeMap<_, _>>();
         let mut terminals = Vec::new();
+        let mut agent_nodes = BTreeSet::new();
         let mut order = Vec::new();
         let mut unknown_route_nodes = BTreeMap::new();
         for node in ir.nodes() {
             let id = node.id().as_str().to_owned();
             order.push(id.clone());
             if node.kind() == IrNodeKind::Agent {
+                agent_nodes.insert(id.clone());
                 let agent: Arc<dyn Agent> = match agents {
                     Some(agents) => agents
                         .get(&id)
@@ -1012,7 +1032,7 @@ impl AdkGraphTranslator {
                                 .and_then(|content| content.parts.first()?.text())
                         })
                         .map_or_else(
-                            || json!(true),
+                            || json!({ "__workflow_invalid_output": true }),
                             |text| serde_json::from_str(text).unwrap_or_else(|_| json!(text)),
                         );
                     let mut output = std::collections::HashMap::new();
@@ -1235,6 +1255,7 @@ impl AdkGraphTranslator {
             visit_bound,
             unknown_route_nodes,
             fan_in_guard_nodes,
+            agent_nodes,
             plan_binding,
         })
     }

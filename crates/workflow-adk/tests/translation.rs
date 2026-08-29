@@ -13,7 +13,7 @@ use adk_rust::{
 };
 use serde_json::json;
 use workflow_adk::events::AdkEventMapper;
-use workflow_adk::{AdkGraphTranslator, TerminalOutcome, TranslationError};
+use workflow_adk::{AdkGraphError, AdkGraphTranslator, TerminalOutcome, TranslationError};
 use workflow_compiler::{
     BindingCategory, BindingRef, CapabilitySet, PredicateRegistry, RegistryEntry, RegistryNotFound,
     RegistryResolutionError, ResolvedBinding, ResolvedRuntimePlan, RuntimePlanRegistry,
@@ -500,6 +500,41 @@ id = "authorization_denied"
 kind = "terminal"
 "#;
 
+const INVALID_TERMINAL_OUTPUT: &str = r#"
+schema_version = 1
+[workflow]
+id = "invalid-terminal-output"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "agent"
+[[nodes]]
+id = "failed"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "failed"
+"#;
+
+fn emit_fixture_receipt(selector: &str, probe: &str, assertion: &str) {
+    if std::env::var("M1_15_FIXTURE_RECEIPT_SELECTOR").as_deref() == Ok(selector) {
+        println!(
+            "M1_15_FIXTURE_RECEIPT={}",
+            serde_json::to_string(&json!({
+                "selector": selector,
+                "class": "graph",
+                "probe": probe,
+                "assertion": assertion,
+                "test_count": 1,
+                "exit_code": 0,
+                "result": "PASS",
+            }))
+            .expect("fixture receipt serializes")
+        );
+    }
+}
+
 struct AnyPredicate;
 
 impl PredicateRegistry for AnyPredicate {
@@ -563,6 +598,36 @@ fn state_agent(name: &str, state: serde_json::Value) -> Arc<dyn Agent> {
         name: name.to_owned(),
         response: json!({"state": state}).to_string(),
     })
+}
+
+struct InvalidOutputAgent;
+
+#[async_trait]
+impl Agent for InvalidOutputAgent {
+    fn name(&self) -> &str {
+        "start"
+    }
+
+    fn description(&self) -> &str {
+        "invalid output fixture"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &[]
+    }
+
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            shared_state: true,
+            ..AgentCapabilities::default()
+        }
+    }
+
+    async fn run(&self, _ctx: Arc<dyn InvocationContext>) -> adk_rust::Result<EventStream> {
+        Ok(Box::pin(adk_rust::futures::stream::iter([Ok(Event::new(
+            "invalid-output",
+        ))])))
+    }
 }
 
 struct SequenceAgent {
@@ -1370,19 +1435,61 @@ fn terminal_outcome_maps_failure_terminals_without_success_fallback() {
     assert_eq!(graph.terminal_outcome("unknown_terminal"), None);
 }
 
-#[test]
-fn terminal_invalid_output_fixture_reaches_failed_terminal_without_publication() {
-    let fixture = FAILURE_TERMINALS.replace("authorization_denied", "failed");
-    let plan = compile_str("failure-terminals.workflow.toml", &fixture)
-        .expect("failure terminal fixture compiles");
+#[tokio::test]
+async fn terminal_invalid_output_fixture_reaches_failed_terminal_without_publication() {
+    let plan = compile_str(
+        "invalid-terminal-output.workflow.toml",
+        INVALID_TERMINAL_OUTPUT,
+    )
+    .expect("failure terminal fixture compiles");
     let graph = AdkGraphTranslator::new()
-        .translate(&plan)
+        .translate_with_agents(
+            &plan,
+            &BTreeMap::from([(
+                "start".to_owned(),
+                Arc::new(InvalidOutputAgent) as Arc<dyn Agent>,
+            )]),
+        )
         .expect("failure terminal fixture translates");
+    let mut mapper = AdkEventMapper::new("invalid-terminal-output", "invalid-terminal-output")
+        .expect("event mapper starts");
+    let mut artifacts = InMemoryArtifactStore::new(
+        std::num::NonZeroU64::new(64 * 1024).unwrap(),
+        std::num::NonZeroU64::new(64 * 1024).unwrap(),
+    );
     assert_eq!(
         graph.terminal_outcome("failed"),
         Some(TerminalOutcome::Failed)
     );
-    assert_eq!(graph.terminal_outcome("invalid-output"), None);
+    assert_eq!(
+        graph
+            .invoke_observed(
+                State::new(),
+                ExecutionConfig::new("invalid-terminal-output"),
+                &mut mapper,
+                &mut artifacts,
+            )
+            .await
+            .expect_err("invalid terminal output must fail before publication"),
+        AdkGraphError::InvalidOutput {
+            node: "start".to_owned()
+        }
+    );
+    assert!(
+        mapper.events().iter().all(|event| {
+            !matches!(
+                event.kind(),
+                WorkflowRuntimeEventKindV1::WorkflowCompleted
+                    | WorkflowRuntimeEventKindV1::ArtifactCommitted
+            )
+        }),
+        "invalid output must not publish a terminal or artifact"
+    );
+    emit_fixture_receipt(
+        "workflow-adk --test translation terminal_invalid_output_fixture_reaches_failed_terminal_without_publication",
+        "terminal node reached with invalid output",
+        "invalid terminal output reaches the failed terminal without publication",
+    );
 }
 
 #[tokio::test]
