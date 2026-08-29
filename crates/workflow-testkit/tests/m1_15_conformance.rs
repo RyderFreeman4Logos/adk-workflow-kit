@@ -466,7 +466,7 @@ fn malformed_tool_arguments_fixture_injects_and_asserts_rejection() {
         "injected malformed tool arguments must be rejected"
     );
     emit_fixture_receipt(
-        "tool",
+        "model",
         "workflow-testkit --test m1_15_conformance malformed_tool_arguments_fixture_injects_and_asserts_rejection",
         "malformed tool arguments",
         "injected malformed tool arguments are rejected before use",
