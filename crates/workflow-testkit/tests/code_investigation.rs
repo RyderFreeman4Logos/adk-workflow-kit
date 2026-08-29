@@ -4,10 +4,11 @@ use workflow_testkit::code_investigation::{
     ReadOnlyTool, SyntheticInvestigation, validate_answer,
 };
 
-#[test]
-fn synthetic_repo_has_expected_grounded_answer() {
+#[tokio::test(flavor = "current_thread")]
+async fn synthetic_repo_has_expected_grounded_answer() {
     let result = SyntheticInvestigation::new(FixtureRepo::synthetic())
         .run_fake()
+        .await
         .expect("deterministic fake model should complete");
     assert_eq!(result.status(), InvestigationStatus::Published);
     assert!(result.answer().claims().iter().any(|claim| {
@@ -74,10 +75,11 @@ fn synthetic_repo_has_expected_grounded_answer() {
     }));
 }
 
-#[test]
-fn evidence_digest_mismatch_fails_closed() {
+#[tokio::test(flavor = "current_thread")]
+async fn evidence_digest_mismatch_fails_closed() {
     let result = SyntheticInvestigation::new(FixtureRepo::synthetic())
         .run_fake()
+        .await
         .expect("fake run should complete");
     let mut answer = result.answer().clone();
     answer.claims_mut()[0].evidence_mut()[0].set_digest("00".repeat(32));
@@ -85,8 +87,8 @@ fn evidence_digest_mismatch_fails_closed() {
     assert_eq!(error.code(), DiagnosticCode::EvidenceDigestMismatch);
 }
 
-#[test]
-fn public_stage_api_rejects_illegal_jump_and_binds_semantic_ids() {
+#[tokio::test(flavor = "current_thread")]
+async fn public_stage_api_rejects_illegal_jump_and_binds_semantic_ids() {
     let mut session = SyntheticInvestigation::new(FixtureRepo::synthetic()).session();
     let error = session
         .advance(InvestigationStage::InspectEvidence)
@@ -95,6 +97,7 @@ fn public_stage_api_rejects_illegal_jump_and_binds_semantic_ids() {
 
     let result = SyntheticInvestigation::new(FixtureRepo::synthetic())
         .run_fake()
+        .await
         .expect("fake run should complete");
     let mut answer = result.answer().clone();
     answer.claims_mut()[0].evidence_mut()[0].set_claim_id("different-claim");
@@ -102,17 +105,19 @@ fn public_stage_api_rejects_illegal_jump_and_binds_semantic_ids() {
     assert_eq!(error.code(), DiagnosticCode::EvidenceClaimBinding);
 }
 
-#[test]
-fn kill_resume_inspect_and_replay_are_deterministic() {
+#[tokio::test(flavor = "current_thread")]
+async fn kill_resume_inspect_and_replay_are_deterministic() {
     let investigation = SyntheticInvestigation::new(FixtureRepo::synthetic());
     let killed = investigation
         .run_until_kill(3)
+        .await
         .expect("kill point is checkpointed");
     assert_eq!(killed.status(), InvestigationStatus::Killed);
     assert!(killed.checkpoint().is_some());
 
     let resumed = SyntheticInvestigation::new(FixtureRepo::synthetic())
         .resume(killed.checkpoint().expect("checkpoint"))
+        .await
         .expect("fresh-process resume should complete");
     assert_eq!(resumed.status(), InvestigationStatus::Published);
     assert_eq!(
@@ -136,20 +141,23 @@ fn kill_resume_inspect_and_replay_are_deterministic() {
     assert!(resumed.replay_validate().is_ok());
 }
 
-#[test]
-fn every_legal_checkpoint_step_resumes_the_remaining_graph() {
+#[tokio::test(flavor = "current_thread")]
+async fn every_legal_checkpoint_step_resumes_the_remaining_graph() {
     let full = SyntheticInvestigation::new(FixtureRepo::synthetic())
         .run_fake()
+        .await
         .expect("deterministic fake model should complete");
     assert!(full.trace().stages().len() >= 4);
 
     for step in 1..=full.trace().stages().len() {
         let killed = SyntheticInvestigation::new(FixtureRepo::synthetic())
             .run_until_kill(step)
+            .await
             .expect("every stage in the completed trace is a legal checkpoint");
         let checkpoint = killed.checkpoint().expect("checkpoint");
         let resumed = SyntheticInvestigation::new(FixtureRepo::synthetic())
             .resume(checkpoint)
+            .await
             .unwrap_or_else(|error| panic!("step {step}: {error:?}"));
 
         assert_eq!(
@@ -167,20 +175,25 @@ fn every_legal_checkpoint_step_resumes_the_remaining_graph() {
     }
 }
 
-#[test]
-fn graph_model_calls_use_one_async_runtime_boundary() {
-    let source = include_str!("../src/code_investigation.rs");
-    assert!(source.contains("async fn fake_model_tool"));
-    assert!(!source.contains("std::thread::spawn"));
-    assert_eq!(source.matches("new_current_thread()").count(), 2);
-    assert_eq!(source.matches("runtime.block_on").count(), 2);
+#[tokio::test(flavor = "current_thread")]
+async fn graph_model_calls_use_the_callers_async_runtime() {
+    let result = SyntheticInvestigation::new(FixtureRepo::synthetic())
+        .run_fake()
+        .await;
+    assert_eq!(
+        result
+            .expect("deterministic fake model should complete")
+            .status(),
+        InvestigationStatus::Published
+    );
 }
 
-#[test]
-fn resume_rejects_a_forged_partial_trace_digest() {
+#[tokio::test(flavor = "current_thread")]
+async fn resume_rejects_a_forged_partial_trace_digest() {
     let investigation = SyntheticInvestigation::new(FixtureRepo::synthetic());
     let killed = investigation
         .run_until_kill(3)
+        .await
         .expect("kill point is checkpointed");
     let mut forged = serde_json::to_value(killed.checkpoint().expect("checkpoint"))
         .expect("checkpoint is serializable");
@@ -189,13 +202,14 @@ fn resume_rejects_a_forged_partial_trace_digest() {
 
     let error = SyntheticInvestigation::new(FixtureRepo::synthetic())
         .resume(&forged)
+        .await
         .expect_err("resume must bind the real partial trace");
     assert_eq!(error.code(), DiagnosticCode::CheckpointInvalid);
 }
 
-#[test]
-fn live_dogfood_is_opt_in_and_safe_to_skip() {
-    let live = LiveDogfood::default().run();
+#[tokio::test(flavor = "current_thread")]
+async fn live_dogfood_is_opt_in_and_safe_to_skip() {
+    let live = LiveDogfood::default().run().await;
     assert!(live.is_skipped());
     assert!(live.diagnostic().is_none_or(|diagnostic| {
         !diagnostic.debug_string().contains("sk-") && !diagnostic.display_string().contains("sk-")
@@ -209,10 +223,11 @@ fn fixture_package_resources_load_with_workflow() {
     assert_eq!(package.resource_count(), 6);
 }
 
-#[test]
-fn review_loop_publishes_from_structured_pass_verdict() {
+#[tokio::test(flavor = "current_thread")]
+async fn review_loop_publishes_from_structured_pass_verdict() {
     let result = SyntheticInvestigation::new(FixtureRepo::synthetic())
         .run_fake()
+        .await
         .expect("review loop should complete");
     assert!(
         result
@@ -230,9 +245,9 @@ fn review_loop_publishes_from_structured_pass_verdict() {
     );
 }
 
-#[test]
-fn opt_in_without_constructable_profile_abstains_fail_closed() {
-    let live = LiveDogfood::opt_in().run();
+#[tokio::test(flavor = "current_thread")]
+async fn opt_in_without_constructable_profile_abstains_fail_closed() {
+    let live = LiveDogfood::opt_in().run().await;
     assert!(live.is_abstained());
     assert!(!live.is_published());
     assert_eq!(
@@ -241,17 +256,19 @@ fn opt_in_without_constructable_profile_abstains_fail_closed() {
     );
 }
 
-#[test]
-fn review_revise_and_abstain_are_terminal_dogfood_routes() {
+#[tokio::test(flavor = "current_thread")]
+async fn review_revise_and_abstain_are_terminal_dogfood_routes() {
     let investigation = SyntheticInvestigation::new(FixtureRepo::synthetic());
     let revised = investigation
         .run_fake_with_review(ReviewVerdict::Revise)
+        .await
         .expect("structured revision route should terminate safely");
     assert_eq!(revised.status(), InvestigationStatus::Abstained);
     assert_eq!(revised.trace().adk_terminal(), Some("abstain"));
 
     let abstained = investigation
         .run_fake_with_review(ReviewVerdict::Abstain)
+        .await
         .expect("structured abstention should be a terminal result");
     assert_eq!(abstained.status(), InvestigationStatus::Abstained);
     assert_eq!(abstained.trace().adk_terminal(), Some("abstain"));

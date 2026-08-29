@@ -1215,12 +1215,12 @@ impl SyntheticInvestigation {
     }
 
     /// Runs the deterministic fake-model GREEN path.
-    pub fn run_fake(&self) -> Result<InvestigationResult, InvestigationError> {
-        self.run_fake_with_review(ReviewVerdict::Pass)
+    pub async fn run_fake(&self) -> Result<InvestigationResult, InvestigationError> {
+        self.run_fake_with_review(ReviewVerdict::Pass).await
     }
 
     /// Runs the fake model with one structured reviewer verdict for route coverage.
-    pub fn run_fake_with_review(
+    pub async fn run_fake_with_review(
         &self,
         requested_verdict: ReviewVerdict,
     ) -> Result<InvestigationResult, InvestigationError> {
@@ -1234,7 +1234,7 @@ impl SyntheticInvestigation {
         .map_err(|_| InvestigationError::new(DiagnosticCode::SchemaInvalid))?;
         let _canonical_ir_hash = plan.ir().canonical_hash();
 
-        let graph = run_investigation_graph(self.clone(), requested_verdict, None, None)?;
+        let graph = run_investigation_graph(self.clone(), requested_verdict, None, None).await?;
         let status = match graph.terminal.as_str() {
             "publish" => InvestigationStatus::Published,
             "abstain" => InvestigationStatus::Abstained,
@@ -1267,11 +1267,14 @@ impl SyntheticInvestigation {
     }
 
     /// Stops after a bounded real trace prefix and writes its checkpoint.
-    pub fn run_until_kill(&self, step: usize) -> Result<InvestigationResult, InvestigationError> {
+    pub async fn run_until_kill(
+        &self,
+        step: usize,
+    ) -> Result<InvestigationResult, InvestigationError> {
         if step == 0 {
             return Err(InvestigationError::new(DiagnosticCode::CheckpointInvalid));
         }
-        let completed = self.run_fake()?;
+        let completed = self.run_fake().await?;
         if step > completed.trace.stages.len() {
             return Err(InvestigationError::new(DiagnosticCode::CheckpointInvalid));
         }
@@ -1290,11 +1293,11 @@ impl SyntheticInvestigation {
     }
 
     /// Resumes from a checkpoint as a fresh, stateless process would.
-    pub fn resume(
+    pub async fn resume(
         &self,
         checkpoint: &InvestigationCheckpoint,
     ) -> Result<InvestigationResult, InvestigationError> {
-        let expected = self.run_until_kill(checkpoint.step)?;
+        let expected = self.run_until_kill(checkpoint.step).await?;
         if expected.checkpoint.as_ref() != Some(checkpoint) {
             return Err(InvestigationError::new(DiagnosticCode::CheckpointInvalid));
         }
@@ -1303,7 +1306,8 @@ impl SyntheticInvestigation {
             ReviewVerdict::Pass,
             Some(checkpoint.step),
             Some(&expected.trace),
-        )?;
+        )
+        .await?;
         let answer = graph
             .answer
             .clone()
@@ -1838,7 +1842,7 @@ impl Agent for GraphRouteAgent {
     }
 }
 
-fn run_investigation_graph(
+async fn run_investigation_graph(
     investigation: SyntheticInvestigation,
     requested_verdict: ReviewVerdict,
     resume_after: Option<usize>,
@@ -1884,31 +1888,19 @@ fn run_investigation_graph(
     let graph = workflow_adk::AdkGraphTranslator::new()
         .translate_with_agents(&plan, &agents)
         .map_err(|_| InvestigationError::new(DiagnosticCode::GraphFailed))?;
-    let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+    let state = graph
+        .invoke(
+            adk_rust::graph::prelude::State::new(),
+            adk_rust::graph::prelude::ExecutionConfig::new("code-investigation"),
+        )
+        .await
         .map_err(|_| InvestigationError::new(DiagnosticCode::GraphFailed))?;
-    let (state, mut exercise) = runtime.block_on(async {
-        let state = graph
-            .invoke(
-                adk_rust::graph::prelude::State::new(),
-                adk_rust::graph::prelude::ExecutionConfig::new("code-investigation"),
-            )
-            .await
-            .map_err(|_| InvestigationError::new(DiagnosticCode::GraphFailed))?;
-        let terminal = state
-            .get("terminal")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| InvestigationError::new(DiagnosticCode::GraphFailed))?
-            .to_owned();
-        let exercise = run.lock().await.finish(&terminal)?;
-        Ok::<_, InvestigationError>((state, exercise))
-    })?;
     let terminal = state
         .get("terminal")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| InvestigationError::new(DiagnosticCode::GraphFailed))?
         .to_owned();
+    let mut exercise = run.lock().await.finish(&terminal)?;
     let mut routes: Vec<String> = state
         .get("investigation:routes")
         .cloned()
@@ -2038,11 +2030,11 @@ impl LiveDogfood {
     }
 
     /// Runs the opt-in gate without reading any credential value.
-    pub fn run(self) -> LiveResult {
-        self.run_with_broker(&CredentialBroker::new())
+    pub async fn run(self) -> LiveResult {
+        self.run_with_broker(&CredentialBroker::new()).await
     }
 
-    fn run_with_broker(self, broker: &CredentialBroker) -> LiveResult {
+    async fn run_with_broker(self, broker: &CredentialBroker) -> LiveResult {
         if !self.enabled {
             return LiveResult {
                 status: LiveStatus::Skipped,
@@ -2079,19 +2071,7 @@ impl LiveDogfood {
                 };
             }
         };
-        let runtime = match adk_rust::tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(_) => {
-                return LiveResult {
-                    status: LiveStatus::Abstained,
-                    diagnostic: Some(InvestigationError::new(DiagnosticCode::ModelFailed)),
-                };
-            }
-        };
-        if runtime.block_on(attempt_live_kit_repo(&worker)).is_ok() {
+        if attempt_live_kit_repo(&worker).await.is_ok() {
             LiveResult {
                 status: LiveStatus::Published,
                 diagnostic: None,
@@ -2153,10 +2133,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn live_dogfood_abstains_when_the_kit_repo_attempt_fails_after_binding() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_dogfood_reuses_the_callers_async_runtime() {
         let broker = CredentialBroker::new().with_secret_provider(Arc::new(TestSecrets));
-        let live = LiveDogfood::opt_in().run_with_broker(&broker);
+        let live = LiveDogfood::opt_in().run_with_broker(&broker).await;
         assert!(live.is_abstained());
         assert_eq!(
             live.diagnostic().map(InvestigationError::code),
