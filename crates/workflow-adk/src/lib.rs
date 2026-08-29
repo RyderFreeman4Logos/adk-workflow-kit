@@ -6,7 +6,7 @@ pub mod model_profiles;
 pub mod tool_bridge;
 
 use crate::execution::{ExecutionError, ExecutionErrorKind};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -719,12 +719,17 @@ impl AdkGraphTranslator {
     ) -> Result<AdkGraph, TranslationError> {
         let ids: std::collections::BTreeSet<&str> =
             ir.nodes().iter().map(|node| node.id().as_str()).collect();
-        let mut incoming = BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+        let mut incoming = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut successors = BTreeMap::<String, BTreeSet<String>>::new();
         for edge in ir.edges() {
             incoming
                 .entry(edge.to().as_str().to_owned())
                 .or_default()
                 .insert(edge.from().as_str().to_owned());
+            successors
+                .entry(edge.from().as_str().to_owned())
+                .or_default()
+                .insert(edge.to().as_str().to_owned());
         }
         for route in ir.routes() {
             for target in route
@@ -737,12 +742,44 @@ impl AdkGraphTranslator {
                     .entry(target.as_str().to_owned())
                     .or_default()
                     .insert(route.from().as_str().to_owned());
+                successors
+                    .entry(route.from().as_str().to_owned())
+                    .or_default()
+                    .insert(target.as_str().to_owned());
             }
         }
+        let can_reach = |from: &str, to: &str| {
+            let mut pending = vec![from];
+            let mut visited = BTreeSet::new();
+            while let Some(node) = pending.pop() {
+                if !visited.insert(node) {
+                    continue;
+                }
+                if node == to {
+                    return true;
+                }
+                if let Some(targets) = successors.get(node) {
+                    pending.extend(targets.iter().map(String::as_str));
+                }
+            }
+            false
+        };
         let fan_in = incoming
             .into_iter()
-            .filter(|(_, sources)| sources.len() > 1)
-            .map(|(target, sources)| (target, sources.into_iter().collect::<Vec<_>>()))
+            .filter_map(|(target, sources)| {
+                let sources = sources
+                    .iter()
+                    .filter(|source| {
+                        sources.iter().any(|other| {
+                            source != &other
+                                && !can_reach(source, other)
+                                && !can_reach(other, source)
+                        })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (sources.len() > 1).then_some((target, sources))
+            })
             .collect::<BTreeMap<_, _>>();
         let mut fan_in_targets_by_source = BTreeMap::<String, Vec<String>>::new();
         for (target, sources) in &fan_in {
