@@ -8,7 +8,10 @@ pub mod tool_bridge;
 use crate::execution::{ExecutionError, ExecutionErrorKind};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use adk_rust::graph::Checkpointer;
 use adk_rust::graph::prelude::{
@@ -642,12 +645,12 @@ struct FanInCheckpointer {
     inner: Arc<dyn Checkpointer>,
 }
 
-fn strip_fan_in_provenance(
+fn strip_consumed_fan_in_provenance(
     mut checkpoint: adk_rust::graph::Checkpoint,
 ) -> adk_rust::graph::Checkpoint {
     checkpoint
         .state
-        .retain(|key, _| !key.starts_with("__workflow_fanin:"));
+        .retain(|key, value| !key.starts_with("__workflow_fanin:") || !value.is_null());
     checkpoint
 }
 
@@ -655,7 +658,7 @@ fn strip_fan_in_provenance(
 impl Checkpointer for FanInCheckpointer {
     async fn save(&self, checkpoint: &adk_rust::graph::Checkpoint) -> Result<String, GraphError> {
         self.inner
-            .save(&strip_fan_in_provenance(checkpoint.clone()))
+            .save(&strip_consumed_fan_in_provenance(checkpoint.clone()))
             .await
     }
 
@@ -667,7 +670,7 @@ impl Checkpointer for FanInCheckpointer {
             .inner
             .load(thread_id)
             .await?
-            .map(strip_fan_in_provenance))
+            .map(strip_consumed_fan_in_provenance))
     }
 
     async fn load_by_id(
@@ -678,7 +681,7 @@ impl Checkpointer for FanInCheckpointer {
             .inner
             .load_by_id(checkpoint_id)
             .await?
-            .map(strip_fan_in_provenance))
+            .map(strip_consumed_fan_in_provenance))
     }
 
     async fn list(&self, thread_id: &str) -> Result<Vec<adk_rust::graph::Checkpoint>, GraphError> {
@@ -687,7 +690,7 @@ impl Checkpointer for FanInCheckpointer {
             .list(thread_id)
             .await?
             .into_iter()
-            .map(strip_fan_in_provenance)
+            .map(strip_consumed_fan_in_provenance)
             .collect())
     }
 
@@ -827,7 +830,7 @@ impl AdkGraphTranslator {
                     .insert(target.as_str().to_owned());
             }
         }
-        let can_reach = |from: &str, to: &str| {
+        let can_reach_before_target = |from: &str, to: &str, target: &str| {
             let mut pending = vec![from];
             let mut visited = BTreeSet::new();
             while let Some(node) = pending.pop() {
@@ -836,6 +839,9 @@ impl AdkGraphTranslator {
                 }
                 if node == to {
                     return true;
+                }
+                if node == target {
+                    continue;
                 }
                 if let Some(targets) = successors.get(node) {
                     pending.extend(targets.iter().map(String::as_str));
@@ -846,18 +852,7 @@ impl AdkGraphTranslator {
         let fan_in = incoming
             .into_iter()
             .filter_map(|(target, sources)| {
-                let sources = sources
-                    .iter()
-                    .filter(|source| {
-                        sources.iter().any(|other| {
-                            source != &other
-                                && !can_reach(source, other)
-                                && !can_reach(other, source)
-                        })
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                (sources.len() > 1).then_some((target, sources))
+                (sources.len() > 1).then_some((target, sources.into_iter().collect::<Vec<_>>()))
             })
             .collect::<BTreeMap<_, _>>();
         let mut fan_in_targets_by_source = BTreeMap::<String, Vec<(String, String)>>::new();
@@ -869,7 +864,7 @@ impl AdkGraphTranslator {
             for (target, sources) in &fan_in {
                 let mut provenance = sources
                     .iter()
-                    .filter(|source| can_reach(writer, source))
+                    .filter(|source| can_reach_before_target(writer, source, target))
                     .cloned();
                 let Some(source) = provenance.next() else {
                     continue;
@@ -932,7 +927,8 @@ impl AdkGraphTranslator {
                     for source in sources {
                         let prefix = format!("__workflow_fanin:{target}:{source}:");
                         for (state_key, value) in &context.state {
-                            if let Some(key) = state_key.strip_prefix(&prefix)
+                            if let Some(generation_and_key) = state_key.strip_prefix(&prefix)
+                                && let Some((_generation, key)) = generation_and_key.split_once(':')
                                 && !value.is_null()
                             {
                                 if writes.insert(key.to_owned(), value.clone()).is_some() {
@@ -978,6 +974,15 @@ impl AdkGraphTranslator {
                     .get(&id)
                     .cloned()
                     .unwrap_or_default();
+                let fan_in_generations = fan_in_targets
+                    .iter()
+                    .map(|(target, source)| {
+                        (
+                            (target.clone(), source.clone()),
+                            Arc::new(AtomicUsize::new(0)),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
                 builder = builder.node(AgentNode::new(agent).with_output_mapper(move |events| {
                     let value = events
                         .iter()
@@ -1005,9 +1010,15 @@ impl AdkGraphTranslator {
                             );
                         } else {
                             for (target, source) in &fan_in_targets {
+                                let generation = fan_in_generations
+                                    .get(&(target.clone(), source.clone()))
+                                    .expect("fan-in generation exists for each target")
+                                    .fetch_add(1, Ordering::Relaxed);
                                 output.extend(state.iter().map(|(key, value)| {
                                     (
-                                        format!("__workflow_fanin:{target}:{source}:{key}"),
+                                        format!(
+                                            "__workflow_fanin:{target}:{source}:{generation}:{key}"
+                                        ),
                                         value.clone(),
                                     )
                                 }));

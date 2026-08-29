@@ -400,6 +400,94 @@ predicate = { id = "route-pred", version = "1" }
 cases = { left = "left", right = "right" }
 "#;
 
+const BOUNDED_CYCLIC_FAN_IN: &str = r#"
+schema_version = 1
+[workflow]
+id = "bounded-cyclic-fan-in"
+version = "1"
+entry = "fork"
+[[nodes]]
+id = "fork"
+kind = "action"
+max_visits = 2
+idempotent = true
+[[nodes]]
+id = "left"
+kind = "agent"
+max_visits = 2
+[[nodes]]
+id = "right"
+kind = "agent"
+max_visits = 2
+[[nodes]]
+id = "join"
+kind = "action"
+max_visits = 2
+idempotent = true
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "fork"
+to = "left"
+[[edges]]
+from = "fork"
+to = "right"
+[[edges]]
+from = "left"
+to = "join"
+[[edges]]
+from = "right"
+to = "join"
+[[edges]]
+from = "join"
+to = "fork"
+[[edges]]
+from = "join"
+to = "done"
+"#;
+
+const BOUNDED_CYCLIC_EXCLUSIVE_FAN_IN: &str = r#"
+schema_version = 1
+[workflow]
+id = "bounded-cyclic-exclusive-fan-in"
+version = "1"
+entry = "fork"
+[[nodes]]
+id = "fork"
+kind = "agent"
+max_visits = 4
+[[nodes]]
+id = "left"
+kind = "agent"
+max_visits = 4
+[[nodes]]
+id = "right"
+kind = "agent"
+max_visits = 4
+[[nodes]]
+id = "join"
+kind = "agent"
+max_visits = 4
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[routes]]
+from = "fork"
+predicate = { id = "route-pred", version = "1" }
+cases = { left = "left", right = "right" }
+[[edges]]
+from = "left"
+to = "join"
+[[edges]]
+from = "right"
+to = "join"
+[[routes]]
+from = "join"
+predicate = { id = "route-pred", version = "1" }
+cases = { again = "fork", done = "done" }
+"#;
+
 const FAILURE_TERMINALS: &str = r#"
 schema_version = 1
 edges = []
@@ -1021,6 +1109,221 @@ async fn exclusive_fan_in_checkpoints_consume_provenance_before_real_resume() {
         .await
         .expect("durable checkpoint resumes without fan-in provenance");
     assert_eq!(resumed.get("shared"), Some(&json!("left")));
+}
+
+#[tokio::test]
+async fn mid_fan_in_checkpoints_preserve_disjoint_writes_and_conflicts_until_guard() {
+    let disjoint_plan = compile_str(
+        "fan-in-disjoint-checkpoint.workflow.toml",
+        &FAN_IN_DECLARED_STATE_WITH_DISJOINT_KEYS.replace("kind = \"action\"", "kind = \"agent\""),
+    )
+    .expect("disjoint checkpoint fixture compiles");
+    let disjoint_agents = BTreeMap::from([
+        ("start".to_owned(), state_agent("start", json!({}))),
+        (
+            "left".to_owned(),
+            state_agent("left", json!({"left": "left"})),
+        ),
+        (
+            "right".to_owned(),
+            state_agent("right", json!({"right": "right"})),
+        ),
+    ]);
+    let disjoint_checkpointer = Arc::new(MemoryCheckpointer::default());
+    let disjoint_graph = AdkGraphTranslator::new()
+        .translate_profile_with_checkpointer(
+            &disjoint_plan,
+            &disjoint_agents,
+            None,
+            &json!({}),
+            Some(disjoint_checkpointer.clone()),
+        )
+        .expect("disjoint checkpoint graph translates");
+    let state = disjoint_graph
+        .invoke(
+            State::new(),
+            ExecutionConfig::new("fan-in-disjoint-checkpoint"),
+        )
+        .await
+        .expect("disjoint fan-in executes before resume");
+    assert_eq!(state.get("left"), Some(&json!("left")));
+    assert_eq!(state.get("right"), Some(&json!("right")));
+    let checkpoint = disjoint_checkpointer
+        .list("fan-in-disjoint-checkpoint")
+        .await
+        .expect("test Checkpointer lists mid-fan-in checkpoints")
+        .into_iter()
+        .find(|checkpoint| {
+            checkpoint
+                .state
+                .keys()
+                .any(|key| key.starts_with("__workflow_fanin:join:"))
+        })
+        .expect("checkpoint after branch writes retains pending fan-in provenance");
+    let resumed = disjoint_graph
+        .invoke(
+            State::new(),
+            ExecutionConfig::new("fan-in-disjoint-checkpoint")
+                .with_resume_from(&checkpoint.checkpoint_id),
+        )
+        .await
+        .expect("mid-fan-in checkpoint resumes through the join guard");
+    assert_eq!(resumed.get("left"), Some(&json!("left")));
+    assert_eq!(resumed.get("right"), Some(&json!("right")));
+    assert!(
+        resumed
+            .keys()
+            .all(|key| !key.starts_with("__workflow_fanin:")),
+        "join consumption removes completed provenance from returned state"
+    );
+
+    let conflict_plan = compile_str(
+        "fan-in-conflict-checkpoint.workflow.toml",
+        &FAN_IN_DECLARED_STATE_WITH_ZERO_WRITES.replace("kind = \"action\"", "kind = \"agent\""),
+    )
+    .expect("conflict checkpoint fixture compiles");
+    let conflict_agents = BTreeMap::from([
+        ("start".to_owned(), state_agent("start", json!({}))),
+        (
+            "left".to_owned(),
+            state_agent("left", json!({"shared": "left"})),
+        ),
+        (
+            "right".to_owned(),
+            state_agent("right", json!({"shared": "right"})),
+        ),
+    ]);
+    let conflict_checkpointer = Arc::new(MemoryCheckpointer::default());
+    let conflict_graph = AdkGraphTranslator::new()
+        .translate_profile_with_checkpointer(
+            &conflict_plan,
+            &conflict_agents,
+            None,
+            &json!({}),
+            Some(conflict_checkpointer.clone()),
+        )
+        .expect("conflict checkpoint graph translates");
+    let _ = conflict_graph
+        .invoke(
+            State::new(),
+            ExecutionConfig::new("fan-in-conflict-checkpoint"),
+        )
+        .await
+        .expect_err("same-key writes fail after the live guard receives both branches");
+    let checkpoint = conflict_checkpointer
+        .list("fan-in-conflict-checkpoint")
+        .await
+        .expect("test Checkpointer lists conflict checkpoints")
+        .into_iter()
+        .find(|checkpoint| {
+            checkpoint
+                .state
+                .keys()
+                .any(|key| key.starts_with("__workflow_fanin:join:"))
+        })
+        .expect("checkpoint before the guard retains conflicting branch provenance");
+    let error = conflict_graph
+        .invoke(
+            State::new(),
+            ExecutionConfig::new("fan-in-conflict-checkpoint")
+                .with_resume_from(&checkpoint.checkpoint_id),
+        )
+        .await
+        .expect_err("resumed guard must retain same-key conflict evidence");
+    assert_eq!(
+        error.to_string(),
+        "fan-in state conflict at \"join\" for key \"shared\""
+    );
+}
+
+#[tokio::test]
+async fn bounded_cyclic_fork_fan_in_same_key_writes_fail_closed() {
+    let plan = compile_str("bounded-cyclic-fan-in.workflow.toml", BOUNDED_CYCLIC_FAN_IN)
+        .expect("bounded cyclic fixture compiles");
+    let agents = BTreeMap::from([
+        (
+            "left".to_owned(),
+            state_agent("left", json!({"shared": "left"})),
+        ),
+        (
+            "right".to_owned(),
+            state_agent("right", json!({"shared": "right"})),
+        ),
+    ]);
+    let graph = AdkGraphTranslator::new()
+        .translate_with_agents(&plan, &agents)
+        .expect("bounded cyclic fan-in translates");
+
+    let error = graph
+        .invoke(State::new(), ExecutionConfig::new("bounded-cyclic-fan-in"))
+        .await
+        .expect_err("cyclic fork writes must reach the join guard");
+    assert_eq!(
+        error.to_string(),
+        "fan-in state conflict at \"join\" for key \"shared\""
+    );
+}
+
+#[tokio::test]
+async fn bounded_cyclic_exclusive_fan_in_keeps_activation_provenance_isolated() {
+    let plan = compile_str_with_predicates(
+        "bounded-cyclic-exclusive-fan-in.workflow.toml",
+        BOUNDED_CYCLIC_EXCLUSIVE_FAN_IN,
+        &AnyPredicate,
+    )
+    .expect("bounded cyclic exclusive fixture compiles");
+    let agents = BTreeMap::from([
+        (
+            "fork".to_owned(),
+            sequence_agent("fork", &["left", "right"]),
+        ),
+        (
+            "left".to_owned(),
+            state_agent("left", json!({"shared": "left"})),
+        ),
+        (
+            "right".to_owned(),
+            state_agent("right", json!({"shared": "right"})),
+        ),
+        (
+            "join".to_owned(),
+            sequence_agent("join", &["again", "done"]),
+        ),
+    ]);
+    let checkpointer = Arc::new(MemoryCheckpointer::default());
+    let graph = AdkGraphTranslator::new()
+        .translate_profile_with_checkpointer(
+            &plan,
+            &agents,
+            None,
+            &json!({}),
+            Some(checkpointer.clone()),
+        )
+        .expect("bounded cyclic exclusive fan-in translates");
+
+    let state = graph
+        .invoke(
+            State::new(),
+            ExecutionConfig::new("bounded-cyclic-exclusive-fan-in"),
+        )
+        .await
+        .expect("alternating exclusive branches do not cross-reject");
+    assert_eq!(state.get("terminal"), Some(&json!("done")));
+    assert_eq!(state.get("shared"), Some(&json!("right")));
+    assert!(
+        checkpointer
+            .list("bounded-cyclic-exclusive-fan-in")
+            .await
+            .expect("test Checkpointer lists cyclic activation checkpoints")
+            .iter()
+            .any(|checkpoint| {
+                checkpoint
+                    .state
+                    .keys()
+                    .any(|key| key.starts_with("__workflow_fanin:join:"))
+            }),
+        "each cyclic activation retains its provenance until its join guard consumes it"
+    );
 }
 
 #[test]
