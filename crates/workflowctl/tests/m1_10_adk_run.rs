@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
@@ -9,6 +10,10 @@ use std::{
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use workflow_runtime::{
+    ArtifactStore, CheckpointManifestV1, FilesystemArtifactStore, PageRequest, RunId,
+    SqliteCheckpointStore, WorkflowRuntimeEventV1,
+};
 
 static TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -627,4 +632,252 @@ fn resume_and_inspect_reuse_the_original_run_identity() {
     assert!(events.contains("\"kind\":\"workflow_resumed\""));
 
     fs::remove_dir_all(root).expect("test root must be removed");
+}
+
+#[test]
+fn credential_value_is_absent_from_production_run_readback_surfaces() {
+    const CHILD: &str = "WORKFLOWCTL_CREDENTIAL_ORACLE_CHILD";
+    const WORKFLOW_ENV: &str = "WORKFLOWCTL_CREDENTIAL_ORACLE_WORKFLOW";
+    const PROFILE_ENV: &str = "WORKFLOWCTL_CREDENTIAL_ORACLE_PROFILE";
+    const RUNS_ENV: &str = "WORKFLOWCTL_CREDENTIAL_ORACLE_RUNS";
+    const HANDLE: &str = "WORKFLOWCTL_CREDENTIAL_ORACLE_HANDLE";
+    const CANARY: &str = "synthetic-credential-canary-m3-01-7f3c";
+
+    if std::env::var_os(CHILD).is_some() {
+        let workflow = PathBuf::from(std::env::var(WORKFLOW_ENV).expect("oracle workflow"));
+        let profile = PathBuf::from(std::env::var(PROFILE_ENV).expect("oracle profile"));
+        let runs = PathBuf::from(std::env::var(RUNS_ENV).expect("oracle runs"));
+        let output = run_adk_with_input(&workflow, &profile, &runs, r#"{"request":"public"}"#);
+        assert!(
+            output.status.success(),
+            "production oracle run must succeed (exit={:?}, stdout={}, stderr={})",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).replace(CANARY, "[REDACTED]"),
+            String::from_utf8_lossy(&output.stderr).replace(CANARY, "[REDACTED]"),
+        );
+        assert_no_canary_bytes(&output.stdout, CANARY);
+        assert_no_canary_bytes(&output.stderr, CANARY);
+        return;
+    }
+
+    let root = temp_root("credential-oracle");
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
+    let address = listener.local_addr().expect("oracle listener address");
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("model request");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let bytes = socket.read(&mut buffer).expect("model request read");
+            request.extend_from_slice(&buffer[..bytes]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("model request headers")
+            + 4;
+        let content_length = String::from_utf8_lossy(&request[..header_end])
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let bytes = socket.read(&mut buffer).expect("model request body read");
+            request.extend_from_slice(&buffer[..bytes]);
+        }
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"oracle-ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("oracle response");
+        socket.flush().expect("oracle response flush");
+    });
+
+    let profile_value = json!({
+        "schema_version": 1,
+        "model": {
+            "provider": "openai-compatible",
+            "name": "oracle-model",
+            "version": "1",
+            "model": "oracle",
+            "base_url": format!("http://{address}/v1"),
+            "credential_env": HANDLE
+        },
+        "sandbox": {"capabilities": []}
+    });
+    let (workflow, profile, runs) = write_fixture(&root, profile_value);
+    let child = Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "credential_value_is_absent_from_production_run_readback_surfaces",
+        ])
+        .env(CHILD, "1")
+        .env(HANDLE, CANARY)
+        .env(WORKFLOW_ENV, &workflow)
+        .env(PROFILE_ENV, &profile)
+        .env(RUNS_ENV, &runs)
+        .output()
+        .expect("oracle child should start");
+    assert!(
+        child.status.success(),
+        "oracle child must succeed (stdout={}, stderr={})",
+        String::from_utf8_lossy(&child.stdout).replace(CANARY, "[REDACTED]"),
+        String::from_utf8_lossy(&child.stderr).replace(CANARY, "[REDACTED]")
+    );
+    server.join().expect("oracle server should finish");
+
+    let run_root = run_root(&runs);
+    let manifest_bytes = fs::read(run_root.join("run-manifest.json")).expect("run manifest");
+    assert_no_canary_bytes(&manifest_bytes, CANARY);
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("manifest JSON");
+    assert_eq!(manifest["status"], "succeeded");
+    assert_eq!(manifest["profile_identity"], "oracle-model:1");
+    assert!(
+        !manifest["plan_hash"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty()
+    );
+    assert!(
+        !manifest["resume_identity"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty()
+    );
+
+    let source = fs::read(run_root.join("workflow.toml")).expect("canonical source");
+    assert_eq!(source, WORKFLOW.as_bytes());
+    assert_no_canary_bytes(&source, CANARY);
+
+    let stored_profile = fs::read(run_root.join("execution-profile.json")).expect("stored profile");
+    assert_no_canary_bytes(&stored_profile, CANARY);
+    let stored_profile: Value = serde_json::from_slice(&stored_profile).expect("profile JSON");
+    assert_eq!(stored_profile["model"]["credential_env"], HANDLE);
+    assert_ne!(stored_profile["model"]["credential_env"], CANARY);
+
+    let run_id = manifest["run_id"].as_str().expect("run ID");
+    let inspect = command_json(&[
+        "--json",
+        "inspect",
+        "--run-id",
+        run_id,
+        "--workdir",
+        runs.to_str().expect("UTF-8 runs path"),
+    ]);
+    assert_no_canary_bytes(&inspect.stdout, CANARY);
+    assert_no_canary_bytes(&inspect.stderr, CANARY);
+    let inspected = json_stdout(&inspect);
+    assert_eq!(inspected["status"], "succeeded");
+    assert_eq!(inspected["run_id"], run_id);
+
+    let checkpoint_manifest: CheckpointManifestV1 =
+        serde_json::from_value(manifest["checkpoint_manifest"].clone())
+            .expect("checkpoint manifest");
+    assert_eq!(checkpoint_manifest.run_id(), run_id);
+    assert_no_canary_bytes(
+        &serde_json::to_vec(&checkpoint_manifest).expect("checkpoint manifest bytes"),
+        CANARY,
+    );
+    let checkpoint_store =
+        SqliteCheckpointStore::open(run_root.join("checkpoint.sqlite"), checkpoint_manifest)
+            .expect("checkpoint store");
+    let checkpoint = checkpoint_store
+        .load_latest(&RunId::new(run_id.to_owned()).expect("valid run ID"))
+        .expect("checkpoint read")
+        .expect("checkpoint exists");
+    assert_no_canary_bytes(checkpoint.state(), CANARY);
+    let checkpoint_state: Value =
+        serde_json::from_slice(checkpoint.state()).expect("checkpoint JSON");
+    assert_no_canary(&checkpoint_state, CANARY);
+
+    let events_bytes = fs::read(run_root.join("events.jsonl")).expect("events");
+    assert_no_canary_bytes(&events_bytes, CANARY);
+    let events = std::str::from_utf8(&events_bytes)
+        .expect("events UTF-8")
+        .lines()
+        .map(serde_json::from_str::<WorkflowRuntimeEventV1>)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("events structurally readable");
+    assert!(!events.is_empty());
+    for event in &events {
+        assert_no_canary(event.payload(), CANARY);
+    }
+
+    let artifact_store = FilesystemArtifactStore::try_new(
+        run_root.join("artifacts"),
+        std::num::NonZeroU64::new(64 * 1024).expect("artifact limit"),
+        std::num::NonZeroU64::new(64 * 1024).expect("page limit"),
+    )
+    .expect("artifact store");
+    let artifact_id = workflow_runtime::ArtifactId::parse(
+        manifest["artifact_id"]
+            .as_str()
+            .expect("terminal artifact ID"),
+    )
+    .expect("artifact ID");
+    let page = artifact_store
+        .read_page(
+            &artifact_id,
+            PageRequest::new(0, std::num::NonZeroU64::new(64 * 1024).expect("page size")),
+        )
+        .expect("artifact readback");
+    assert!(page.next_offset().is_none());
+    assert_no_canary_bytes(page.bytes(), CANARY);
+    let replay_artifacts = vec![json!({
+        "id": artifact_id.as_str(),
+        "bytes": page.bytes()
+    })];
+
+    let input = fs::read(run_root.join("execution-input.json")).expect("execution input");
+    assert_no_canary_bytes(&input, CANARY);
+    let workflow_digest = format!("sha256:{:x}", Sha256::digest(&source));
+    let input_digest = format!("sha256:{:x}", Sha256::digest(&input));
+    let replay_value = json!({
+        "schema_version": 1,
+        "workflow_lock": {"toml": String::from_utf8(source).expect("workflow UTF-8"), "sha256": workflow_digest},
+        "input_sha256": input_digest.clone(),
+        "events": [
+            {"type": "node_started", "node_id": "agent"},
+            {"type": "terminal", "status": "completed", "outcome_sha256": input_digest}
+        ],
+        "fixtures": [{"sha256": input_digest}],
+        "artifacts": replay_artifacts
+    });
+    let replay_bytes = serde_json::to_vec(&replay_value).expect("replay bytes");
+    assert_no_canary_bytes(&replay_bytes, CANARY);
+    let replay = workflow_testkit::ReplayBundle::from_json(&replay_bytes)
+        .expect("replay-facing data should read back");
+    assert_eq!(replay.replay().events().len(), 2);
+
+    assert_no_canary_in_run_root(&run_root, CANARY);
+    fs::remove_dir_all(root).expect("oracle root should be removed");
+}
+
+fn assert_no_canary(value: &Value, canary: &str) {
+    assert!(!value.to_string().contains(canary));
+}
+
+fn assert_no_canary_bytes(bytes: &[u8], canary: &str) {
+    assert!(
+        !bytes
+            .windows(canary.len())
+            .any(|window| window == canary.as_bytes())
+    );
+}
+
+fn assert_no_canary_in_run_root(root: &Path, canary: &str) {
+    for entry in fs::read_dir(root).expect("run root should be readable") {
+        let path = entry.expect("run-root entry").path();
+        if path.is_dir() {
+            assert_no_canary_in_run_root(&path, canary);
+        } else {
+            assert_no_canary_bytes(&fs::read(path).expect("run-root file"), canary);
+        }
+    }
 }
