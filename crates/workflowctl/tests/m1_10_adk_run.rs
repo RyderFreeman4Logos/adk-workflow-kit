@@ -4,7 +4,6 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
-        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -431,64 +430,35 @@ fn append_output_errors(
     }
 }
 
-fn clean_up_child(mut child: Child) -> Vec<&'static str> {
+fn clean_up_child(mut child: Child) -> Result<Vec<&'static str>, Vec<&'static str>> {
     let mut diagnostics = Vec::new();
     if child.kill().is_err() {
         diagnostics.push("oracle child kill failed");
     }
-    let deadline = Instant::now() + ORACLE_CLEANUP_TIMEOUT;
+    let cleanup_deadline = Instant::now() + ORACLE_CLEANUP_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => {
                 diagnostics.push("oracle child reaped after kill");
-                return diagnostics;
+                return Ok(diagnostics);
             }
-            Ok(None) if Instant::now() < deadline => thread::yield_now(),
-            Err(_) if Instant::now() < deadline => {
+            Ok(None) => {}
+            Err(_) => {
                 if !diagnostics.contains(&"oracle child reap check failed") {
                     diagnostics.push("oracle child reap check failed");
                 }
-                thread::yield_now();
-            }
-            Ok(None) | Err(_) => {
-                let owner = Arc::new(Mutex::new(Some(child)));
-                let reaper_owner = Arc::clone(&owner);
-                match thread::Builder::new()
-                    .name("oracle-delayed-reaper".to_owned())
-                    .spawn(move || {
-                        if let Some(mut child) = reaper_owner
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .take()
-                        {
-                            let _ = child.wait();
-                        }
-                    }) {
-                    Ok(_) => {
-                        diagnostics.push("oracle child cleanup timed out; delayed reaper started")
-                    }
-                    Err(_) => {
-                        diagnostics
-                            .push("oracle child cleanup timed out; delayed reaper start failed");
-                        if let Some(mut child) = owner
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .take()
-                        {
-                            if child.kill().is_err() {
-                                diagnostics.push("oracle child synchronous kill failed");
-                            }
-                            if child.wait().is_ok() {
-                                diagnostics.push("oracle child synchronously reaped");
-                            } else {
-                                diagnostics.push("oracle child synchronous reap failed");
-                            }
-                        }
-                    }
-                }
-                return diagnostics;
             }
         }
+        let now = Instant::now();
+        if now >= cleanup_deadline {
+            diagnostics.push("oracle child terminal reap not proven");
+            return Err(diagnostics);
+        }
+        thread::sleep(
+            cleanup_deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(10)),
+        );
     }
 }
 
@@ -503,7 +473,9 @@ fn wait_bounded_child(
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::yield_now(),
             Ok(None) => {
-                let mut diagnostics = clean_up_child(child);
+                let mut diagnostics = match clean_up_child(child) {
+                    Ok(diagnostics) | Err(diagnostics) => diagnostics,
+                };
                 append_output_errors(&mut diagnostics, stdout_path, stderr_path);
                 return Err(format!(
                     "oracle child timed out; {}",
@@ -511,7 +483,9 @@ fn wait_bounded_child(
                 ));
             }
             Err(_) => {
-                let mut diagnostics = clean_up_child(child);
+                let mut diagnostics = match clean_up_child(child) {
+                    Ok(diagnostics) | Err(diagnostics) => diagnostics,
+                };
                 append_output_errors(&mut diagnostics, stdout_path, stderr_path);
                 return Err(format!(
                     "oracle child wait failed; {}",
@@ -1018,7 +992,7 @@ fn oracle_child_timeout_is_primary_and_directly_reaped() {
             break;
         }
         if Instant::now() >= ready_deadline {
-            let diagnostics = clean_up_child(child);
+            let diagnostics = clean_up_child(child).unwrap_or_else(|diagnostics| diagnostics);
             panic!(
                 "fixture child output readiness timed out; {}",
                 diagnostics.join("; ")
@@ -1036,6 +1010,8 @@ fn oracle_child_timeout_is_primary_and_directly_reaped() {
     assert!(error.starts_with("oracle child timed out"));
     assert!(error.contains("oracle child reaped after kill"));
     assert!(error.contains("oracle child output exceeded size limit"));
+    assert!(!error.contains("reaper"));
+    assert!(!error.contains("handoff"));
 }
 
 #[test]
