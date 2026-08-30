@@ -220,9 +220,17 @@ struct RequestObservation {
 }
 
 const ORACLE_TIMEOUT: Duration = Duration::from_secs(5);
+const ORACLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const ORACLE_SOCKET_TIMEOUT: Duration = Duration::from_millis(100);
 const ORACLE_MAX_REQUEST_BYTES: usize = 64 * 1024;
 const ORACLE_MAX_CHILD_OUTPUT_BYTES: usize = 64 * 1024;
+const ORACLE_SCAN_MAX_DEPTH: usize = 8;
+const ORACLE_SCAN_MAX_ENTRIES: usize = 512;
+const ORACLE_SCAN_MAX_FILES: usize = 256;
+const ORACLE_SCAN_MAX_FILE_BYTES: usize = 1024 * 1024;
+const ORACLE_SCAN_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const ORACLE_SCAN_CHUNK_BYTES: usize = 8192;
+const ORACLE_SCAN_MAX_CANARY_BYTES: usize = 256;
 
 fn read_model_request(
     socket: &mut std::net::TcpStream,
@@ -323,9 +331,8 @@ fn read_model_request(
 
 fn serve_oracle_request(
     listener: std::net::TcpListener,
-    request_tx: mpsc::SyncSender<Result<RequestObservation, &'static str>>,
     canary: &'static str,
-) -> Result<(), &'static str> {
+) -> Result<RequestObservation, &'static str> {
     listener
         .set_nonblocking(true)
         .map_err(|_| "oracle listener setup failed")?;
@@ -358,15 +365,13 @@ fn serve_oracle_request(
     )
     .map_err(|_| "oracle response write failed")?;
     socket.flush().map_err(|_| "oracle response flush failed")?;
-    request_tx
-        .send(Ok(observation))
-        .map_err(|_| "oracle request observation receiver closed")?;
-    Ok(())
+    Ok(observation)
 }
 
-fn capture_child_output<R: Read>(reader: R) -> Result<Vec<u8>, &'static str> {
+fn read_child_output(path: &Path) -> Result<Vec<u8>, &'static str> {
     let mut output = Vec::new();
-    reader
+    fs::File::open(path)
+        .map_err(|_| "oracle child output open failed")?
         .take((ORACLE_MAX_CHILD_OUTPUT_BYTES + 1) as u64)
         .read_to_end(&mut output)
         .map_err(|_| "oracle child output read failed")?;
@@ -376,66 +381,84 @@ fn capture_child_output<R: Read>(reader: R) -> Result<Vec<u8>, &'static str> {
     Ok(output)
 }
 
-fn kill_and_reap(child: &mut Child) -> Result<std::process::ExitStatus, &'static str> {
-    let _ = child.kill();
-    child.wait().map_err(|_| "oracle child reap failed")
+fn append_output_errors(
+    diagnostics: &mut Vec<&'static str>,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) {
+    if let Err(error) = read_child_output(stdout_path) {
+        diagnostics.push(error);
+    }
+    if let Err(error) = read_child_output(stderr_path) {
+        diagnostics.push(error);
+    }
 }
 
-fn wait_bounded_child(mut child: Child) -> Result<Output, &'static str> {
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            let _ = kill_and_reap(&mut child);
-            return Err("oracle child stdout pipe missing");
-        }
-    };
-    let stdout_thread = thread::spawn(move || capture_child_output(stdout));
-    let stderr = match child.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            let reap = kill_and_reap(&mut child);
-            let _ = stdout_thread.join();
-            return match reap {
-                Ok(_) => Err("oracle child stderr pipe missing"),
-                Err(error) => Err(error),
-            };
-        }
-    };
-    let stderr_thread = thread::spawn(move || capture_child_output(stderr));
-
-    let deadline = Instant::now() + ORACLE_TIMEOUT;
-    let mut timed_out = false;
-    let wait_result = loop {
+fn clean_up_child(mut child: Child) -> Vec<&'static str> {
+    let mut diagnostics = Vec::new();
+    if child.kill().is_err() {
+        diagnostics.push("oracle child kill failed");
+    }
+    let deadline = Instant::now() + ORACLE_CLEANUP_TIMEOUT;
+    loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
+            Ok(Some(_)) => {
+                diagnostics.push("oracle child reaped after kill");
+                return diagnostics;
+            }
+            Ok(None) if Instant::now() < deadline => thread::yield_now(),
+            Err(_) if Instant::now() < deadline => {
+                if !diagnostics.contains(&"oracle child reap check failed") {
+                    diagnostics.push("oracle child reap check failed");
+                }
+                thread::yield_now();
+            }
+            Ok(None) | Err(_) => {
+                let diagnostic = match thread::Builder::new()
+                    .name("oracle-delayed-reaper".to_owned())
+                    .spawn(move || {
+                        let _ = child.wait();
+                    }) {
+                    Ok(_) => "oracle child cleanup timed out; delayed reaper started",
+                    Err(_) => "oracle child cleanup timed out; delayed reaper start failed",
+                };
+                diagnostics.push(diagnostic);
+                return diagnostics;
+            }
+        }
+    }
+}
+
+fn wait_bounded_child(
+    mut child: Child,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    deadline: Instant,
+) -> Result<Output, String> {
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::yield_now(),
             Ok(None) => {
-                timed_out = true;
-                break kill_and_reap(&mut child);
+                let mut diagnostics = clean_up_child(child);
+                append_output_errors(&mut diagnostics, stdout_path, stderr_path);
+                return Err(format!(
+                    "oracle child timed out; {}",
+                    diagnostics.join("; ")
+                ));
             }
             Err(_) => {
-                let reap = kill_and_reap(&mut child);
-                break match reap {
-                    Ok(_) => Err("oracle child wait failed"),
-                    Err(error) => Err(error),
-                };
+                let mut diagnostics = clean_up_child(child);
+                append_output_errors(&mut diagnostics, stdout_path, stderr_path);
+                return Err(format!(
+                    "oracle child wait failed; {}",
+                    diagnostics.join("; ")
+                ));
             }
         }
     };
-    let stdout_result = match stdout_thread.join() {
-        Ok(result) => result,
-        Err(_) => Err("oracle child stdout thread failed"),
-    };
-    let stderr_result = match stderr_thread.join() {
-        Ok(result) => result,
-        Err(_) => Err("oracle child stderr thread failed"),
-    };
-    let status = wait_result?;
-    let stdout = stdout_result?;
-    let stderr = stderr_result?;
-    if timed_out {
-        return Err("oracle child timed out");
-    }
+    let stdout = read_child_output(stdout_path).map_err(str::to_owned)?;
+    let stderr = read_child_output(stderr_path).map_err(str::to_owned)?;
     Ok(Output {
         status,
         stdout,
@@ -893,43 +916,135 @@ fn oracle_request_reader_rejects_early_eof() {
 }
 
 #[test]
+fn oracle_request_reader_rejects_oversized_body() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
+    let address = listener.local_addr().expect("oracle listener address");
+    let mut client = std::net::TcpStream::connect(address).expect("oracle client");
+    write!(
+        client,
+        "POST /v1/chat/completions HTTP/1.1\r\ncontent-length: {ORACLE_MAX_REQUEST_BYTES}\r\n\r\n"
+    )
+    .expect("oversized request header");
+    let (mut socket, _) = listener.accept().expect("oracle request");
+    socket
+        .set_read_timeout(Some(ORACLE_SOCKET_TIMEOUT))
+        .expect("oracle socket read timeout");
+    assert!(matches!(
+        read_model_request(
+            &mut socket,
+            Instant::now() + ORACLE_TIMEOUT,
+            "synthetic-credential-canary-m3-01-7f3c",
+        ),
+        Err("oracle request body exceeded size limit")
+    ));
+}
+
+const SUPERVISOR_FIXTURE_ENV: &str = "WORKFLOWCTL_ORACLE_SUPERVISOR_FIXTURE";
+
+#[test]
+fn oracle_supervisor_fixture_blocks() {
+    if std::env::var_os(SUPERVISOR_FIXTURE_ENV).is_none() {
+        return;
+    }
+    std::io::stdout()
+        .write_all(&vec![b'x'; ORACLE_MAX_CHILD_OUTPUT_BYTES + 1])
+        .expect("fixture output");
+    std::io::stdout().flush().expect("fixture output flush");
+    thread::park();
+}
+
+#[test]
+fn oracle_child_timeout_is_primary_and_directly_reaped() {
+    let root = temp_root("oracle-child-timeout");
+    let stdout_path = root.join("stdout");
+    let stderr_path = root.join("stderr");
+    let child = Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", "oracle_supervisor_fixture_blocks", "--nocapture"])
+        .env(SUPERVISOR_FIXTURE_ENV, "1")
+        .stdout(Stdio::from(
+            fs::File::create(&stdout_path).expect("fixture stdout"),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(&stderr_path).expect("fixture stderr"),
+        ))
+        .spawn()
+        .expect("fixture child");
+    let ready_deadline = Instant::now() + ORACLE_TIMEOUT;
+    loop {
+        if fs::metadata(&stdout_path)
+            .is_ok_and(|metadata| metadata.len() > ORACLE_MAX_CHILD_OUTPUT_BYTES as u64)
+        {
+            break;
+        }
+        if Instant::now() >= ready_deadline {
+            let diagnostics = clean_up_child(child);
+            panic!(
+                "fixture child output readiness timed out; {}",
+                diagnostics.join("; ")
+            );
+        }
+        thread::yield_now();
+    }
+    let pid = child.id();
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let supervisor = thread::spawn(move || {
+        let result = wait_bounded_child(
+            child,
+            &stdout_path,
+            &stderr_path,
+            Instant::now() + Duration::from_millis(100),
+        );
+        result_tx.send(result).expect("supervisor result receiver");
+    });
+    let error = result_rx
+        .recv_timeout(ORACLE_TIMEOUT)
+        .expect("supervisor must finish boundedly")
+        .expect_err("fixture child must time out");
+    supervisor.join().expect("supervisor thread must finish");
+    assert!(error.starts_with("oracle child timed out"));
+    assert!(error.contains("oracle child reaped after kill"));
+    assert!(error.contains("oracle child output exceeded size limit"));
+    // SAFETY: signal 0 only probes whether the directly owned child PID still exists.
+    let probe = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    assert_eq!(probe, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    fs::remove_dir_all(root).expect("fixture root removal");
+}
+
+#[test]
+fn oracle_run_root_scan_rejects_boundary_canary_and_symlink() {
+    const CANARY: &str = "synthetic-credential-canary-m3-01-7f3c";
+    let root = temp_root("oracle-run-root-scan");
+    let split = ORACLE_SCAN_CHUNK_BYTES - CANARY.len() / 2;
+    let mut bytes = vec![b'x'; split];
+    bytes.extend_from_slice(CANARY.as_bytes());
+    fs::write(root.join("boundary"), bytes).expect("boundary fixture");
+    assert_eq!(
+        scan_run_root(&root, CANARY),
+        Err("oracle run-root canary detected")
+    );
+    fs::remove_file(root.join("boundary")).expect("boundary fixture removal");
+    std::os::unix::fs::symlink(root.join("missing"), root.join("link")).expect("symlink fixture");
+    assert_eq!(
+        scan_run_root(&root, CANARY),
+        Err("oracle run-root symlink rejected")
+    );
+    fs::remove_dir_all(root).expect("scan fixture removal");
+}
+
+#[test]
 fn credential_value_is_absent_from_production_run_readback_surfaces() {
-    const CHILD: &str = "WORKFLOWCTL_CREDENTIAL_ORACLE_CHILD";
-    const WORKFLOW_ENV: &str = "WORKFLOWCTL_CREDENTIAL_ORACLE_WORKFLOW";
-    const PROFILE_ENV: &str = "WORKFLOWCTL_CREDENTIAL_ORACLE_PROFILE";
-    const RUNS_ENV: &str = "WORKFLOWCTL_CREDENTIAL_ORACLE_RUNS";
     const HANDLE: &str = "WORKFLOWCTL_CREDENTIAL_ORACLE_HANDLE";
     const CANARY: &str = "synthetic-credential-canary-m3-01-7f3c";
 
-    if std::env::var_os(CHILD).is_some() {
-        let workflow = PathBuf::from(std::env::var(WORKFLOW_ENV).expect("oracle workflow"));
-        let profile = PathBuf::from(std::env::var(PROFILE_ENV).expect("oracle profile"));
-        let runs = PathBuf::from(std::env::var(RUNS_ENV).expect("oracle runs"));
-        let output = run_adk_with_input(&workflow, &profile, &runs, r#"{"request":"public"}"#);
-        assert!(
-            output.status.success(),
-            "production oracle run must succeed (exit={:?}, stdout={}, stderr={})",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout).replace(CANARY, "[REDACTED]"),
-            String::from_utf8_lossy(&output.stderr).replace(CANARY, "[REDACTED]"),
-        );
-        assert_no_canary_bytes(&output.stdout, CANARY);
-        assert_no_canary_bytes(&output.stderr, CANARY);
-        return;
-    }
-
     let root = temp_root("credential-oracle");
+    let stdout_path = root.join("workflowctl.stdout");
+    let stderr_path = root.join("workflowctl.stderr");
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
     let address = listener.local_addr().expect("oracle listener address");
-    let (request_tx, request_rx) = mpsc::sync_channel(1);
-    let server = thread::spawn(move || {
-        let result = serve_oracle_request(listener, request_tx.clone(), CANARY);
-        if let Err(error) = result {
-            let _ = request_tx.send(Err(error));
-        }
-        result
-    });
-
     let profile_value = json!({
         "schema_version": 1,
         "model": {
@@ -943,32 +1058,52 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         "sandbox": {"capabilities": []}
     });
     let (workflow, profile, runs) = write_fixture(&root, profile_value);
-    let child = Command::new(std::env::current_exe().expect("test binary"))
+    let stdout = fs::File::create(&stdout_path).expect("oracle stdout file");
+    let stderr = fs::File::create(&stderr_path).expect("oracle stderr file");
+    let (request_tx, request_rx) = mpsc::sync_channel(1);
+    let server = thread::spawn(move || {
+        let result = serve_oracle_request(listener, CANARY);
+        let _ = request_tx.send(result);
+    });
+    let child = binary()
         .args([
-            "--exact",
-            "credential_value_is_absent_from_production_run_readback_surfaces",
+            "--json",
+            "run",
+            workflow.to_str().expect("UTF-8 workflow path"),
+            "--profile",
+            profile.to_str().expect("UTF-8 profile path"),
+            "--input",
+            r#"{"request":"public"}"#,
+            "--workdir",
+            runs.to_str().expect("UTF-8 run base"),
         ])
-        .env(CHILD, "1")
         .env(HANDLE, CANARY)
-        .env(WORKFLOW_ENV, &workflow)
-        .env(PROFILE_ENV, &profile)
-        .env(RUNS_ENV, &runs)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn();
     let child_result = match child {
-        Ok(child) => wait_bounded_child(child),
-        Err(error) => {
-            let _ = server.join();
-            panic!("oracle child should start: {error}");
-        }
+        Ok(child) => wait_bounded_child(
+            child,
+            &stdout_path,
+            &stderr_path,
+            Instant::now() + ORACLE_TIMEOUT,
+        ),
+        Err(_) => Err("oracle child spawn failed".to_owned()),
     };
     let observation_result = request_rx.recv_timeout(ORACLE_TIMEOUT);
     let server_result = server.join();
 
     let child = match child_result {
         Ok(child) => child,
-        Err(error) => panic!("oracle child supervision failed: {error}"),
+        Err(error) => {
+            let server_diagnostic = match (&observation_result, &server_result) {
+                (_, Err(_)) => "oracle server thread failed",
+                (Ok(Err(error)), _) => error,
+                (Err(_), _) => "oracle request observation unavailable",
+                (Ok(Ok(_)), Ok(())) => "oracle server completed",
+            };
+            panic!("oracle child supervision failed: {error}; {server_diagnostic}");
+        }
     };
     assert!(
         child.status.success(),
@@ -976,6 +1111,8 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         String::from_utf8_lossy(&child.stdout).replace(CANARY, "[REDACTED]"),
         String::from_utf8_lossy(&child.stderr).replace(CANARY, "[REDACTED]")
     );
+    assert_no_canary_bytes(&child.stdout, CANARY);
+    assert_no_canary_bytes(&child.stderr, CANARY);
     assert!(server_result.is_ok(), "oracle server should finish");
     let observation = observation_result
         .expect("oracle request observation receive")
@@ -1124,13 +1261,79 @@ fn assert_no_canary_bytes(bytes: &[u8], canary: &str) {
     );
 }
 
-fn assert_no_canary_in_run_root(root: &Path, canary: &str) {
-    for entry in fs::read_dir(root).expect("run root should be readable") {
-        let path = entry.expect("run-root entry").path();
-        if path.is_dir() {
-            assert_no_canary_in_run_root(&path, canary);
-        } else {
-            assert_no_canary_bytes(&fs::read(path).expect("run-root file"), canary);
+fn scan_run_root(root: &Path, canary: &str) -> Result<(), &'static str> {
+    if canary.is_empty() || canary.len() > ORACLE_SCAN_MAX_CANARY_BYTES {
+        return Err("oracle run-root canary length rejected");
+    }
+    let mut pending = vec![(root.to_owned(), 0_usize)];
+    let mut entries = 0_usize;
+    let mut files = 0_usize;
+    let mut total_bytes = 0_usize;
+    let mut buffer = [0_u8; ORACLE_SCAN_CHUNK_BYTES];
+    while let Some((path, depth)) = pending.pop() {
+        if depth > ORACLE_SCAN_MAX_DEPTH {
+            return Err("oracle run-root depth exceeded");
+        }
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|_| "oracle run-root metadata read failed")?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err("oracle run-root symlink rejected");
+        }
+        if file_type.is_dir() {
+            for entry in fs::read_dir(path).map_err(|_| "oracle run-root directory read failed")? {
+                entries += 1;
+                if entries > ORACLE_SCAN_MAX_ENTRIES {
+                    return Err("oracle run-root entry count exceeded");
+                }
+                pending.push((
+                    entry
+                        .map_err(|_| "oracle run-root entry read failed")?
+                        .path(),
+                    depth + 1,
+                ));
+            }
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err("oracle run-root special file rejected");
+        }
+        files += 1;
+        if files > ORACLE_SCAN_MAX_FILES {
+            return Err("oracle run-root file count exceeded");
+        }
+        let mut file = fs::File::open(path).map_err(|_| "oracle run-root file open failed")?;
+        let mut file_bytes = 0_usize;
+        let mut overlap = Vec::with_capacity(canary.len() - 1);
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|_| "oracle run-root file read failed")?;
+            if read == 0 {
+                break;
+            }
+            file_bytes = file_bytes.saturating_add(read);
+            total_bytes = total_bytes.saturating_add(read);
+            if file_bytes > ORACLE_SCAN_MAX_FILE_BYTES {
+                return Err("oracle run-root file bytes exceeded");
+            }
+            if total_bytes > ORACLE_SCAN_MAX_TOTAL_BYTES {
+                return Err("oracle run-root total bytes exceeded");
+            }
+            overlap.extend_from_slice(&buffer[..read]);
+            if overlap
+                .windows(canary.len())
+                .any(|window| window == canary.as_bytes())
+            {
+                return Err("oracle run-root canary detected");
+            }
+            let keep = overlap.len().min(canary.len() - 1);
+            overlap.drain(..overlap.len() - keep);
         }
     }
+    Ok(())
+}
+
+fn assert_no_canary_in_run_root(root: &Path, canary: &str) {
+    scan_run_root(root, canary).expect("bounded run-root scan");
 }
