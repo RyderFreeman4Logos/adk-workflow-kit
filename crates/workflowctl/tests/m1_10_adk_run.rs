@@ -259,6 +259,7 @@ struct RequestObservation {
 const ORACLE_TIMEOUT: Duration = Duration::from_secs(5);
 const ORACLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const ORACLE_SOCKET_TIMEOUT: Duration = Duration::from_millis(100);
+const ORACLE_TERMINAL_QUIET_WINDOW: Duration = Duration::from_millis(25);
 const ORACLE_MAX_REQUEST_BYTES: usize = 64 * 1024;
 const ORACLE_MAX_CHILD_OUTPUT_BYTES: usize = 64 * 1024;
 
@@ -343,11 +344,41 @@ fn read_model_request(
             .position(|byte| *byte == b':')
             .ok_or("oracle request header rejected")?;
         let name = &line[..colon];
+        if name.is_empty()
+            || !name.iter().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            })
+        {
+            return Err("oracle request header rejected");
+        }
         let mut value = &line[colon + 1..];
-        while value.first().is_some_and(u8::is_ascii_whitespace) {
+        while value
+            .first()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        {
             value = &value[1..];
         }
-        while value.last().is_some_and(u8::is_ascii_whitespace) {
+        while value
+            .last()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        {
             value = &value[..value.len() - 1];
         }
         if name.eq_ignore_ascii_case(b"transfer-encoding") {
@@ -423,6 +454,7 @@ fn serve_oracle_request_until_child_done(
     listener: std::net::TcpListener,
     canary: &'static str,
     child_done: mpsc::Receiver<()>,
+    terminal_probe: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
 ) -> Result<RequestObservation, &'static str> {
     listener
         .set_nonblocking(true)
@@ -460,13 +492,18 @@ fn serve_oracle_request_until_child_done(
         .set_nonblocking(true)
         .map_err(|_| "oracle socket nonblocking setup failed")?;
 
+    let mut quiet_deadline = None;
     loop {
-        let child_complete = match child_done.try_recv() {
-            Ok(()) => true,
-            Err(mpsc::TryRecvError::Empty) => false,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return Err("oracle child completion unavailable");
+        let child_complete = if quiet_deadline.is_none() {
+            match child_done.try_recv() {
+                Ok(()) => true,
+                Err(mpsc::TryRecvError::Empty) => false,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err("oracle child completion unavailable");
+                }
             }
+        } else {
+            false
         };
         match listener.accept() {
             Ok(_) => return Err("oracle request count rejected"),
@@ -481,9 +518,27 @@ fn serve_oracle_request_until_child_done(
             Err(_) => return Err("oracle request trailing read failed"),
         }
         if child_complete {
+            if let Some((observed, release)) = &terminal_probe {
+                observed
+                    .send(())
+                    .map_err(|_| "oracle terminal probe unavailable")?;
+                release
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|_| "oracle terminal probe timed out")?;
+            }
+            let now = Instant::now();
+            quiet_deadline = now
+                .checked_add(ORACLE_TERMINAL_QUIET_WINDOW)
+                .filter(|quiet_deadline| *quiet_deadline <= deadline);
+            if quiet_deadline.is_none() {
+                return Err("oracle child completion timed out");
+            }
+        }
+        let now = Instant::now();
+        if quiet_deadline.is_some_and(|quiet_deadline| now >= quiet_deadline) {
             return Ok(observation);
         }
-        if Instant::now() >= deadline {
+        if now >= deadline {
             return Err("oracle child completion timed out");
         }
         thread::yield_now();
@@ -513,6 +568,20 @@ fn append_output_errors(
     }
     if let Err(error) = read_child_output(stderr_path) {
         diagnostics.push(error);
+    }
+}
+
+fn diagnostics_after_cleanup(
+    cleanup: Result<Vec<&'static str>, Vec<&'static str>>,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Vec<&'static str> {
+    match cleanup {
+        Ok(mut diagnostics) => {
+            append_output_errors(&mut diagnostics, stdout_path, stderr_path);
+            diagnostics
+        }
+        Err(diagnostics) => diagnostics,
     }
 }
 
@@ -559,20 +628,16 @@ fn wait_bounded_child(
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::yield_now(),
             Ok(None) => {
-                let mut diagnostics = match clean_up_child(child) {
-                    Ok(diagnostics) | Err(diagnostics) => diagnostics,
-                };
-                append_output_errors(&mut diagnostics, stdout_path, stderr_path);
+                let diagnostics =
+                    diagnostics_after_cleanup(clean_up_child(child), stdout_path, stderr_path);
                 return Err(format!(
                     "oracle child timed out; {}",
                     diagnostics.join("; ")
                 ));
             }
             Err(_) => {
-                let mut diagnostics = match clean_up_child(child) {
-                    Ok(diagnostics) | Err(diagnostics) => diagnostics,
-                };
-                append_output_errors(&mut diagnostics, stdout_path, stderr_path);
+                let diagnostics =
+                    diagnostics_after_cleanup(clean_up_child(child), stdout_path, stderr_path);
                 return Err(format!(
                     "oracle child wait failed; {}",
                     diagnostics.join("; ")
@@ -1164,6 +1229,103 @@ fn oracle_request_reader_rejects_ambiguous_http_framing() {
 }
 
 #[test]
+fn oracle_request_reader_enforces_header_syntax_and_ows() {
+    const CANARY: &str = "synthetic-credential-canary-m3-01-7f3c";
+    let cases = [
+        (
+            "content-length-space-before-colon",
+            b"POST /v1/chat/completions HTTP/1.1\r\ncontent-length : 1\r\ncontent-length: 0\r\n\r\n".as_slice(),
+            "oracle request header rejected",
+        ),
+        (
+            "transfer-encoding-tab-before-colon",
+            b"POST /v1/chat/completions HTTP/1.1\r\ntransfer-encoding\t: chunked\r\ncontent-length: 0\r\n\r\n".as_slice(),
+            "oracle request header rejected",
+        ),
+        (
+            "space-obs-fold",
+            b"POST /v1/chat/completions HTTP/1.1\r\n folded: value\r\ncontent-length: 0\r\n\r\n".as_slice(),
+            "oracle request header rejected",
+        ),
+        (
+            "tab-obs-fold",
+            b"POST /v1/chat/completions HTTP/1.1\r\n\tfolded: value\r\ncontent-length: 0\r\n\r\n".as_slice(),
+            "oracle request header rejected",
+        ),
+        (
+            "empty-field-name",
+            b"POST /v1/chat/completions HTTP/1.1\r\n: value\r\ncontent-length: 0\r\n\r\n".as_slice(),
+            "oracle request header rejected",
+        ),
+        (
+            "separator-in-field-name",
+            b"POST /v1/chat/completions HTTP/1.1\r\nx/name: value\r\ncontent-length: 0\r\n\r\n".as_slice(),
+            "oracle request header rejected",
+        ),
+        (
+            "control-in-field-name",
+            b"POST /v1/chat/completions HTTP/1.1\r\nx\x01name: value\r\ncontent-length: 0\r\n\r\n".as_slice(),
+            "oracle request header rejected",
+        ),
+        (
+            "vertical-tab-around-length",
+            b"POST /v1/chat/completions HTTP/1.1\r\ncontent-length:\x0b0\x0b\r\n\r\n".as_slice(),
+            "oracle request content length invalid",
+        ),
+        (
+            "form-feed-around-length",
+            b"POST /v1/chat/completions HTTP/1.1\r\ncontent-length:\x0c0\x0c\r\n\r\n".as_slice(),
+            "oracle request content length invalid",
+        ),
+        (
+            "carriage-return-around-length",
+            b"POST /v1/chat/completions HTTP/1.1\r\ncontent-length: \r0\r\n\r\n".as_slice(),
+            "oracle request content length invalid",
+        ),
+        (
+            "mixed-case-transfer-encoding",
+            b"POST /v1/chat/completions HTTP/1.1\r\nTrAnSfEr-EnCoDiNg: chunked\r\ncontent-length: 0\r\n\r\n".as_slice(),
+            "oracle request transfer encoding rejected",
+        ),
+    ];
+
+    for (name, request, expected) in cases {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
+        let address = listener.local_addr().expect("oracle listener address");
+        let mut client = std::net::TcpStream::connect(address).expect("oracle client");
+        client.write_all(request).expect("oracle request write");
+        let (mut socket, _) = listener.accept().expect("oracle request");
+        socket
+            .set_read_timeout(Some(ORACLE_SOCKET_TIMEOUT))
+            .expect("oracle socket read timeout");
+        assert!(
+            matches!(
+                read_model_request(&mut socket, Instant::now() + ORACLE_TIMEOUT, CANARY),
+                Err(error) if error == expected
+            ),
+            "{name}: unexpected static diagnostic"
+        );
+    }
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
+    let address = listener.local_addr().expect("oracle listener address");
+    let mut client = std::net::TcpStream::connect(address).expect("oracle client");
+    client
+        .write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\nx!#$%&'*+-.^_`|~: value:with:colons\r\nCoNtEnT-LeNgTh:\t 0 \t\r\n\r\n",
+        )
+        .expect("oracle request write");
+    let (mut socket, _) = listener.accept().expect("oracle request");
+    socket
+        .set_read_timeout(Some(ORACLE_SOCKET_TIMEOUT))
+        .expect("oracle socket read timeout");
+    assert!(
+        read_model_request(&mut socket, Instant::now() + ORACLE_TIMEOUT, CANARY).is_ok(),
+        "legal tchar names, value colons, case folding, and SP/HTAB OWS must remain valid"
+    );
+}
+
+#[test]
 fn oracle_server_rejects_second_physical_request() {
     const CANARY: &str = "synthetic-credential-canary-m3-01-7f3c";
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
@@ -1181,9 +1343,118 @@ fn oracle_server_rejects_second_physical_request() {
     let (_child_done_tx, child_done_rx) = mpsc::sync_channel(1);
 
     assert!(matches!(
-        serve_oracle_request_until_child_done(listener, CANARY, child_done_rx),
+        serve_oracle_request_until_child_done(listener, CANARY, child_done_rx, None),
         Err("oracle request count rejected")
     ));
+}
+
+#[test]
+fn oracle_server_enforces_terminal_quiescence_and_cardinality_edges() {
+    const CANARY: &str = "synthetic-credential-canary-m3-01-7f3c";
+
+    fn connect_and_read_response(
+        address: std::net::SocketAddr,
+        canary: &str,
+    ) -> std::net::TcpStream {
+        let mut client = std::net::TcpStream::connect(address).expect("oracle client");
+        client
+            .set_read_timeout(Some(ORACLE_SOCKET_TIMEOUT))
+            .expect("oracle client read timeout");
+        write!(
+            client,
+            "POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer {canary}\r\ncontent-length: 0\r\n\r\n"
+        )
+        .expect("oracle request write");
+        let deadline = Instant::now() + ORACLE_TIMEOUT;
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 512];
+        while !response
+            .windows(b"oracle-ok".len())
+            .any(|window| window == b"oracle-ok")
+        {
+            match client.read(&mut chunk) {
+                Ok(0) => panic!("oracle response ended early"),
+                Ok(read) => response.extend_from_slice(&chunk[..read]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(_) => panic!("oracle response read failed"),
+            }
+            assert!(Instant::now() < deadline, "oracle response timed out");
+        }
+        client
+    }
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
+    let address = listener.local_addr().expect("oracle listener address");
+    let (child_done_tx, child_done_rx) = mpsc::sync_channel(1);
+    let server = thread::spawn(move || {
+        serve_oracle_request_until_child_done(listener, CANARY, child_done_rx, None)
+    });
+    let mut client = connect_and_read_response(address, CANARY);
+    client.write_all(b"x").expect("delayed same-stream byte");
+    child_done_tx.send(()).expect("child completion signal");
+    assert!(matches!(
+        server.join().expect("oracle server thread"),
+        Err("oracle request trailing bytes rejected")
+    ));
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
+    let address = listener.local_addr().expect("oracle listener address");
+    let (child_done_tx, child_done_rx) = mpsc::sync_channel(1);
+    let (observed_tx, observed_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let server = thread::spawn(move || {
+        serve_oracle_request_until_child_done(
+            listener,
+            CANARY,
+            child_done_rx,
+            Some((observed_tx, release_rx)),
+        )
+    });
+    let mut client = connect_and_read_response(address, CANARY);
+    child_done_tx.send(()).expect("child completion signal");
+    observed_rx
+        .recv_timeout(ORACLE_SOCKET_TIMEOUT)
+        .expect("terminal observation barrier");
+    client.write_all(b"x").expect("terminal-race byte");
+    release_tx.send(()).expect("terminal probe release");
+    assert!(matches!(
+        server.join().expect("oracle server thread"),
+        Err("oracle request trailing bytes rejected")
+    ));
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
+    let address = listener.local_addr().expect("oracle listener address");
+    let mut client = std::net::TcpStream::connect(address).expect("oracle client");
+    client
+        .write_all(b"POST /v1/chat/completions HTTP/1.1\r\ncontent-length: 0\r\n\r\n")
+        .expect("oracle request write");
+    let (mut socket, _) = listener.accept().expect("oracle request");
+    socket
+        .set_read_timeout(Some(ORACLE_SOCKET_TIMEOUT))
+        .expect("oracle socket read timeout");
+    assert!(matches!(
+        read_model_request(&mut socket, Instant::now() + ORACLE_TIMEOUT, ""),
+        Err("oracle request canary length rejected")
+    ));
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
+    let address = listener.local_addr().expect("oracle listener address");
+    let mut client = std::net::TcpStream::connect(address).expect("oracle client");
+    client
+        .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer aaaa\r\ncontent-length: 0\r\n\r\n")
+        .expect("oracle request write");
+    let (mut socket, _) = listener.accept().expect("oracle request");
+    socket
+        .set_read_timeout(Some(ORACLE_SOCKET_TIMEOUT))
+        .expect("oracle socket read timeout");
+    let observation = read_model_request(&mut socket, Instant::now() + ORACLE_TIMEOUT, "aaa")
+        .expect("overlapping canary observation");
+    assert_eq!(observation.authorization_canary_occurrences, 2);
+    assert_eq!(observation.request_canary_occurrences, 2);
 }
 
 const SUPERVISOR_FIXTURE_ENV: &str = "WORKFLOWCTL_ORACLE_SUPERVISOR_FIXTURE";
@@ -1244,6 +1515,33 @@ fn oracle_child_timeout_is_primary_and_directly_reaped() {
     assert!(error.contains("oracle child output exceeded size limit"));
     assert!(!error.contains("reaper"));
     assert!(!error.contains("handoff"));
+}
+
+#[test]
+fn oracle_output_diagnostics_require_proven_reap() {
+    let root = temp_root("oracle-output-diagnostics");
+    let stdout_path = root.join("stdout");
+    let stderr_path = root.join("stderr");
+    fs::write(&stdout_path, vec![b'x'; ORACLE_MAX_CHILD_OUTPUT_BYTES + 1])
+        .expect("proven stdout fixture");
+    fs::write(&stderr_path, []).expect("proven stderr fixture");
+    let proven = diagnostics_after_cleanup(
+        Ok(vec!["oracle child reaped after kill"]),
+        &stdout_path,
+        &stderr_path,
+    );
+    assert!(proven.contains(&"oracle child output exceeded size limit"));
+
+    let unproven = diagnostics_after_cleanup(
+        Err(vec!["oracle child terminal reap not proven"]),
+        &root.join("missing-stdout"),
+        &root.join("missing-stderr"),
+    );
+    assert_eq!(
+        unproven,
+        vec!["oracle child terminal reap not proven"],
+        "unproven terminal cleanup must not access output files"
+    );
 }
 
 #[test]
@@ -1510,7 +1808,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     let stderr = fs::File::create(&stderr_path).expect("oracle stderr file");
     let (child_done_tx, child_done_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
-        serve_oracle_request_until_child_done(listener, CANARY, child_done_rx)
+        serve_oracle_request_until_child_done(listener, CANARY, child_done_rx, None)
     });
     let child = binary()
         .args([
