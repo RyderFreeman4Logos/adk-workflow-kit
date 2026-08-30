@@ -34,6 +34,28 @@ impl Drop for TestRoot {
     }
 }
 
+fn profile() -> ExecutionProfileV1 {
+    ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .expect("profile fixture should parse")
+}
+
+fn workflow() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml")
+}
+
 #[test]
 fn execution_publishes_a_run_scoped_checkpoint_for_restart() {
     let root = TestRoot::new();
@@ -702,4 +724,70 @@ fn execution_persists_resolved_runtime_plan_identity() {
         manifest["resume_identity"],
         format!("resume-v1:{plan_hash}")
     );
+}
+
+#[test]
+fn inspect_missing_run_remains_not_found() {
+    let root = TestRoot::new();
+    let error = ExecutionBackend::inspect(&root.0, "missing-run").expect_err("missing run");
+    assert_eq!(error.kind(), ExecutionErrorKind::RunNotFound);
+}
+
+#[test]
+fn inspect_accepts_current_manifest() {
+    let root = TestRoot::new();
+    let receipt =
+        ExecutionBackend::run(workflow(), profile(), json!({"request":"public"}), &root.0)
+            .expect("fixture run should succeed");
+
+    let inspected = ExecutionBackend::inspect(&root.0, receipt.run_id()).expect("current run");
+    assert_eq!(inspected.run_id(), receipt.run_id());
+    assert_eq!(inspected.status(), "succeeded");
+}
+
+#[test]
+fn execution_rejects_legacy_manifest_as_incompatible() {
+    let root = TestRoot::new();
+    let receipt =
+        ExecutionBackend::run(workflow(), profile(), json!({"request":"public"}), &root.0)
+            .expect("fixture run should succeed");
+    let manifest_path = receipt.run_root().join("run-manifest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("manifest should exist"))
+            .expect("manifest should be JSON");
+    let object = manifest.as_object_mut().expect("manifest object");
+    object.remove("plan_hash");
+    object.remove("resume_identity");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("legacy manifest should encode"),
+    )
+    .expect("legacy manifest should be writable");
+
+    let error = ExecutionBackend::inspect(&root.0, receipt.run_id()).expect_err("legacy run");
+    assert_eq!(error.kind(), ExecutionErrorKind::IncompatibleManifest);
+}
+
+#[test]
+fn resume_rejects_manifest_workdir_identity_mismatch() {
+    let root = TestRoot::new();
+    let receipt =
+        ExecutionBackend::run(workflow(), profile(), json!({"request":"public"}), &root.0)
+            .expect("fixture run should succeed");
+    let manifest_path = receipt.run_root().join("run-manifest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("manifest should exist"))
+            .expect("manifest should be JSON");
+    manifest
+        .as_object_mut()
+        .expect("manifest object")
+        .insert("workdir_id".to_owned(), json!("different-workdir"));
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("manifest should encode"),
+    )
+    .expect("manifest should be writable");
+
+    let error = ExecutionBackend::resume(&root.0, receipt.run_id()).expect_err("mismatch");
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
 }

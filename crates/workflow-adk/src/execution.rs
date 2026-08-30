@@ -619,7 +619,7 @@ impl ExecutionReceipt {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct RunManifestV1 {
+struct RunManifestV2 {
     schema_version: u16,
     run_id: String,
     workflow_id: String,
@@ -635,7 +635,7 @@ struct RunManifestV1 {
     checkpoint_manifest: Option<CheckpointManifestV1>,
 }
 
-impl RunManifestV1 {
+impl RunManifestV2 {
     fn receipt(&self, run_root: PathBuf) -> ExecutionReceipt {
         ExecutionReceipt {
             run_id: self.run_id.clone(),
@@ -663,6 +663,7 @@ pub enum ExecutionErrorKind {
     AuthorizationDenied,
     Persistence,
     RunNotFound,
+    IncompatibleManifest,
     InvalidRunState,
 }
 
@@ -840,8 +841,8 @@ impl ExecutionBackend {
             {
                 persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
             } else {
-                let provisional = RunManifestV1 {
-                    schema_version: 1,
+                let provisional = RunManifestV2 {
+                    schema_version: 2,
                     run_id: run_id.as_str().to_owned(),
                     workflow_id: compiled.ir().workflow_id().as_str().to_owned(),
                     workflow_version: compiled.ir().workflow_version().to_owned(),
@@ -1116,8 +1117,8 @@ impl ExecutionBackend {
             },
             None => "unavailable".to_owned(),
         };
-        let manifest = RunManifestV1 {
-            schema_version: 1,
+        let manifest = RunManifestV2 {
+            schema_version: 2,
             run_id: run_id.as_str().to_owned(),
             workflow_id: compiled.ir().workflow_id().as_str().to_owned(),
             workflow_version: compiled.ir().workflow_version().to_owned(),
@@ -1160,6 +1161,17 @@ impl ExecutionBackend {
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let run_identity = RunId::new(run_id.to_owned())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let base = root
+            .parent()
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let manager = WorkdirManager::new(base)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let run_workdir = manager
+            .reopen(&run_identity, &root)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if run_workdir.id().as_str() != manifest.workdir_id {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
         let mut checkpoint_store = SqliteCheckpointStore::open(
             root.join("checkpoint.sqlite"),
             checkpoint_manifest.clone(),
@@ -1261,14 +1273,6 @@ impl ExecutionBackend {
                 "workflowctl",
                 AdkRuntimeObservationKindV1::WorkflowResumed,
             ))
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let base = root
-            .parent()
-            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let manager = WorkdirManager::new(base)
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let run_workdir = manager
-            .reopen(&run_identity, &root)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let sandbox = RunSandbox::new(
             RunContext::new(run_identity.clone(), run_limits()),
@@ -1626,7 +1630,7 @@ fn bounded_terminal_artifact(
     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
 }
 
-fn find_run(base: &Path, run_id: &str) -> Result<(PathBuf, RunManifestV1), ExecutionError> {
+fn find_run(base: &Path, run_id: &str) -> Result<(PathBuf, RunManifestV2), ExecutionError> {
     WorkdirManager::new(base).map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
     let base =
         fs::canonicalize(base).map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
@@ -1646,12 +1650,20 @@ fn find_run(base: &Path, run_id: &str) -> Result<(PathBuf, RunManifestV1), Execu
         let Ok(bytes) = bounded_read(&manifest_path) else {
             continue;
         };
-        let Ok(manifest) = serde_json::from_slice::<RunManifestV1>(&bytes) else {
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
             continue;
         };
-        if manifest.schema_version == 1 && manifest.run_id == run_id {
+        if value.get("run_id").and_then(Value::as_str) != Some(run_id) {
+            continue;
+        }
+        let manifest = serde_json::from_value::<RunManifestV2>(value)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::IncompatibleManifest))?;
+        if manifest.schema_version == 2 {
             return Ok((path, manifest));
         }
+        return Err(ExecutionError::new(
+            ExecutionErrorKind::IncompatibleManifest,
+        ));
     }
     Err(ExecutionError::new(ExecutionErrorKind::RunNotFound))
 }
