@@ -238,7 +238,8 @@ struct RequestObservation {
     method: String,
     path: String,
     authorization_headers: usize,
-    canary_occurrences: usize,
+    authorization_canary_occurrences: usize,
+    request_canary_occurrences: usize,
 }
 
 const ORACLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -273,6 +274,9 @@ fn read_model_request(
     deadline: Instant,
     canary: &str,
 ) -> Result<RequestObservation, &'static str> {
+    if canary.is_empty() {
+        return Err("oracle request canary length rejected");
+    }
     let mut request = Vec::new();
     let mut buffer = [0_u8; 8192];
     let header_end = loop {
@@ -347,21 +351,30 @@ fn read_model_request(
     let method = request_parts.next().unwrap_or_default().to_owned();
     let path = request_parts.next().unwrap_or_default().to_owned();
     let mut authorization_headers = 0;
-    let mut canary_occurrences = 0;
-    for line in lines {
-        match line.split_once(':') {
-            Some((name, value)) if name.eq_ignore_ascii_case("authorization") => {
-                authorization_headers += 1;
-                canary_occurrences += value.matches(canary).count();
-            }
-            _ => {}
+    let mut authorization_canary_occurrences = 0;
+    for line in request[..header_end].split(|byte| *byte == b'\n').skip(1) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        if line[..colon].eq_ignore_ascii_case(b"authorization") {
+            authorization_headers += 1;
+            authorization_canary_occurrences += line[colon + 1..]
+                .windows(canary.len())
+                .filter(|window| *window == canary.as_bytes())
+                .count();
         }
     }
+    let request_canary_occurrences = request
+        .windows(canary.len())
+        .filter(|window| *window == canary.as_bytes())
+        .count();
     Ok(RequestObservation {
         method,
         path,
         authorization_headers,
-        canary_occurrences,
+        authorization_canary_occurrences,
+        request_canary_occurrences,
     })
 }
 
@@ -954,6 +967,44 @@ fn oracle_request_reader_rejects_oversized_body() {
     ));
 }
 
+#[test]
+fn oracle_request_reader_counts_canary_across_complete_request() {
+    const CANARY: &str = "synthetic-credential-canary-m3-01-7f3c";
+    let requests = [
+        (
+            "duplicate-header",
+            format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer {CANARY}\r\nx-extra: {CANARY}\r\ncontent-length: 0\r\n\r\n"
+            ),
+        ),
+        (
+            "duplicate-body",
+            format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer {CANARY}\r\ncontent-length: {}\r\n\r\n{CANARY}",
+                CANARY.len()
+            ),
+        ),
+    ];
+
+    for (name, request) in requests {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
+        let address = listener.local_addr().expect("oracle listener address");
+        let mut client = std::net::TcpStream::connect(address).expect("oracle client");
+        client
+            .write_all(request.as_bytes())
+            .expect("oracle request write");
+        let (mut socket, _) = listener.accept().expect("oracle request");
+        socket
+            .set_read_timeout(Some(ORACLE_SOCKET_TIMEOUT))
+            .expect("oracle socket read timeout");
+        let observation = read_model_request(&mut socket, Instant::now() + ORACLE_TIMEOUT, CANARY)
+            .expect("oracle request observation");
+        assert_eq!(observation.authorization_headers, 1, "{name}");
+        assert_eq!(observation.authorization_canary_occurrences, 1, "{name}");
+        assert_eq!(observation.request_canary_occurrences, 2, "{name}");
+    }
+}
+
 const SUPERVISOR_FIXTURE_ENV: &str = "WORKFLOWCTL_ORACLE_SUPERVISOR_FIXTURE";
 
 #[test]
@@ -1301,7 +1352,8 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     assert_eq!(observation.method, "POST");
     assert_eq!(observation.path, "/v1/chat/completions");
     assert_eq!(observation.authorization_headers, 1);
-    assert_eq!(observation.canary_occurrences, 1);
+    assert_eq!(observation.authorization_canary_occurrences, 1);
+    assert_eq!(observation.request_canary_occurrences, 1);
 
     let run_root = run_root(&runs);
     let manifest_bytes = fs::read(run_root.join("run-manifest.json")).expect("run manifest");
