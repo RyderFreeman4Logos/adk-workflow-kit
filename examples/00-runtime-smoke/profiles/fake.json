@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "model": {
+    "provider": "fake",
+    "name": "m3-00-fake",
+    "version": "1",
+    "model": "fake-runtime",
+    "responses": ["runtime smoke complete"]
+  },
+  "tool": {
+    "name": "echo",
+    "result": {"echo": "runtime smoke"},
+    "required_capabilities": [],
+    "required_scopes": []
+  },
+  "sandbox": {"capabilities": []}
+}
