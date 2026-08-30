@@ -224,13 +224,27 @@ fn json_stdout(output: &Output) -> Value {
     })
 }
 
+fn sole_run_root(runs: &Path) -> Result<PathBuf, &'static str> {
+    let mut roots = fs::read_dir(runs).map_err(|_| "oracle run base read failed")?;
+    let root = roots
+        .next()
+        .transpose()
+        .map_err(|_| "oracle run entry read failed")?
+        .ok_or("oracle run root missing")?
+        .path();
+    if roots
+        .next()
+        .transpose()
+        .map_err(|_| "oracle run entry read failed")?
+        .is_some()
+    {
+        return Err("oracle run root count rejected");
+    }
+    Ok(root)
+}
+
 fn run_root(runs: &Path) -> PathBuf {
-    let roots = fs::read_dir(runs)
-        .expect("run base must be readable")
-        .map(|entry| entry.expect("run entry must be readable").path())
-        .collect::<Vec<_>>();
-    assert_eq!(roots.len(), 1, "one invocation must allocate one run root");
-    roots[0].clone()
+    sole_run_root(runs).expect("one invocation must allocate one run root")
 }
 
 #[derive(Debug)]
@@ -305,18 +319,63 @@ fn read_model_request(
         }
     };
 
-    let content_length = {
-        let header_text = String::from_utf8_lossy(&request[..header_end]);
-        header_text
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .ok_or("oracle request content length missing or invalid")?
-    };
+    let mut lines = request[..header_end].split(|byte| *byte == b'\n');
+    let request_line = lines
+        .next()
+        .and_then(|line| line.strip_suffix(b"\r"))
+        .ok_or("oracle request line rejected")?;
+    if request_line != b"POST /v1/chat/completions HTTP/1.1" {
+        return Err("oracle request line rejected");
+    }
+
+    let mut content_length = None;
+    let mut authorization_headers = 0;
+    let mut authorization_canary_occurrences = 0;
+    for line in lines {
+        let line = line
+            .strip_suffix(b"\r")
+            .ok_or("oracle request header rejected")?;
+        if line.is_empty() {
+            break;
+        }
+        let colon = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or("oracle request header rejected")?;
+        let name = &line[..colon];
+        let mut value = &line[colon + 1..];
+        while value.first().is_some_and(u8::is_ascii_whitespace) {
+            value = &value[1..];
+        }
+        while value.last().is_some_and(u8::is_ascii_whitespace) {
+            value = &value[..value.len() - 1];
+        }
+        if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            return Err("oracle request transfer encoding rejected");
+        }
+        if name.eq_ignore_ascii_case(b"content-length") {
+            if content_length.is_some() {
+                return Err("oracle request content length duplicated");
+            }
+            if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+                return Err("oracle request content length invalid");
+            }
+            let length = value.iter().try_fold(0_usize, |length, digit| {
+                length
+                    .checked_mul(10)?
+                    .checked_add(usize::from(*digit - b'0'))
+            });
+            content_length = Some(length.ok_or("oracle request content length invalid")?);
+        }
+        if name.eq_ignore_ascii_case(b"authorization") {
+            authorization_headers += 1;
+            authorization_canary_occurrences += value
+                .windows(canary.len())
+                .filter(|window| *window == canary.as_bytes())
+                .count();
+        }
+    }
+    let content_length = content_length.ok_or("oracle request content length missing")?;
     if content_length > ORACLE_MAX_REQUEST_BYTES.saturating_sub(header_end) {
         return Err("oracle request body exceeded size limit");
     }
@@ -343,44 +402,27 @@ fn read_model_request(
         }
         request.extend_from_slice(&buffer[..bytes]);
     }
-
-    let header_text = String::from_utf8_lossy(&request[..header_end]);
-    let mut lines = header_text.lines();
-    let request_line = lines.next().ok_or("oracle request line missing")?;
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts.next().unwrap_or_default().to_owned();
-    let path = request_parts.next().unwrap_or_default().to_owned();
-    let mut authorization_headers = 0;
-    let mut authorization_canary_occurrences = 0;
-    for line in request[..header_end].split(|byte| *byte == b'\n').skip(1) {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
-            continue;
-        };
-        if line[..colon].eq_ignore_ascii_case(b"authorization") {
-            authorization_headers += 1;
-            authorization_canary_occurrences += line[colon + 1..]
-                .windows(canary.len())
-                .filter(|window| *window == canary.as_bytes())
-                .count();
-        }
+    if request.len() != request_end {
+        return Err("oracle request trailing bytes rejected");
     }
+
     let request_canary_occurrences = request
         .windows(canary.len())
         .filter(|window| *window == canary.as_bytes())
         .count();
     Ok(RequestObservation {
-        method,
-        path,
+        method: "POST".to_owned(),
+        path: "/v1/chat/completions".to_owned(),
         authorization_headers,
         authorization_canary_occurrences,
         request_canary_occurrences,
     })
 }
 
-fn serve_oracle_request(
+fn serve_oracle_request_until_child_done(
     listener: std::net::TcpListener,
     canary: &'static str,
+    child_done: mpsc::Receiver<()>,
 ) -> Result<RequestObservation, &'static str> {
     listener
         .set_nonblocking(true)
@@ -414,7 +456,38 @@ fn serve_oracle_request(
     )
     .map_err(|_| "oracle response write failed")?;
     socket.flush().map_err(|_| "oracle response flush failed")?;
-    Ok(observation)
+    socket
+        .set_nonblocking(true)
+        .map_err(|_| "oracle socket nonblocking setup failed")?;
+
+    loop {
+        let child_complete = match child_done.try_recv() {
+            Ok(()) => true,
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err("oracle child completion unavailable");
+            }
+        };
+        match listener.accept() {
+            Ok(_) => return Err("oracle request count rejected"),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return Err("oracle listener accept failed"),
+        }
+        let mut trailing = [0_u8; 1];
+        match socket.read(&mut trailing) {
+            Ok(0) => {}
+            Ok(_) => return Err("oracle request trailing bytes rejected"),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return Err("oracle request trailing read failed"),
+        }
+        if child_complete {
+            return Ok(observation);
+        }
+        if Instant::now() >= deadline {
+            return Err("oracle child completion timed out");
+        }
+        thread::yield_now();
+    }
 }
 
 fn read_child_output(path: &Path) -> Result<Vec<u8>, &'static str> {
@@ -1005,6 +1078,114 @@ fn oracle_request_reader_counts_canary_across_complete_request() {
     }
 }
 
+#[test]
+fn oracle_request_reader_rejects_ambiguous_http_framing() {
+    const CANARY: &str = "synthetic-credential-canary-m3-01-7f3c";
+    let requests = [
+        (
+            "request-line-extra-token",
+            "POST /v1/chat/completions HTTP/1.1 extra\r\ncontent-length: 0\r\n\r\n".to_owned(),
+            "oracle request line rejected",
+        ),
+        (
+            "request-line-version",
+            "POST /v1/chat/completions HTTP/2\r\ncontent-length: 0\r\n\r\n".to_owned(),
+            "oracle request line rejected",
+        ),
+        (
+            "duplicate-content-length",
+            "POST /v1/chat/completions HTTP/1.1\r\ncontent-length: 0\r\ncontent-length: 0\r\n\r\n".to_owned(),
+            "oracle request content length duplicated",
+        ),
+        (
+            "conflicting-content-length",
+            "POST /v1/chat/completions HTTP/1.1\r\ncontent-length: 0\r\ncontent-length: 1\r\n\r\nx".to_owned(),
+            "oracle request content length duplicated",
+        ),
+        (
+            "malformed-content-length",
+            "POST /v1/chat/completions HTTP/1.1\r\ncontent-length: nope\r\n\r\n".to_owned(),
+            "oracle request content length invalid",
+        ),
+        (
+            "overflow-content-length",
+            format!(
+                "POST /v1/chat/completions HTTP/1.1\r\ncontent-length: {}0\r\n\r\n",
+                usize::MAX
+            ),
+            "oracle request content length invalid",
+        ),
+        (
+            "transfer-encoding-with-content-length",
+            "POST /v1/chat/completions HTTP/1.1\r\ntransfer-encoding: chunked\r\ncontent-length: 0\r\n\r\n".to_owned(),
+            "oracle request transfer encoding rejected",
+        ),
+        (
+            "transfer-encoding-only",
+            "POST /v1/chat/completions HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n".to_owned(),
+            "oracle request transfer encoding rejected",
+        ),
+        (
+            "missing-framing",
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: localhost\r\n\r\n".to_owned(),
+            "oracle request content length missing",
+        ),
+        (
+            "trailing-byte",
+            "POST /v1/chat/completions HTTP/1.1\r\ncontent-length: 0\r\n\r\nx".to_owned(),
+            "oracle request trailing bytes rejected",
+        ),
+        (
+            "pipelined-request",
+            "POST /v1/chat/completions HTTP/1.1\r\ncontent-length: 0\r\n\r\nPOST /v1/chat/completions HTTP/1.1\r\ncontent-length: 0\r\n\r\n".to_owned(),
+            "oracle request trailing bytes rejected",
+        ),
+    ];
+
+    for (name, request, expected) in requests {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
+        let address = listener.local_addr().expect("oracle listener address");
+        let mut client = std::net::TcpStream::connect(address).expect("oracle client");
+        client
+            .write_all(request.as_bytes())
+            .expect("oracle request write");
+        let (mut socket, _) = listener.accept().expect("oracle request");
+        socket
+            .set_read_timeout(Some(ORACLE_SOCKET_TIMEOUT))
+            .expect("oracle socket read timeout");
+        assert!(
+            matches!(
+                read_model_request(&mut socket, Instant::now() + ORACLE_TIMEOUT, CANARY),
+                Err(error) if error == expected
+            ),
+            "{name}: unexpected request parser result"
+        );
+    }
+}
+
+#[test]
+fn oracle_server_rejects_second_physical_request() {
+    const CANARY: &str = "synthetic-credential-canary-m3-01-7f3c";
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
+    let address = listener.local_addr().expect("oracle listener address");
+    let mut clients = Vec::new();
+    for _ in 0..2 {
+        let mut client = std::net::TcpStream::connect(address).expect("oracle client");
+        write!(
+            client,
+            "POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer {CANARY}\r\ncontent-length: 0\r\n\r\n"
+        )
+        .expect("oracle request write");
+        clients.push(client);
+    }
+    let (_child_done_tx, child_done_rx) = mpsc::sync_channel(1);
+
+    assert!(matches!(
+        serve_oracle_request_until_child_done(listener, CANARY, child_done_rx),
+        Err("oracle request count rejected")
+    ));
+}
+
 const SUPERVISOR_FIXTURE_ENV: &str = "WORKFLOWCTL_ORACLE_SUPERVISOR_FIXTURE";
 
 #[test]
@@ -1268,6 +1449,41 @@ fn oracle_run_root_scan_enforces_tiny_boundary_matrix() {
 }
 
 #[test]
+fn oracle_run_root_admission_is_bounded_before_readback() {
+    let runs = temp_root("run-root-admission");
+    assert!(matches!(
+        sole_run_root(&runs),
+        Err("oracle run root missing")
+    ));
+
+    let only = runs.join("only");
+    fs::create_dir(&only).expect("sole run root fixture");
+    assert_eq!(sole_run_root(&runs).expect("sole run root"), only);
+
+    fs::create_dir(runs.join("extra")).expect("extra run root fixture");
+    assert!(matches!(
+        sole_run_root(&runs),
+        Err("oracle run root count rejected")
+    ));
+    fs::remove_dir(runs.join("extra")).expect("remove extra run root fixture");
+
+    fs::write(only.join("oversized"), b"12345").expect("oversized persisted fixture");
+    let limits = ScanLimits {
+        depth: 2,
+        entries: 2,
+        files: 1,
+        file_bytes: 4,
+        total_bytes: 8,
+        chunk_bytes: 2,
+        canary_bytes: 4,
+    };
+    assert!(matches!(
+        scan_run_root_with_limits(&only, "safe", limits),
+        Err("oracle run-root file bytes exceeded")
+    ));
+}
+
+#[test]
 fn credential_value_is_absent_from_production_run_readback_surfaces() {
     const HANDLE: &str = "WORKFLOWCTL_CREDENTIAL_ORACLE_HANDLE";
     const CANARY: &str = "synthetic-credential-canary-m3-01-7f3c";
@@ -1292,10 +1508,9 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     let (workflow, profile, runs) = write_fixture(&root, profile_value);
     let stdout = fs::File::create(&stdout_path).expect("oracle stdout file");
     let stderr = fs::File::create(&stderr_path).expect("oracle stderr file");
-    let (request_tx, request_rx) = mpsc::sync_channel(1);
+    let (child_done_tx, child_done_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
-        let result = serve_oracle_request(listener, CANARY);
-        let _ = request_tx.send(result);
+        serve_oracle_request_until_child_done(listener, CANARY, child_done_rx)
     });
     let child = binary()
         .args([
@@ -1322,17 +1537,16 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         ),
         Err(_) => Err("oracle child spawn failed".to_owned()),
     };
-    let observation_result = request_rx.recv_timeout(ORACLE_TIMEOUT);
+    let _ = child_done_tx.send(());
     let server_result = server.join();
 
     let child = match child_result {
         Ok(child) => child,
         Err(error) => {
-            let server_diagnostic = match (&observation_result, &server_result) {
-                (_, Err(_)) => "oracle server thread failed",
-                (Ok(Err(error)), _) => error,
-                (Err(_), _) => "oracle request observation unavailable",
-                (Ok(Ok(_)), Ok(())) => "oracle server completed",
+            let server_diagnostic = match &server_result {
+                Err(_) => "oracle server thread failed",
+                Ok(Err(error)) => error,
+                Ok(Ok(_)) => "oracle server completed",
             };
             panic!("oracle child supervision failed: {error}; {server_diagnostic}");
         }
@@ -1345,9 +1559,8 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     );
     assert_no_canary_bytes(&child.stdout, CANARY);
     assert_no_canary_bytes(&child.stderr, CANARY);
-    assert!(server_result.is_ok(), "oracle server should finish");
-    let observation = observation_result
-        .expect("oracle request observation receive")
+    let observation = server_result
+        .expect("oracle server thread")
         .expect("oracle request observation");
     assert_eq!(observation.method, "POST");
     assert_eq!(observation.path, "/v1/chat/completions");
@@ -1355,7 +1568,8 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     assert_eq!(observation.authorization_canary_occurrences, 1);
     assert_eq!(observation.request_canary_occurrences, 1);
 
-    let run_root = run_root(&runs);
+    let run_root = sole_run_root(&runs).expect("sole oracle run root");
+    assert_no_canary_in_run_root(&run_root, CANARY);
     let manifest_bytes = fs::read(run_root.join("run-manifest.json")).expect("run manifest");
     assert_no_canary_bytes(&manifest_bytes, CANARY);
     let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("manifest JSON");
@@ -1385,19 +1599,44 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     assert_ne!(stored_profile["model"]["credential_env"], CANARY);
 
     let run_id = manifest["run_id"].as_str().expect("run ID");
-    let inspect = command_json(&[
-        "--json",
-        "inspect",
-        "--run-id",
-        run_id,
-        "--workdir",
-        runs.to_str().expect("UTF-8 runs path"),
-    ]);
+    let inspect_stdout_path = root.join("workflowctl-inspect.stdout");
+    let inspect_stderr_path = root.join("workflowctl-inspect.stderr");
+    let inspect_child = binary()
+        .args([
+            "--json",
+            "inspect",
+            "--run-id",
+            run_id,
+            "--workdir",
+            runs.to_str().expect("UTF-8 runs path"),
+        ])
+        .stdout(Stdio::from(
+            fs::File::create(&inspect_stdout_path).expect("oracle inspect stdout file"),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(&inspect_stderr_path).expect("oracle inspect stderr file"),
+        ))
+        .spawn()
+        .expect("oracle inspect child spawn");
+    let inspect = wait_bounded_child(
+        inspect_child,
+        &inspect_stdout_path,
+        &inspect_stderr_path,
+        Instant::now() + ORACLE_TIMEOUT,
+    )
+    .expect("bounded oracle inspect child");
+    assert!(
+        inspect.status.success(),
+        "oracle inspect must succeed (stdout={}, stderr={})",
+        String::from_utf8_lossy(&inspect.stdout).replace(CANARY, "[REDACTED]"),
+        String::from_utf8_lossy(&inspect.stderr).replace(CANARY, "[REDACTED]")
+    );
     assert_no_canary_bytes(&inspect.stdout, CANARY);
     assert_no_canary_bytes(&inspect.stderr, CANARY);
     let inspected = json_stdout(&inspect);
     assert_eq!(inspected["status"], "succeeded");
     assert_eq!(inspected["run_id"], run_id);
+    assert_no_canary_in_run_root(&run_root, CANARY);
 
     let checkpoint_manifest: CheckpointManifestV1 =
         serde_json::from_value(manifest["checkpoint_manifest"].clone())
