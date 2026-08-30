@@ -218,9 +218,7 @@ impl RuntimePlanRequest {
         for route in ir.routes() {
             request = request.with_predicate(route.predicate().id(), route.predicate().version());
         }
-        for resource in ir.resources() {
-            request = request.with_artifact(resource.path(), resource.sha256());
-        }
+        // IR resources are immutable locks carried by `ir_hash`, not executable artifacts.
         request
     }
     fn with_binding(mut self, category: BindingCategory, id: &str, version: &str) -> Self {

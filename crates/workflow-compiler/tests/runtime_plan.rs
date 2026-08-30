@@ -170,7 +170,7 @@ fn resolution_covers_all_backend_neutral_projection_categories() {
 }
 
 #[test]
-fn from_ir_collects_predicates_and_all_ir_resources() {
+fn from_ir_resolves_predicates_but_resources_are_ir_locks() {
     let source = r#"
 schema_version = 1
 [[nodes]]
@@ -199,32 +199,26 @@ sha256 = "sha256:top"
     let spec = parse_str("routed.toml", source).expect("fixture parses");
     let request = RuntimePlanRequest::from_ir(&WorkflowIr::from(&spec));
     let registry = RecordingRegistry::default();
-    ResolvedRuntimePlan::resolve(request, &registry).expect("all IR references resolve");
+    let plan = ResolvedRuntimePlan::resolve(request, &registry).expect("predicate resolves");
     assert_eq!(
         registry.calls.borrow().clone(),
-        vec![
-            (
-                BindingCategory::Predicate,
-                "route-predicate".into(),
-                "7".into()
-            ),
-            (
-                BindingCategory::Artifact,
-                "node.bin".into(),
-                "sha256:node".into()
-            ),
-            (
-                BindingCategory::Artifact,
-                "top.bin".into(),
-                "sha256:top".into()
-            ),
-            (
-                BindingCategory::Artifact,
-                "workflow.bin".into(),
-                "sha256:workflow".into()
-            ),
-        ]
+        vec![(
+            BindingCategory::Predicate,
+            "route-predicate".into(),
+            "7".into()
+        )]
     );
+    assert!(plan.artifacts().is_empty());
+
+    let changed = source.replace("sha256:top", "sha256:changed");
+    let changed_spec = parse_str("routed.toml", &changed).expect("changed fixture parses");
+    let changed_plan = ResolvedRuntimePlan::resolve(
+        RuntimePlanRequest::from_ir(&WorkflowIr::from(&changed_spec)),
+        &RecordingRegistry::default(),
+    )
+    .expect("changed predicate resolves");
+    assert_ne!(plan.plan_hash(), changed_plan.plan_hash());
+    assert_ne!(plan.resume_identity(), changed_plan.resume_identity());
 }
 
 #[derive(Default)]

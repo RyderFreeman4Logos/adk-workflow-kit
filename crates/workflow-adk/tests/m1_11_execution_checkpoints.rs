@@ -56,6 +56,31 @@ fn workflow() -> PathBuf {
         .join("../workflowctl/tests/fixtures/minimal.workflow.toml")
 }
 
+fn resource_workflow_source(digest: &str) -> String {
+    format!(
+        r#"schema_version = 1
+
+[workflow]
+id = "resource-workflow"
+version = "1"
+entry = "start"
+resources = [{{ path = "workflow.bin", sha256 = "{digest}" }}]
+
+[[nodes]]
+id = "start"
+kind = "agent"
+
+[[nodes]]
+id = "done"
+kind = "terminal"
+
+[[edges]]
+from = "start"
+to = "done"
+"#
+    )
+}
+
 fn capability_profile(backend: &[&str], requested: &[&str]) -> ExecutionProfileV1 {
     ExecutionProfileV1::parse(
         &serde_json::to_vec(&json!({
@@ -167,6 +192,44 @@ fn execution_publishes_a_run_scoped_checkpoint_for_restart() {
     let checkpoint = store.load_latest(&run_id).unwrap().expect("checkpoint");
     assert!(checkpoint.event_sequence() > 0);
     assert!(!checkpoint.state().is_empty());
+}
+
+#[test]
+fn execution_with_declared_resource_reaches_model_and_records_plan_identity() {
+    let root = TestRoot::new();
+    let workflow = root.0.join("resource.workflow.toml");
+    fs::write(&workflow, resource_workflow_source("sha256:resource-v1")).unwrap();
+
+    let receipt = ExecutionBackend::run(&workflow, profile(), json!({"request":"public"}), &root.0)
+        .expect("resource-bearing workflow should execute");
+    assert_eq!(receipt.status(), "succeeded");
+    assert!(!receipt.plan_hash().is_empty());
+
+    let resumed = ExecutionBackend::resume(&root.0, receipt.run_id())
+        .expect("resource-bearing workflow should resume");
+    assert_eq!(resumed.plan_hash(), receipt.plan_hash());
+    assert_eq!(resumed.resume_identity(), receipt.resume_identity());
+}
+
+#[test]
+fn resource_digest_change_rejects_resume_before_graph_invocation() {
+    let root = TestRoot::new();
+    let workflow = root.0.join("resource.workflow.toml");
+    fs::write(&workflow, resource_workflow_source("sha256:resource-v1")).unwrap();
+    let receipt = ExecutionBackend::run(&workflow, profile(), json!({"request":"public"}), &root.0)
+        .expect("resource-bearing workflow should execute");
+    let events_path = receipt.run_root().join("events.jsonl");
+    let before = fs::read(&events_path).unwrap();
+    let persisted_workflow = receipt.run_root().join("workflow.toml");
+    let changed = fs::read_to_string(&persisted_workflow)
+        .unwrap()
+        .replace("sha256:resource-v1", "sha256:resource-v2");
+    fs::write(persisted_workflow, changed).unwrap();
+
+    let error = ExecutionBackend::resume(&root.0, receipt.run_id())
+        .expect_err("changed resource identity must reject resume");
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(fs::read(events_path).unwrap(), before);
 }
 
 #[test]
