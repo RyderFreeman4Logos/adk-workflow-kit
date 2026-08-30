@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -81,14 +82,36 @@ fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_workflowctl"))
 }
 
-fn temp_root(label: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "workflowctl-m1-10-{label}-{}-{}",
-        std::process::id(),
-        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir(&root).expect("test root must be unique");
-    root
+struct TempRoot(PathBuf);
+
+impl TempRoot {
+    fn new(label: &str) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "workflowctl-m1-10-{label}-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("test root must be unique");
+        Self(root)
+    }
+}
+
+impl std::ops::Deref for TempRoot {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn temp_root(label: &str) -> TempRoot {
+    TempRoot::new(label)
 }
 
 fn write_fixture(root: &Path, profile: Value) -> (PathBuf, PathBuf, PathBuf) {
@@ -224,13 +247,27 @@ const ORACLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const ORACLE_SOCKET_TIMEOUT: Duration = Duration::from_millis(100);
 const ORACLE_MAX_REQUEST_BYTES: usize = 64 * 1024;
 const ORACLE_MAX_CHILD_OUTPUT_BYTES: usize = 64 * 1024;
-const ORACLE_SCAN_MAX_DEPTH: usize = 8;
-const ORACLE_SCAN_MAX_ENTRIES: usize = 512;
-const ORACLE_SCAN_MAX_FILES: usize = 256;
-const ORACLE_SCAN_MAX_FILE_BYTES: usize = 1024 * 1024;
-const ORACLE_SCAN_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
-const ORACLE_SCAN_CHUNK_BYTES: usize = 8192;
-const ORACLE_SCAN_MAX_CANARY_BYTES: usize = 256;
+
+#[derive(Clone, Copy)]
+struct ScanLimits {
+    depth: usize,
+    entries: usize,
+    files: usize,
+    file_bytes: usize,
+    total_bytes: usize,
+    chunk_bytes: usize,
+    canary_bytes: usize,
+}
+
+const ORACLE_SCAN_LIMITS: ScanLimits = ScanLimits {
+    depth: 8,
+    entries: 512,
+    files: 256,
+    file_bytes: 1024 * 1024,
+    total_bytes: 8 * 1024 * 1024,
+    chunk_bytes: 8192,
+    canary_bytes: 256,
+};
 
 fn read_model_request(
     socket: &mut std::net::TcpStream,
@@ -414,15 +451,41 @@ fn clean_up_child(mut child: Child) -> Vec<&'static str> {
                 thread::yield_now();
             }
             Ok(None) | Err(_) => {
-                let diagnostic = match thread::Builder::new()
+                let owner = Arc::new(Mutex::new(Some(child)));
+                let reaper_owner = Arc::clone(&owner);
+                match thread::Builder::new()
                     .name("oracle-delayed-reaper".to_owned())
                     .spawn(move || {
-                        let _ = child.wait();
+                        if let Some(mut child) = reaper_owner
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take()
+                        {
+                            let _ = child.wait();
+                        }
                     }) {
-                    Ok(_) => "oracle child cleanup timed out; delayed reaper started",
-                    Err(_) => "oracle child cleanup timed out; delayed reaper start failed",
-                };
-                diagnostics.push(diagnostic);
+                    Ok(_) => {
+                        diagnostics.push("oracle child cleanup timed out; delayed reaper started")
+                    }
+                    Err(_) => {
+                        diagnostics
+                            .push("oracle child cleanup timed out; delayed reaper start failed");
+                        if let Some(mut child) = owner
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take()
+                        {
+                            if child.kill().is_err() {
+                                diagnostics.push("oracle child synchronous kill failed");
+                            }
+                            if child.wait().is_ok() {
+                                diagnostics.push("oracle child synchronously reaped");
+                            } else {
+                                diagnostics.push("oracle child synchronous reap failed");
+                            }
+                        }
+                    }
+                }
                 return diagnostics;
             }
         }
@@ -505,8 +568,6 @@ fn subprocess_adk_run_needs_no_transform_module_and_persists_state() {
         !artifacts.is_empty(),
         "successful run must persist an artifact"
     );
-
-    fs::remove_dir_all(root).expect("test root must be removed");
 }
 
 #[test]
@@ -522,8 +583,6 @@ fn fake_model_and_tool_execute_end_to_end_through_adk_events() {
     assert!(events.contains("model-ok"));
     assert!(events.contains("\"kind\":\"tool_completed\""));
     assert!(events.contains("tool-ok"));
-
-    fs::remove_dir_all(root).expect("test root must be removed");
 }
 
 #[test]
@@ -560,8 +619,6 @@ fn profile_graph_runs_non_agent_nodes_through_the_wasm_backend() {
             "{node} must preserve the WASM transform output instead of a true placeholder"
         );
     }
-
-    fs::remove_dir_all(root).expect("test root must be removed");
 }
 
 #[test]
@@ -617,8 +674,6 @@ fn large_non_agent_outputs_are_individually_persisted_and_inspectable() {
         assert_eq!(persisted, input_value);
     }
     assert!(combined_bytes > 64 * 1024);
-
-    fs::remove_dir_all(root).expect("test root must be removed");
 }
 
 #[test]
@@ -658,8 +713,6 @@ fn oversized_node_output_reference_aggregate_remains_bounded_and_inspectable() {
             .as_str()
             .is_some_and(|digest| digest.starts_with("sha256:"))
     );
-
-    fs::remove_dir_all(root).expect("test root must be removed");
 }
 
 #[test]
@@ -736,8 +789,6 @@ fn post_execution_artifact_failure_still_persists_the_returned_receipt() {
         runs.to_str().expect("UTF-8 run base"),
     ]);
     assert_eq!(json_stdout(&inspect), failed_receipt);
-
-    fs::remove_dir_all(root).expect("test root must be removed");
 }
 
 #[test]
@@ -760,8 +811,6 @@ fn invalid_profile_fails_closed_with_stable_exit_code() {
             .is_none(),
         "invalid profile must fail before allocating run state"
     );
-
-    fs::remove_dir_all(root).expect("test root must be removed");
 }
 
 #[test]
@@ -781,8 +830,6 @@ fn sandbox_denial_fails_before_backend_spawn() {
             .is_none(),
         "sandbox denial must happen before workdir allocation or backend spawn"
     );
-
-    fs::remove_dir_all(root).expect("test root must be removed");
 }
 
 #[test]
@@ -826,8 +873,6 @@ fn failed_profile_run_persists_and_remains_inspectable() {
             .is_some(),
         "failed run must persist a terminal artifact"
     );
-
-    fs::remove_dir_all(root).expect("test root must be removed");
 }
 
 #[test]
@@ -847,8 +892,6 @@ fn oversized_agent_only_profile_input_fails_before_run_allocation() {
             .is_none(),
         "oversized input must fail before allocating run state"
     );
-
-    fs::remove_dir_all(root).expect("test root must be removed");
 }
 
 #[test]
@@ -888,8 +931,6 @@ fn resume_and_inspect_reuse_the_original_run_identity() {
     let events = fs::read_to_string(run_root(&runs).join("events.jsonl"))
         .expect("resumed events must be readable");
     assert!(events.contains("\"kind\":\"workflow_resumed\""));
-
-    fs::remove_dir_all(root).expect("test root must be removed");
 }
 
 #[test]
@@ -985,54 +1026,218 @@ fn oracle_child_timeout_is_primary_and_directly_reaped() {
         }
         thread::yield_now();
     }
-    let pid = child.id();
-    let (result_tx, result_rx) = mpsc::sync_channel(1);
-    let supervisor = thread::spawn(move || {
-        let result = wait_bounded_child(
-            child,
-            &stdout_path,
-            &stderr_path,
-            Instant::now() + Duration::from_millis(100),
-        );
-        result_tx.send(result).expect("supervisor result receiver");
-    });
-    let error = result_rx
-        .recv_timeout(ORACLE_TIMEOUT)
-        .expect("supervisor must finish boundedly")
-        .expect_err("fixture child must time out");
-    supervisor.join().expect("supervisor thread must finish");
+    let error = wait_bounded_child(
+        child,
+        &stdout_path,
+        &stderr_path,
+        Instant::now() + Duration::from_millis(100),
+    )
+    .expect_err("fixture child must time out");
     assert!(error.starts_with("oracle child timed out"));
     assert!(error.contains("oracle child reaped after kill"));
     assert!(error.contains("oracle child output exceeded size limit"));
-    // SAFETY: signal 0 only probes whether the directly owned child PID still exists.
-    let probe = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    assert_eq!(probe, -1);
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::ESRCH)
-    );
-    fs::remove_dir_all(root).expect("fixture root removal");
 }
 
 #[test]
-fn oracle_run_root_scan_rejects_boundary_canary_and_symlink() {
-    const CANARY: &str = "synthetic-credential-canary-m3-01-7f3c";
-    let root = temp_root("oracle-run-root-scan");
-    let split = ORACLE_SCAN_CHUNK_BYTES - CANARY.len() / 2;
-    let mut bytes = vec![b'x'; split];
-    bytes.extend_from_slice(CANARY.as_bytes());
-    fs::write(root.join("boundary"), bytes).expect("boundary fixture");
-    assert_eq!(
-        scan_run_root(&root, CANARY),
-        Err("oracle run-root canary detected")
-    );
-    fs::remove_file(root.join("boundary")).expect("boundary fixture removal");
-    std::os::unix::fs::symlink(root.join("missing"), root.join("link")).expect("symlink fixture");
-    assert_eq!(
-        scan_run_root(&root, CANARY),
-        Err("oracle run-root symlink rejected")
-    );
-    fs::remove_dir_all(root).expect("scan fixture removal");
+fn oracle_run_root_scan_enforces_tiny_boundary_matrix() {
+    enum Fixture {
+        Empty,
+        Files(&'static [usize]),
+        Depth(usize),
+        RootSymlink,
+        DescendantSymlink,
+        Special,
+        Bytes(&'static [u8]),
+    }
+
+    const TINY: ScanLimits = ScanLimits {
+        depth: 4,
+        entries: 8,
+        files: 8,
+        file_bytes: 8,
+        total_bytes: 16,
+        chunk_bytes: 4,
+        canary_bytes: 4,
+    };
+    let cases = [
+        (
+            "depth-exact",
+            Fixture::Depth(2),
+            ScanLimits { depth: 2, ..TINY },
+            "safe",
+            Ok(()),
+        ),
+        (
+            "depth-plus-one",
+            Fixture::Depth(3),
+            ScanLimits { depth: 2, ..TINY },
+            "safe",
+            Err("oracle run-root depth exceeded"),
+        ),
+        (
+            "entries-exact",
+            Fixture::Files(&[0, 0]),
+            ScanLimits { entries: 2, ..TINY },
+            "safe",
+            Ok(()),
+        ),
+        (
+            "entries-plus-one",
+            Fixture::Files(&[0, 0, 0]),
+            ScanLimits { entries: 2, ..TINY },
+            "safe",
+            Err("oracle run-root entry count exceeded"),
+        ),
+        (
+            "files-exact",
+            Fixture::Files(&[0, 0]),
+            ScanLimits { files: 2, ..TINY },
+            "safe",
+            Ok(()),
+        ),
+        (
+            "files-plus-one",
+            Fixture::Files(&[0, 0, 0]),
+            ScanLimits { files: 2, ..TINY },
+            "safe",
+            Err("oracle run-root file count exceeded"),
+        ),
+        (
+            "file-bytes-exact",
+            Fixture::Files(&[4]),
+            ScanLimits {
+                file_bytes: 4,
+                ..TINY
+            },
+            "safe",
+            Ok(()),
+        ),
+        (
+            "file-bytes-plus-one",
+            Fixture::Files(&[5]),
+            ScanLimits {
+                file_bytes: 4,
+                ..TINY
+            },
+            "safe",
+            Err("oracle run-root file bytes exceeded"),
+        ),
+        (
+            "total-bytes-exact",
+            Fixture::Files(&[3, 3]),
+            ScanLimits {
+                total_bytes: 6,
+                ..TINY
+            },
+            "safe",
+            Ok(()),
+        ),
+        (
+            "total-bytes-plus-one",
+            Fixture::Files(&[3, 4]),
+            ScanLimits {
+                total_bytes: 6,
+                ..TINY
+            },
+            "safe",
+            Err("oracle run-root total bytes exceeded"),
+        ),
+        ("canary-exact", Fixture::Empty, TINY, "safe", Ok(())),
+        (
+            "canary-plus-one",
+            Fixture::Empty,
+            TINY,
+            "safex",
+            Err("oracle run-root canary length rejected"),
+        ),
+        (
+            "canary-empty",
+            Fixture::Empty,
+            TINY,
+            "",
+            Err("oracle run-root canary length rejected"),
+        ),
+        (
+            "root-symlink",
+            Fixture::RootSymlink,
+            TINY,
+            "safe",
+            Err("oracle run-root symlink rejected"),
+        ),
+        (
+            "descendant-symlink",
+            Fixture::DescendantSymlink,
+            TINY,
+            "safe",
+            Err("oracle run-root symlink rejected"),
+        ),
+        (
+            "special-file",
+            Fixture::Special,
+            TINY,
+            "safe",
+            Err("oracle run-root special file rejected"),
+        ),
+        (
+            "cross-chunk-canary",
+            Fixture::Bytes(b"xxxsafe"),
+            TINY,
+            "safe",
+            Err("oracle run-root canary detected"),
+        ),
+    ];
+
+    for (name, fixture, limits, canary, expected) in cases {
+        let root = temp_root(name);
+        let mut scan_root = root.to_path_buf();
+        let mut socket = None;
+        match fixture {
+            Fixture::Empty => {}
+            Fixture::Files(sizes) => {
+                for (index, size) in sizes.iter().enumerate() {
+                    fs::write(root.join(format!("file-{index}")), vec![b'x'; *size])
+                        .expect("file fixture");
+                }
+            }
+            Fixture::Depth(depth) => {
+                let mut directory = root.to_path_buf();
+                for index in 0..depth {
+                    directory = directory.join(format!("depth-{index}"));
+                    fs::create_dir(&directory).expect("depth fixture");
+                }
+            }
+            Fixture::RootSymlink => {
+                fs::create_dir(root.join("target")).expect("symlink target");
+                scan_root = root.join("link");
+                std::os::unix::fs::symlink(root.join("target"), &scan_root)
+                    .expect("root symlink fixture");
+            }
+            Fixture::DescendantSymlink => {
+                std::os::unix::fs::symlink(root.join("missing"), root.join("link"))
+                    .expect("descendant symlink fixture");
+            }
+            Fixture::Special => {
+                socket = Some(
+                    std::os::unix::net::UnixListener::bind(root.join("socket"))
+                        .expect("socket fixture"),
+                );
+            }
+            Fixture::Bytes(bytes) => fs::write(root.join("bytes"), bytes).expect("byte fixture"),
+        }
+        assert_eq!(
+            scan_run_root_with_limits(&scan_root, canary, limits),
+            expected,
+            "{name}"
+        );
+        drop(socket);
+    }
+
+    let mut exact = usize::MAX - 1;
+    assert!(!scan_bytes_exceeded(&mut exact, 1, usize::MAX));
+    assert_eq!(exact, usize::MAX);
+    let mut saturated = usize::MAX - 1;
+    assert!(scan_bytes_exceeded(&mut saturated, 2, usize::MAX - 1));
+    assert_eq!(saturated, usize::MAX);
 }
 
 #[test]
@@ -1246,7 +1451,6 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     assert_eq!(replay.replay().events().len(), 2);
 
     assert_no_canary_in_run_root(&run_root, CANARY);
-    fs::remove_dir_all(root).expect("oracle root should be removed");
 }
 
 fn assert_no_canary(value: &Value, canary: &str) {
@@ -1261,17 +1465,30 @@ fn assert_no_canary_bytes(bytes: &[u8], canary: &str) {
     );
 }
 
+fn scan_bytes_exceeded(total: &mut usize, read: usize, limit: usize) -> bool {
+    *total = total.saturating_add(read);
+    *total > limit
+}
+
 fn scan_run_root(root: &Path, canary: &str) -> Result<(), &'static str> {
-    if canary.is_empty() || canary.len() > ORACLE_SCAN_MAX_CANARY_BYTES {
+    scan_run_root_with_limits(root, canary, ORACLE_SCAN_LIMITS)
+}
+
+fn scan_run_root_with_limits(
+    root: &Path,
+    canary: &str,
+    limits: ScanLimits,
+) -> Result<(), &'static str> {
+    if canary.is_empty() || canary.len() > limits.canary_bytes {
         return Err("oracle run-root canary length rejected");
     }
     let mut pending = vec![(root.to_owned(), 0_usize)];
     let mut entries = 0_usize;
     let mut files = 0_usize;
     let mut total_bytes = 0_usize;
-    let mut buffer = [0_u8; ORACLE_SCAN_CHUNK_BYTES];
+    let mut buffer = vec![0_u8; limits.chunk_bytes];
     while let Some((path, depth)) = pending.pop() {
-        if depth > ORACLE_SCAN_MAX_DEPTH {
+        if depth > limits.depth {
             return Err("oracle run-root depth exceeded");
         }
         let metadata =
@@ -1283,7 +1500,7 @@ fn scan_run_root(root: &Path, canary: &str) -> Result<(), &'static str> {
         if file_type.is_dir() {
             for entry in fs::read_dir(path).map_err(|_| "oracle run-root directory read failed")? {
                 entries += 1;
-                if entries > ORACLE_SCAN_MAX_ENTRIES {
+                if entries > limits.entries {
                     return Err("oracle run-root entry count exceeded");
                 }
                 pending.push((
@@ -1299,7 +1516,7 @@ fn scan_run_root(root: &Path, canary: &str) -> Result<(), &'static str> {
             return Err("oracle run-root special file rejected");
         }
         files += 1;
-        if files > ORACLE_SCAN_MAX_FILES {
+        if files > limits.files {
             return Err("oracle run-root file count exceeded");
         }
         let mut file = fs::File::open(path).map_err(|_| "oracle run-root file open failed")?;
@@ -1312,12 +1529,10 @@ fn scan_run_root(root: &Path, canary: &str) -> Result<(), &'static str> {
             if read == 0 {
                 break;
             }
-            file_bytes = file_bytes.saturating_add(read);
-            total_bytes = total_bytes.saturating_add(read);
-            if file_bytes > ORACLE_SCAN_MAX_FILE_BYTES {
+            if scan_bytes_exceeded(&mut file_bytes, read, limits.file_bytes) {
                 return Err("oracle run-root file bytes exceeded");
             }
-            if total_bytes > ORACLE_SCAN_MAX_TOTAL_BYTES {
+            if scan_bytes_exceeded(&mut total_bytes, read, limits.total_bytes) {
                 return Err("oracle run-root total bytes exceeded");
             }
             overlap.extend_from_slice(&buffer[..read]);
