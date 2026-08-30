@@ -671,3 +671,35 @@ fn execution_graph_preserves_authorization_denial_before_handler_effect() {
         }
     }
 }
+
+#[test]
+fn execution_persists_resolved_runtime_plan_identity() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .unwrap();
+    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
+    let receipt =
+        ExecutionBackend::run(workflow, profile, json!({"request":"public"}), &root.0).unwrap();
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(receipt.run_root().join("run-manifest.json")).unwrap())
+            .unwrap();
+    let plan_hash = manifest["plan_hash"].as_str().expect("plan hash");
+    assert!(!plan_hash.is_empty());
+    assert_eq!(
+        manifest["resume_identity"],
+        format!("resume-v1:{plan_hash}")
+    );
+}

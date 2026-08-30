@@ -21,7 +21,10 @@ use adk_rust::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use workflow_compiler::compile_file;
+use workflow_compiler::{
+    BindingCategory, BindingRef, CapabilitySet, RegistryResolutionError, ResolvedBinding,
+    ResolvedRuntimePlan, RuntimePlanRegistry, RuntimePlanRequest, compile_file,
+};
 use workflow_runtime::{
     ArtifactId, ArtifactStore, BackendCapabilities, CapabilityIntersection, CheckpointManifestV1,
     DurableCheckpointV1, EffectCommit, EffectJournal, EffectKey, FilesystemArtifactStore,
@@ -390,12 +393,85 @@ impl ExecutionProfileV1 {
             .transpose()
     }
 
-    fn profile_identity(&self) -> String {
+    fn model_binding(&self) -> (&str, &str) {
         match &self.model {
             ModelWire::Fake { name, version, .. }
-            | ModelWire::OpenaiCompatible { name, version, .. } => format!("{name}:{version}"),
+            | ModelWire::OpenaiCompatible { name, version, .. } => (name, version),
         }
     }
+
+    fn tool_binding(&self) -> Option<(&str, &str)> {
+        self.tool.as_ref().map(|tool| (tool.name.as_str(), "1"))
+    }
+
+    fn bind_resolved_model(
+        &self,
+        plan: &ResolvedRuntimePlan,
+    ) -> Result<Arc<ModelBinding>, ExecutionError> {
+        let (name, version) = self.model_binding();
+        if plan.models().len() != 1
+            || plan.models()[0].id() != name
+            || plan.models()[0].version() != version
+        {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+        }
+        self.bind_model()
+    }
+
+    fn validate_resolved_tool(&self, plan: &ResolvedRuntimePlan) -> Result<(), ExecutionError> {
+        match (self.tool_binding(), plan.tools()) {
+            (None, []) => Ok(()),
+            (Some((name, version)), [binding])
+                if binding.id() == name && binding.version() == version =>
+            {
+                Ok(())
+            }
+            _ => Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile)),
+        }
+    }
+
+    fn profile_identity(&self) -> String {
+        let (name, version) = self.model_binding();
+        format!("{name}:{version}")
+    }
+}
+
+struct ExecutionRuntimeRegistry<'a> {
+    profile: &'a ExecutionProfileV1,
+}
+
+impl RuntimePlanRegistry for ExecutionRuntimeRegistry<'_> {
+    fn resolve(
+        &self,
+        category: BindingCategory,
+        binding: &BindingRef,
+    ) -> Result<ResolvedBinding, RegistryResolutionError> {
+        let expected = match category {
+            BindingCategory::Model => Some(self.profile.model_binding()),
+            BindingCategory::Tool => self.profile.tool_binding(),
+            _ => None,
+        };
+        expected
+            .filter(|(id, version)| binding.id() == *id && binding.version() == *version)
+            .map(|(id, version)| ResolvedBinding::new(id, version))
+            .ok_or_else(|| RegistryResolutionError::missing(category, binding))
+    }
+}
+
+fn resolve_runtime_plan(
+    profile: &ExecutionProfileV1,
+    ir: &workflow_ir::WorkflowIr,
+) -> Result<ResolvedRuntimePlan, ExecutionError> {
+    let (model, version) = profile.model_binding();
+    let mut request = RuntimePlanRequest::from_ir(ir).with_model(model, version);
+    if let Some((tool, version)) = profile.tool_binding() {
+        request = request.with_tool(tool, version);
+    }
+    let capabilities = CapabilitySet::new(profile.sandbox.capabilities.clone());
+    request.set_capabilities(capabilities.clone());
+    request.set_effective_capabilities(capabilities);
+    ResolvedRuntimePlan::resolve(request, &ExecutionRuntimeRegistry { profile })
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))
 }
 
 fn parse_capability(value: &str) -> Result<SandboxCapability, ExecutionError> {
@@ -519,6 +595,8 @@ pub struct ExecutionReceipt {
     artifact_id: String,
     run_root: PathBuf,
     resume_count: u64,
+    plan_hash: String,
+    resume_identity: String,
 }
 
 impl ExecutionReceipt {
@@ -530,6 +608,12 @@ impl ExecutionReceipt {
     }
     pub fn run_root(&self) -> &Path {
         &self.run_root
+    }
+    pub fn plan_hash(&self) -> &str {
+        &self.plan_hash
+    }
+    pub fn resume_identity(&self) -> &str {
+        &self.resume_identity
     }
 }
 
@@ -546,6 +630,8 @@ struct RunManifestV1 {
     status: String,
     artifact_id: String,
     resume_count: u64,
+    plan_hash: String,
+    resume_identity: String,
     checkpoint_manifest: Option<CheckpointManifestV1>,
 }
 
@@ -558,6 +644,8 @@ impl RunManifestV1 {
             artifact_id: self.artifact_id.clone(),
             run_root,
             resume_count: self.resume_count,
+            plan_hash: self.plan_hash.clone(),
+            resume_identity: self.resume_identity.clone(),
         }
     }
 }
@@ -638,8 +726,10 @@ impl ExecutionBackend {
 
         let compiled = compile_file(workflow.as_ref().to_string_lossy().as_ref())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Compile))?;
+        let resolved_plan = resolve_runtime_plan(&profile, compiled.ir())?;
+        profile.validate_resolved_tool(&resolved_plan)?;
         let transform_module = profile.transform_module()?;
-        let model = profile.bind_model()?;
+        let model = profile.bind_resolved_model(&resolved_plan)?;
         let recursion_limit = compiled
             .ir()
             .nodes()
@@ -761,6 +851,8 @@ impl ExecutionBackend {
                     status: "running".to_owned(),
                     artifact_id: "unavailable".to_owned(),
                     resume_count: 0,
+                    plan_hash: resolved_plan.plan_hash().to_owned(),
+                    resume_identity: resolved_plan.resume_identity().to_owned(),
                     checkpoint_manifest: Some(checkpoint_manifest.clone()),
                 };
                 if write_json(&run_root.join("run-manifest.json"), &provisional).is_err() {
@@ -799,8 +891,9 @@ impl ExecutionBackend {
                     .collect::<BTreeMap<_, _>>();
                 let continuation = Arc::new(GraphCheckpointMemory::default());
                 let graph = AdkGraphTranslator::new()
-                    .translate_profile_with_checkpointer(
-                        &compiled,
+                    .translate_resolved_with_profile(
+                        &resolved_plan,
+                        compiled.ir(),
                         &agents,
                         transform_module.as_deref(),
                         &input,
@@ -1034,6 +1127,8 @@ impl ExecutionBackend {
             status: status.to_owned(),
             artifact_id,
             resume_count: 0,
+            plan_hash: resolved_plan.plan_hash().to_owned(),
+            resume_identity: resolved_plan.resume_identity().to_owned(),
             checkpoint_manifest: Some(checkpoint_manifest),
         };
         if let Err(error) = write_json(&run_root.join("run-manifest.json"), &manifest) {
@@ -1111,6 +1206,16 @@ impl ExecutionBackend {
         {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
+        let resolved_plan = resolve_runtime_plan(&profile, compiled.ir())
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if manifest.plan_hash != resolved_plan.plan_hash()
+            || manifest.resume_identity != resolved_plan.resume_identity()
+        {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        profile
+            .validate_resolved_tool(&resolved_plan)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let transform_module = profile.transform_module()?;
         let live_checkpoint_manifest = build_checkpoint_manifest(
             &run_identity,
@@ -1124,7 +1229,7 @@ impl ExecutionBackend {
         if live_checkpoint_manifest != checkpoint_manifest {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
-        let model = profile.bind_model()?;
+        let model = profile.bind_resolved_model(&resolved_plan)?;
         let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
         verify_sandbox_capabilities(
             &RequestedCapabilities::new(required_capabilities.iter().copied()),
@@ -1216,8 +1321,9 @@ impl ExecutionBackend {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
         let graph = AdkGraphTranslator::new()
-            .translate_profile_with_checkpointer(
-                &compiled,
+            .translate_resolved_with_profile(
+                &resolved_plan,
+                compiled.ir(),
                 &agents,
                 transform_module.as_deref(),
                 &input,
