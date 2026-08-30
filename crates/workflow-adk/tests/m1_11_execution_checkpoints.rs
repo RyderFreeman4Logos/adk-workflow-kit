@@ -791,3 +791,38 @@ fn resume_rejects_manifest_workdir_identity_mismatch() {
     let error = ExecutionBackend::resume(&root.0, receipt.run_id()).expect_err("mismatch");
     assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
 }
+
+#[test]
+fn checkpoint_tool_identity_comes_from_the_resolved_projection() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "tool": {
+                "name": "non-default-tool",
+                "result": {"ok": true},
+                "required_capabilities": [],
+                "required_scopes": []
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .expect("profile fixture should parse");
+    let receipt = ExecutionBackend::run(workflow(), profile, json!({"request":"public"}), &root.0)
+        .expect("fixture run should succeed");
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("run-manifest.json")).expect("manifest should exist"),
+    )
+    .expect("manifest should be JSON");
+    assert_eq!(
+        manifest["checkpoint_manifest"]["implementation_identities"]["tool"],
+        "non-default-tool:1"
+    );
+}

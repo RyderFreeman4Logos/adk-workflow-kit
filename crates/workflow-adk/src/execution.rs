@@ -408,26 +408,76 @@ impl ExecutionProfileV1 {
         &self,
         plan: &ResolvedRuntimePlan,
     ) -> Result<Arc<ModelBinding>, ExecutionError> {
-        let (name, version) = self.model_binding();
-        if plan.models().len() != 1
-            || plan.models()[0].id() != name
-            || plan.models()[0].version() != version
-        {
-            return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+        let binding = plan.models().first().ok_or_else(|| {
+            ExecutionError::binding(
+                ExecutionErrorKind::MissingBinding,
+                BindingCategory::Model,
+                None,
+            )
+        })?;
+        let registry = ExecutionRuntimeRegistry::new(self);
+        registry
+            .resolve(
+                BindingCategory::Model,
+                &BindingRef::new(binding.id(), binding.version()),
+            )
+            .map_err(|error| {
+                if self.model_binding() != (binding.id(), binding.version()) {
+                    ExecutionError::binding(
+                        ExecutionErrorKind::MismatchedBinding,
+                        error.category(),
+                        Some(binding),
+                    )
+                } else {
+                    map_registry_error(error, None)
+                }
+            })?;
+        for candidate in &plan.models()[1..] {
+            // M3-02 will assign projections per node; current IR uses the first resolved model.
+            registry
+                .resolve(
+                    BindingCategory::Model,
+                    &BindingRef::new(candidate.id(), candidate.version()),
+                )
+                .map_err(|error| map_registry_error(error, Some(candidate)))?;
         }
-        self.bind_model()
+        self.bind_model().map_err(|_| {
+            ExecutionError::binding(
+                ExecutionErrorKind::ImplementationBinding,
+                BindingCategory::Model,
+                Some(binding),
+            )
+        })
     }
 
     fn validate_resolved_tool(&self, plan: &ResolvedRuntimePlan) -> Result<(), ExecutionError> {
-        match (self.tool_binding(), plan.tools()) {
-            (None, []) => Ok(()),
-            (Some((name, version)), [binding])
-                if binding.id() == name && binding.version() == version =>
-            {
-                Ok(())
-            }
-            _ => Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile)),
+        let registry = ExecutionRuntimeRegistry::new(self);
+        for binding in plan.tools() {
+            registry
+                .resolve(
+                    BindingCategory::Tool,
+                    &BindingRef::new(binding.id(), binding.version()),
+                )
+                .map_err(|error| {
+                    if self.tool_binding() != Some((binding.id(), binding.version())) {
+                        ExecutionError::binding(
+                            ExecutionErrorKind::MismatchedBinding,
+                            error.category(),
+                            Some(binding),
+                        )
+                    } else {
+                        map_registry_error(error, Some(binding))
+                    }
+                })?;
         }
+        if self.tool.is_some() && plan.tools().is_empty() {
+            return Err(ExecutionError::binding(
+                ExecutionErrorKind::MismatchedBinding,
+                BindingCategory::Tool,
+                None,
+            ));
+        }
+        Ok(())
     }
 
     fn profile_identity(&self) -> String {
@@ -436,26 +486,64 @@ impl ExecutionProfileV1 {
     }
 }
 
-struct ExecutionRuntimeRegistry<'a> {
-    profile: &'a ExecutionProfileV1,
+struct ExecutionRuntimeRegistry {
+    candidates: BTreeMap<BindingCategory, Vec<ResolvedBinding>>,
 }
 
-impl RuntimePlanRegistry for ExecutionRuntimeRegistry<'_> {
+impl ExecutionRuntimeRegistry {
+    fn new(profile: &ExecutionProfileV1) -> Self {
+        let mut candidates = BTreeMap::new();
+        let (model, version) = profile.model_binding();
+        candidates.insert(
+            BindingCategory::Model,
+            vec![ResolvedBinding::new(model, version)],
+        );
+        if let Some((tool, version)) = profile.tool_binding() {
+            candidates.insert(
+                BindingCategory::Tool,
+                vec![ResolvedBinding::new(tool, version)],
+            );
+        }
+        ExecutionRuntimeRegistry { candidates }
+    }
+}
+
+impl RuntimePlanRegistry for ExecutionRuntimeRegistry {
     fn resolve(
         &self,
         category: BindingCategory,
         binding: &BindingRef,
     ) -> Result<ResolvedBinding, RegistryResolutionError> {
-        let expected = match category {
-            BindingCategory::Model => Some(self.profile.model_binding()),
-            BindingCategory::Tool => self.profile.tool_binding(),
-            _ => None,
-        };
-        expected
-            .filter(|(id, version)| binding.id() == *id && binding.version() == *version)
-            .map(|(id, version)| ResolvedBinding::new(id, version))
-            .ok_or_else(|| RegistryResolutionError::missing(category, binding))
+        let matches = self
+            .candidates
+            .get(&category)
+            .into_iter()
+            .flatten()
+            .filter(|candidate| {
+                candidate.id() == binding.id() && candidate.version() == binding.version()
+            })
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [candidate] => Ok((*candidate).clone()),
+            [] => Err(RegistryResolutionError::missing(category, binding)),
+            _ => Err(RegistryResolutionError::ambiguous(category)),
+        }
     }
+}
+
+fn map_registry_error(
+    error: RegistryResolutionError,
+    resolved: Option<&ResolvedBinding>,
+) -> ExecutionError {
+    let kind = match error.kind() {
+        workflow_compiler::RegistryResolutionErrorKind::Missing => {
+            ExecutionErrorKind::MissingBinding
+        }
+        workflow_compiler::RegistryResolutionErrorKind::Ambiguous => {
+            ExecutionErrorKind::AmbiguousBinding
+        }
+    };
+    ExecutionError::binding(kind, error.category(), resolved)
 }
 
 fn resolve_runtime_plan(
@@ -470,8 +558,27 @@ fn resolve_runtime_plan(
     let capabilities = CapabilitySet::new(profile.sandbox.capabilities.clone());
     request.set_capabilities(capabilities.clone());
     request.set_effective_capabilities(capabilities);
-    ResolvedRuntimePlan::resolve(request, &ExecutionRuntimeRegistry { profile })
-        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))
+    ResolvedRuntimePlan::resolve(request, &ExecutionRuntimeRegistry::new(profile)).map_err(
+        |error| {
+            let kind = match error.kind() {
+                workflow_compiler::PlanResolutionErrorKind::MissingBinding => {
+                    ExecutionErrorKind::MissingBinding
+                }
+                workflow_compiler::PlanResolutionErrorKind::AmbiguousBinding => {
+                    ExecutionErrorKind::AmbiguousBinding
+                }
+                workflow_compiler::PlanResolutionErrorKind::CapabilityWidening
+                | workflow_compiler::PlanResolutionErrorKind::InvalidBinding => {
+                    ExecutionErrorKind::MismatchedBinding
+                }
+            };
+            ExecutionError::binding(
+                kind,
+                error.category().unwrap_or(BindingCategory::Model),
+                None,
+            )
+        },
+    )
 }
 
 fn parse_capability(value: &str) -> Result<SandboxCapability, ExecutionError> {
@@ -654,6 +761,10 @@ impl RunManifestV2 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionErrorKind {
     InvalidProfile,
+    MissingBinding,
+    AmbiguousBinding,
+    MismatchedBinding,
+    ImplementationBinding,
     SandboxDenied,
     Compile,
     Workdir,
@@ -671,6 +782,8 @@ pub enum ExecutionErrorKind {
 pub struct ExecutionError {
     kind: ExecutionErrorKind,
     receipt: Option<Box<ExecutionReceipt>>,
+    binding_category: Option<BindingCategory>,
+    resolved_binding: Option<ResolvedBinding>,
 }
 
 impl ExecutionError {
@@ -678,6 +791,20 @@ impl ExecutionError {
         Self {
             kind,
             receipt: None,
+            binding_category: None,
+            resolved_binding: None,
+        }
+    }
+    fn binding(
+        kind: ExecutionErrorKind,
+        category: BindingCategory,
+        resolved_binding: Option<&ResolvedBinding>,
+    ) -> Self {
+        Self {
+            kind,
+            receipt: None,
+            binding_category: Some(category),
+            resolved_binding: resolved_binding.cloned(),
         }
     }
     pub const fn kind(&self) -> ExecutionErrorKind {
@@ -685,6 +812,12 @@ impl ExecutionError {
     }
     pub fn receipt(&self) -> Option<&ExecutionReceipt> {
         self.receipt.as_deref()
+    }
+    pub fn binding_category(&self) -> Option<BindingCategory> {
+        self.binding_category
+    }
+    pub fn resolved_binding(&self) -> Option<&ResolvedBinding> {
+        self.resolved_binding.as_ref()
     }
     fn with_receipt(mut self, receipt: ExecutionReceipt) -> Self {
         self.receipt = Some(Box::new(receipt));
@@ -748,6 +881,7 @@ impl ExecutionBackend {
             compiled.ir().workflow_version(),
             crate::canonical_ir_hash(compiled.ir()),
             &profile,
+            &resolved_plan,
             transform_module.as_deref(),
         )?;
         let context = RunContext::new(run_id.clone(), run_limits());
@@ -870,6 +1004,7 @@ impl ExecutionBackend {
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::SandboxDenied))?;
                 let tool = build_tool(
                     &profile,
+                    resolved_plan.tools().first(),
                     sandbox,
                     &required_capabilities,
                     &run_id,
@@ -1235,6 +1370,7 @@ impl ExecutionBackend {
             compiled.ir().workflow_version(),
             crate::canonical_ir_hash(compiled.ir()),
             &profile,
+            &resolved_plan,
             transform_module.as_deref(),
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
@@ -1286,6 +1422,7 @@ impl ExecutionBackend {
         );
         let tool = build_tool(
             &profile,
+            resolved_plan.tools().first(),
             sandbox,
             &required_capabilities,
             &run_identity,
@@ -1434,6 +1571,7 @@ fn build_checkpoint_manifest(
     workflow_version: &str,
     workflow_hash: String,
     profile: &ExecutionProfileV1,
+    plan: &ResolvedRuntimePlan,
     transform_module: Option<&[u8]>,
 ) -> Result<CheckpointManifestV1, ExecutionError> {
     let profile_hash = serde_json::to_vec(profile)
@@ -1452,8 +1590,9 @@ fn build_checkpoint_manifest(
             Sha256::digest(profile.sandbox.capabilities.join("\n").as_bytes())
         ))
         .with_event_log_identity("workflow-runtime-events-v1");
-    if let Some(tool) = &profile.tool {
-        manifest = manifest.with_implementation("tool", format!("{}:profile", tool.name));
+    if let Some(tool) = plan.tools().first() {
+        manifest =
+            manifest.with_implementation("tool", format!("{}:{}", tool.id(), tool.version()));
     }
     if let Some(transform) = transform_module {
         manifest = manifest.with_resource_hash(
@@ -1466,6 +1605,7 @@ fn build_checkpoint_manifest(
 
 fn build_tool(
     profile: &ExecutionProfileV1,
+    resolved_tool: Option<&ResolvedBinding>,
     sandbox: RunSandbox,
     required_capabilities: &[SandboxCapability],
     run_id: &RunId,
@@ -1474,13 +1614,33 @@ fn build_tool(
     let Some(tool) = &profile.tool else {
         return Ok(None);
     };
-    let provenance = ToolProvenance::new("profile.fake-tool", "1");
+    let resolved_tool = resolved_tool.ok_or_else(|| {
+        ExecutionError::binding(
+            ExecutionErrorKind::MissingBinding,
+            BindingCategory::Tool,
+            None,
+        )
+    })?;
+    if tool.name != resolved_tool.id() || resolved_tool.version() != "1" {
+        return Err(ExecutionError::binding(
+            ExecutionErrorKind::MismatchedBinding,
+            BindingCategory::Tool,
+            Some(resolved_tool),
+        ));
+    }
+    let provenance = ToolProvenance::new(resolved_tool.id(), resolved_tool.version());
     let registration = ToolRegistration::for_types::<Value, Value>(
-        &tool.name,
+        resolved_tool.id(),
         provenance.clone(),
         ToolFlags::new(true, true, true),
     )
-    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?
+    .map_err(|_| {
+        ExecutionError::binding(
+            ExecutionErrorKind::ImplementationBinding,
+            BindingCategory::Tool,
+            Some(resolved_tool),
+        )
+    })?
     .with_required_capabilities(required_capabilities.iter().copied())
     .with_required_scopes(tool.required_scopes.iter().cloned());
     let mut bridge = ToolBridge::new(sandbox);
@@ -1491,21 +1651,30 @@ fn build_tool(
                 result: tool.result.clone(),
                 provenance: provenance.clone(),
                 run_id: run_id.as_str().to_owned(),
-                node_id: tool.name.clone(),
+                node_id: resolved_tool.id().to_owned(),
                 effect_journal,
             },
         )
-        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
+        .map_err(|_| {
+            ExecutionError::binding(
+                ExecutionErrorKind::ImplementationBinding,
+                BindingCategory::Tool,
+                Some(resolved_tool),
+            )
+        })?;
     let adapter = AdkToolBridge::new(
         bridge,
-        CapabilityIntersection::all_for_tool(&tool.name, required_capabilities.iter().copied()),
+        CapabilityIntersection::all_for_tool(
+            resolved_tool.id(),
+            required_capabilities.iter().copied(),
+        ),
         None,
         InMemoryArtifactStore::new(
             NonZeroU64::new(ARTIFACT_LIMIT).expect("positive artifact limit"),
             NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page limit"),
         ),
     );
-    Ok(Some((tool.name.clone(), Arc::new(adapter))))
+    Ok(Some((resolved_tool.id().to_owned(), Arc::new(adapter))))
 }
 
 struct StaticToolHandler {
@@ -1724,4 +1893,88 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ExecutionError> {
     fs::write(&temporary, bytes)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
     fs::rename(temporary, path).map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+}
+
+#[cfg(test)]
+mod execution_registry_tests {
+    use super::*;
+
+    fn registry_with(candidates: &[(BindingCategory, &str, &str)]) -> ExecutionRuntimeRegistry {
+        let mut grouped = BTreeMap::new();
+        for &(category, id, version) in candidates {
+            grouped
+                .entry(category)
+                .or_insert_with(Vec::new)
+                .push(ResolvedBinding::new(id, version));
+        }
+        ExecutionRuntimeRegistry {
+            candidates: grouped,
+        }
+    }
+
+    #[test]
+    fn registry_requires_exact_category_id_and_version() {
+        let registry = registry_with(&[(BindingCategory::Model, "model-a", "2")]);
+        let resolved = registry
+            .resolve(BindingCategory::Model, &BindingRef::new("model-a", "2"))
+            .expect("exact model identity should resolve");
+        assert_eq!(resolved.id(), "model-a");
+        assert_eq!(resolved.version(), "2");
+        assert_eq!(
+            registry
+                .resolve(BindingCategory::Tool, &BindingRef::new("model-a", "2"))
+                .expect_err("category mismatch should be missing")
+                .kind(),
+            workflow_compiler::RegistryResolutionErrorKind::Missing
+        );
+        assert_eq!(
+            registry
+                .resolve(BindingCategory::Model, &BindingRef::new("model-a", "1"))
+                .expect_err("version mismatch should be missing")
+                .kind(),
+            workflow_compiler::RegistryResolutionErrorKind::Missing
+        );
+    }
+
+    #[test]
+    fn registry_resolves_multiple_models_and_tools_deterministically() {
+        let registry = registry_with(&[
+            (BindingCategory::Model, "model-a", "1"),
+            (BindingCategory::Model, "model-b", "1"),
+            (BindingCategory::Tool, "tool-a", "1"),
+            (BindingCategory::Tool, "tool-b", "2"),
+        ]);
+        for (category, id, version) in [
+            (BindingCategory::Model, "model-a", "1"),
+            (BindingCategory::Model, "model-b", "1"),
+            (BindingCategory::Tool, "tool-a", "1"),
+            (BindingCategory::Tool, "tool-b", "2"),
+        ] {
+            let resolved = registry
+                .resolve(category, &BindingRef::new(id, version))
+                .expect("each exact projection should resolve");
+            assert_eq!((resolved.id(), resolved.version()), (id, version));
+        }
+    }
+
+    #[test]
+    fn ambiguous_registry_binding_maps_to_typed_error_with_projection() {
+        let registry = registry_with(&[
+            (BindingCategory::Tool, "tool-a", "1"),
+            (BindingCategory::Tool, "tool-a", "1"),
+        ]);
+        let projection = ResolvedBinding::new("tool-a", "1");
+        let error = map_registry_error(
+            registry
+                .resolve(
+                    BindingCategory::Tool,
+                    &BindingRef::new(projection.id(), projection.version()),
+                )
+                .expect_err("duplicate implementation must be ambiguous"),
+            Some(&projection),
+        );
+        assert_eq!(error.kind(), ExecutionErrorKind::AmbiguousBinding);
+        assert_eq!(error.binding_category(), Some(BindingCategory::Tool));
+        assert_eq!(error.resolved_binding(), Some(&projection));
+    }
 }
