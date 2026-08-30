@@ -81,17 +81,45 @@ fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_workflowctl"))
 }
 
-struct TempRoot(PathBuf);
+struct TempRoot {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
 
 impl TempRoot {
     fn new(label: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
+        use std::os::unix::fs::MetadataExt;
+
+        let path = std::env::temp_dir().join(format!(
             "workflowctl-m1-10-{label}-{}-{}",
             std::process::id(),
             TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&root).expect("test root must be unique");
-        Self(root)
+        fs::create_dir(&path).expect("test root must be unique");
+        let metadata = fs::symlink_metadata(&path).expect("test root metadata");
+        Self {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    fn cleanup(&self) -> Result<(), &'static str> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err("test root cleanup metadata failed"),
+        };
+        if !metadata.file_type().is_dir()
+            || metadata.dev() != self.device
+            || metadata.ino() != self.inode
+        {
+            return Err("test root cleanup identity mismatch");
+        }
+        fs::remove_dir_all(&self.path).map_err(|_| "test root cleanup failed")
     }
 }
 
@@ -99,13 +127,13 @@ impl std::ops::Deref for TempRoot {
     type Target = Path;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.path
     }
 }
 
 impl Drop for TempRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = self.cleanup();
     }
 }
 
@@ -263,6 +291,19 @@ const ORACLE_TERMINAL_QUIET_WINDOW: Duration = Duration::from_millis(25);
 const ORACLE_MAX_REQUEST_BYTES: usize = 64 * 1024;
 const ORACLE_MAX_CHILD_OUTPUT_BYTES: usize = 64 * 1024;
 
+fn oracle_remaining_duration(
+    deadline: Instant,
+    now: Instant,
+    maximum: Duration,
+    timeout: &'static str,
+) -> Result<Duration, &'static str> {
+    deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+        .map(|remaining| remaining.min(maximum))
+        .ok_or(timeout)
+}
+
 #[derive(Clone, Copy)]
 struct ScanLimits {
     depth: usize,
@@ -295,9 +336,14 @@ fn read_model_request(
     let mut request = Vec::new();
     let mut buffer = [0_u8; 8192];
     let header_end = loop {
-        if Instant::now() >= deadline {
-            return Err("oracle request headers timed out");
-        }
+        socket
+            .set_read_timeout(Some(oracle_remaining_duration(
+                deadline,
+                Instant::now(),
+                ORACLE_SOCKET_TIMEOUT,
+                "oracle request headers timed out",
+            )?))
+            .map_err(|_| "oracle socket read timeout setup failed")?;
         let bytes = match socket.read(&mut buffer) {
             Ok(0) => return Err("oracle request ended before headers"),
             Ok(bytes) => bytes,
@@ -311,6 +357,9 @@ fn read_model_request(
             }
             Err(_) => return Err("oracle request header read failed"),
         };
+        if Instant::now() >= deadline {
+            return Err("oracle request headers timed out");
+        }
         if request.len().saturating_add(bytes) > ORACLE_MAX_REQUEST_BYTES {
             return Err("oracle request headers exceeded size limit");
         }
@@ -381,6 +430,12 @@ fn read_model_request(
         {
             value = &value[..value.len() - 1];
         }
+        if !value
+            .iter()
+            .all(|byte| matches!(byte, b'\t' | b' '..=b'~' | 0x80..=0xff))
+        {
+            return Err("oracle request header value rejected");
+        }
         if name.eq_ignore_ascii_case(b"transfer-encoding") {
             return Err("oracle request transfer encoding rejected");
         }
@@ -412,9 +467,14 @@ fn read_model_request(
     }
     let request_end = header_end + content_length;
     while request.len() < request_end {
-        if Instant::now() >= deadline {
-            return Err("oracle request body timed out");
-        }
+        socket
+            .set_read_timeout(Some(oracle_remaining_duration(
+                deadline,
+                Instant::now(),
+                ORACLE_SOCKET_TIMEOUT,
+                "oracle request body timed out",
+            )?))
+            .map_err(|_| "oracle socket read timeout setup failed")?;
         let bytes = match socket.read(&mut buffer) {
             Ok(0) => return Err("oracle request ended before body"),
             Ok(bytes) => bytes,
@@ -428,6 +488,9 @@ fn read_model_request(
             }
             Err(_) => return Err("oracle request body read failed"),
         };
+        if Instant::now() >= deadline {
+            return Err("oracle request body timed out");
+        }
         if request.len().saturating_add(bytes) > ORACLE_MAX_REQUEST_BYTES {
             return Err("oracle request exceeded size limit");
         }
@@ -455,11 +518,11 @@ fn serve_oracle_request_until_child_done(
     canary: &'static str,
     child_done: mpsc::Receiver<()>,
     terminal_probe: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
+    deadline: Instant,
 ) -> Result<RequestObservation, &'static str> {
     listener
         .set_nonblocking(true)
         .map_err(|_| "oracle listener setup failed")?;
-    let deadline = Instant::now() + ORACLE_TIMEOUT;
     let (mut socket, _) = loop {
         match listener.accept() {
             Ok(connection) => break connection,
@@ -472,22 +535,27 @@ fn serve_oracle_request_until_child_done(
             Err(_) => return Err("oracle listener accept failed"),
         }
     };
-    socket
-        .set_read_timeout(Some(ORACLE_SOCKET_TIMEOUT))
-        .map_err(|_| "oracle socket read timeout setup failed")?;
-    socket
-        .set_write_timeout(Some(ORACLE_SOCKET_TIMEOUT))
-        .map_err(|_| "oracle socket write timeout setup failed")?;
     let observation = read_model_request(&mut socket, deadline, canary)?;
     let body = r#"{"choices":[{"message":{"role":"assistant","content":"oracle-ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
-    write!(
-        socket,
+    let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
         body.len(),
         body
-    )
-    .map_err(|_| "oracle response write failed")?;
-    socket.flush().map_err(|_| "oracle response flush failed")?;
+    );
+    socket
+        .set_write_timeout(Some(oracle_remaining_duration(
+            deadline,
+            Instant::now(),
+            ORACLE_SOCKET_TIMEOUT,
+            "oracle response write timed out",
+        )?))
+        .map_err(|_| "oracle socket write timeout setup failed")?;
+    socket
+        .write_all(response.as_bytes())
+        .map_err(|_| "oracle response write failed")?;
+    if Instant::now() >= deadline {
+        return Err("oracle response write timed out");
+    }
     socket
         .set_nonblocking(true)
         .map_err(|_| "oracle socket nonblocking setup failed")?;
@@ -523,7 +591,12 @@ fn serve_oracle_request_until_child_done(
                     .send(())
                     .map_err(|_| "oracle terminal probe unavailable")?;
                 release
-                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .recv_timeout(oracle_remaining_duration(
+                        deadline,
+                        Instant::now(),
+                        ORACLE_TIMEOUT,
+                        "oracle terminal probe timed out",
+                    )?)
                     .map_err(|_| "oracle terminal probe timed out")?;
             }
             let now = Instant::now();
@@ -572,30 +645,28 @@ fn append_output_errors(
 }
 
 fn diagnostics_after_cleanup(
-    cleanup: Result<Vec<&'static str>, Vec<&'static str>>,
+    mut diagnostics: Vec<&'static str>,
     stdout_path: &Path,
     stderr_path: &Path,
 ) -> Vec<&'static str> {
-    match cleanup {
-        Ok(mut diagnostics) => {
-            append_output_errors(&mut diagnostics, stdout_path, stderr_path);
-            diagnostics
-        }
-        Err(diagnostics) => diagnostics,
-    }
+    append_output_errors(&mut diagnostics, stdout_path, stderr_path);
+    diagnostics
 }
 
-fn clean_up_child(mut child: Child) -> Result<Vec<&'static str>, Vec<&'static str>> {
+fn clean_up_child(mut child: Child) -> Vec<&'static str> {
     let mut diagnostics = Vec::new();
     if child.kill().is_err() {
         diagnostics.push("oracle child kill failed");
+    }
+    if std::env::var_os(UNPROVEN_REAP_FIXTURE_ENV).is_some() {
+        abort_unproven_reap();
     }
     let cleanup_deadline = Instant::now() + ORACLE_CLEANUP_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => {
                 diagnostics.push("oracle child reaped after kill");
-                return Ok(diagnostics);
+                return diagnostics;
             }
             Ok(None) => {}
             Err(_) => {
@@ -606,8 +677,7 @@ fn clean_up_child(mut child: Child) -> Result<Vec<&'static str>, Vec<&'static st
         }
         let now = Instant::now();
         if now >= cleanup_deadline {
-            diagnostics.push("oracle child terminal reap not proven");
-            return Err(diagnostics);
+            abort_unproven_reap();
         }
         thread::sleep(
             cleanup_deadline
@@ -615,6 +685,14 @@ fn clean_up_child(mut child: Child) -> Result<Vec<&'static str>, Vec<&'static st
                 .min(Duration::from_millis(10)),
         );
     }
+}
+
+fn abort_unproven_reap() -> ! {
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "oracle child terminal reap not proven; aborting"
+    );
+    std::process::abort();
 }
 
 fn wait_bounded_child(
@@ -652,6 +730,34 @@ fn wait_bounded_child(
         stdout,
         stderr,
     })
+}
+
+fn run_oracle_operation(
+    root: &Path,
+    label: &str,
+    args: &[&str],
+    credential: (&str, Option<&str>),
+    deadline: Instant,
+) -> Result<Output, String> {
+    let stdout_path = root.join(format!("workflowctl-{label}.stdout"));
+    let stderr_path = root.join(format!("workflowctl-{label}.stderr"));
+    let mut command = binary();
+    command.args(args);
+    if let Some(value) = credential.1 {
+        command.env(credential.0, value);
+    } else {
+        command.env_remove(credential.0);
+    }
+    let child = command
+        .stdout(Stdio::from(
+            fs::File::create(&stdout_path).map_err(|_| "oracle child stdout create failed")?,
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(&stderr_path).map_err(|_| "oracle child stderr create failed")?,
+        ))
+        .spawn()
+        .map_err(|_| "oracle child spawn failed")?;
+    wait_bounded_child(child, &stdout_path, &stderr_path, deadline)
 }
 
 fn command_json(args: &[&str]) -> Output {
@@ -1268,19 +1374,29 @@ fn oracle_request_reader_enforces_header_syntax_and_ows() {
             "oracle request header rejected",
         ),
         (
+            "control-in-ordinary-field-value",
+            b"POST /v1/chat/completions HTTP/1.1\r\nx-test: value\x01\r\ncontent-length: 0\r\n\r\n".as_slice(),
+            "oracle request header value rejected",
+        ),
+        (
+            "control-in-authorization-field-value",
+            b"POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer synthetic-credential-canary-m3-01-7f3c\x7f\r\ncontent-length: 0\r\n\r\n".as_slice(),
+            "oracle request header value rejected",
+        ),
+        (
             "vertical-tab-around-length",
             b"POST /v1/chat/completions HTTP/1.1\r\ncontent-length:\x0b0\x0b\r\n\r\n".as_slice(),
-            "oracle request content length invalid",
+            "oracle request header value rejected",
         ),
         (
             "form-feed-around-length",
             b"POST /v1/chat/completions HTTP/1.1\r\ncontent-length:\x0c0\x0c\r\n\r\n".as_slice(),
-            "oracle request content length invalid",
+            "oracle request header value rejected",
         ),
         (
             "carriage-return-around-length",
             b"POST /v1/chat/completions HTTP/1.1\r\ncontent-length: \r0\r\n\r\n".as_slice(),
-            "oracle request content length invalid",
+            "oracle request header value rejected",
         ),
         (
             "mixed-case-transfer-encoding",
@@ -1343,7 +1459,13 @@ fn oracle_server_rejects_second_physical_request() {
     let (_child_done_tx, child_done_rx) = mpsc::sync_channel(1);
 
     assert!(matches!(
-        serve_oracle_request_until_child_done(listener, CANARY, child_done_rx, None),
+        serve_oracle_request_until_child_done(
+            listener,
+            CANARY,
+            child_done_rx,
+            None,
+            Instant::now() + ORACLE_TIMEOUT,
+        ),
         Err("oracle request count rejected")
     ));
 }
@@ -1390,8 +1512,9 @@ fn oracle_server_enforces_terminal_quiescence_and_cardinality_edges() {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
     let address = listener.local_addr().expect("oracle listener address");
     let (child_done_tx, child_done_rx) = mpsc::sync_channel(1);
+    let deadline = Instant::now() + ORACLE_TIMEOUT;
     let server = thread::spawn(move || {
-        serve_oracle_request_until_child_done(listener, CANARY, child_done_rx, None)
+        serve_oracle_request_until_child_done(listener, CANARY, child_done_rx, None, deadline)
     });
     let mut client = connect_and_read_response(address, CANARY);
     client.write_all(b"x").expect("delayed same-stream byte");
@@ -1406,23 +1529,45 @@ fn oracle_server_enforces_terminal_quiescence_and_cardinality_edges() {
     let (child_done_tx, child_done_rx) = mpsc::sync_channel(1);
     let (observed_tx, observed_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let deadline = Instant::now() + ORACLE_TIMEOUT;
     let server = thread::spawn(move || {
         serve_oracle_request_until_child_done(
             listener,
             CANARY,
             child_done_rx,
             Some((observed_tx, release_rx)),
+            deadline,
         )
     });
     let mut client = connect_and_read_response(address, CANARY);
     child_done_tx.send(()).expect("child completion signal");
-    observed_rx
-        .recv_timeout(ORACLE_SOCKET_TIMEOUT)
-        .expect("terminal observation barrier");
-    client.write_all(b"x").expect("terminal-race byte");
-    release_tx.send(()).expect("terminal probe release");
+    let barrier_result = oracle_remaining_duration(
+        deadline,
+        Instant::now(),
+        ORACLE_TIMEOUT,
+        "oracle terminal probe timed out",
+    )
+    .and_then(|remaining| {
+        observed_rx
+            .recv_timeout(remaining)
+            .map_err(|_| "oracle terminal probe timed out")
+    });
+    let terminal_probe_result = barrier_result.and_then(|()| {
+        client
+            .write_all(b"x")
+            .map_err(|_| "terminal-race write failed")?;
+        release_tx
+            .send(())
+            .map_err(|_| "terminal probe release failed")
+    });
+    drop(release_tx);
+    let server_result = server.join().expect("oracle server thread");
+    assert!(
+        terminal_probe_result.is_ok(),
+        "terminal observation barrier must use the overall remaining deadline"
+    );
     assert!(matches!(
-        server.join().expect("oracle server thread"),
+        server_result,
         Err("oracle request trailing bytes rejected")
     ));
 
@@ -1471,6 +1616,130 @@ fn oracle_supervisor_fixture_blocks() {
     thread::park();
 }
 
+const UNPROVEN_REAP_FIXTURE_ENV: &str = "WORKFLOWCTL_ORACLE_UNPROVEN_REAP_FIXTURE";
+const UNPROVEN_REAP_ROOT_ENV: &str = "WORKFLOWCTL_ORACLE_UNPROVEN_REAP_ROOT";
+
+#[test]
+fn oracle_unproven_reap_abort_fixture() {
+    if std::env::var_os(UNPROVEN_REAP_FIXTURE_ENV).is_none() {
+        return;
+    }
+    let root = temp_root("oracle-unproven-reap-fixture");
+    fs::write(root.join("sentinel"), b"survives-abort").expect("abort sentinel");
+    fs::write(
+        std::env::var_os(UNPROVEN_REAP_ROOT_ENV).expect("abort root receipt path"),
+        root.as_os_str().as_encoded_bytes(),
+    )
+    .expect("abort root receipt");
+    let stdout_path = root.join("stdout");
+    let stderr_path = root.join("stderr");
+    let child = Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", "oracle_supervisor_fixture_blocks", "--nocapture"])
+        .env(SUPERVISOR_FIXTURE_ENV, "1")
+        .env_remove(UNPROVEN_REAP_FIXTURE_ENV)
+        .stdout(Stdio::from(
+            fs::File::create(&stdout_path).expect("abort fixture stdout"),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(&stderr_path).expect("abort fixture stderr"),
+        ))
+        .spawn()
+        .expect("abort fixture owned child");
+    let _ = wait_bounded_child(child, &stdout_path, &stderr_path, Instant::now());
+}
+
+#[test]
+fn oracle_unproven_reap_aborts_without_root_cleanup() {
+    let receipt_root = temp_root("oracle-unproven-reap-parent");
+    let receipt_path = receipt_root.join("root-path");
+    let output = Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "oracle_unproven_reap_abort_fixture",
+            "--nocapture",
+        ])
+        .env(UNPROVEN_REAP_FIXTURE_ENV, "1")
+        .env(UNPROVEN_REAP_ROOT_ENV, &receipt_path)
+        .output()
+        .expect("abort fixture child");
+    let fixture_root = PathBuf::from(
+        std::str::from_utf8(&fs::read(&receipt_path).expect("abort root receipt"))
+            .expect("UTF-8 abort root"),
+    );
+    let sentinel_survived = fixture_root.join("sentinel").is_file();
+    let _ = fs::remove_dir_all(&fixture_root);
+
+    assert!(!output.status.success(), "unproven reap must abort");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("oracle child terminal reap not proven; aborting")
+    );
+    assert!(sentinel_survived, "abort must not unwind root cleanup");
+}
+
+#[test]
+fn oracle_remaining_duration_rejects_expiry_and_clamps_socket_io() {
+    let now = Instant::now();
+    assert!(matches!(
+        oracle_remaining_duration(
+            now,
+            now,
+            ORACLE_SOCKET_TIMEOUT,
+            "oracle request headers timed out",
+        ),
+        Err("oracle request headers timed out")
+    ));
+    assert_eq!(
+        oracle_remaining_duration(
+            now + Duration::from_millis(50),
+            now,
+            ORACLE_SOCKET_TIMEOUT,
+            "oracle request headers timed out",
+        ),
+        Ok(Duration::from_millis(50))
+    );
+    assert_eq!(
+        oracle_remaining_duration(
+            now + ORACLE_TIMEOUT,
+            now,
+            ORACLE_SOCKET_TIMEOUT,
+            "oracle request headers timed out",
+        ),
+        Ok(ORACLE_SOCKET_TIMEOUT)
+    );
+}
+
+#[test]
+fn temp_root_cleanup_refuses_replacement_directory() {
+    let root = temp_root("replacement-cleanup");
+    let original = root.to_path_buf();
+    let owned = original.with_extension("owned");
+    fs::rename(&original, &owned).expect("move owned root");
+    fs::create_dir(&original).expect("create substitute root");
+    fs::write(original.join("sentinel"), b"substitute").expect("substitute sentinel");
+    let cleanup_result = root.cleanup();
+    drop(root);
+    let substitute_survived = original.join("sentinel").is_file();
+    let _ = fs::remove_dir_all(&original);
+    let _ = fs::remove_dir_all(&owned);
+    assert!(matches!(
+        cleanup_result,
+        Err("test root cleanup identity mismatch")
+    ));
+    assert!(
+        substitute_survived,
+        "cleanup must refuse a replacement directory"
+    );
+}
+
+#[test]
+fn temp_root_cleanup_result_is_observable() {
+    let root = temp_root("observable-cleanup");
+    let path = root.to_path_buf();
+    assert_eq!(root.cleanup(), Ok(()));
+    assert!(!path.exists());
+}
+
 #[test]
 fn oracle_child_timeout_is_primary_and_directly_reaped() {
     let root = temp_root("oracle-child-timeout");
@@ -1495,7 +1764,7 @@ fn oracle_child_timeout_is_primary_and_directly_reaped() {
             break;
         }
         if Instant::now() >= ready_deadline {
-            let diagnostics = clean_up_child(child).unwrap_or_else(|diagnostics| diagnostics);
+            let diagnostics = clean_up_child(child);
             panic!(
                 "fixture child output readiness timed out; {}",
                 diagnostics.join("; ")
@@ -1526,22 +1795,11 @@ fn oracle_output_diagnostics_require_proven_reap() {
         .expect("proven stdout fixture");
     fs::write(&stderr_path, []).expect("proven stderr fixture");
     let proven = diagnostics_after_cleanup(
-        Ok(vec!["oracle child reaped after kill"]),
+        vec!["oracle child reaped after kill"],
         &stdout_path,
         &stderr_path,
     );
     assert!(proven.contains(&"oracle child output exceeded size limit"));
-
-    let unproven = diagnostics_after_cleanup(
-        Err(vec!["oracle child terminal reap not proven"]),
-        &root.join("missing-stdout"),
-        &root.join("missing-stderr"),
-    );
-    assert_eq!(
-        unproven,
-        vec!["oracle child terminal reap not proven"],
-        "unproven terminal cleanup must not access output files"
-    );
 }
 
 #[test]
@@ -1787,8 +2045,6 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     const CANARY: &str = "synthetic-credential-canary-m3-01-7f3c";
 
     let root = temp_root("credential-oracle");
-    let stdout_path = root.join("workflowctl.stdout");
-    let stderr_path = root.join("workflowctl.stderr");
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
     let address = listener.local_addr().expect("oracle listener address");
     let profile_value = json!({
@@ -1804,14 +2060,22 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         "sandbox": {"capabilities": []}
     });
     let (workflow, profile, runs) = write_fixture(&root, profile_value);
-    let stdout = fs::File::create(&stdout_path).expect("oracle stdout file");
-    let stderr = fs::File::create(&stderr_path).expect("oracle stderr file");
+    let run_listener = listener.try_clone().expect("oracle run listener clone");
     let (child_done_tx, child_done_rx) = mpsc::sync_channel(1);
+    let run_deadline = Instant::now() + ORACLE_TIMEOUT;
     let server = thread::spawn(move || {
-        serve_oracle_request_until_child_done(listener, CANARY, child_done_rx, None)
+        serve_oracle_request_until_child_done(
+            run_listener,
+            CANARY,
+            child_done_rx,
+            None,
+            run_deadline,
+        )
     });
-    let child = binary()
-        .args([
+    let child_result = run_oracle_operation(
+        &root,
+        "run",
+        &[
             "--json",
             "run",
             workflow.to_str().expect("UTF-8 workflow path"),
@@ -1821,20 +2085,10 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
             r#"{"request":"public"}"#,
             "--workdir",
             runs.to_str().expect("UTF-8 run base"),
-        ])
-        .env(HANDLE, CANARY)
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn();
-    let child_result = match child {
-        Ok(child) => wait_bounded_child(
-            child,
-            &stdout_path,
-            &stderr_path,
-            Instant::now() + ORACLE_TIMEOUT,
-        ),
-        Err(_) => Err("oracle child spawn failed".to_owned()),
-    };
+        ],
+        (HANDLE, Some(CANARY)),
+        run_deadline,
+    );
     let _ = child_done_tx.send(());
     let server_result = server.join();
 
@@ -1857,6 +2111,8 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     );
     assert_no_canary_bytes(&child.stdout, CANARY);
     assert_no_canary_bytes(&child.stderr, CANARY);
+    let run_receipt = json_stdout(&child);
+    assert_eq!(run_receipt["status"], "succeeded");
     let observation = server_result
         .expect("oracle server thread")
         .expect("oracle request observation");
@@ -1897,29 +2153,19 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     assert_ne!(stored_profile["model"]["credential_env"], CANARY);
 
     let run_id = manifest["run_id"].as_str().expect("run ID");
-    let inspect_stdout_path = root.join("workflowctl-inspect.stdout");
-    let inspect_stderr_path = root.join("workflowctl-inspect.stderr");
-    let inspect_child = binary()
-        .args([
+    assert_eq!(run_receipt["run_id"], run_id);
+    let inspect = run_oracle_operation(
+        &root,
+        "inspect",
+        &[
             "--json",
             "inspect",
             "--run-id",
             run_id,
             "--workdir",
             runs.to_str().expect("UTF-8 runs path"),
-        ])
-        .stdout(Stdio::from(
-            fs::File::create(&inspect_stdout_path).expect("oracle inspect stdout file"),
-        ))
-        .stderr(Stdio::from(
-            fs::File::create(&inspect_stderr_path).expect("oracle inspect stderr file"),
-        ))
-        .spawn()
-        .expect("oracle inspect child spawn");
-    let inspect = wait_bounded_child(
-        inspect_child,
-        &inspect_stdout_path,
-        &inspect_stderr_path,
+        ],
+        (HANDLE, None),
         Instant::now() + ORACLE_TIMEOUT,
     )
     .expect("bounded oracle inspect child");
@@ -1934,6 +2180,77 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     let inspected = json_stdout(&inspect);
     assert_eq!(inspected["status"], "succeeded");
     assert_eq!(inspected["run_id"], run_id);
+    assert_no_canary_in_run_root(&run_root, CANARY);
+
+    drop(listener);
+    let before_missing_resume =
+        bounded_run_root_snapshot(&run_root, CANARY).expect("bounded pre-resume run-root snapshot");
+    let missing_resume = run_oracle_operation(
+        &root,
+        "resume-missing-credential",
+        &[
+            "--json",
+            "resume",
+            "--run-id",
+            run_id,
+            "--workdir",
+            runs.to_str().expect("UTF-8 runs path"),
+        ],
+        (HANDLE, None),
+        Instant::now() + ORACLE_TIMEOUT,
+    )
+    .expect("bounded missing-credential resume child");
+    assert_eq!(missing_resume.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&missing_resume.stderr).contains("workflow.run.failed"),
+        "missing credential must retain the static workflow failure category"
+    );
+    assert_no_canary_bytes(&missing_resume.stdout, CANARY);
+    assert_no_canary_bytes(&missing_resume.stderr, CANARY);
+    assert_no_canary_in_run_root(&run_root, CANARY);
+    assert_eq!(
+        bounded_run_root_snapshot(&run_root, CANARY)
+            .expect("bounded post-failure run-root snapshot"),
+        before_missing_resume,
+        "missing-credential resume must not mutate the run root"
+    );
+
+    let resume = run_oracle_operation(
+        &root,
+        "resume",
+        &[
+            "--json",
+            "resume",
+            "--run-id",
+            run_id,
+            "--workdir",
+            runs.to_str().expect("UTF-8 runs path"),
+        ],
+        (HANDLE, Some(CANARY)),
+        Instant::now() + ORACLE_TIMEOUT,
+    )
+    .expect("bounded credential-backed resume child");
+    assert!(
+        resume.status.success(),
+        "completed resume must succeed without a model request (stdout={}, stderr={})",
+        String::from_utf8_lossy(&resume.stdout).replace(CANARY, "[REDACTED]"),
+        String::from_utf8_lossy(&resume.stderr).replace(CANARY, "[REDACTED]")
+    );
+    assert_no_canary_bytes(&resume.stdout, CANARY);
+    assert_no_canary_bytes(&resume.stderr, CANARY);
+    let resumed = json_stdout(&resume);
+    assert_eq!(resumed["status"], "succeeded");
+    assert_eq!(resumed["run_id"], run_id);
+    assert_no_canary_in_run_root(&run_root, CANARY);
+    let resumed_events =
+        fs::read(run_root.join("events.jsonl")).expect("resume events must be readable");
+    assert_no_canary_bytes(&resumed_events, CANARY);
+    assert!(
+        std::str::from_utf8(&resumed_events)
+            .expect("resume events UTF-8")
+            .contains("\"kind\":\"workflow_resumed\""),
+        "credential oracle must exercise completed-run resume"
+    );
     assert_no_canary_in_run_root(&run_root, CANARY);
 
     let checkpoint_manifest: CheckpointManifestV1 =
@@ -2016,6 +2333,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     assert_eq!(replay.replay().events().len(), 2);
 
     assert_no_canary_in_run_root(&run_root, CANARY);
+    root.cleanup().expect("credential oracle root cleanup");
 }
 
 fn assert_no_canary(value: &Value, canary: &str) {
@@ -2112,6 +2430,44 @@ fn scan_run_root_with_limits(
         }
     }
     Ok(())
+}
+
+fn bounded_run_root_snapshot(root: &Path, canary: &str) -> Result<[u8; 32], &'static str> {
+    scan_run_root(root, canary)?;
+    let mut pending = vec![root.to_owned()];
+    let mut digest = Sha256::new();
+    while let Some(path) = pending.pop() {
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| "oracle run-root snapshot path rejected")?;
+        digest.update(relative.to_string_lossy().as_bytes());
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|_| "oracle run-root snapshot read failed")?;
+        if metadata.file_type().is_dir() {
+            digest.update([0]);
+            let mut children = fs::read_dir(path)
+                .map_err(|_| "oracle run-root snapshot read failed")?
+                .map(|entry| {
+                    entry
+                        .map(|entry| entry.path())
+                        .map_err(|_| "oracle run-root snapshot read failed")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            children.sort();
+            pending.extend(children.into_iter().rev());
+        } else if metadata.file_type().is_file() {
+            digest.update([1]);
+            let bytes = fs::read(path).map_err(|_| "oracle run-root snapshot read failed")?;
+            digest.update(bytes.len().to_le_bytes());
+            digest.update(bytes);
+        } else {
+            return Err("oracle run-root snapshot type rejected");
+        }
+    }
+    let digest = digest.finalize();
+    let mut snapshot = [0_u8; 32];
+    snapshot.copy_from_slice(&digest);
+    Ok(snapshot)
 }
 
 fn assert_no_canary_in_run_root(root: &Path, canary: &str) {
