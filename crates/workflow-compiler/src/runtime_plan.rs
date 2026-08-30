@@ -211,10 +211,17 @@ pub struct RuntimePlanRequest {
 
 impl RuntimePlanRequest {
     pub fn from_ir(ir: &WorkflowIr) -> Self {
-        Self {
+        let mut request = Self {
             ir_hash: hex(ir.canonical_hash().as_bytes()),
             ..Self::default()
+        };
+        for route in ir.routes() {
+            request = request.with_predicate(route.predicate().id(), route.predicate().version());
         }
+        for resource in ir.resources() {
+            request = request.with_artifact(resource.path(), resource.sha256());
+        }
+        request
     }
     fn with_binding(mut self, category: BindingCategory, id: &str, version: &str) -> Self {
         self.bindings
