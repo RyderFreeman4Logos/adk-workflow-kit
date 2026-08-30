@@ -35,6 +35,44 @@ fn example_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/00-runtime-smoke")
 }
 
+fn repository_root() -> PathBuf {
+    fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).expect("repository root")
+}
+
+fn documented_shell_block(readme: &str) -> &str {
+    assert_eq!(
+        readme.matches("```sh\n").count(),
+        1,
+        "README must have one authoritative shell block"
+    );
+    let (_, block) = readme.split_once("```sh\n").expect("README shell block");
+    block
+        .split_once("\n```")
+        .map(|(block, _)| block)
+        .expect("README shell block terminator")
+}
+
+fn run_documented_shell_block(block: &str, workdir: &Path) -> Output {
+    let binary = Path::new(env!("CARGO_BIN_EXE_workflowctl"));
+    let mut path_entries = vec![
+        binary
+            .parent()
+            .expect("workflowctl binary directory")
+            .to_path_buf(),
+    ];
+    if let Some(path) = std::env::var_os("PATH") {
+        path_entries.extend(std::env::split_paths(&path));
+    }
+    let path = std::env::join_paths(path_entries).expect("workflowctl PATH");
+    Command::new("bash")
+        .args(["-c", block])
+        .current_dir(repository_root())
+        .env("PATH", path)
+        .env("WORKDIR", workdir)
+        .output()
+        .unwrap_or_else(|error| panic!("documented README shell block must start: {error}"))
+}
+
 fn temp_root(label: &str) -> TempRoot {
     let root = std::env::temp_dir().join(format!(
         "workflowctl-m3-00-{label}-{}-{}",
@@ -50,22 +88,6 @@ fn command(args: &[&str]) -> Output {
         .args(args)
         .output()
         .unwrap_or_else(|error| panic!("workflowctl must start: {error}"))
-}
-
-fn successful_json(args: &[&str]) -> Value {
-    let output = command(args);
-    assert!(
-        output.status.success(),
-        "workflowctl failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-        panic!(
-            "workflowctl stdout must be JSON: {error}; stdout={}",
-            String::from_utf8_lossy(&output.stdout)
-        )
-    })
 }
 
 fn assert_fixture_safe(path: &Path) -> Vec<u8> {
@@ -166,13 +188,6 @@ fn runtime_smoke_example_executes_full_provider_free_sequence() {
         7
     );
 
-    let lock_args = &["--json", "lock", workflow.to_str().unwrap()];
-    let lock_a = command(lock_args);
-    let lock_b = command(lock_args);
-    assert!(lock_a.status.success() && lock_b.status.success());
-    assert!(!lock_a.stdout.is_empty());
-    assert_eq!(lock_a.stdout, lock_b.stdout);
-
     let replay_value: Value = serde_json::from_slice(&replay_bytes).expect("replay JSON");
     assert_eq!(replay_value["schema_version"], 1);
     assert!(!replay_value["events"].as_array().unwrap().is_empty());
@@ -181,52 +196,66 @@ fn runtime_smoke_example_executes_full_provider_free_sequence() {
         replay_value["events"].as_array().unwrap().last().unwrap()["type"],
         "terminal"
     );
-    assert_eq!(
-        replay_value["workflow_lock"]["toml"],
-        String::from_utf8(lock_a.stdout.clone()).unwrap()
-    );
+    let lock_toml = replay_value["workflow_lock"]["toml"]
+        .as_str()
+        .expect("replay lock TOML");
     assert_eq!(
         replay_value["workflow_lock"]["sha256"],
-        format!("sha256:{:x}", Sha256::digest(&lock_a.stdout))
+        format!("sha256:{:x}", Sha256::digest(lock_toml.as_bytes()))
     );
     assert_eq!(
         replay_value["input_sha256"],
         format!("sha256:{:x}", Sha256::digest(&input_bytes))
     );
 
-    let validate = command(&["--json", "validate", workflow.to_str().unwrap()]);
-    assert!(validate.status.success());
-    assert_eq!(String::from_utf8_lossy(&validate.stdout), "valid\n");
-
-    let graph = command(&[
-        "--json",
-        "graph",
-        workflow.to_str().unwrap(),
-        "--format",
-        "mermaid",
-    ]);
-    assert!(graph.status.success());
-    let graph_text = String::from_utf8(graph.stdout).expect("Mermaid graph must be UTF-8");
-    assert!(!graph_text.trim().is_empty());
-    assert!(graph_text.contains("agent"));
-    assert!(graph_text.contains("terminal"));
-
     let root = temp_root("run");
     let runs = root.path().join("runs");
     fs::create_dir(&runs).expect("run base");
-    let input_text = String::from_utf8(input_bytes).expect("input UTF-8");
-    let run = successful_json(&[
-        "--json",
-        "run",
-        workflow.to_str().unwrap(),
-        "--profile",
-        profile.to_str().unwrap(),
-        "--input",
-        input_text.trim(),
-        "--workdir",
-        runs.to_str().unwrap(),
-    ]);
-    assert_receipt_shape(&run);
+    let input_text = String::from_utf8(input_bytes.clone()).expect("input UTF-8");
+    let block = documented_shell_block(&readme);
+    let walkthrough = run_documented_shell_block(block, &runs);
+    assert!(
+        walkthrough.status.success(),
+        "documented walkthrough failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&walkthrough.stdout),
+        String::from_utf8_lossy(&walkthrough.stderr)
+    );
+    assert!(walkthrough.stdout.len() <= MAX_FIXTURE_BYTES);
+    assert_no_forbidden_bytes(&walkthrough.stdout);
+    let walkthrough_text = String::from_utf8(walkthrough.stdout).expect("walkthrough UTF-8");
+    assert!(walkthrough_text.lines().any(|line| line == "valid"));
+    assert!(walkthrough_text.contains("agent"));
+    assert!(walkthrough_text.contains("terminal"));
+    assert_eq!(
+        walkthrough_text.matches(lock_toml).count(),
+        1,
+        "walkthrough must visibly emit the committed lock"
+    );
+    let json_outputs: Vec<Value> = walkthrough_text
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert_eq!(
+        json_outputs.len(),
+        4,
+        "walkthrough must emit run, inspect, resume, and replay JSON"
+    );
+    for field in [
+        "run_id",
+        "status",
+        "run_root",
+        "plan_hash",
+        "resume_identity",
+        "artifact_id",
+        "resume_count",
+        "disposition",
+        "fixture_count",
+        "payload_len",
+    ] {
+        assert!(expected.contains(field), "expected output omits {field}");
+    }
+    let run = &json_outputs[0];
+    assert_receipt_shape(run);
     assert!(
         run["run_root"]
             .as_str()
@@ -279,32 +308,18 @@ fn runtime_smoke_example_executes_full_provider_free_sequence() {
     assert!(!events.is_empty() && events.len() <= MAX_FIXTURE_BYTES);
     assert_no_forbidden_bytes(&events);
 
-    let run_id = run["run_id"].as_str().unwrap();
-    let inspect = successful_json(&[
-        "--json",
-        "inspect",
-        "--run-id",
-        run_id,
-        "--workdir",
-        runs.to_str().unwrap(),
-    ]);
+    let inspect = &json_outputs[1];
     assert_eq!(inspect, run);
 
-    let resumed = successful_json(&[
-        "--json",
-        "resume",
-        "--run-id",
-        run_id,
-        "--workdir",
-        runs.to_str().unwrap(),
-    ]);
+    let resumed = &json_outputs[2];
+    assert_eq!(inspect["run_id"], run["run_id"]);
     assert_eq!(resumed["run_id"], run["run_id"]);
     assert_eq!(resumed["plan_hash"], run["plan_hash"]);
     assert_eq!(resumed["resume_identity"], run["resume_identity"]);
     assert_eq!(resumed["resume_count"], 1);
     assert_eq!(resumed["status"], "succeeded");
 
-    let replay_result = successful_json(&["--json", "replay", replay.to_str().unwrap()]);
+    let replay_result = &json_outputs[3];
     assert_eq!(replay_result["disposition"], "replay_run");
     assert!(replay_result["fixture_count"].as_u64().unwrap() > 0);
     assert_eq!(
@@ -343,23 +358,20 @@ fn runtime_smoke_example_executes_full_provider_free_sequence() {
     assert!(!invalid.status.success());
 
     let required_sequence = [
-        "validate",
-        "graph --format mermaid",
-        "lock",
-        "run --profile",
-        "inspect",
-        "resume",
-        "replay",
+        "workflowctl validate workflow.toml",
+        "workflowctl graph workflow.toml --format mermaid",
+        "workflowctl lock workflow.toml",
+        "workflowctl --json run workflow.toml",
+        "workflowctl --json inspect --run-id",
+        "workflowctl --json resume --run-id",
+        "workflowctl --json replay replay.json",
     ];
     let mut previous = 0;
     for step in required_sequence {
-        let position = readme
+        let position = block
             .find(step)
-            .unwrap_or_else(|| panic!("README missing {step}"));
-        assert!(
-            position >= previous,
-            "README command sequence is out of order"
-        );
+            .unwrap_or_else(|| panic!("README shell block missing {step}"));
+        assert!(position >= previous, "README shell block is out of order");
         previous = position;
     }
     assert!(readme.contains("runtime smoke example"));
