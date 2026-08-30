@@ -2,8 +2,11 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
-    sync::atomic::{AtomicUsize, Ordering},
+    process::{Child, Command, Output, Stdio},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -206,6 +209,238 @@ fn run_root(runs: &Path) -> PathBuf {
         .collect::<Vec<_>>();
     assert_eq!(roots.len(), 1, "one invocation must allocate one run root");
     roots[0].clone()
+}
+
+#[derive(Debug)]
+struct RequestObservation {
+    method: String,
+    path: String,
+    authorization_headers: usize,
+    canary_occurrences: usize,
+}
+
+const ORACLE_TIMEOUT: Duration = Duration::from_secs(5);
+const ORACLE_SOCKET_TIMEOUT: Duration = Duration::from_millis(100);
+const ORACLE_MAX_REQUEST_BYTES: usize = 64 * 1024;
+const ORACLE_MAX_CHILD_OUTPUT_BYTES: usize = 64 * 1024;
+
+fn read_model_request(
+    socket: &mut std::net::TcpStream,
+    deadline: Instant,
+    canary: &str,
+) -> Result<RequestObservation, &'static str> {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let header_end = loop {
+        if Instant::now() >= deadline {
+            return Err("oracle request headers timed out");
+        }
+        let bytes = match socket.read(&mut buffer) {
+            Ok(0) => return Err("oracle request ended before headers"),
+            Ok(bytes) => bytes,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => return Err("oracle request header read failed"),
+        };
+        if request.len().saturating_add(bytes) > ORACLE_MAX_REQUEST_BYTES {
+            return Err("oracle request headers exceeded size limit");
+        }
+        request.extend_from_slice(&buffer[..bytes]);
+        if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+
+    let content_length = {
+        let header_text = String::from_utf8_lossy(&request[..header_end]);
+        header_text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .ok_or("oracle request content length missing or invalid")?
+    };
+    if content_length > ORACLE_MAX_REQUEST_BYTES.saturating_sub(header_end) {
+        return Err("oracle request body exceeded size limit");
+    }
+    let request_end = header_end + content_length;
+    while request.len() < request_end {
+        if Instant::now() >= deadline {
+            return Err("oracle request body timed out");
+        }
+        let bytes = match socket.read(&mut buffer) {
+            Ok(0) => return Err("oracle request ended before body"),
+            Ok(bytes) => bytes,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => return Err("oracle request body read failed"),
+        };
+        if request.len().saturating_add(bytes) > ORACLE_MAX_REQUEST_BYTES {
+            return Err("oracle request exceeded size limit");
+        }
+        request.extend_from_slice(&buffer[..bytes]);
+    }
+
+    let header_text = String::from_utf8_lossy(&request[..header_end]);
+    let mut lines = header_text.lines();
+    let request_line = lines.next().ok_or("oracle request line missing")?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().unwrap_or_default().to_owned();
+    let path = request_parts.next().unwrap_or_default().to_owned();
+    let mut authorization_headers = 0;
+    let mut canary_occurrences = 0;
+    for line in lines {
+        match line.split_once(':') {
+            Some((name, value)) if name.eq_ignore_ascii_case("authorization") => {
+                authorization_headers += 1;
+                canary_occurrences += value.matches(canary).count();
+            }
+            _ => {}
+        }
+    }
+    Ok(RequestObservation {
+        method,
+        path,
+        authorization_headers,
+        canary_occurrences,
+    })
+}
+
+fn serve_oracle_request(
+    listener: std::net::TcpListener,
+    request_tx: mpsc::SyncSender<Result<RequestObservation, &'static str>>,
+    canary: &'static str,
+) -> Result<(), &'static str> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|_| "oracle listener setup failed")?;
+    let deadline = Instant::now() + ORACLE_TIMEOUT;
+    let (mut socket, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err("oracle listener accept timed out");
+                }
+                thread::yield_now();
+            }
+            Err(_) => return Err("oracle listener accept failed"),
+        }
+    };
+    socket
+        .set_read_timeout(Some(ORACLE_SOCKET_TIMEOUT))
+        .map_err(|_| "oracle socket read timeout setup failed")?;
+    socket
+        .set_write_timeout(Some(ORACLE_SOCKET_TIMEOUT))
+        .map_err(|_| "oracle socket write timeout setup failed")?;
+    let observation = read_model_request(&mut socket, deadline, canary)?;
+    let body = r#"{"choices":[{"message":{"role":"assistant","content":"oracle-ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+    write!(
+        socket,
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .map_err(|_| "oracle response write failed")?;
+    socket.flush().map_err(|_| "oracle response flush failed")?;
+    request_tx
+        .send(Ok(observation))
+        .map_err(|_| "oracle request observation receiver closed")?;
+    Ok(())
+}
+
+fn capture_child_output<R: Read>(reader: R) -> Result<Vec<u8>, &'static str> {
+    let mut output = Vec::new();
+    reader
+        .take((ORACLE_MAX_CHILD_OUTPUT_BYTES + 1) as u64)
+        .read_to_end(&mut output)
+        .map_err(|_| "oracle child output read failed")?;
+    if output.len() > ORACLE_MAX_CHILD_OUTPUT_BYTES {
+        return Err("oracle child output exceeded size limit");
+    }
+    Ok(output)
+}
+
+fn kill_and_reap(child: &mut Child) -> Result<std::process::ExitStatus, &'static str> {
+    let _ = child.kill();
+    child.wait().map_err(|_| "oracle child reap failed")
+}
+
+fn wait_bounded_child(mut child: Child) -> Result<Output, &'static str> {
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = kill_and_reap(&mut child);
+            return Err("oracle child stdout pipe missing");
+        }
+    };
+    let stdout_thread = thread::spawn(move || capture_child_output(stdout));
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let reap = kill_and_reap(&mut child);
+            let _ = stdout_thread.join();
+            return match reap {
+                Ok(_) => Err("oracle child stderr pipe missing"),
+                Err(error) => Err(error),
+            };
+        }
+    };
+    let stderr_thread = thread::spawn(move || capture_child_output(stderr));
+
+    let deadline = Instant::now() + ORACLE_TIMEOUT;
+    let mut timed_out = false;
+    let wait_result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < deadline => thread::yield_now(),
+            Ok(None) => {
+                timed_out = true;
+                break kill_and_reap(&mut child);
+            }
+            Err(_) => {
+                let reap = kill_and_reap(&mut child);
+                break match reap {
+                    Ok(_) => Err("oracle child wait failed"),
+                    Err(error) => Err(error),
+                };
+            }
+        }
+    };
+    let stdout_result = match stdout_thread.join() {
+        Ok(result) => result,
+        Err(_) => Err("oracle child stdout thread failed"),
+    };
+    let stderr_result = match stderr_thread.join() {
+        Ok(result) => result,
+        Err(_) => Err("oracle child stderr thread failed"),
+    };
+    let status = wait_result?;
+    let stdout = stdout_result?;
+    let stderr = stderr_result?;
+    if timed_out {
+        return Err("oracle child timed out");
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn command_json(args: &[&str]) -> Output {
@@ -635,6 +870,29 @@ fn resume_and_inspect_reuse_the_original_run_identity() {
 }
 
 #[test]
+fn oracle_request_reader_rejects_early_eof() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
+    let address = listener.local_addr().expect("oracle listener address");
+    let client = std::net::TcpStream::connect(address).expect("oracle client");
+    client
+        .shutdown(std::net::Shutdown::Write)
+        .expect("oracle client shutdown");
+    let (mut socket, _) = listener.accept().expect("oracle request");
+    socket
+        .set_read_timeout(Some(ORACLE_SOCKET_TIMEOUT))
+        .expect("oracle socket read timeout");
+    assert!(
+        read_model_request(
+            &mut socket,
+            Instant::now() + ORACLE_TIMEOUT,
+            "synthetic-credential-canary-m3-01-7f3c",
+        )
+        .is_err(),
+        "early EOF must fail instead of spinning"
+    );
+}
+
+#[test]
 fn credential_value_is_absent_from_production_run_readback_surfaces() {
     const CHILD: &str = "WORKFLOWCTL_CREDENTIAL_ORACLE_CHILD";
     const WORKFLOW_ENV: &str = "WORKFLOWCTL_CREDENTIAL_ORACLE_WORKFLOW";
@@ -663,40 +921,13 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     let root = temp_root("credential-oracle");
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("oracle listener");
     let address = listener.local_addr().expect("oracle listener address");
+    let (request_tx, request_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
-        let (mut socket, _) = listener.accept().expect("model request");
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 8192];
-        loop {
-            let bytes = socket.read(&mut buffer).expect("model request read");
-            request.extend_from_slice(&buffer[..bytes]);
-            if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
-            }
+        let result = serve_oracle_request(listener, request_tx.clone(), CANARY);
+        if let Err(error) = result {
+            let _ = request_tx.send(Err(error));
         }
-        let header_end = request
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("model request headers")
-            + 4;
-        let content_length = String::from_utf8_lossy(&request[..header_end])
-            .lines()
-            .find_map(|line| line.strip_prefix("content-length: "))
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        while request.len() < header_end + content_length {
-            let bytes = socket.read(&mut buffer).expect("model request body read");
-            request.extend_from_slice(&buffer[..bytes]);
-        }
-        let body = r#"{"choices":[{"message":{"role":"assistant","content":"oracle-ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
-        write!(
-            socket,
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        )
-        .expect("oracle response");
-        socket.flush().expect("oracle response flush");
+        result
     });
 
     let profile_value = json!({
@@ -722,15 +953,37 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         .env(WORKFLOW_ENV, &workflow)
         .env(PROFILE_ENV, &profile)
         .env(RUNS_ENV, &runs)
-        .output()
-        .expect("oracle child should start");
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let child_result = match child {
+        Ok(child) => wait_bounded_child(child),
+        Err(error) => {
+            let _ = server.join();
+            panic!("oracle child should start: {error}");
+        }
+    };
+    let observation_result = request_rx.recv_timeout(ORACLE_TIMEOUT);
+    let server_result = server.join();
+
+    let child = match child_result {
+        Ok(child) => child,
+        Err(error) => panic!("oracle child supervision failed: {error}"),
+    };
     assert!(
         child.status.success(),
         "oracle child must succeed (stdout={}, stderr={})",
         String::from_utf8_lossy(&child.stdout).replace(CANARY, "[REDACTED]"),
         String::from_utf8_lossy(&child.stderr).replace(CANARY, "[REDACTED]")
     );
-    server.join().expect("oracle server should finish");
+    assert!(server_result.is_ok(), "oracle server should finish");
+    let observation = observation_result
+        .expect("oracle request observation receive")
+        .expect("oracle request observation");
+    assert_eq!(observation.method, "POST");
+    assert_eq!(observation.path, "/v1/chat/completions");
+    assert_eq!(observation.authorization_headers, 1);
+    assert_eq!(observation.canary_occurrences, 1);
 
     let run_root = run_root(&runs);
     let manifest_bytes = fs::read(run_root.join("run-manifest.json")).expect("run manifest");
