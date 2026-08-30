@@ -767,11 +767,35 @@ impl AdkGraphTranslator {
         )
     }
 
-    /// Translates a resolved runtime plan while keeping its canonical IR separate.
-    pub fn translate_resolved(
+    /// Translates a resolved profile plan with live profile adapters only after resolution.
+    pub fn translate_resolved_with_profile(
         &self,
         plan: &ResolvedRuntimePlan,
         ir: &workflow_ir::WorkflowIr,
+        agents: &BTreeMap<String, Arc<dyn Agent>>,
+        module: Option<&[u8]>,
+        input: &Value,
+        checkpointer: Option<Arc<dyn Checkpointer>>,
+    ) -> Result<AdkGraph, TranslationError> {
+        self.translate_resolved_with_backend(
+            plan,
+            ir,
+            Some(agents),
+            Some(ProfileNodeBackend {
+                module: module.map(Arc::from),
+                input: input.clone(),
+            }),
+            checkpointer,
+        )
+    }
+
+    fn translate_resolved_with_backend(
+        &self,
+        plan: &ResolvedRuntimePlan,
+        ir: &workflow_ir::WorkflowIr,
+        agents: Option<&BTreeMap<String, Arc<dyn Agent>>>,
+        profile_backend: Option<ProfileNodeBackend>,
+        checkpointer: Option<Arc<dyn Checkpointer>>,
     ) -> Result<AdkGraph, TranslationError> {
         let ir_hash = canonical_ir_hash(ir);
         let Some(plan_ir_hash) = serde_json::to_value(plan).ok().and_then(|value| {
@@ -803,10 +827,19 @@ impl AdkGraphTranslator {
                     .map(|capability| (*capability).to_owned())
                     .collect(),
             }),
-            None,
-            None,
-            None,
+            agents,
+            profile_backend,
+            checkpointer,
         )
+    }
+
+    /// Translates a resolved runtime plan while keeping its canonical IR separate.
+    pub fn translate_resolved(
+        &self,
+        plan: &ResolvedRuntimePlan,
+        ir: &workflow_ir::WorkflowIr,
+    ) -> Result<AdkGraph, TranslationError> {
+        self.translate_resolved_with_backend(plan, ir, None, None, None)
     }
 
     fn translate_ir(

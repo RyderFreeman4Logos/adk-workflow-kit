@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{cell::RefCell, collections::BTreeMap};
 
 use workflow_compiler::{
     BindingCategory, BindingRef, CapabilitySet, PlanResolutionErrorKind, ResolvedBinding,
@@ -167,4 +167,76 @@ fn resolution_covers_all_backend_neutral_projection_categories() {
     assert_eq!(plan.checkpoints().len(), 1);
     assert_eq!(plan.events().len(), 1);
     assert_eq!(plan.artifacts().len(), 1);
+}
+
+#[test]
+fn from_ir_resolves_predicates_but_resources_are_ir_locks() {
+    let source = r#"
+schema_version = 1
+[[nodes]]
+id = "start"
+kind = "action"
+resources = [{ path = "node.bin", sha256 = "sha256:node" }]
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "done"
+[[routes]]
+from = "start"
+predicate = { id = "route-predicate", version = "7" }
+cases = { ok = "done" }
+[workflow]
+id = "routed"
+version = "1"
+entry = "start"
+resources = [{ path = "workflow.bin", sha256 = "sha256:workflow" }]
+[[resources]]
+path = "top.bin"
+sha256 = "sha256:top"
+"#;
+    let spec = parse_str("routed.toml", source).expect("fixture parses");
+    let request = RuntimePlanRequest::from_ir(&WorkflowIr::from(&spec));
+    let registry = RecordingRegistry::default();
+    let plan = ResolvedRuntimePlan::resolve(request, &registry).expect("predicate resolves");
+    assert_eq!(
+        registry.calls.borrow().clone(),
+        vec![(
+            BindingCategory::Predicate,
+            "route-predicate".into(),
+            "7".into()
+        )]
+    );
+    assert!(plan.artifacts().is_empty());
+
+    let changed = source.replace("sha256:top", "sha256:changed");
+    let changed_spec = parse_str("routed.toml", &changed).expect("changed fixture parses");
+    let changed_plan = ResolvedRuntimePlan::resolve(
+        RuntimePlanRequest::from_ir(&WorkflowIr::from(&changed_spec)),
+        &RecordingRegistry::default(),
+    )
+    .expect("changed predicate resolves");
+    assert_ne!(plan.plan_hash(), changed_plan.plan_hash());
+    assert_ne!(plan.resume_identity(), changed_plan.resume_identity());
+}
+
+#[derive(Default)]
+struct RecordingRegistry {
+    calls: RefCell<Vec<(BindingCategory, String, String)>>,
+}
+
+impl RuntimePlanRegistry for RecordingRegistry {
+    fn resolve(
+        &self,
+        category: BindingCategory,
+        binding: &BindingRef,
+    ) -> Result<ResolvedBinding, workflow_compiler::RegistryResolutionError> {
+        self.calls.borrow_mut().push((
+            category,
+            binding.id().to_owned(),
+            binding.version().to_owned(),
+        ));
+        Ok(ResolvedBinding::new(binding.id(), binding.version()))
+    }
 }

@@ -34,6 +34,131 @@ impl Drop for TestRoot {
     }
 }
 
+fn profile() -> ExecutionProfileV1 {
+    ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .expect("profile fixture should parse")
+}
+
+fn workflow() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml")
+}
+
+fn resource_workflow_source(digest: &str) -> String {
+    format!(
+        r#"schema_version = 1
+
+[workflow]
+id = "resource-workflow"
+version = "1"
+entry = "start"
+resources = [{{ path = "workflow.bin", sha256 = "{digest}" }}]
+
+[[nodes]]
+id = "start"
+kind = "agent"
+
+[[nodes]]
+id = "done"
+kind = "terminal"
+
+[[edges]]
+from = "start"
+to = "done"
+"#
+    )
+}
+
+fn capability_profile(backend: &[&str], requested: &[&str]) -> ExecutionProfileV1 {
+    ExecutionProfileV1::parse(
+        &serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "tool": {
+                "name": "static-tool",
+                "result": {"ok": true},
+                "required_capabilities": requested
+            },
+            "sandbox": {"capabilities": backend}
+        }))
+        .expect("profile fixture serializes"),
+    )
+    .expect("profile fixture should parse")
+}
+
+#[test]
+fn resolved_capabilities_narrow_backend_and_survive_resume() {
+    let wide_root = TestRoot::new();
+    let narrow_root = TestRoot::new();
+    let workflow = workflow();
+    let wide = ExecutionBackend::run(
+        &workflow,
+        capability_profile(
+            &["filesystem.read", "network", "process.spawn"],
+            &["filesystem.read"],
+        ),
+        json!({"request":"public"}),
+        &wide_root.0,
+    )
+    .expect("wider backend must not widen the resolved plan");
+    let narrow = ExecutionBackend::run(
+        &workflow,
+        capability_profile(&["filesystem.read"], &["filesystem.read"]),
+        json!({"request":"public"}),
+        &narrow_root.0,
+    )
+    .expect("narrow backend must execute the same requested authority");
+    assert_eq!(wide.plan_hash(), narrow.plan_hash());
+    assert_eq!(wide.resume_identity(), narrow.resume_identity());
+
+    let profile_path = wide.run_root().join("execution-profile.json");
+    let mut stored_profile: Value =
+        serde_json::from_slice(&fs::read(&profile_path).unwrap()).unwrap();
+    stored_profile["sandbox"]["capabilities"] = json!([
+        "process.spawn",
+        "filesystem.read",
+        "network",
+        "filesystem.read"
+    ]);
+    fs::write(profile_path, serde_json::to_vec(&stored_profile).unwrap()).unwrap();
+    let resumed = ExecutionBackend::resume(&wide_root.0, wide.run_id())
+        .expect("irrelevant backend widening and ordering must not invalidate resume");
+    assert_eq!(resumed.plan_hash(), wide.plan_hash());
+    assert_eq!(resumed.resume_identity(), wide.resume_identity());
+}
+
+#[test]
+fn unavailable_requested_capability_fails_before_model_or_tool_execution() {
+    let root = TestRoot::new();
+    let error = ExecutionBackend::run(
+        workflow(),
+        capability_profile(&[], &["filesystem.read"]),
+        json!({"request":"public"}),
+        &root.0,
+    )
+    .expect_err("unavailable requested capability must fail closed");
+    assert_eq!(error.kind(), ExecutionErrorKind::SandboxDenied);
+    assert!(root.0.read_dir().unwrap().next().is_none());
+}
+
 #[test]
 fn execution_publishes_a_run_scoped_checkpoint_for_restart() {
     let root = TestRoot::new();
@@ -67,6 +192,44 @@ fn execution_publishes_a_run_scoped_checkpoint_for_restart() {
     let checkpoint = store.load_latest(&run_id).unwrap().expect("checkpoint");
     assert!(checkpoint.event_sequence() > 0);
     assert!(!checkpoint.state().is_empty());
+}
+
+#[test]
+fn execution_with_declared_resource_reaches_model_and_records_plan_identity() {
+    let root = TestRoot::new();
+    let workflow = root.0.join("resource.workflow.toml");
+    fs::write(&workflow, resource_workflow_source("sha256:resource-v1")).unwrap();
+
+    let receipt = ExecutionBackend::run(&workflow, profile(), json!({"request":"public"}), &root.0)
+        .expect("resource-bearing workflow should execute");
+    assert_eq!(receipt.status(), "succeeded");
+    assert!(!receipt.plan_hash().is_empty());
+
+    let resumed = ExecutionBackend::resume(&root.0, receipt.run_id())
+        .expect("resource-bearing workflow should resume");
+    assert_eq!(resumed.plan_hash(), receipt.plan_hash());
+    assert_eq!(resumed.resume_identity(), receipt.resume_identity());
+}
+
+#[test]
+fn resource_digest_change_rejects_resume_before_graph_invocation() {
+    let root = TestRoot::new();
+    let workflow = root.0.join("resource.workflow.toml");
+    fs::write(&workflow, resource_workflow_source("sha256:resource-v1")).unwrap();
+    let receipt = ExecutionBackend::run(&workflow, profile(), json!({"request":"public"}), &root.0)
+        .expect("resource-bearing workflow should execute");
+    let events_path = receipt.run_root().join("events.jsonl");
+    let before = fs::read(&events_path).unwrap();
+    let persisted_workflow = receipt.run_root().join("workflow.toml");
+    let changed = fs::read_to_string(&persisted_workflow)
+        .unwrap()
+        .replace("sha256:resource-v1", "sha256:resource-v2");
+    fs::write(persisted_workflow, changed).unwrap();
+
+    let error = ExecutionBackend::resume(&root.0, receipt.run_id())
+        .expect_err("changed resource identity must reject resume");
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(fs::read(events_path).unwrap(), before);
 }
 
 #[test]
@@ -670,4 +833,137 @@ fn execution_graph_preserves_authorization_denial_before_handler_effect() {
             assert_eq!(count, 0);
         }
     }
+}
+
+#[test]
+fn execution_persists_resolved_runtime_plan_identity() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .unwrap();
+    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
+    let receipt =
+        ExecutionBackend::run(workflow, profile, json!({"request":"public"}), &root.0).unwrap();
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(receipt.run_root().join("run-manifest.json")).unwrap())
+            .unwrap();
+    let plan_hash = manifest["plan_hash"].as_str().expect("plan hash");
+    assert!(!plan_hash.is_empty());
+    assert_eq!(
+        manifest["resume_identity"],
+        format!("resume-v1:{plan_hash}")
+    );
+}
+
+#[test]
+fn inspect_missing_run_remains_not_found() {
+    let root = TestRoot::new();
+    let error = ExecutionBackend::inspect(&root.0, "missing-run").expect_err("missing run");
+    assert_eq!(error.kind(), ExecutionErrorKind::RunNotFound);
+}
+
+#[test]
+fn inspect_accepts_current_manifest() {
+    let root = TestRoot::new();
+    let receipt =
+        ExecutionBackend::run(workflow(), profile(), json!({"request":"public"}), &root.0)
+            .expect("fixture run should succeed");
+
+    let inspected = ExecutionBackend::inspect(&root.0, receipt.run_id()).expect("current run");
+    assert_eq!(inspected.run_id(), receipt.run_id());
+    assert_eq!(inspected.status(), "succeeded");
+}
+
+#[test]
+fn execution_rejects_legacy_manifest_as_incompatible() {
+    let root = TestRoot::new();
+    let receipt =
+        ExecutionBackend::run(workflow(), profile(), json!({"request":"public"}), &root.0)
+            .expect("fixture run should succeed");
+    let manifest_path = receipt.run_root().join("run-manifest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("manifest should exist"))
+            .expect("manifest should be JSON");
+    let object = manifest.as_object_mut().expect("manifest object");
+    object.remove("plan_hash");
+    object.remove("resume_identity");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("legacy manifest should encode"),
+    )
+    .expect("legacy manifest should be writable");
+
+    let error = ExecutionBackend::inspect(&root.0, receipt.run_id()).expect_err("legacy run");
+    assert_eq!(error.kind(), ExecutionErrorKind::IncompatibleManifest);
+}
+
+#[test]
+fn resume_rejects_manifest_workdir_identity_mismatch() {
+    let root = TestRoot::new();
+    let receipt =
+        ExecutionBackend::run(workflow(), profile(), json!({"request":"public"}), &root.0)
+            .expect("fixture run should succeed");
+    let manifest_path = receipt.run_root().join("run-manifest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("manifest should exist"))
+            .expect("manifest should be JSON");
+    manifest
+        .as_object_mut()
+        .expect("manifest object")
+        .insert("workdir_id".to_owned(), json!("different-workdir"));
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("manifest should encode"),
+    )
+    .expect("manifest should be writable");
+
+    let error = ExecutionBackend::resume(&root.0, receipt.run_id()).expect_err("mismatch");
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+}
+
+#[test]
+fn checkpoint_tool_identity_comes_from_the_resolved_projection() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "tool": {
+                "name": "non-default-tool",
+                "result": {"ok": true},
+                "required_capabilities": [],
+                "required_scopes": []
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .expect("profile fixture should parse");
+    let receipt = ExecutionBackend::run(workflow(), profile, json!({"request":"public"}), &root.0)
+        .expect("fixture run should succeed");
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("run-manifest.json")).expect("manifest should exist"),
+    )
+    .expect("manifest should be JSON");
+    assert_eq!(
+        manifest["checkpoint_manifest"]["implementation_identities"]["tool"],
+        "non-default-tool:1"
+    );
 }
