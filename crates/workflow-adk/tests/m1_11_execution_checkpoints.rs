@@ -56,6 +56,84 @@ fn workflow() -> PathBuf {
         .join("../workflowctl/tests/fixtures/minimal.workflow.toml")
 }
 
+fn capability_profile(backend: &[&str], requested: &[&str]) -> ExecutionProfileV1 {
+    ExecutionProfileV1::parse(
+        &serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": ["done"]
+            },
+            "tool": {
+                "name": "static-tool",
+                "result": {"ok": true},
+                "required_capabilities": requested
+            },
+            "sandbox": {"capabilities": backend}
+        }))
+        .expect("profile fixture serializes"),
+    )
+    .expect("profile fixture should parse")
+}
+
+#[test]
+fn resolved_capabilities_narrow_backend_and_survive_resume() {
+    let wide_root = TestRoot::new();
+    let narrow_root = TestRoot::new();
+    let workflow = workflow();
+    let wide = ExecutionBackend::run(
+        &workflow,
+        capability_profile(
+            &["filesystem.read", "network", "process.spawn"],
+            &["filesystem.read"],
+        ),
+        json!({"request":"public"}),
+        &wide_root.0,
+    )
+    .expect("wider backend must not widen the resolved plan");
+    let narrow = ExecutionBackend::run(
+        &workflow,
+        capability_profile(&["filesystem.read"], &["filesystem.read"]),
+        json!({"request":"public"}),
+        &narrow_root.0,
+    )
+    .expect("narrow backend must execute the same requested authority");
+    assert_eq!(wide.plan_hash(), narrow.plan_hash());
+    assert_eq!(wide.resume_identity(), narrow.resume_identity());
+
+    let profile_path = wide.run_root().join("execution-profile.json");
+    let mut stored_profile: Value =
+        serde_json::from_slice(&fs::read(&profile_path).unwrap()).unwrap();
+    stored_profile["sandbox"]["capabilities"] = json!([
+        "process.spawn",
+        "filesystem.read",
+        "network",
+        "filesystem.read"
+    ]);
+    fs::write(profile_path, serde_json::to_vec(&stored_profile).unwrap()).unwrap();
+    let resumed = ExecutionBackend::resume(&wide_root.0, wide.run_id())
+        .expect("irrelevant backend widening and ordering must not invalidate resume");
+    assert_eq!(resumed.plan_hash(), wide.plan_hash());
+    assert_eq!(resumed.resume_identity(), wide.resume_identity());
+}
+
+#[test]
+fn unavailable_requested_capability_fails_before_model_or_tool_execution() {
+    let root = TestRoot::new();
+    let error = ExecutionBackend::run(
+        workflow(),
+        capability_profile(&[], &["filesystem.read"]),
+        json!({"request":"public"}),
+        &root.0,
+    )
+    .expect_err("unavailable requested capability must fail closed");
+    assert_eq!(error.kind(), ExecutionErrorKind::SandboxDenied);
+    assert!(root.0.read_dir().unwrap().next().is_none());
+}
+
 #[test]
 fn execution_publishes_a_run_scoped_checkpoint_for_restart() {
     let root = TestRoot::new();

@@ -555,9 +555,20 @@ fn resolve_runtime_plan(
     if let Some((tool, version)) = profile.tool_binding() {
         request = request.with_tool(tool, version);
     }
-    let capabilities = CapabilitySet::new(profile.sandbox.capabilities.clone());
-    request.set_capabilities(capabilities.clone());
-    request.set_effective_capabilities(capabilities);
+    let (backend_capabilities, required_capabilities) = profile.capabilities()?;
+    let requested = CapabilitySet::new(required_capabilities.iter().map(SandboxCapability::as_str));
+    let effective = CapabilitySet::new(
+        required_capabilities
+            .iter()
+            .filter(|capability| {
+                backend_capabilities
+                    .iter()
+                    .any(|backend| backend == *capability)
+            })
+            .map(SandboxCapability::as_str),
+    );
+    request.set_capabilities(requested);
+    request.set_effective_capabilities(effective);
     ResolvedRuntimePlan::resolve(request, &ExecutionRuntimeRegistry::new(profile)).map_err(
         |error| {
             let kind = match error.kind() {
@@ -579,6 +590,16 @@ fn resolve_runtime_plan(
             )
         },
     )
+}
+
+fn effective_sandbox_capabilities(
+    plan: &ResolvedRuntimePlan,
+) -> Result<Vec<SandboxCapability>, ExecutionError> {
+    plan.effective_capabilities()
+        .as_slice()
+        .into_iter()
+        .map(parse_capability)
+        .collect()
 }
 
 fn parse_capability(value: &str) -> Result<SandboxCapability, ExecutionError> {
@@ -861,6 +882,7 @@ impl ExecutionBackend {
         let compiled = compile_file(workflow.as_ref().to_string_lossy().as_ref())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Compile))?;
         let resolved_plan = resolve_runtime_plan(&profile, compiled.ir())?;
+        let effective_capabilities = effective_sandbox_capabilities(&resolved_plan)?;
         profile.validate_resolved_tool(&resolved_plan)?;
         let transform_module = profile.transform_module()?;
         let model = profile.bind_resolved_model(&resolved_plan)?;
@@ -1000,13 +1022,13 @@ impl ExecutionBackend {
         } else {
             let artifacts = artifacts.as_mut().expect("artifact store must be present");
             (|| {
-                let sandbox = RunSandbox::new(context, run_workdir, sandbox_capabilities)
+                let sandbox = RunSandbox::new(context, run_workdir, effective_capabilities.clone())
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::SandboxDenied))?;
                 let tool = build_tool(
                     &profile,
                     resolved_plan.tools().first(),
                     sandbox,
-                    &required_capabilities,
+                    &effective_capabilities,
                     &run_id,
                     effect_journal.clone(),
                 )?;
@@ -1342,6 +1364,12 @@ impl ExecutionBackend {
         }
         let profile =
             ExecutionProfileV1::parse(&bounded_read(&root.join("execution-profile.json"))?)?;
+        let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
+        verify_sandbox_capabilities(
+            &RequestedCapabilities::new(required_capabilities.iter().copied()),
+            &BackendCapabilities::new(sandbox_capabilities.iter().copied()),
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let input =
             serde_json::from_slice::<Value>(&bounded_read(&root.join("execution-input.json"))?)
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
@@ -1377,13 +1405,8 @@ impl ExecutionBackend {
         if live_checkpoint_manifest != checkpoint_manifest {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
+        let effective_capabilities = effective_sandbox_capabilities(&resolved_plan)?;
         let model = profile.bind_resolved_model(&resolved_plan)?;
-        let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
-        verify_sandbox_capabilities(
-            &RequestedCapabilities::new(required_capabilities.iter().copied()),
-            &BackendCapabilities::new(sandbox_capabilities.iter().copied()),
-        )
-        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let events_path = root.join("events.jsonl");
         let mut events = read_events(&events_path)?;
         let event_sequence = events.last().map_or(0, |event| event.sequence());
@@ -1413,7 +1436,7 @@ impl ExecutionBackend {
         let sandbox = RunSandbox::new(
             RunContext::new(run_identity.clone(), run_limits()),
             run_workdir,
-            sandbox_capabilities,
+            effective_capabilities.clone(),
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let effect_journal = Arc::new(
@@ -1424,7 +1447,7 @@ impl ExecutionBackend {
             &profile,
             resolved_plan.tools().first(),
             sandbox,
-            &required_capabilities,
+            &effective_capabilities,
             &run_identity,
             Some(effect_journal),
         )?;
@@ -1574,8 +1597,9 @@ fn build_checkpoint_manifest(
     plan: &ResolvedRuntimePlan,
     transform_module: Option<&[u8]>,
 ) -> Result<CheckpointManifestV1, ExecutionError> {
-    let profile_hash = serde_json::to_vec(profile)
+    let profile_identity = serde_json::to_vec(&(&profile.model, &profile.tool))
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+    let effective_capabilities = plan.effective_capabilities().as_slice().join("\n");
     let mut manifest = CheckpointManifestV1::new(run_id, workflow_id, workflow_version)
         .with_workflow_hash(workflow_hash.clone())
         .with_resource_hash("workflow.ir", workflow_hash)
@@ -1583,11 +1607,11 @@ fn build_checkpoint_manifest(
         .with_implementation("adk-rust", "2.1.0")
         .with_implementation(
             "execution-profile",
-            format!("sha256:{:x}", Sha256::digest(profile_hash)),
+            format!("sha256:{:x}", Sha256::digest(profile_identity)),
         )
         .with_sandbox_policy_hash(format!(
             "sha256:{:x}",
-            Sha256::digest(profile.sandbox.capabilities.join("\n").as_bytes())
+            Sha256::digest(effective_capabilities.as_bytes())
         ))
         .with_event_log_identity("workflow-runtime-events-v1");
     if let Some(tool) = plan.tools().first() {
