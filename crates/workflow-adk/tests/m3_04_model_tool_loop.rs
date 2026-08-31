@@ -288,6 +288,39 @@ fn non_json_or_wrong_finish_shape_never_succeeds() {
 }
 
 #[test]
+fn extra_field_finish_run_and_resume_fail_closed_before_dispatch() {
+    let response = json!(
+        serde_json::to_string(&json!({
+            "status": "finished",
+            "output": {"answer":"forged"},
+            "extra": true,
+        }))
+        .unwrap()
+    );
+    let (root, error) = run(profile_with(vec![response], None));
+    let error = error.unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::Adk);
+    let run_root = error.receipt().unwrap().run_root();
+    let ledger_path = run_root.join("loop-ledger.json");
+    let events_path = run_root.join("events.jsonl");
+    let before = (
+        fs::read(&ledger_path).unwrap(),
+        fs::read(&events_path).unwrap(),
+    );
+    let resume = ExecutionBackend::resume(&root, error.receipt().unwrap().run_id()).unwrap_err();
+    assert_eq!(resume.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(effect_count(run_root), 0);
+    assert_eq!(
+        (
+            fs::read(ledger_path).unwrap(),
+            fs::read(events_path).unwrap()
+        ),
+        before
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn empty_response_missing_finish_and_repeated_call_fail_closed() {
     for responses in [
         vec![json!(" ")],
@@ -422,6 +455,29 @@ fn tool_time_limit_is_exact_and_timed_out() {
     let error = error.unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::ToolTimeLimit);
     assert_eq!(error.receipt().unwrap().status(), "timed_out");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tool_idle_limit_fences_effect_before_commit() {
+    let mut policy = loop_policy();
+    policy["idle_time_ms"] = json!(25);
+    policy["tool_time_ms"] = json!(1000);
+    let (root, error) = run(profile_with_delays(
+        vec![
+            json!({"calls": [{"id":"call-idle","name":"search_code","args":{"query":"one"}}]}),
+            finish(json!({"answer":"must not run"})),
+        ],
+        Some(policy),
+        0,
+        100,
+        json!({"found":true}),
+    ));
+    let error = error.unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::IdleTimeLimit);
+    assert_eq!(error.receipt().unwrap().status(), "timed_out");
+    assert_eq!(effect_count(error.receipt().unwrap().run_root()), 0);
+    assert!(!events(&error).contains("tool_completed"));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -608,6 +664,110 @@ fn resume_wall_time_limit_includes_pending_replay_and_is_typed() {
     assert!(started.elapsed() < Duration::from_millis(200));
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(effect_count(&run_root), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resume_idle_limit_fences_pending_replay_before_commit() {
+    if let Ok(root) = env::var("M3_04_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let mut policy = loop_policy();
+        policy["idle_time_ms"] = json!(25);
+        policy["tool_time_ms"] = json!(1000);
+        let _ = ExecutionBackend::run(
+            workflow,
+            profile_with_delays(
+                vec![
+                    json!({"calls": [{"id":"call-idle-replay","name":"search_code","args":{"query":"needle"}}]}),
+                    finish(json!({"answer":"must not run"})),
+                ],
+                Some(policy),
+                0,
+                100,
+                json!({"found":true}),
+            ),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let root = root();
+    let run_root = crash_run(
+        &root,
+        "resume_idle_limit_fences_pending_replay_before_commit",
+        "before-effect",
+    );
+    let error = ExecutionBackend::resume(&root, &run_id(&run_root)).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::IdleTimeLimit);
+    assert_eq!(error.receipt().unwrap().status(), "timed_out");
+    assert_eq!(effect_count(&run_root), 0);
+    assert!(!events(&error).contains("tool_completed"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resume_rejects_unverified_multiple_mixed_finish_before_dispatch() {
+    if let Ok(root) = env::var("M3_04_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            workflow,
+            profile_with(
+                vec![
+                    json!({"calls": [{"id":"call-mixed","name":"search_code","args":{"query":"needle"}}]}),
+                ],
+                Some(loop_policy()),
+            ),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let root = root();
+    let run_root = crash_run(
+        &root,
+        "resume_rejects_unverified_multiple_mixed_finish_before_dispatch",
+        "before-effect",
+    );
+    let ledger_path = run_root.join("loop-ledger.json");
+    let mut ledger: Value = serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    let finish = serde_json::to_string(&json!({
+        "status": "finished",
+        "output": {"answer":"forged"},
+    }))
+    .unwrap();
+    let parts = ledger["nodes"]["work"]["conversation"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap()["parts"]
+        .as_array_mut()
+        .unwrap();
+    parts.push(json!({"text": finish}));
+    parts.push(json!({"text": finish}));
+    ledger["nodes"]["work"]["finished_output"] = json!({"answer":"forged"});
+    fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+    let events_path = run_root.join("events.jsonl");
+    let before = (
+        fs::read(&ledger_path).unwrap(),
+        fs::read(&events_path).unwrap(),
+    );
+
+    let error = ExecutionBackend::resume(&root, &run_id(&run_root)).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(effect_count(&run_root), 0);
+    assert_eq!(
+        (
+            fs::read(ledger_path).unwrap(),
+            fs::read(events_path).unwrap()
+        ),
+        before
+    );
     fs::remove_dir_all(root).unwrap();
 }
 

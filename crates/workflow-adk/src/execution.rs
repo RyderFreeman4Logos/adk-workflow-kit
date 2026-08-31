@@ -66,6 +66,8 @@ struct LoopState {
     conversation: Vec<adk_rust::Content>,
     previous_response_id: Option<String>,
     pending_calls: VecDeque<PendingCall>,
+    #[serde(default)]
+    finish_admitted: bool,
     finished_output: Option<Value>,
 }
 
@@ -103,7 +105,12 @@ impl LoopLedgerStore {
     fn open(path: PathBuf) -> Result<Self, ExecutionError> {
         let ledger = serde_json::from_slice::<LoopLedgerV1>(&bounded_read(&path)?)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        if ledger.schema_version != 1 {
+        if ledger.schema_version != 1
+            || ledger
+                .nodes
+                .values()
+                .any(|state| !valid_terminal_state(state))
+        {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
         Ok(Self {
@@ -275,6 +282,7 @@ fn tool_response_content(call: &PendingCall, response: Value) -> adk_rust::Conte
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ModelFinish {
     status: FinishStatus,
     output: Value,
@@ -285,6 +293,50 @@ struct ModelFinish {
 enum FinishStatus {
     Finished,
 }
+
+fn admitted_finish(content: &adk_rust::Content) -> Result<Option<Value>, ()> {
+    let mut output = None;
+    let mut has_call = false;
+    for part in &content.parts {
+        match part {
+            adk_rust::Part::Text { text } if !text.trim().is_empty() => {
+                let ModelFinish {
+                    status: FinishStatus::Finished,
+                    output: next,
+                } = serde_json::from_str(text).map_err(|_| ())?;
+                if output.replace(next).is_some() {
+                    return Err(());
+                }
+            }
+            adk_rust::Part::FunctionCall { .. } => has_call = true,
+            _ => {}
+        }
+    }
+    if has_call && output.is_some() {
+        return Err(());
+    }
+    if has_call {
+        Ok(None)
+    } else {
+        output.map(Some).ok_or(())
+    }
+}
+
+fn valid_terminal_state(state: &LoopState) -> bool {
+    match (&state.finished_output, state.finish_admitted) {
+        (None, false) => true,
+        (Some(output), true) if state.pending_calls.is_empty() => {
+            state
+                .conversation
+                .last()
+                .and_then(|content| admitted_finish(content).ok().flatten())
+                .as_ref()
+                == Some(output)
+        }
+        _ => false,
+    }
+}
+
 struct LoopController {
     limits: RunLimits,
     state: Mutex<LoopState>,
@@ -292,7 +344,7 @@ struct LoopController {
     ledger: Arc<LoopLedgerStore>,
     terminal: Arc<Mutex<Option<ExecutionErrorKind>>>,
     cancellation: Arc<AtomicBool>,
-    last_progress: Mutex<Instant>,
+    last_progress: Arc<Mutex<Instant>>,
 }
 
 impl LoopController {
@@ -302,6 +354,7 @@ impl LoopController {
         ledger: Arc<LoopLedgerStore>,
         terminal: Arc<Mutex<Option<ExecutionErrorKind>>>,
         cancellation: Arc<AtomicBool>,
+        last_progress: Arc<Mutex<Instant>>,
     ) -> Result<Self, ExecutionError> {
         let node = node.into();
         Ok(Self {
@@ -311,7 +364,7 @@ impl LoopController {
             ledger,
             terminal,
             cancellation,
-            last_progress: Mutex::new(Instant::now()),
+            last_progress,
         })
     }
 
@@ -376,52 +429,38 @@ impl LoopController {
                 "workflow.loop.timeout.idle",
             ));
         }
-        *last_progress = Instant::now();
-        drop(last_progress);
+        let finished_output = admitted_finish(content)
+            .map_err(|_| adk_rust::AdkError::agent("model response missing typed finish"))?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| adk_rust::AdkError::agent("model call state poisoned"))?;
         let mut next = state.clone();
-        let mut finished_output = None;
-        let mut has_call = false;
         for part in &content.parts {
-            match part {
-                adk_rust::Part::Text { text } if !text.trim().is_empty() => {
-                    let finish: ModelFinish = serde_json::from_str(text).map_err(|_| {
-                        adk_rust::AdkError::agent("model response missing typed finish")
-                    })?;
-                    let ModelFinish { status, output } = finish;
-                    let FinishStatus::Finished = status;
-                    finished_output = Some(output);
+            if let adk_rust::Part::FunctionCall { name, args, id, .. } = part {
+                let id = id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| adk_rust::AdkError::agent("model call missing ID"))?;
+                if !allowed.contains(name) || !args.is_object() {
+                    return Err(adk_rust::AdkError::agent(
+                        "model call is unselected or schema-invalid",
+                    ));
                 }
-                adk_rust::Part::FunctionCall { name, args, id, .. } => {
-                    has_call = true;
-                    let id = id
-                        .as_deref()
-                        .filter(|id| !id.is_empty())
-                        .ok_or_else(|| adk_rust::AdkError::agent("model call missing ID"))?;
-                    if !allowed.contains(name) || !args.is_object() {
-                        return Err(adk_rust::AdkError::agent(
-                            "model call is unselected or schema-invalid",
-                        ));
-                    }
-                    let fingerprint = workflow_runtime::argument_fingerprint(args);
-                    if !next.seen_ids.insert(id.to_owned())
-                        || !next.seen_calls.insert((name.clone(), fingerprint.clone()))
-                    {
-                        return Err(adk_rust::AdkError::agent("repeated model tool call"));
-                    }
-                    next.total_tool_calls = next.total_tool_calls.saturating_add(1);
-                    *next.tool_calls.entry(name.clone()).or_default() += 1;
-                    next.pending_calls.push_back(PendingCall {
-                        id: id.to_owned(),
-                        name: name.clone(),
-                        args: args.clone(),
-                        fingerprint,
-                    });
+                let fingerprint = workflow_runtime::argument_fingerprint(args);
+                if !next.seen_ids.insert(id.to_owned())
+                    || !next.seen_calls.insert((name.clone(), fingerprint.clone()))
+                {
+                    return Err(adk_rust::AdkError::agent("repeated model tool call"));
                 }
-                _ => {}
+                next.total_tool_calls = next.total_tool_calls.saturating_add(1);
+                *next.tool_calls.entry(name.clone()).or_default() += 1;
+                next.pending_calls.push_back(PendingCall {
+                    id: id.to_owned(),
+                    name: name.clone(),
+                    args: args.clone(),
+                    fingerprint,
+                });
             }
         }
         if next.total_tool_calls > self.limits.max_tool_calls().get() {
@@ -440,11 +479,7 @@ impl LoopController {
                 "workflow.loop.limit.per_tool_calls",
             ));
         }
-        if !has_call && finished_output.is_none() {
-            return Err(adk_rust::AdkError::agent(
-                "model response missing typed finish",
-            ));
-        }
+        next.finish_admitted = finished_output.is_some();
         next.finished_output = finished_output;
         next.model_iterations += 1;
         next.conversation.push(content.clone());
@@ -453,6 +488,7 @@ impl LoopController {
             .replace(&self.node, next.clone())
             .map_err(|_| self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable"))?;
         *state = next;
+        *last_progress = Instant::now();
         Ok(())
     }
 
@@ -463,9 +499,6 @@ impl LoopController {
     ) -> adk_rust::Result<()> {
         if self.cancellation.load(Ordering::Acquire) {
             return Err(self.fail(ExecutionErrorKind::Cancelled, "workflow.loop.cancelled"));
-        }
-        if let Ok(mut last_progress) = self.last_progress.lock() {
-            *last_progress = Instant::now();
         }
         let outcome = context
             .tool_outcome()
@@ -1279,8 +1312,7 @@ fn build_profile_agent(
     tool: Option<BoundTool>,
     limits: RunLimits,
     ledger: Arc<LoopLedgerStore>,
-    terminal: Arc<Mutex<Option<ExecutionErrorKind>>>,
-    cancellation: Arc<AtomicBool>,
+    effect_fence: Arc<EffectFence>,
 ) -> Result<Arc<dyn Agent>, ExecutionError> {
     let (names, toolset) = match tool {
         Some((names, toolset)) => (names, Some(toolset)),
@@ -1291,8 +1323,9 @@ fn build_profile_agent(
         name,
         limits,
         ledger,
-        terminal,
-        cancellation,
+        Arc::clone(&effect_fence.terminal),
+        Arc::clone(&effect_fence.cancellation),
+        Arc::clone(&effect_fence.last_progress),
     )?);
     let before_controller = Arc::clone(&controller);
     let tool_controller = Arc::clone(&controller);
@@ -1815,20 +1848,25 @@ impl ExecutionBackend {
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::SandboxDenied))?;
                 let deadline = execution_deadline(&profile.run_limits())?;
                 let terminal_kind = Arc::new(Mutex::new(None));
+                let last_progress = Arc::new(Mutex::new(Instant::now()));
                 let effect_fence = Arc::new(EffectFence {
                     cancellation: Arc::clone(&cancellation),
                     wall_deadline: deadline,
+                    idle_timeout: Duration::from_millis(
+                        profile.run_limits().max_idle_time_ms().get(),
+                    ),
                     tool_timeout: Duration::from_millis(
                         profile.run_limits().max_tool_time_ms().get(),
                     ),
                     terminal: Arc::clone(&terminal_kind),
+                    last_progress: Arc::clone(&last_progress),
                 });
                 let tool_registry = build_tool_registry(
                     &profile,
                     sandbox,
                     &run_id,
                     effect_journal.clone(),
-                    effect_fence,
+                    Arc::clone(&effect_fence),
                 )?;
                 let agents = compiled
                     .ir()
@@ -1852,8 +1890,7 @@ impl ExecutionBackend {
                             )?,
                             profile.run_limits(),
                             Arc::clone(&loop_ledger),
-                            Arc::clone(&terminal_kind),
-                            Arc::clone(&cancellation),
+                            Arc::clone(&effect_fence),
                         )?;
                         Ok((node.id().as_str().to_owned(), agent))
                     })
@@ -2124,6 +2161,9 @@ impl ExecutionBackend {
         run_id: &str,
     ) -> Result<ExecutionReceipt, ExecutionError> {
         let (root, mut manifest) = find_run(workdir_base.as_ref(), run_id)?;
+        if !matches!(manifest.status.as_str(), "running" | "succeeded") {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
         let checkpoint_manifest = manifest
             .checkpoint_manifest
             .clone()
@@ -2272,11 +2312,14 @@ impl ExecutionBackend {
         let deadline = execution_deadline(&profile.run_limits())?;
         let terminal_kind = Arc::new(Mutex::new(None));
         let cancellation = Arc::new(AtomicBool::new(false));
+        let last_progress = Arc::new(Mutex::new(Instant::now()));
         let effect_fence = Arc::new(EffectFence {
             cancellation: Arc::clone(&cancellation),
             wall_deadline: deadline,
+            idle_timeout: Duration::from_millis(profile.run_limits().max_idle_time_ms().get()),
             tool_timeout: Duration::from_millis(profile.run_limits().max_tool_time_ms().get()),
             terminal: Arc::clone(&terminal_kind),
+            last_progress: Arc::clone(&last_progress),
         });
         let loop_ledger = Arc::new(LoopLedgerStore::open(root.join(LOOP_LEDGER_FILE))?);
         let tool_registry = build_tool_registry(
@@ -2284,7 +2327,7 @@ impl ExecutionBackend {
             sandbox,
             &run_identity,
             Some(Arc::clone(&effect_journal)),
-            effect_fence,
+            Arc::clone(&effect_fence),
         )?;
         let toolsets = compiled
             .ir()
@@ -2302,9 +2345,13 @@ impl ExecutionBackend {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        if let Err(error) =
-            replay_pending_tools(&loop_ledger, &toolsets, profile.run_limits(), deadline)
-        {
+        if let Err(error) = replay_pending_tools(
+            &loop_ledger,
+            &toolsets,
+            profile.run_limits(),
+            deadline,
+            &terminal_kind,
+        ) {
             return Err(resume_failure(
                 &root,
                 &events_path,
@@ -2337,8 +2384,7 @@ impl ExecutionBackend {
                         toolsets.get(name).cloned().flatten(),
                         profile.run_limits(),
                         Arc::clone(&loop_ledger),
-                        Arc::clone(&terminal_kind),
-                        Arc::clone(&cancellation),
+                        Arc::clone(&effect_fence),
                     )?
                 };
                 Ok((name.to_owned(), agent))
@@ -2523,8 +2569,10 @@ fn build_checkpoint_manifest(
 struct EffectFence {
     cancellation: Arc<AtomicBool>,
     wall_deadline: Instant,
+    idle_timeout: Duration,
     tool_timeout: Duration,
     terminal: Arc<Mutex<Option<ExecutionErrorKind>>>,
+    last_progress: Arc<Mutex<Instant>>,
 }
 
 impl EffectFence {
@@ -2546,6 +2594,12 @@ impl EffectFence {
             Some(ExecutionErrorKind::Cancelled)
         } else if Instant::now() >= self.wall_deadline {
             Some(ExecutionErrorKind::WallTimeLimit)
+        } else if self
+            .last_progress
+            .lock()
+            .map_or(true, |progress| progress.elapsed() >= self.idle_timeout)
+        {
+            Some(ExecutionErrorKind::IdleTimeLimit)
         } else if Instant::now() >= tool_deadline {
             Some(ExecutionErrorKind::ToolTimeLimit)
         } else {
@@ -2559,6 +2613,15 @@ impl EffectFence {
             }
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
         }
+        Ok(())
+    }
+
+    fn mark_progress(&self) -> Result<(), ToolBridgeError> {
+        *self
+            .last_progress
+            .lock()
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))? =
+            Instant::now();
         Ok(())
     }
 }
@@ -2648,6 +2711,7 @@ fn replay_pending_tools(
     toolsets: &BTreeMap<String, Option<BoundTool>>,
     limits: RunLimits,
     deadline: Instant,
+    terminal: &Mutex<Option<ExecutionErrorKind>>,
 ) -> Result<(), ExecutionError> {
     for (node, pending) in ledger.pending_calls()? {
         let toolset = toolsets
@@ -2670,6 +2734,9 @@ fn replay_pending_tools(
         let (node, pending, response) = worker
             .join()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
+        if let Some(kind) = terminal.lock().ok().and_then(|terminal| *terminal) {
+            return Err(ExecutionError::new(kind));
+        }
         remaining_wall_time(deadline)?;
         let response = response.map_err(|error| {
             let kind = match error.kind() {
@@ -2766,6 +2833,7 @@ impl ToolHandler for StaticToolHandler {
             self.result.clone()
         };
         crash_barrier("after-effect");
+        self.effect_fence.mark_progress()?;
         Ok(ToolEnvelope::success(result, self.provenance.clone()))
     }
 }
