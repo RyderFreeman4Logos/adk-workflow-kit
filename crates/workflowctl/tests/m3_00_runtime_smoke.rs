@@ -142,14 +142,81 @@ fn assert_receipt_shape(receipt: &Value) {
     assert_eq!(receipt["workflow_id"], "m3-00-runtime-smoke");
 }
 
-fn assert_no_forbidden_bytes(bytes: &[u8]) {
+const RUNTIME_FORBIDDEN: [&str; 6] = ["/home/", "/Users/", "Bearer ", "sk-", "api_key", "password"];
+const SECRET_FORBIDDEN: [&str; 4] = ["Bearer ", "sk-", "api_key", "password"];
+
+fn forbidden_value(bytes: &[u8], forbidden: &[&'static str]) -> Option<&'static str> {
     let text = String::from_utf8_lossy(bytes);
-    for forbidden in ["/home/", "/Users/", "Bearer ", "sk-", "api_key", "password"] {
-        assert!(
-            !text.contains(forbidden),
-            "runtime output leaked {forbidden:?}"
-        );
+    forbidden
+        .iter()
+        .copied()
+        .find(|value| text.contains(*value))
+}
+
+fn assert_no_forbidden_bytes(bytes: &[u8]) {
+    if let Some(forbidden) = forbidden_value(bytes, &RUNTIME_FORBIDDEN) {
+        panic!("runtime output leaked {forbidden:?}");
     }
+}
+
+fn check_walkthrough_privacy(bytes: &[u8], expected_run_root: &[u8]) -> Result<(), &'static str> {
+    if expected_run_root.is_empty() {
+        return Err("expected run_root is empty");
+    }
+    if forbidden_value(expected_run_root, &SECRET_FORBIDDEN).is_some() {
+        return Err("expected run_root contains secret material");
+    }
+
+    let expected_matches = bytes
+        .windows(expected_run_root.len())
+        .filter(|window| *window == expected_run_root)
+        .count();
+    if expected_matches == 0 {
+        return Err("expected run_root is missing");
+    }
+
+    let mut redacted = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+    let mut replacements = 0;
+    while let Some(position) = remaining
+        .windows(expected_run_root.len())
+        .position(|window| window == expected_run_root)
+    {
+        redacted.extend_from_slice(&remaining[..position]);
+        redacted.extend_from_slice(b"<run-root>");
+        remaining = &remaining[position + expected_run_root.len()..];
+        replacements += 1;
+    }
+    if replacements != expected_matches {
+        return Err("expected run_root exemption is ambiguous");
+    }
+    redacted.extend_from_slice(remaining);
+
+    if forbidden_value(&redacted, &RUNTIME_FORBIDDEN).is_some() {
+        return Err("walkthrough contains forbidden material");
+    }
+    Ok(())
+}
+
+#[test]
+fn privacy_oracle_allows_validated_home_run_root() {
+    let run_root = "/home/user/tmp/workflowctl-m3-00/runs/run-123";
+    let walkthrough = format!(
+        r#"{{"run":{{"run_root":"{run_root}"}},"inspect":{{"run_root":"{run_root}"}},"resume":{{"run_root":"{run_root}"}}}}"#
+    );
+    assert_eq!(
+        check_walkthrough_privacy(walkthrough.as_bytes(), run_root.as_bytes()),
+        Ok(())
+    );
+
+    let distinct_home = format!(r#"{walkthrough}{{"path":"/home/other/tmp"}}"#);
+    assert!(check_walkthrough_privacy(distinct_home.as_bytes(), run_root.as_bytes()).is_err());
+
+    let secret = format!(r#"{walkthrough}{{"api_key":"not-a-key"}}"#);
+    assert!(check_walkthrough_privacy(secret.as_bytes(), run_root.as_bytes()).is_err());
+    assert!(check_walkthrough_privacy(walkthrough.as_bytes(), b"").is_err());
+    assert!(check_walkthrough_privacy(walkthrough.as_bytes(), b"/home/user/tmp/missing").is_err());
+    assert!(check_walkthrough_privacy(b"aaaa", b"aaa").is_err());
 }
 
 #[test]
@@ -221,7 +288,6 @@ fn runtime_smoke_example_executes_full_provider_free_sequence() {
         String::from_utf8_lossy(&walkthrough.stderr)
     );
     assert!(walkthrough.stdout.len() <= MAX_FIXTURE_BYTES);
-    assert_no_forbidden_bytes(&walkthrough.stdout);
     let walkthrough_text = String::from_utf8(walkthrough.stdout).expect("walkthrough UTF-8");
     assert!(walkthrough_text.lines().any(|line| line == "valid"));
     assert!(walkthrough_text.contains("agent"));
@@ -263,7 +329,10 @@ fn runtime_smoke_example_executes_full_provider_free_sequence() {
             .starts_with(runs.to_str().unwrap())
     );
 
-    let run_root = PathBuf::from(run["run_root"].as_str().unwrap());
+    let run_root_text = run["run_root"].as_str().unwrap();
+    let run_root = PathBuf::from(run_root_text);
+    check_walkthrough_privacy(walkthrough_text.as_bytes(), run_root_text.as_bytes())
+        .unwrap_or_else(|error| panic!("runtime output privacy check failed: {error}"));
     for surface in [
         "workflow.toml",
         "execution-profile.json",
