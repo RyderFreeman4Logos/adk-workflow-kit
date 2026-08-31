@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 static TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+static NON_REAPING_OBSERVATION_USED: AtomicBool = AtomicBool::new(false);
 
 const MAX_FIXTURE_BYTES: usize = 64 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 64 * 1024;
@@ -213,8 +214,15 @@ fn observe_child_exit_without_reaping(
         return Err("subprocess wait failed");
     }
     // SAFETY: waitid initialized the siginfo buffer on success.
-    Ok(unsafe { info.si_pid() } == child_pid as libc::pid_t)
+    let exited = unsafe { info.si_pid() } == child_pid as libc::pid_t;
+    if exited {
+        NON_REAPING_OBSERVATION_USED.store(true, Ordering::Release);
+    }
+    Ok(exited)
 }
+
+// Keep the helper live for the serial historical-order mutation proof.
+const _: fn(u32, Instant) -> Result<bool, &'static str> = observe_child_exit_without_reaping;
 
 fn bounded_output(
     command: &mut Command,
@@ -947,83 +955,76 @@ fn normal_completion_signals_owned_group_before_reaping_leader() {
     let marker = root.path().join("descendant.pid");
     fs::write(&hold, b"hold").expect("descendant hold");
     let script = format!(
-        "(printf '%s' \"$BASHPID\" > '{}'; while test -e '{}'; do :; done) & exit 0",
+        "(read -r descendant_pid command_name state parent_pid process_group session < /proc/$BASHPID/stat; printf '%s %s %s' \"$descendant_pid\" \"$process_group\" \"$$\" > '{}'; while test -e '{}'; do :; done) & while ! test -s '{}'; do :; done; exit 0",
         marker.display(),
         hold.display(),
+        marker.display(),
     );
     let mut command = Command::new("bash");
-    command
-        .args(["-c", &script])
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = command.spawn().expect("lifecycle fixture");
-    let process_group = child.id();
-    let setup_deadline = Instant::now() + CLEANUP_TIMEOUT;
-    let descendant = loop {
-        if let Some(pid) = fs::read(&marker)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .and_then(|text| text.parse::<u32>().ok())
-        {
-            break pid;
-        }
-        if Instant::now() >= setup_deadline {
-            kill_process_group(process_group);
-            let _ = child.wait();
-            panic!("descendant fixture did not publish its PID");
-        }
-        thread::yield_now();
-    };
-    assert_eq!(
-        unsafe { libc::getpgid(descendant as libc::pid_t) },
-        process_group as libc::pid_t
-    );
+    command.args(["-c", &script]);
 
-    loop {
-        match observe_child_exit_without_reaping(child.id(), setup_deadline) {
-            Ok(true) => break,
-            Ok(false) if Instant::now() < setup_deadline => thread::yield_now(),
-            Ok(false) => {
-                kill_process_group(process_group);
-                let _ = child.wait();
-                panic!("leader did not exit before the observation deadline");
-            }
-            Err(error) => {
-                kill_process_group(process_group);
-                let _ = child.wait();
-                panic!("leader observation failed: {error}");
-            }
+    let timeout = Duration::from_secs(1);
+    let absolute_bound = timeout + CLEANUP_TIMEOUT;
+    NON_REAPING_OBSERVATION_USED.store(false, Ordering::Release);
+    let started = Instant::now();
+    let result = bounded_output(&mut command, timeout, MAX_FIXTURE_BYTES);
+    let elapsed = started.elapsed();
+    assert!(
+        NON_REAPING_OBSERVATION_USED.load(Ordering::Acquire),
+        "bounded_output normal completion did not use non-reaping observation"
+    );
+    let identity = fs::read(&marker)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| {
+            let mut fields = text.split_whitespace();
+            Some((
+                fields.next()?.parse::<u32>().ok()?,
+                fields.next()?.parse::<u32>().ok()?,
+                fields.next()?.parse::<u32>().ok()?,
+            ))
+        })
+        .expect("descendant fixture must publish its identity");
+    let (descendant, descendant_group, leader) = identity;
+    assert_eq!(descendant_group, leader);
+    if result.is_err() {
+        let process_group = unsafe { libc::getpgid(descendant as libc::pid_t) };
+        if process_group > 0 {
+            kill_process_group(process_group as u32);
         }
     }
+    let output = result.expect("normal completion must return output");
 
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let waitid_result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            child.id() as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-        )
-    };
-    assert_eq!(waitid_result, 0, "leader must remain waitable");
-    assert_eq!(unsafe { info.si_pid() }, child.id() as libc::pid_t);
+    assert!(
+        elapsed <= absolute_bound,
+        "bounded_output exceeded its absolute bound: {elapsed:?} > {absolute_bound:?}"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.len() <= MAX_FIXTURE_BYTES);
+    assert!(output.stderr.len() <= MAX_FIXTURE_BYTES);
 
-    kill_process_group(process_group);
-    assert!(child.wait().expect("reap leader").success());
     let cleanup_deadline = Instant::now() + CLEANUP_TIMEOUT;
-    loop {
+    let descendant_gone = loop {
         if unsafe { libc::kill(descendant as libc::pid_t, 0) } == -1
             && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
         {
-            break;
+            break true;
         }
         if Instant::now() >= cleanup_deadline {
-            panic!("same-process-group descendant survived cleanup");
+            break false;
         }
         thread::yield_now();
+    };
+    if !descendant_gone {
+        let process_group = unsafe { libc::getpgid(descendant as libc::pid_t) };
+        if process_group > 0 {
+            kill_process_group(process_group as u32);
+        }
     }
+    assert!(
+        descendant_gone,
+        "actual bounded_output normal completion left descendant alive"
+    );
 }
 
 #[test]
