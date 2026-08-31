@@ -63,6 +63,8 @@ pub enum CompileError {
     Graph(GraphValidationError),
     /// Declared state key/schema/handle preflight failed.
     State(StateValidationError),
+    /// Declared agent-node bindings violate the closed v1 contract.
+    Binding(BindingValidationError),
     /// The workflow declares predicate routes but no registry was supplied.
     PredicateRegistryRequired,
     /// Exact predicate registry resolution failed.
@@ -75,6 +77,9 @@ impl fmt::Display for CompileError {
             Self::Parse(error) => write!(formatter, "workflow parsing failed: {error}"),
             Self::Graph(error) => write!(formatter, "workflow graph validation failed: {error}"),
             Self::State(error) => write!(formatter, "workflow state validation failed: {error}"),
+            Self::Binding(error) => {
+                write!(formatter, "workflow binding validation failed: {error}")
+            }
             Self::PredicateRegistryRequired => {
                 formatter.write_str("predicate registry is required")
             }
@@ -89,6 +94,7 @@ impl std::error::Error for CompileError {
             Self::Parse(error) => Some(error),
             Self::Graph(error) => Some(error),
             Self::State(error) => Some(error),
+            Self::Binding(error) => Some(error),
             Self::PredicateRegistryRequired => None,
             Self::Registry(error) => Some(error),
         }
@@ -180,10 +186,49 @@ fn compile_with_predicates<R: PredicateRegistry>(
 
 fn validated_ir(spec: &WorkflowSpec) -> Result<WorkflowIr, CompileError> {
     validate_approval_nodes(spec)?;
+    validate_node_bindings(spec)?;
     let ir = WorkflowIr::from(spec);
     validate_graph(&ir).map_err(CompileError::Graph)?;
     validate_state(&ir).map_err(CompileError::State)?;
     Ok(ir)
+}
+
+/// A closed v1 agent-node binding preflight failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BindingValidationError {
+    /// Model or tool fields appeared on a non-agent node.
+    InvalidPlacement,
+    /// A reviewer model attempted to own a static tool.
+    ReviewerTool,
+}
+
+impl fmt::Display for BindingValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidPlacement => "binding fields require an agent node",
+            Self::ReviewerTool => "reviewer nodes cannot own tools",
+        })
+    }
+}
+
+impl std::error::Error for BindingValidationError {}
+
+fn validate_node_bindings(spec: &WorkflowSpec) -> Result<(), CompileError> {
+    for node in spec.nodes() {
+        if node.kind() != NodeKind::Agent && (node.model().is_some() || node.tool().is_some()) {
+            return Err(CompileError::Binding(
+                BindingValidationError::InvalidPlacement,
+            ));
+        }
+        if node
+            .model()
+            .is_some_and(|model| model.role() == workflow_spec::ModelRole::Reviewer)
+            && node.tool().is_some()
+        {
+            return Err(CompileError::Binding(BindingValidationError::ReviewerTool));
+        }
+    }
+    Ok(())
 }
 
 fn validate_approval_nodes(spec: &WorkflowSpec) -> Result<(), CompileError> {

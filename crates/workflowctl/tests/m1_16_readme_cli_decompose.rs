@@ -40,7 +40,7 @@ fn documented_commands_smoke_the_real_adk_path() {
     let workdir = root.join("runs");
     fs::write(
         &workflow,
-        "schema_version = 1\n[workflow]\nid = \"m1-16-docs\"\nversion = \"1\"\nentry = \"agent\"\n[[nodes]]\nid = \"agent\"\nkind = \"agent\"\n[[nodes]]\nid = \"done\"\nkind = \"terminal\"\n[[edges]]\nfrom = \"agent\"\nto = \"done\"\n",
+        "schema_version = 1\n[workflow]\nid = \"m1-16-docs\"\nversion = \"1\"\nentry = \"agent\"\n[[nodes]]\nid = \"agent\"\nkind = \"agent\"\nmodel = { role = \"worker\", id = \"docs\", version = \"1\" }\ntool = { id = \"echo\", version = \"1\" }\n[[nodes]]\nid = \"done\"\nkind = \"terminal\"\n[[edges]]\nfrom = \"agent\"\nto = \"done\"\n",
     )
     .expect("write workflow");
     fs::write(

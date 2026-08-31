@@ -25,6 +25,7 @@ use workflow_compiler::{
     BindingCategory, BindingRef, CapabilitySet, RegistryResolutionError, ResolvedBinding,
     ResolvedRuntimePlan, RuntimePlanRegistry, RuntimePlanRequest, compile_file,
 };
+use workflow_ir::IrModelRole;
 use workflow_runtime::{
     ArtifactId, ArtifactStore, BackendCapabilities, CapabilityIntersection, CheckpointManifestV1,
     DurableCheckpointV1, EffectCommit, EffectJournal, EffectKey, FilesystemArtifactStore,
@@ -223,6 +224,7 @@ fn restore_checkpoint_state(
 pub struct ExecutionProfileV1 {
     schema_version: u16,
     model: ModelWire,
+    reviewer_model: Option<ModelWire>,
     tool: Option<ToolWire>,
     pure_transform: Option<PureTransformWire>,
     sandbox: SandboxWire,
@@ -281,34 +283,36 @@ impl ExecutionProfileV1 {
         if profile.schema_version != 1 {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
         }
-        match &profile.model {
-            ModelWire::Fake {
-                name,
-                version,
-                model,
-                responses,
-            } => {
-                if [name, version, model]
-                    .into_iter()
-                    .any(|value| value.is_empty())
-                    || responses.is_empty()
-                    || responses.iter().any(String::is_empty)
-                {
-                    return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+        for model in std::iter::once(&profile.model).chain(profile.reviewer_model.iter()) {
+            match model {
+                ModelWire::Fake {
+                    name,
+                    version,
+                    model,
+                    responses,
+                } => {
+                    if [name, version, model]
+                        .into_iter()
+                        .any(|value| value.is_empty())
+                        || responses.is_empty()
+                        || responses.iter().any(String::is_empty)
+                    {
+                        return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+                    }
                 }
-            }
-            ModelWire::OpenaiCompatible {
-                name,
-                version,
-                model,
-                base_url,
-                credential_env,
-            } => {
-                if [name, version, model, base_url, credential_env]
-                    .into_iter()
-                    .any(|value| value.is_empty())
-                {
-                    return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+                ModelWire::OpenaiCompatible {
+                    name,
+                    version,
+                    model,
+                    base_url,
+                    credential_env,
+                } => {
+                    if [name, version, model, base_url, credential_env]
+                        .into_iter()
+                        .any(|value| value.is_empty())
+                    {
+                        return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+                    }
                 }
             }
         }
@@ -346,26 +350,69 @@ impl ExecutionProfileV1 {
         Ok((sandbox, required))
     }
 
-    fn bind_model(&self) -> Result<Arc<ModelBinding>, ExecutionError> {
-        let registry = match &self.model {
-            ModelWire::Fake {
-                name,
-                version,
-                model,
-                responses,
-            } => ModelProfileRegistry::new().with_worker(FakeModelProfile::new(
+    fn bind_model(&self, role: IrModelRole) -> Result<Arc<ModelBinding>, ExecutionError> {
+        let model = match role {
+            IrModelRole::Worker => &self.model,
+            IrModelRole::Reviewer => self
+                .reviewer_model
+                .as_ref()
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?,
+        };
+        let registry = match (role, model) {
+            (
+                IrModelRole::Worker,
+                ModelWire::Fake {
+                    name,
+                    version,
+                    model,
+                    responses,
+                },
+            ) => ModelProfileRegistry::new().with_worker(FakeModelProfile::new(
                 name,
                 version,
                 model,
                 responses.clone(),
             )),
-            ModelWire::OpenaiCompatible {
+            (
+                IrModelRole::Reviewer,
+                ModelWire::Fake {
+                    name,
+                    version,
+                    model,
+                    responses,
+                },
+            ) => ModelProfileRegistry::new().with_reviewer(FakeModelProfile::new(
+                name,
+                version,
+                model,
+                responses.clone(),
+            )),
+            (
+                IrModelRole::Worker,
+                ModelWire::OpenaiCompatible {
+                    name,
+                    version,
+                    model,
+                    base_url,
+                    credential_env,
+                },
+            ) => ModelProfileRegistry::new().with_worker(OpenAiCompatibleProfile::new(
                 name,
                 version,
                 model,
                 base_url,
-                credential_env,
-            } => ModelProfileRegistry::new().with_worker(OpenAiCompatibleProfile::new(
+                CredentialHandle::environment(credential_env),
+            )),
+            (
+                IrModelRole::Reviewer,
+                ModelWire::OpenaiCompatible {
+                    name,
+                    version,
+                    model,
+                    base_url,
+                    credential_env,
+                },
+            ) => ModelProfileRegistry::new().with_reviewer(OpenAiCompatibleProfile::new(
                 name,
                 version,
                 model,
@@ -374,10 +421,12 @@ impl ExecutionProfileV1 {
             )),
         }
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
-        registry
-            .bind_worker(&CredentialBroker::new())
-            .map(Arc::new)
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Model))
+        match role {
+            IrModelRole::Worker => registry.bind_worker(&CredentialBroker::new()),
+            IrModelRole::Reviewer => registry.bind_reviewer(&CredentialBroker::new()),
+        }
+        .map(Arc::new)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Model))
     }
 
     fn transform_module(&self) -> Result<Option<Vec<u8>>, ExecutionError> {
@@ -394,9 +443,20 @@ impl ExecutionProfileV1 {
     }
 
     fn model_binding(&self) -> (&str, &str) {
-        match &self.model {
+        Self::wire_binding(&self.model)
+    }
+
+    fn wire_binding(model: &ModelWire) -> (&str, &str) {
+        match model {
             ModelWire::Fake { name, version, .. }
             | ModelWire::OpenaiCompatible { name, version, .. } => (name, version),
+        }
+    }
+
+    fn model_binding_for_role(&self, role: IrModelRole) -> Option<(&str, &str)> {
+        match role {
+            IrModelRole::Worker => Some(self.model_binding()),
+            IrModelRole::Reviewer => self.reviewer_model.as_ref().map(Self::wire_binding),
         }
     }
 
@@ -407,42 +467,38 @@ impl ExecutionProfileV1 {
     fn bind_resolved_model(
         &self,
         plan: &ResolvedRuntimePlan,
+        node_id: &str,
     ) -> Result<Arc<ModelBinding>, ExecutionError> {
-        let binding = match plan.models() {
-            [] => {
-                return Err(ExecutionError::binding(
-                    ExecutionErrorKind::MissingBinding,
-                    BindingCategory::Model,
-                    None,
-                ));
-            }
-            [binding] => binding,
-            [binding, ..] => {
-                return Err(ExecutionError::binding(
-                    ExecutionErrorKind::AmbiguousBinding,
-                    BindingCategory::Model,
-                    Some(binding),
-                ));
-            }
-        };
+        let binding = plan.node_model(node_id).ok_or_else(|| {
+            ExecutionError::binding(
+                ExecutionErrorKind::MissingBinding,
+                BindingCategory::Model,
+                None,
+            )
+        })?;
+        let role = plan.node_model_role(node_id).ok_or_else(|| {
+            ExecutionError::binding(
+                ExecutionErrorKind::MissingBinding,
+                BindingCategory::Model,
+                None,
+            )
+        })?;
+        let expected = self.model_binding_for_role(role);
+        if expected != Some((binding.id(), binding.version())) {
+            return Err(ExecutionError::binding(
+                ExecutionErrorKind::MismatchedBinding,
+                BindingCategory::Model,
+                Some(binding),
+            ));
+        }
         let registry = ExecutionRuntimeRegistry::new(self);
         registry
             .resolve(
                 BindingCategory::Model,
                 &BindingRef::new(binding.id(), binding.version()),
             )
-            .map_err(|error| {
-                if self.model_binding() != (binding.id(), binding.version()) {
-                    ExecutionError::binding(
-                        ExecutionErrorKind::MismatchedBinding,
-                        error.category(),
-                        Some(binding),
-                    )
-                } else {
-                    map_registry_error(error, None)
-                }
-            })?;
-        self.bind_model().map_err(|_| {
+            .map_err(|error| map_registry_error(error, Some(binding)))?;
+        self.bind_model(role).map_err(|_| {
             ExecutionError::binding(
                 ExecutionErrorKind::ImplementationBinding,
                 BindingCategory::Model,
@@ -454,27 +510,10 @@ impl ExecutionProfileV1 {
     fn select_resolved_tool<'a>(
         &self,
         plan: &'a ResolvedRuntimePlan,
+        node_id: &str,
     ) -> Result<Option<&'a ResolvedBinding>, ExecutionError> {
-        let binding = match plan.tools() {
-            [] => {
-                return if self.tool.is_some() {
-                    Err(ExecutionError::binding(
-                        ExecutionErrorKind::MismatchedBinding,
-                        BindingCategory::Tool,
-                        None,
-                    ))
-                } else {
-                    Ok(None)
-                };
-            }
-            [binding] => binding,
-            [binding, ..] => {
-                return Err(ExecutionError::binding(
-                    ExecutionErrorKind::AmbiguousBinding,
-                    BindingCategory::Tool,
-                    Some(binding),
-                ));
-            }
+        let Some(binding) = plan.node_tool(node_id) else {
+            return Ok(None);
         };
         if self.tool_binding() != Some((binding.id(), binding.version())) {
             return Err(ExecutionError::binding(
@@ -494,8 +533,13 @@ impl ExecutionProfileV1 {
     }
 
     fn profile_identity(&self) -> String {
-        let (name, version) = self.model_binding();
-        format!("{name}:{version}")
+        let (worker, worker_version) = self.model_binding();
+        match self.reviewer_model.as_ref().map(Self::wire_binding) {
+            Some((reviewer, reviewer_version)) => {
+                format!("worker={worker}:{worker_version};reviewer={reviewer}:{reviewer_version}")
+            }
+            None => format!("worker={worker}:{worker_version}"),
+        }
     }
 }
 
@@ -507,10 +551,12 @@ impl ExecutionRuntimeRegistry {
     fn new(profile: &ExecutionProfileV1) -> Self {
         let mut candidates = BTreeMap::new();
         let (model, version) = profile.model_binding();
-        candidates.insert(
-            BindingCategory::Model,
-            vec![ResolvedBinding::new(model, version)],
-        );
+        let mut models = vec![ResolvedBinding::new(model, version)];
+        if let Some(reviewer) = &profile.reviewer_model {
+            let (model, version) = ExecutionProfileV1::wire_binding(reviewer);
+            models.push(ResolvedBinding::new(model, version));
+        }
+        candidates.insert(BindingCategory::Model, models);
         if let Some((tool, version)) = profile.tool_binding() {
             candidates.insert(
                 BindingCategory::Tool,
@@ -563,11 +609,7 @@ fn resolve_runtime_plan(
     profile: &ExecutionProfileV1,
     ir: &workflow_ir::WorkflowIr,
 ) -> Result<ResolvedRuntimePlan, ExecutionError> {
-    let (model, version) = profile.model_binding();
-    let mut request = RuntimePlanRequest::from_ir(ir).with_model(model, version);
-    if let Some((tool, version)) = profile.tool_binding() {
-        request = request.with_tool(tool, version);
-    }
+    let mut request = RuntimePlanRequest::from_ir(ir);
     let (backend_capabilities, required_capabilities) = profile.capabilities()?;
     let requested = CapabilitySet::new(required_capabilities.iter().map(SandboxCapability::as_str));
     let effective = CapabilitySet::new(
@@ -895,10 +937,28 @@ impl ExecutionBackend {
         let compiled = compile_file(workflow.as_ref().to_string_lossy().as_ref())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Compile))?;
         let resolved_plan = resolve_runtime_plan(&profile, compiled.ir())?;
+        let resolved_models = compiled
+            .ir()
+            .nodes()
+            .iter()
+            .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
+            .map(|node| {
+                profile
+                    .bind_resolved_model(&resolved_plan, node.id().as_str())
+                    .map(|model| (node.id().as_str().to_owned(), model))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
         let effective_capabilities = effective_sandbox_capabilities(&resolved_plan)?;
-        let resolved_tool = profile.select_resolved_tool(&resolved_plan)?;
+        let tool_node = compiled
+            .ir()
+            .nodes()
+            .iter()
+            .find(|node| resolved_plan.node_tool(node.id().as_str()).is_some());
+        let resolved_tool = tool_node
+            .map(|node| profile.select_resolved_tool(&resolved_plan, node.id().as_str()))
+            .transpose()?
+            .flatten();
         let transform_module = profile.transform_module()?;
-        let model = profile.bind_resolved_model(&resolved_plan)?;
         let recursion_limit = compiled
             .ir()
             .nodes()
@@ -1053,16 +1113,24 @@ impl ExecutionBackend {
                     .nodes()
                     .iter()
                     .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
-                    .map(|node| {
+                    .map(|node| -> Result<_, ExecutionError> {
+                        let model = resolved_models
+                            .get(node.id().as_str())
+                            .cloned()
+                            .ok_or_else(|| {
+                                ExecutionError::new(ExecutionErrorKind::ImplementationBinding)
+                            })?;
                         let agent: Arc<dyn Agent> = Arc::new(ProfileAgent {
                             name: node.id().as_str().to_owned(),
-                            model: Arc::clone(&model),
-                            tool: tool.clone(),
+                            model,
+                            tool: resolved_plan
+                                .node_tool(node.id().as_str())
+                                .and(tool.clone()),
                             input: input.clone(),
                         });
-                        (node.id().as_str().to_owned(), agent)
+                        Ok((node.id().as_str().to_owned(), agent))
                     })
-                    .collect::<BTreeMap<_, _>>();
+                    .collect::<Result<BTreeMap<_, _>, _>>()?;
                 let continuation = Arc::new(GraphCheckpointMemory::default());
                 let graph = AdkGraphTranslator::new()
                     .translate_resolved_with_profile(
@@ -1404,9 +1472,16 @@ impl ExecutionBackend {
         {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
-        let resolved_tool = profile
-            .select_resolved_tool(&resolved_plan)
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let tool_node = compiled
+            .ir()
+            .nodes()
+            .iter()
+            .find(|node| resolved_plan.node_tool(node.id().as_str()).is_some());
+        let resolved_tool = tool_node
+            .map(|node| profile.select_resolved_tool(&resolved_plan, node.id().as_str()))
+            .transpose()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+            .flatten();
         let transform_module = profile.transform_module()?;
         let live_checkpoint_manifest = build_checkpoint_manifest(
             &run_identity,
@@ -1425,7 +1500,6 @@ impl ExecutionBackend {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
         let effective_capabilities = effective_sandbox_capabilities(&resolved_plan)?;
-        let model = profile.bind_resolved_model(&resolved_plan)?;
         let events_path = root.join("events.jsonl");
         let mut events = read_events(&events_path)?;
         let event_sequence = events.last().map_or(0, |event| event.sequence());
@@ -1475,16 +1549,19 @@ impl ExecutionBackend {
             .nodes()
             .iter()
             .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
-            .map(|node| {
+            .map(|node| -> Result<_, ExecutionError> {
+                let model = profile.bind_resolved_model(&resolved_plan, node.id().as_str())?;
                 let agent: Arc<dyn Agent> = Arc::new(ProfileAgent {
                     name: node.id().as_str().to_owned(),
-                    model: Arc::clone(&model),
-                    tool: tool.clone(),
+                    model,
+                    tool: resolved_plan
+                        .node_tool(node.id().as_str())
+                        .and(tool.clone()),
                     input: input.clone(),
                 });
-                (node.id().as_str().to_owned(), agent)
+                Ok((node.id().as_str().to_owned(), agent))
             })
-            .collect::<BTreeMap<_, _>>();
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
         let mut state = serde_json::from_slice::<State>(checkpoint.state())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let nodes = compiled
@@ -1616,8 +1693,9 @@ fn build_checkpoint_manifest(
     resolved_tool: Option<&ResolvedBinding>,
     transform_module: Option<&[u8]>,
 ) -> Result<CheckpointManifestV1, ExecutionError> {
-    let profile_identity = serde_json::to_vec(&(&profile.model, &profile.tool))
-        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+    let profile_identity =
+        serde_json::to_vec(&(&profile.model, &profile.reviewer_model, &profile.tool))
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
     let effective_capabilities = plan.effective_capabilities().as_slice().join("\n");
     let mut manifest = CheckpointManifestV1::new(run_id, workflow.0, workflow.1)
         .with_workflow_hash(workflow_hash.clone())
@@ -1654,16 +1732,16 @@ fn build_tool(
     run_id: &RunId,
     effect_journal: Option<Arc<EffectJournal>>,
 ) -> Result<Option<BoundTool>, ExecutionError> {
-    let Some(tool) = &profile.tool else {
+    let Some(resolved_tool) = resolved_tool else {
         return Ok(None);
     };
-    let resolved_tool = resolved_tool.ok_or_else(|| {
-        ExecutionError::binding(
+    let Some(tool) = &profile.tool else {
+        return Err(ExecutionError::binding(
             ExecutionErrorKind::MissingBinding,
             BindingCategory::Tool,
-            None,
-        )
-    })?;
+            Some(resolved_tool),
+        ));
+    };
     if tool.name != resolved_tool.id() || resolved_tool.version() != "1" {
         return Err(ExecutionError::binding(
             ExecutionErrorKind::MismatchedBinding,
@@ -1980,37 +2058,6 @@ mod execution_registry_tests {
     }
 
     #[test]
-    fn registry_resolves_multiple_models_and_tools_deterministically() {
-        let request = RuntimePlanRequest::default()
-            .with_model("model-a", "1")
-            .with_model("model-b", "1")
-            .with_tool("tool-a", "1")
-            .with_tool("tool-b", "2");
-        let registry = registry_with(&[
-            (BindingCategory::Model, "model-a", "1"),
-            (BindingCategory::Model, "model-b", "1"),
-            (BindingCategory::Tool, "tool-a", "1"),
-            (BindingCategory::Tool, "tool-b", "2"),
-        ]);
-        let plan = ResolvedRuntimePlan::resolve(request, &registry)
-            .expect("one plan should preserve all exact projections");
-        assert_eq!(
-            plan.models()
-                .iter()
-                .map(|binding| (binding.id(), binding.version()))
-                .collect::<Vec<_>>(),
-            vec![("model-a", "1"), ("model-b", "1")]
-        );
-        assert_eq!(
-            plan.tools()
-                .iter()
-                .map(|binding| (binding.id(), binding.version()))
-                .collect::<Vec<_>>(),
-            vec![("tool-a", "1"), ("tool-b", "2")]
-        );
-    }
-
-    #[test]
     fn ambiguous_registry_binding_maps_to_typed_error_with_projection() {
         let registry = registry_with(&[
             (BindingCategory::Tool, "tool-a", "1"),
@@ -2029,60 +2076,5 @@ mod execution_registry_tests {
         assert_eq!(error.kind(), ExecutionErrorKind::AmbiguousBinding);
         assert_eq!(error.binding_category(), Some(BindingCategory::Tool));
         assert_eq!(error.resolved_binding(), Some(&projection));
-    }
-
-    fn profile() -> ExecutionProfileV1 {
-        ExecutionProfileV1::parse(
-            br#"{
-                "schema_version": 1,
-                "model": {
-                    "provider": "fake",
-                    "name": "model-a",
-                    "version": "1",
-                    "model": "fake",
-                    "responses": ["done"]
-                },
-                "tool": {
-                    "name": "static-tool",
-                    "result": {"ok": true},
-                    "required_capabilities": [],
-                    "required_scopes": []
-                },
-                "sandbox": {"capabilities": []}
-            }"#,
-        )
-        .expect("profile fixture should parse")
-    }
-
-    #[test]
-    fn unassigned_multiple_models_fail_closed() {
-        let request = RuntimePlanRequest::default()
-            .with_model("model-a", "1")
-            .with_model("model-a", "1");
-        let registry = registry_with(&[(BindingCategory::Model, "model-a", "1")]);
-        let plan = ResolvedRuntimePlan::resolve(request, &registry).expect("plan resolves");
-        let error = match profile().bind_resolved_model(&plan) {
-            Ok(_) => panic!("multiple global models must fail closed"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), ExecutionErrorKind::AmbiguousBinding);
-        assert_eq!(error.binding_category(), Some(BindingCategory::Model));
-    }
-
-    #[test]
-    fn unassigned_multiple_tools_fail_closed() {
-        let request = RuntimePlanRequest::default()
-            .with_tool("static-tool", "1")
-            .with_tool("other-tool", "1");
-        let registry = registry_with(&[
-            (BindingCategory::Tool, "static-tool", "1"),
-            (BindingCategory::Tool, "other-tool", "1"),
-        ]);
-        let plan = ResolvedRuntimePlan::resolve(request, &registry).expect("plan resolves");
-        let error = profile()
-            .select_resolved_tool(&plan)
-            .expect_err("multiple global tools must fail closed");
-        assert_eq!(error.kind(), ExecutionErrorKind::AmbiguousBinding);
-        assert_eq!(error.binding_category(), Some(BindingCategory::Tool));
     }
 }

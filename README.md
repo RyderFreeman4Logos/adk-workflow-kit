@@ -22,6 +22,8 @@ entry = "agent"
 [[nodes]]
 id = "agent"
 kind = "agent"
+model = { role = "worker", id = "quickstart", version = "1" }
+tool = { id = "echo", version = "1" }
 
 [[nodes]]
 id = "done"

@@ -1,10 +1,10 @@
 # Runtime smoke example
 
 This runtime smoke example is the smallest provider-free ADK execution path:
-a deterministic `agent` entry node flows to one `terminal` node. The checked-in
-fake profile has one deterministic response, an `echo` tool/result, and no
-sandbox capabilities. It is not a model-directed multi-tool workflow, a
-per-node configuration example, or a live provider-conformance test.
+a deterministic `agent` entry node flows to one `terminal` node. The node binds
+the checked-in fake worker model and `echo:1` tool explicitly; the profile has
+one deterministic response/result and no sandbox capabilities. It is not a
+model-directed multi-tool workflow or a live provider-conformance test.
 
 ## Run it
 
@@ -80,12 +80,11 @@ bytes, so its validation also performs no network access.
 ## What this proves
 
 - deterministic workflow validation, Mermaid graphing, and lock generation;
-- provider-free fake-profile execution with persisted receipt, checkpoint,
+- provider-free, explicitly bound fake-profile execution with persisted receipt, checkpoint,
   events, effects, manifest, and bounded terminal artifact;
 - fresh-process inspection and resume using the selected workdir; and
 - offline validation of the committed redacted replay bundle.
 
 The example intentionally does not claim model-directed multi-tool behavior,
-per-node agent configuration, Skill execution, code investigation, or live
-provider conformance. Keep credentials and machine-specific paths out of every
-checked-in fixture.
+Skill execution, code investigation, or live provider conformance. Keep
+credentials and machine-specific paths out of every checked-in fixture.

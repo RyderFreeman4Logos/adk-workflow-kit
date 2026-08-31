@@ -16,14 +16,14 @@ version = "1"
 entry = "done"
 [[nodes]]
 id = "done"
-kind = "terminal"
+kind = "agent"
+model = { role = "worker", id = "model", version = "1" }
+tool = { id = "tool", version = "1" }
 "#;
 
 fn request() -> RuntimePlanRequest {
     let spec = parse_str("fixture.toml", SOURCE).expect("fixture parses");
     RuntimePlanRequest::from_ir(&WorkflowIr::from(&spec))
-        .with_model("model", "1")
-        .with_tool("tool", "1")
         .with_validator("validator", "1")
         .with_predicate("predicate", "1")
         .with_skill("skill", "1")
@@ -157,8 +157,14 @@ fn every_projection_surface_redacts_hostile_values() {
 #[test]
 fn resolution_covers_all_backend_neutral_projection_categories() {
     let plan = ResolvedRuntimePlan::resolve(request(), &FakeRegistry::all()).expect("resolves");
-    assert_eq!(plan.models().len(), 1);
-    assert_eq!(plan.tools().len(), 1);
+    assert_eq!(
+        plan.node_model("done").map(|binding| binding.id()),
+        Some("model")
+    );
+    assert_eq!(
+        plan.node_tool("done").map(|binding| binding.id()),
+        Some("tool")
+    );
     assert_eq!(plan.validators().len(), 1);
     assert_eq!(plan.predicates().len(), 1);
     assert_eq!(plan.skills().len(), 1);

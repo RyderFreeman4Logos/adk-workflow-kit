@@ -2,7 +2,8 @@
 
 use sha2::{Digest, Sha256};
 use workflow_spec::{
-    NodeKind as SpecNodeKind, ResourceReference, RouteOperator, SchemaVersion, WorkflowSpec,
+    ModelRole as SpecModelRole, NodeKind as SpecNodeKind, ResourceReference, RouteOperator,
+    SchemaVersion, WorkflowSpec,
 };
 
 /// The canonical byte-wire version used for content identity.
@@ -15,6 +16,8 @@ pub const CANONICAL_IR_WIRE_VERSION_V3: u16 = 3;
 pub const CANONICAL_IR_WIRE_VERSION_V4: u16 = 4;
 /// The canonical byte-wire version for executable cycle metadata.
 pub const CANONICAL_IR_WIRE_VERSION_V5: u16 = 5;
+/// The canonical byte-wire version for per-node model and tool bindings.
+pub const CANONICAL_IR_WIRE_VERSION_V6: u16 = 6;
 
 const DOMAIN: &[u8] = b"adk-workflow-kit/workflow-ir\0";
 const IR_SCHEMA_VERSION_V1: u32 = 1;
@@ -142,6 +145,68 @@ impl From<RouteOperator> for IrRouteOperator {
     }
 }
 
+/// The closed model-role vocabulary retained by canonical IR.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrModelRole {
+    /// An ordinary worker model.
+    Worker,
+    /// A reviewer model without tool authority.
+    Reviewer,
+}
+
+impl IrModelRole {
+    fn tag(self) -> u8 {
+        match self {
+            Self::Worker => 1,
+            Self::Reviewer => 2,
+        }
+    }
+}
+
+/// A canonical opaque model identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrModelReference {
+    role: IrModelRole,
+    id: String,
+    version: String,
+}
+
+impl IrModelReference {
+    /// Returns the model role.
+    pub fn role(&self) -> IrModelRole {
+        self.role
+    }
+
+    /// Returns the opaque model identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the opaque model version.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+}
+
+/// A canonical opaque static-tool identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrToolReference {
+    id: String,
+    version: String,
+}
+
+impl IrToolReference {
+    /// Returns the opaque tool identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the opaque tool version.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+}
+
 /// A normalized node record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrNode {
@@ -150,6 +215,8 @@ pub struct IrNode {
     timeout_ms: Option<u64>,
     max_visits: Option<u32>,
     idempotent: bool,
+    model: Option<IrModelReference>,
+    tool: Option<IrToolReference>,
 }
 
 impl IrNode {
@@ -176,6 +243,16 @@ impl IrNode {
     /// Returns whether repeated execution is declared idempotent.
     pub fn idempotent(&self) -> bool {
         self.idempotent
+    }
+
+    /// Returns the node-owned model identity, when declared.
+    pub fn model(&self) -> Option<&IrModelReference> {
+        self.model.as_ref()
+    }
+
+    /// Returns the node-owned static tool identity, when declared.
+    pub fn tool(&self) -> Option<&IrToolReference> {
+        self.tool.as_ref()
     }
 }
 
@@ -450,6 +527,18 @@ impl From<&WorkflowSpec> for WorkflowIr {
                         .flatten(),
                     max_visits: node.max_visits(),
                     idempotent: node.idempotent(),
+                    model: node.model().map(|model| IrModelReference {
+                        role: match model.role() {
+                            SpecModelRole::Worker => IrModelRole::Worker,
+                            SpecModelRole::Reviewer => IrModelRole::Reviewer,
+                        },
+                        id: model.id().to_owned(),
+                        version: model.version().to_owned(),
+                    }),
+                    tool: node.tool().map(|tool| IrToolReference {
+                        id: tool.id().to_owned(),
+                        version: tool.version().to_owned(),
+                    }),
                 }
             })
             .collect::<Vec<_>>();
@@ -637,6 +726,24 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
             }
             sink.write_chunk(&[u8::from(node.idempotent)]);
         }
+        if canonical_wire_version(ir) == CANONICAL_IR_WIRE_VERSION_V6 {
+            match &node.model {
+                Some(model) => {
+                    sink.write_chunk(&[1, model.role.tag()]);
+                    write_frame(sink, &model.id);
+                    write_frame(sink, &model.version);
+                }
+                None => sink.write_chunk(&[0]),
+            }
+            match &node.tool {
+                Some(tool) => {
+                    sink.write_chunk(&[1]);
+                    write_frame(sink, &tool.id);
+                    write_frame(sink, &tool.version);
+                }
+                None => sink.write_chunk(&[0]),
+            }
+        }
     }
     write_u64(sink, u64_from_usize(ir.edges.len()));
     for edge in &ir.edges {
@@ -700,7 +807,13 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
 }
 
 fn canonical_wire_version(ir: &WorkflowIr) -> u16 {
-    if !ir.resources.is_empty()
+    if ir
+        .nodes
+        .iter()
+        .any(|node| node.model.is_some() || node.tool.is_some())
+    {
+        CANONICAL_IR_WIRE_VERSION_V6
+    } else if !ir.resources.is_empty()
         || ir
             .nodes
             .iter()

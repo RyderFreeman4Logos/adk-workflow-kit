@@ -37,9 +37,19 @@ impl Drop for TestRoot {
     }
 }
 
-fn workflow() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../workflowctl/tests/fixtures/minimal.workflow.toml")
+fn workflow(root: &Path) -> PathBuf {
+    let source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../workflowctl/tests/fixtures/minimal.workflow.toml"),
+    )
+    .expect("minimal workflow")
+    .replace(
+        "kind = \"agent\"",
+        "kind = \"agent\"\ntool = { id = \"send\", version = \"1\" }",
+    );
+    let path = root.join("workflow.toml");
+    fs::write(&path, source).expect("workflow write");
+    path
 }
 
 fn profile(root: &Path) -> PathBuf {
@@ -115,7 +125,7 @@ fn run_args(profile: &Path, workdir: &Path) -> Command {
     let mut command = command();
     command
         .arg("run")
-        .arg(workflow())
+        .arg(workflow(profile.parent().expect("profile parent")))
         .arg("--profile")
         .arg(profile)
         .arg("--input")

@@ -30,6 +30,7 @@ entry = "agent"
 [[nodes]]
 id = "agent"
 kind = "agent"
+model = { role = "worker", id = "fake-model", version = "1" }
 [[nodes]]
 id = "action"
 kind = "action"
@@ -682,7 +683,7 @@ fn sequence_agent(name: &str, responses: &[&str]) -> Arc<dyn Agent> {
 }
 
 fn resolved_plan(ir: &workflow_ir::WorkflowIr, capabilities: CapabilitySet) -> ResolvedRuntimePlan {
-    let mut request = RuntimePlanRequest::from_ir(ir).with_model("fake-model", "1");
+    let mut request = RuntimePlanRequest::from_ir(ir);
     request.set_capabilities(capabilities.clone());
     request.set_effective_capabilities(capabilities);
     ResolvedRuntimePlan::resolve(request, &AnyRuntimeBinding).expect("runtime plan resolves")

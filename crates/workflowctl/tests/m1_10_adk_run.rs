@@ -46,6 +46,8 @@ entry = "agent"
 [[nodes]]
 id = "agent"
 kind = "agent"
+model = { role = "worker", id = "worker", version = "1" }
+tool = { id = "echo", version = "1" }
 [[nodes]]
 id = "action"
 kind = "action"
@@ -145,7 +147,20 @@ fn write_fixture(root: &Path, profile: Value) -> (PathBuf, PathBuf, PathBuf) {
     let workflow = root.join("workflow.toml");
     let profile_path = root.join("profile.json");
     let runs = root.join("runs");
-    fs::write(&workflow, WORKFLOW).expect("workflow fixture must write");
+    let model = &profile["model"];
+    let mut binding = format!(
+        "kind = \"agent\"\nmodel = {{ role = \"worker\", id = {:?}, version = {:?} }}",
+        model["name"].as_str().unwrap_or("worker"),
+        model["version"].as_str().unwrap_or("1")
+    );
+    if let Some(tool) = profile.get("tool").and_then(|tool| tool["name"].as_str()) {
+        binding.push_str(&format!("\ntool = {{ id = {:?}, version = \"1\" }}", tool));
+    }
+    fs::write(
+        &workflow,
+        WORKFLOW.replacen("kind = \"agent\"", &binding, 1),
+    )
+    .expect("workflow fixture must write");
     fs::write(
         &profile_path,
         serde_json::to_vec(&profile).expect("profile fixture must serialize"),
@@ -2060,6 +2075,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         "sandbox": {"capabilities": []}
     });
     let (workflow, profile, runs) = write_fixture(&root, profile_value);
+    let expected_source = fs::read(&workflow).expect("workflow fixture");
     let run_listener = listener.try_clone().expect("oracle run listener clone");
     let (child_done_tx, child_done_rx) = mpsc::sync_channel(1);
     let run_deadline = Instant::now() + ORACLE_TIMEOUT;
@@ -2128,7 +2144,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     assert_no_canary_bytes(&manifest_bytes, CANARY);
     let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("manifest JSON");
     assert_eq!(manifest["status"], "succeeded");
-    assert_eq!(manifest["profile_identity"], "oracle-model:1");
+    assert_eq!(manifest["profile_identity"], "worker=oracle-model:1");
     assert!(
         !manifest["plan_hash"]
             .as_str()
@@ -2143,7 +2159,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     );
 
     let source = fs::read(run_root.join("workflow.toml")).expect("canonical source");
-    assert_eq!(source, WORKFLOW.as_bytes());
+    assert_eq!(source, expected_source);
     assert_no_canary_bytes(&source, CANARY);
 
     let stored_profile = fs::read(run_root.join("execution-profile.json")).expect("stored profile");

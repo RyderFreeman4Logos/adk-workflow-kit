@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "workflow_lock": {
-    "toml": "lock_version = 1\ncanonical_ir_wire_version = 1\nir_schema_version = 1\nworkflow_id = \"m3-00-runtime-smoke\"\nworkflow_version = \"1\"\nir_hash = \"sha256:78a4b84b40a64db617d980d30efeb2f76baf3277cb67b7ffc9f76dc4a1ac61c4\"\nsemantic_resource_hashes = []\n",
-    "sha256": "sha256:de7430f13a6a1327dc473570ab62d0f138492417f07d16fa2c411d37c99f9d5a"
+    "toml": "lock_version = 1\ncanonical_ir_wire_version = 6\nir_schema_version = 1\nworkflow_id = \"m3-00-runtime-smoke\"\nworkflow_version = \"1\"\nir_hash = \"sha256:c848bcbf7af08c5db4b61751572be4f64857d86638f8c9c6ac86cf85549d1942\"\nsemantic_resource_hashes = []\n",
+    "sha256": "sha256:0b882c1b3d7bfdaabda0d2db3e08524e9302275d6180cb3db75b147f88ac8ddd"
   },
   "input_sha256": "sha256:c9f15e5b391af039214b698d5fd8513494b47f50ed7512d0078f994e4763158f",
   "events": [

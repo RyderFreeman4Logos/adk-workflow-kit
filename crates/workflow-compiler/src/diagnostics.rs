@@ -217,6 +217,15 @@ impl TryFrom<&SpecError> for Diagnostic {
     type Error = DiagnosticProjectionError;
 
     fn try_from(error: &SpecError) -> Result<Self, Self::Error> {
+        if matches!(error, SpecError::InvalidNodeBinding) {
+            return Ok(Self {
+                diagnostic_version: DIAGNOSTIC_VERSION,
+                code: "workflow.node.invalid_binding",
+                message: "invalid node binding",
+                location: None,
+                details: DiagnosticDetails::Empty {},
+            });
+        }
         let (location, code, message, details) = match error {
             SpecError::Read { location, .. } => (
                 location,
@@ -244,6 +253,7 @@ impl TryFrom<&SpecError> for Diagnostic {
                     found: u64::from(*found),
                 },
             ),
+            SpecError::InvalidNodeBinding => unreachable!("handled above"),
         };
 
         Ok(Self {
@@ -455,6 +465,13 @@ impl TryFrom<&CompileError> for Diagnostic {
             CompileError::Parse(error) => Self::try_from(error),
             CompileError::Graph(error) => Self::try_from(error),
             CompileError::State(error) => Self::try_from(error),
+            CompileError::Binding(_) => Ok(Self {
+                diagnostic_version: DIAGNOSTIC_VERSION,
+                code: "workflow.node.invalid_binding",
+                message: "invalid node binding",
+                location: None,
+                details: DiagnosticDetails::Empty {},
+            }),
             CompileError::PredicateRegistryRequired => Ok(Self {
                 diagnostic_version: DIAGNOSTIC_VERSION,
                 code: "workflow.registry.predicate_registry_required",

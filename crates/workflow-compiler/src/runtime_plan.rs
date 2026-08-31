@@ -10,7 +10,7 @@ use serde::{
     ser::{SerializeSeq, SerializeStruct},
 };
 use sha2::{Digest, Sha256};
-use workflow_ir::WorkflowIr;
+use workflow_ir::{IrModelRole, IrNodeKind, WorkflowIr};
 
 /// The closed set of backend binding categories resolved before execution.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -200,19 +200,44 @@ impl<const N: usize> From<[&str; N]> for CapabilitySet {
 }
 
 /// A plan request assembled from canonical IR and authored backend identities.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimePlanRequest {
     ir_hash: String,
+    node_bindings: BTreeMap<String, NodeBindingRequest>,
     bindings: BTreeMap<BindingCategory, Vec<BindingRef>>,
     capabilities: CapabilitySet,
     effective_capabilities: Option<CapabilitySet>,
     ambiguous: BTreeMap<BindingCategory, BindingRef>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NodeBindingRequest {
+    model: Option<(IrModelRole, BindingRef)>,
+    tool: Option<BindingRef>,
+}
+
 impl RuntimePlanRequest {
     pub fn from_ir(ir: &WorkflowIr) -> Self {
         let mut request = Self {
             ir_hash: hex(ir.canonical_hash().as_bytes()),
+            node_bindings: ir
+                .nodes()
+                .iter()
+                .filter(|node| node.kind() == IrNodeKind::Agent)
+                .map(|node| {
+                    (
+                        node.id().as_str().to_owned(),
+                        NodeBindingRequest {
+                            model: node.model().map(|model| {
+                                (model.role(), BindingRef::new(model.id(), model.version()))
+                            }),
+                            tool: node
+                                .tool()
+                                .map(|tool| BindingRef::new(tool.id(), tool.version())),
+                        },
+                    )
+                })
+                .collect(),
             ..Self::default()
         };
         for route in ir.routes() {
@@ -227,12 +252,6 @@ impl RuntimePlanRequest {
             .or_default()
             .push(BindingRef::new(id, version));
         self
-    }
-    pub fn with_model(self, id: &str, version: &str) -> Self {
-        self.with_binding(BindingCategory::Model, id, version)
-    }
-    pub fn with_tool(self, id: &str, version: &str) -> Self {
-        self.with_binding(BindingCategory::Tool, id, version)
     }
     pub fn with_validator(self, id: &str, version: &str) -> Self {
         self.with_binding(BindingCategory::Validator, id, version)
@@ -269,9 +288,7 @@ impl RuntimePlanRequest {
     }
 }
 
-/// Backend-neutral projection aliases for each binding category.
-pub type ModelBindingProjection = ResolvedBinding;
-pub type ToolBindingProjection = ResolvedBinding;
+/// Backend-neutral projection aliases for global binding categories.
 pub type ValidatorBindingProjection = ResolvedBinding;
 pub type PredicateBindingProjection = ResolvedBinding;
 pub type SkillBindingProjection = ResolvedBinding;
@@ -281,13 +298,12 @@ pub type CheckpointBindingProjection = ResolvedBinding;
 pub type EventBindingProjection = ResolvedBinding;
 pub type ArtifactBindingProjection = ResolvedBinding;
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ResolvedRuntimePlan {
     ir_hash: String,
     plan_hash: String,
     resume_identity: String,
-    models: Vec<ModelBindingProjection>,
-    tools: Vec<ToolBindingProjection>,
+    node_bindings: BTreeMap<String, ResolvedNodeBinding>,
     validators: Vec<ValidatorBindingProjection>,
     predicates: Vec<PredicateBindingProjection>,
     skills: Vec<SkillBindingProjection>,
@@ -298,6 +314,29 @@ pub struct ResolvedRuntimePlan {
     artifacts: Vec<ArtifactBindingProjection>,
     effective_capabilities: CapabilitySet,
     redaction: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedNodeBinding {
+    role: IrModelRole,
+    model: ResolvedBinding,
+    tool: Option<ResolvedBinding>,
+}
+
+impl Serialize for ResolvedNodeBinding {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut value = serializer.serialize_struct("ResolvedNodeBinding", 3)?;
+        value.serialize_field(
+            "role",
+            match self.role {
+                IrModelRole::Worker => "worker",
+                IrModelRole::Reviewer => "reviewer",
+            },
+        )?;
+        value.serialize_field("model", &self.model)?;
+        value.serialize_field("tool", &self.tool)?;
+        value.end()
+    }
 }
 
 /// Typed, fail-closed planning categories.
@@ -313,11 +352,23 @@ pub enum PlanResolutionErrorKind {
 pub struct PlanResolutionError {
     kind: PlanResolutionErrorKind,
     category: Option<BindingCategory>,
+    node_id: Option<String>,
 }
 
 impl PlanResolutionError {
     fn new(kind: PlanResolutionErrorKind, category: Option<BindingCategory>) -> Self {
-        Self { kind, category }
+        Self {
+            kind,
+            category,
+            node_id: None,
+        }
+    }
+    fn node(kind: PlanResolutionErrorKind, category: BindingCategory, node_id: &str) -> Self {
+        Self {
+            kind,
+            category: Some(category),
+            node_id: Some(node_id.to_owned()),
+        }
     }
     pub fn kind(&self) -> PlanResolutionErrorKind {
         self.kind
@@ -325,10 +376,17 @@ impl PlanResolutionError {
     pub fn category(&self) -> Option<BindingCategory> {
         self.category
     }
+    pub fn node_id(&self) -> Option<&str> {
+        self.node_id.as_deref()
+    }
 }
 impl fmt::Display for PlanResolutionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "runtime plan resolution failed: {:?}", self.kind)
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "runtime plan resolution failed: {:?}", self.kind)?;
+        if let Some(node_id) = &self.node_id {
+            write!(formatter, " for node {node_id}")?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for PlanResolutionError {}
@@ -349,10 +407,55 @@ impl ResolvedRuntimePlan {
                 None,
             ));
         }
+
+        let mut node_bindings = BTreeMap::new();
+        for (node_id, binding) in &request.node_bindings {
+            let Some((role, model_ref)) = &binding.model else {
+                return Err(PlanResolutionError::node(
+                    PlanResolutionErrorKind::MissingBinding,
+                    BindingCategory::Model,
+                    node_id,
+                ));
+            };
+            let model = resolve_node_value(
+                registry,
+                &request.ambiguous,
+                BindingCategory::Model,
+                model_ref,
+                node_id,
+            )?;
+            if *role == IrModelRole::Reviewer && binding.tool.is_some() {
+                return Err(PlanResolutionError::node(
+                    PlanResolutionErrorKind::InvalidBinding,
+                    BindingCategory::Tool,
+                    node_id,
+                ));
+            }
+            let tool = binding
+                .tool
+                .as_ref()
+                .map(|tool_ref| {
+                    resolve_node_value(
+                        registry,
+                        &request.ambiguous,
+                        BindingCategory::Tool,
+                        tool_ref,
+                        node_id,
+                    )
+                })
+                .transpose()?;
+            node_bindings.insert(
+                node_id.clone(),
+                ResolvedNodeBinding {
+                    role: *role,
+                    model,
+                    tool,
+                },
+            );
+        }
+
         let mut resolved = BTreeMap::<BindingCategory, Vec<ResolvedBinding>>::new();
         for category in [
-            BindingCategory::Model,
-            BindingCategory::Tool,
             BindingCategory::Validator,
             BindingCategory::Predicate,
             BindingCategory::Skill,
@@ -371,14 +474,7 @@ impl ResolvedRuntimePlan {
                 }
                 let value = registry.resolve(category, binding).map_err(|error| {
                     PlanResolutionError::new(
-                        match error.kind() {
-                            RegistryResolutionErrorKind::Missing => {
-                                PlanResolutionErrorKind::MissingBinding
-                            }
-                            RegistryResolutionErrorKind::Ambiguous => {
-                                PlanResolutionErrorKind::AmbiguousBinding
-                            }
-                        },
+                        registry_error_kind(error.kind()),
                         Some(error.category()),
                     )
                 })?;
@@ -396,18 +492,28 @@ impl ResolvedRuntimePlan {
             .unwrap_or(request.capabilities.clone());
         let fingerprint = PlanFingerprint {
             ir_hash: request.ir_hash.clone(),
+            node_bindings: node_bindings
+                .iter()
+                .map(|(node_id, binding)| {
+                    (
+                        node_id.clone(),
+                        NodeBindingFingerprint {
+                            role: match binding.role {
+                                IrModelRole::Worker => "worker".to_owned(),
+                                IrModelRole::Reviewer => "reviewer".to_owned(),
+                            },
+                            model: binding_fingerprint(&binding.model),
+                            tool: binding.tool.as_ref().map(binding_fingerprint),
+                        },
+                    )
+                })
+                .collect(),
             bindings: resolved
                 .iter()
                 .map(|(category, bindings)| {
                     (
                         *category,
-                        bindings
-                            .iter()
-                            .map(|binding| BindingFingerprint {
-                                id: binding.id.clone(),
-                                version: binding.version.clone(),
-                            })
-                            .collect(),
+                        bindings.iter().map(binding_fingerprint).collect(),
                     )
                 })
                 .collect(),
@@ -418,8 +524,7 @@ impl ResolvedRuntimePlan {
             ir_hash: request.ir_hash,
             plan_hash: plan_hash.clone(),
             resume_identity: format!("resume-v1:{plan_hash}"),
-            models: take(&mut resolved, BindingCategory::Model),
-            tools: take(&mut resolved, BindingCategory::Tool),
+            node_bindings,
             validators: take(&mut resolved, BindingCategory::Validator),
             predicates: take(&mut resolved, BindingCategory::Predicate),
             skills: take(&mut resolved, BindingCategory::Skill),
@@ -441,11 +546,18 @@ impl ResolvedRuntimePlan {
     pub fn effective_capabilities(&self) -> &CapabilitySet {
         &self.effective_capabilities
     }
-    pub fn models(&self) -> &[ModelBindingProjection] {
-        &self.models
+    pub fn node_model_role(&self, node_id: &str) -> Option<IrModelRole> {
+        self.node_bindings.get(node_id).map(|binding| binding.role)
     }
-    pub fn tools(&self) -> &[ToolBindingProjection] {
-        &self.tools
+    pub fn node_model(&self, node_id: &str) -> Option<&ResolvedBinding> {
+        self.node_bindings
+            .get(node_id)
+            .map(|binding| &binding.model)
+    }
+    pub fn node_tool(&self, node_id: &str) -> Option<&ResolvedBinding> {
+        self.node_bindings
+            .get(node_id)
+            .and_then(|binding| binding.tool.as_ref())
     }
     pub fn validators(&self) -> &[ValidatorBindingProjection] {
         &self.validators
@@ -476,17 +588,66 @@ impl ResolvedRuntimePlan {
     }
 }
 
+fn resolve_node_value<R: RuntimePlanRegistry>(
+    registry: &R,
+    ambiguous: &BTreeMap<BindingCategory, BindingRef>,
+    category: BindingCategory,
+    binding: &BindingRef,
+    node_id: &str,
+) -> Result<ResolvedBinding, PlanResolutionError> {
+    if ambiguous.get(&category) == Some(binding) {
+        return Err(PlanResolutionError::node(
+            PlanResolutionErrorKind::AmbiguousBinding,
+            category,
+            node_id,
+        ));
+    }
+    let value = registry.resolve(category, binding).map_err(|error| {
+        PlanResolutionError::node(registry_error_kind(error.kind()), error.category(), node_id)
+    })?;
+    if value.id().is_empty() || value.version().is_empty() {
+        return Err(PlanResolutionError::node(
+            PlanResolutionErrorKind::InvalidBinding,
+            category,
+            node_id,
+        ));
+    }
+    Ok(value)
+}
+
+fn registry_error_kind(kind: RegistryResolutionErrorKind) -> PlanResolutionErrorKind {
+    match kind {
+        RegistryResolutionErrorKind::Missing => PlanResolutionErrorKind::MissingBinding,
+        RegistryResolutionErrorKind::Ambiguous => PlanResolutionErrorKind::AmbiguousBinding,
+    }
+}
+
 #[derive(Serialize)]
 struct PlanFingerprint {
     ir_hash: String,
+    node_bindings: BTreeMap<String, NodeBindingFingerprint>,
     bindings: BTreeMap<BindingCategory, Vec<BindingFingerprint>>,
     capabilities: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct NodeBindingFingerprint {
+    role: String,
+    model: BindingFingerprint,
+    tool: Option<BindingFingerprint>,
 }
 
 #[derive(Serialize)]
 struct BindingFingerprint {
     id: String,
     version: String,
+}
+
+fn binding_fingerprint(binding: &ResolvedBinding) -> BindingFingerprint {
+    BindingFingerprint {
+        id: binding.id.clone(),
+        version: binding.version.clone(),
+    }
 }
 
 fn take(

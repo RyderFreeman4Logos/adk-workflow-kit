@@ -308,6 +308,60 @@ impl std::str::FromStr for RouteOperator {
     }
 }
 
+/// The closed v1 model-role vocabulary for agent nodes.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelRole {
+    /// An ordinary worker model.
+    Worker,
+    /// A reviewer model without tool authority.
+    Reviewer,
+}
+
+/// An exact model identity authored on an agent node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelReference {
+    role: ModelRole,
+    id: String,
+    version: String,
+}
+
+impl ModelReference {
+    /// Returns the closed model role.
+    pub fn role(&self) -> ModelRole {
+        self.role
+    }
+
+    /// Returns the opaque model identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the opaque model version.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+}
+
+/// An exact static-tool identity authored on an agent node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolReference {
+    id: String,
+    version: String,
+}
+
+impl ToolReference {
+    /// Returns the opaque tool identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the opaque tool version.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+}
+
 /// A source-level node with its closed kind and optional approval timeout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Node {
@@ -317,6 +371,8 @@ pub struct Node {
     max_visits: Option<u32>,
     idempotent: bool,
     resources: Vec<ResourceReference>,
+    model: Option<ModelReference>,
+    tool: Option<ToolReference>,
 }
 
 impl Node {
@@ -348,6 +404,16 @@ impl Node {
     /// Returns resources attached to this node.
     pub fn resources(&self) -> &[ResourceReference] {
         &self.resources
+    }
+
+    /// Returns the declared model identity, when this node owns one.
+    pub fn model(&self) -> Option<&ModelReference> {
+        self.model.as_ref()
+    }
+
+    /// Returns the declared static tool identity, when this node owns one.
+    pub fn tool(&self) -> Option<&ToolReference> {
+        self.tool.as_ref()
     }
 }
 
@@ -540,6 +606,9 @@ pub enum SpecError {
         /// Version supplied by the source document.
         found: u32,
     },
+    /// A node binding has an empty opaque identity component.
+    #[error("workflow node binding has an empty identity")]
+    InvalidNodeBinding,
 }
 
 /// Parses strict v1 TOML text associated with a logical or filesystem source path.
@@ -566,6 +635,17 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
                 source: Box::new(source_error),
             }
         })?;
+    if raw.nodes.iter().any(|node| {
+        node.model
+            .as_ref()
+            .is_some_and(|model| model.id.is_empty() || model.version.is_empty())
+            || node
+                .tool
+                .as_ref()
+                .is_some_and(|tool| tool.id.is_empty() || tool.version.is_empty())
+    }) {
+        return Err(SpecError::InvalidNodeBinding);
+    }
 
     let schema_version = match raw.schema_version {
         WORKFLOW_SCHEMA_VERSION_V1 => SchemaVersion::V1,
@@ -599,6 +679,15 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
                 max_visits: node.max_visits,
                 idempotent: node.idempotent,
                 resources: node.resources.into_iter().map(resource).collect(),
+                model: node.model.map(|model| ModelReference {
+                    role: model.role,
+                    id: model.id,
+                    version: model.version,
+                }),
+                tool: node.tool.map(|tool| ToolReference {
+                    id: tool.id,
+                    version: tool.version,
+                }),
             })
             .collect(),
         edges: raw
@@ -765,6 +854,25 @@ struct RawNode {
     idempotent: bool,
     #[serde(default)]
     resources: Vec<RawResource>,
+    #[serde(default)]
+    model: Option<RawModelReference>,
+    #[serde(default)]
+    tool: Option<RawToolReference>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModelReference {
+    role: ModelRole,
+    id: String,
+    version: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawToolReference {
+    id: String,
+    version: String,
 }
 
 #[derive(Deserialize)]
