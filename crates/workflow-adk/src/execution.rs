@@ -84,37 +84,39 @@ struct PendingCall {
 #[serde(deny_unknown_fields)]
 struct LoopLedgerV1 {
     schema_version: u8,
+    checkpoint_identity: String,
     nodes: BTreeMap<String, LoopState>,
 }
 
 struct LoopLedgerStore {
     path: PathBuf,
+    checkpoint_identity: String,
     nodes: Mutex<BTreeMap<String, LoopState>>,
 }
 
 impl LoopLedgerStore {
-    fn create(path: PathBuf) -> Result<Self, ExecutionError> {
+    fn create(path: PathBuf, checkpoint_identity: String) -> Result<Self, ExecutionError> {
         let store = Self {
             path,
+            checkpoint_identity,
             nodes: Mutex::new(BTreeMap::new()),
         };
         store.persist()?;
         Ok(store)
     }
 
-    fn open(path: PathBuf) -> Result<Self, ExecutionError> {
+    fn open(path: PathBuf, checkpoint_identity: String) -> Result<Self, ExecutionError> {
         let ledger = serde_json::from_slice::<LoopLedgerV1>(&bounded_read(&path)?)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        if ledger.schema_version != 1
-            || ledger
-                .nodes
-                .values()
-                .any(|state| !valid_terminal_state(state))
+        if ledger.schema_version != 2
+            || ledger.checkpoint_identity != checkpoint_identity
+            || ledger.nodes.values().any(|state| !valid_loop_state(state))
         {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
         Ok(Self {
             path,
+            checkpoint_identity,
             nodes: Mutex::new(ledger.nodes),
         })
     }
@@ -261,7 +263,8 @@ impl LoopLedgerStore {
         write_json(
             &self.path,
             &LoopLedgerV1 {
-                schema_version: 1,
+                schema_version: 2,
+                checkpoint_identity: self.checkpoint_identity.clone(),
                 nodes: nodes.clone(),
             },
         )
@@ -335,6 +338,116 @@ fn valid_terminal_state(state: &LoopState) -> bool {
         }
         _ => false,
     }
+}
+
+fn valid_loop_state(state: &LoopState) -> bool {
+    if !valid_terminal_state(state) {
+        return false;
+    }
+
+    let mut calls = VecDeque::new();
+    let mut seen_ids = BTreeSet::new();
+    let mut seen_calls = BTreeSet::new();
+    let mut tool_calls = BTreeMap::<String, u64>::new();
+    let mut completed_ids = BTreeSet::new();
+    let mut tool_output_bytes = 0_u64;
+    let mut model_iterations = 0_u64;
+
+    for content in &state.conversation {
+        let has_call = content
+            .parts
+            .iter()
+            .any(|part| matches!(part, adk_rust::Part::FunctionCall { .. }));
+        if has_call || admitted_finish(content).is_ok_and(|output| output.is_some()) {
+            let Some(next) = model_iterations.checked_add(1) else {
+                return false;
+            };
+            model_iterations = next;
+        }
+        for part in &content.parts {
+            match part {
+                adk_rust::Part::FunctionCall {
+                    name,
+                    args,
+                    id: Some(id),
+                    ..
+                } if !id.is_empty() && args.is_object() => {
+                    let fingerprint = workflow_runtime::argument_fingerprint(args);
+                    if !seen_ids.insert(id.clone())
+                        || !seen_calls.insert((name.clone(), fingerprint.clone()))
+                    {
+                        return false;
+                    }
+                    let Some(count) = tool_calls.get(name).copied().unwrap_or(0).checked_add(1)
+                    else {
+                        return false;
+                    };
+                    tool_calls.insert(name.clone(), count);
+                    calls.push_back(PendingCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args: args.clone(),
+                        fingerprint,
+                    });
+                }
+                adk_rust::Part::FunctionCall { .. } => return false,
+                adk_rust::Part::FunctionResponse {
+                    function_response,
+                    id: Some(id),
+                    ..
+                } if !id.is_empty() => {
+                    if !seen_ids.contains(id) || !completed_ids.insert(id.clone()) {
+                        return false;
+                    }
+                    let Ok(bytes) = serde_json::to_vec(&function_response.response) else {
+                        return false;
+                    };
+                    let Ok(bytes) = u64::try_from(bytes.len()) else {
+                        return false;
+                    };
+                    let Some(total) = tool_output_bytes.checked_add(bytes) else {
+                        return false;
+                    };
+                    tool_output_bytes = total;
+                }
+                adk_rust::Part::FunctionResponse { .. } => return false,
+                _ => {}
+            }
+        }
+    }
+
+    let pending_calls = calls
+        .into_iter()
+        .filter(|call| !completed_ids.contains(&call.id))
+        .collect::<VecDeque<_>>();
+    let Ok(total_tool_calls) = u64::try_from(seen_ids.len()) else {
+        return false;
+    };
+    state.model_iterations == model_iterations
+        && state.total_tool_calls == total_tool_calls
+        && state.tool_calls == tool_calls
+        && state.seen_ids == seen_ids
+        && state.seen_calls == seen_calls
+        && state.pending_calls.len() == pending_calls.len()
+        && state
+            .pending_calls
+            .iter()
+            .zip(pending_calls.iter())
+            .all(|(actual, expected)| {
+                actual.id == expected.id
+                    && actual.name == expected.name
+                    && actual.args == expected.args
+                    && actual.fingerprint == expected.fingerprint
+            })
+        && state.tool_output_bytes == tool_output_bytes
+}
+
+fn ledger_checkpoint_identity(
+    checkpoint_manifest: &CheckpointManifestV1,
+) -> Result<String, ExecutionError> {
+    let manifest = serde_json::to_vec(checkpoint_manifest)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(manifest)))
 }
 
 struct LoopController {
@@ -1719,6 +1832,7 @@ impl ExecutionBackend {
             &resolved_plan,
             transform_module.as_deref(),
         )?;
+        let ledger_identity = ledger_checkpoint_identity(&checkpoint_manifest)?;
         let context = RunContext::new(run_id.clone(), profile.run_limits());
         let mut mapper = AdkEventMapper::new(run_id.as_str(), compiled.ir().workflow_id().as_str())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
@@ -1753,13 +1867,14 @@ impl ExecutionBackend {
                 None
             }
         };
-        let loop_ledger = match LoopLedgerStore::create(run_root.join(LOOP_LEDGER_FILE)) {
-            Ok(ledger) => Some(Arc::new(ledger)),
-            Err(_) => {
-                persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
-                None
-            }
-        };
+        let loop_ledger =
+            match LoopLedgerStore::create(run_root.join(LOOP_LEDGER_FILE), ledger_identity) {
+                Ok(ledger) => Some(Arc::new(ledger)),
+                Err(_) => {
+                    persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
+                    None
+                }
+            };
         let mut checkpoint_store = match SqliteCheckpointStore::open(
             run_root.join("checkpoint.sqlite"),
             checkpoint_manifest.clone(),
@@ -2168,6 +2283,7 @@ impl ExecutionBackend {
             .checkpoint_manifest
             .clone()
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let ledger_identity = ledger_checkpoint_identity(&checkpoint_manifest)?;
         let run_identity = RunId::new(run_id.to_owned())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let base = root
@@ -2321,7 +2437,10 @@ impl ExecutionBackend {
             terminal: Arc::clone(&terminal_kind),
             last_progress: Arc::clone(&last_progress),
         });
-        let loop_ledger = Arc::new(LoopLedgerStore::open(root.join(LOOP_LEDGER_FILE))?);
+        let loop_ledger = Arc::new(LoopLedgerStore::open(
+            root.join(LOOP_LEDGER_FILE),
+            ledger_identity,
+        )?);
         let tool_registry = build_tool_registry(
             &profile,
             sandbox,
@@ -2547,6 +2666,7 @@ fn build_checkpoint_manifest(
         .with_resource_hash("workflow.ir", workflow_hash)
         .with_implementation("model", profile.profile_identity())
         .with_implementation("adk-rust", "2.1.0")
+        .with_implementation("loop-ledger", "v2")
         .with_implementation(
             "execution-profile",
             format!("sha256:{:x}", Sha256::digest(profile_identity)),

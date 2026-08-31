@@ -838,6 +838,54 @@ fn restored_effect_envelope_obeys_tool_output_byte_limit() {
 }
 
 #[test]
+fn resume_rejects_tampered_pending_ledger_before_effect() {
+    if let Ok(root) = env::var("M3_04_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            workflow,
+            profile_with(
+                vec![
+                    json!({"calls": [{"id":"call-tampered","name":"search_code","args":{"query":"needle"}}]}),
+                    finish(json!({"answer":"must not run"})),
+                ],
+                Some(loop_policy()),
+            ),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let root = root();
+    let run_root = crash_run(
+        &root,
+        "resume_rejects_tampered_pending_ledger_before_effect",
+        "before-effect",
+    );
+    let ledger_path = run_root.join("loop-ledger.json");
+    let mut ledger: Value = serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    let call = &mut ledger["nodes"]["work"]["pending_calls"][0];
+    call["args"] = json!({"query":"forged"});
+    call["fingerprint"] = json!(workflow_runtime::argument_fingerprint(&call["args"]));
+    ledger["nodes"]["work"]["total_tool_calls"] = json!(2);
+    ledger["nodes"]["work"]["tool_calls"]["search_code"] = json!(2);
+    ledger["nodes"]["work"]["tool_output_bytes"] = json!(1);
+    fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+
+    let error = ExecutionBackend::resume(&root, &run_id(&run_root)).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(effect_count(&run_root), 0);
+    assert!(
+        !fs::read_to_string(run_root.join("events.jsonl"))
+            .unwrap()
+            .contains("tool_completed")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn effect_after_crash_before_node_checkpoint_resumes_from_loop_ledger() {
     if let Ok(root) = env::var("M3_04_CRASH_RUN_ROOT") {
         let root = PathBuf::from(root);
