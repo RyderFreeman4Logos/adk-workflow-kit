@@ -140,6 +140,30 @@ fn dispatches_models_and_tool_by_resolved_node() {
 }
 
 #[test]
+fn model_binding_failure_leaves_no_run_root() {
+    let root = TestRoot::new();
+    let role_mismatch = TWO_AGENTS.replace(
+        "role = \"reviewer\", id = \"reviewer-model\"",
+        "role = \"reviewer\", id = \"worker-model\"",
+    );
+    let error = ExecutionBackend::run(
+        root.workflow(&role_mismatch),
+        profile(true),
+        json!({"request": "public"}),
+        &root.0,
+    )
+    .expect_err("role and model identity mismatch must fail");
+
+    assert_eq!(error.kind(), ExecutionErrorKind::MismatchedBinding);
+    assert!(
+        fs::read_dir(&root.0)
+            .expect("test root exists")
+            .all(|entry| !entry.expect("test root entry").path().is_dir()),
+        "binding failure must precede run-root allocation"
+    );
+}
+
+#[test]
 fn reviewer_cannot_receive_worker_tool() {
     let root = TestRoot::new();
     let receipt = ExecutionBackend::run(

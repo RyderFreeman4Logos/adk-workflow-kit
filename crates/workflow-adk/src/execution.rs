@@ -484,23 +484,20 @@ impl ExecutionProfileV1 {
             )
         })?;
         let expected = self.model_binding_for_role(role);
+        if expected != Some((binding.id(), binding.version())) {
+            return Err(ExecutionError::binding(
+                ExecutionErrorKind::MismatchedBinding,
+                BindingCategory::Model,
+                Some(binding),
+            ));
+        }
         let registry = ExecutionRuntimeRegistry::new(self);
         registry
             .resolve(
                 BindingCategory::Model,
                 &BindingRef::new(binding.id(), binding.version()),
             )
-            .map_err(|error| {
-                if expected != Some((binding.id(), binding.version())) {
-                    ExecutionError::binding(
-                        ExecutionErrorKind::MismatchedBinding,
-                        error.category(),
-                        Some(binding),
-                    )
-                } else {
-                    map_registry_error(error, None)
-                }
-            })?;
+            .map_err(|error| map_registry_error(error, Some(binding)))?;
         self.bind_model(role).map_err(|_| {
             ExecutionError::binding(
                 ExecutionErrorKind::ImplementationBinding,
@@ -940,6 +937,17 @@ impl ExecutionBackend {
         let compiled = compile_file(workflow.as_ref().to_string_lossy().as_ref())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Compile))?;
         let resolved_plan = resolve_runtime_plan(&profile, compiled.ir())?;
+        let resolved_models = compiled
+            .ir()
+            .nodes()
+            .iter()
+            .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
+            .map(|node| {
+                profile
+                    .bind_resolved_model(&resolved_plan, node.id().as_str())
+                    .map(|model| (node.id().as_str().to_owned(), model))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
         let effective_capabilities = effective_sandbox_capabilities(&resolved_plan)?;
         let tool_node = compiled
             .ir()
@@ -1106,8 +1114,12 @@ impl ExecutionBackend {
                     .iter()
                     .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
                     .map(|node| -> Result<_, ExecutionError> {
-                        let model =
-                            profile.bind_resolved_model(&resolved_plan, node.id().as_str())?;
+                        let model = resolved_models
+                            .get(node.id().as_str())
+                            .cloned()
+                            .ok_or_else(|| {
+                                ExecutionError::new(ExecutionErrorKind::ImplementationBinding)
+                            })?;
                         let agent: Arc<dyn Agent> = Arc::new(ProfileAgent {
                             name: node.id().as_str().to_owned(),
                             model,
