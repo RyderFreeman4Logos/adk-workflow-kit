@@ -56,6 +56,18 @@ fn workflow() -> PathBuf {
         .join("../workflowctl/tests/fixtures/minimal.workflow.toml")
 }
 
+fn workflow_with_tool(root: &TestRoot, tool: &str) -> PathBuf {
+    let source = fs::read_to_string(workflow())
+        .expect("minimal workflow")
+        .replace(
+            "kind = \"agent\"",
+            &format!("kind = \"agent\"\ntool = {{ id = \"{tool}\", version = \"1\" }}"),
+        );
+    let path = root.0.join("bound.workflow.toml");
+    fs::write(&path, source).expect("bound workflow");
+    path
+}
+
 fn resource_workflow_source(digest: &str) -> String {
     format!(
         r#"schema_version = 1
@@ -69,6 +81,7 @@ resources = [{{ path = "workflow.bin", sha256 = "{digest}" }}]
 [[nodes]]
 id = "start"
 kind = "agent"
+model = {{ role = "worker", id = "fake-model", version = "1" }}
 
 [[nodes]]
 id = "done"
@@ -812,8 +825,7 @@ fn execution_graph_preserves_authorization_denial_before_handler_effect() {
         }"#,
     )
     .unwrap();
-    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../workflowctl/tests/fixtures/minimal.workflow.toml");
+    let workflow = workflow_with_tool(&root, "protected-tool");
 
     let error =
         ExecutionBackend::run(workflow, profile, json!({"request":"public"}), &root.0).unwrap_err();
@@ -956,8 +968,13 @@ fn checkpoint_tool_identity_comes_from_the_resolved_projection() {
         }"#,
     )
     .expect("profile fixture should parse");
-    let receipt = ExecutionBackend::run(workflow(), profile, json!({"request":"public"}), &root.0)
-        .expect("fixture run should succeed");
+    let receipt = ExecutionBackend::run(
+        workflow_with_tool(&root, "non-default-tool"),
+        profile,
+        json!({"request":"public"}),
+        &root.0,
+    )
+    .expect("fixture run should succeed");
     let manifest: Value = serde_json::from_slice(
         &fs::read(receipt.run_root().join("run-manifest.json")).expect("manifest should exist"),
     )

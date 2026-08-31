@@ -8,6 +8,7 @@ entry = "start"
 [[nodes]]
 id = "start"
 kind = "agent"
+model = { role = "worker", id = "fake-model", version = "1" }
 
 [[nodes]]
 id = "done"

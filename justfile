@@ -38,6 +38,16 @@ m1-03-red:
 m1-03-green:
     {{_io}} cargo +1.98.0 test -p workflow-compiler --test runtime_plan --locked
 
+# Focused M3-02 per-node binding tests.
+m3-02-spec test_name:
+    {{_io}} cargo +1.98.0 test -p workflow-spec --test m3_02_node_bindings {{test_name}} --locked -- --exact --nocapture
+
+m3-02-compiler test_name:
+    {{_io}} cargo +1.98.0 test -p workflow-compiler --test m3_02_node_bindings {{test_name}} --locked -- --exact --nocapture
+
+m3-02-adk test_name:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test m3_02_node_bindings {{test_name}} --locked -- --exact --nocapture
+
 # Focused M1-15 conformance contract tests.
 m1-15-test:
     {{_io}} cargo +1.98.0 test -p workflow-testkit --test m1_15_conformance --locked
