@@ -45,7 +45,7 @@ fn workflow(root: &Path) -> PathBuf {
     .expect("minimal workflow")
     .replace(
         "kind = \"agent\"",
-        "kind = \"agent\"\ntool = { id = \"send\", version = \"1\" }",
+        "kind = \"agent\"\ntools = [{ id = \"send\", version = \"1\" }]",
     );
     let path = root.join("workflow.toml");
     fs::write(&path, source).expect("workflow write");

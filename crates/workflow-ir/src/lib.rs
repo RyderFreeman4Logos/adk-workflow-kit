@@ -18,6 +18,8 @@ pub const CANONICAL_IR_WIRE_VERSION_V4: u16 = 4;
 pub const CANONICAL_IR_WIRE_VERSION_V5: u16 = 5;
 /// The canonical byte-wire version for per-node model and tool bindings.
 pub const CANONICAL_IR_WIRE_VERSION_V6: u16 = 6;
+/// The canonical byte-wire version for per-node multi-tool subsets.
+pub const CANONICAL_IR_WIRE_VERSION_V7: u16 = 7;
 
 const DOMAIN: &[u8] = b"adk-workflow-kit/workflow-ir\0";
 const IR_SCHEMA_VERSION_V1: u32 = 1;
@@ -216,7 +218,7 @@ pub struct IrNode {
     max_visits: Option<u32>,
     idempotent: bool,
     model: Option<IrModelReference>,
-    tool: Option<IrToolReference>,
+    tools: Vec<IrToolReference>,
 }
 
 impl IrNode {
@@ -250,9 +252,9 @@ impl IrNode {
         self.model.as_ref()
     }
 
-    /// Returns the node-owned static tool identity, when declared.
-    pub fn tool(&self) -> Option<&IrToolReference> {
-        self.tool.as_ref()
+    /// Returns the node-owned static tool subset in canonical raw UTF-8 order.
+    pub fn tools(&self) -> &[IrToolReference] {
+        &self.tools
     }
 }
 
@@ -535,10 +537,23 @@ impl From<&WorkflowSpec> for WorkflowIr {
                         id: model.id().to_owned(),
                         version: model.version().to_owned(),
                     }),
-                    tool: node.tool().map(|tool| IrToolReference {
-                        id: tool.id().to_owned(),
-                        version: tool.version().to_owned(),
-                    }),
+                    tools: {
+                        let mut tools = node
+                            .tools()
+                            .iter()
+                            .map(|tool| IrToolReference {
+                                id: tool.id().to_owned(),
+                                version: tool.version().to_owned(),
+                            })
+                            .collect::<Vec<_>>();
+                        tools.sort_by(|left, right| {
+                            left.id
+                                .as_bytes()
+                                .cmp(right.id.as_bytes())
+                                .then(left.version.as_bytes().cmp(right.version.as_bytes()))
+                        });
+                        tools
+                    },
                 }
             })
             .collect::<Vec<_>>();
@@ -726,7 +741,7 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
             }
             sink.write_chunk(&[u8::from(node.idempotent)]);
         }
-        if canonical_wire_version(ir) == CANONICAL_IR_WIRE_VERSION_V6 {
+        if canonical_wire_version(ir) >= CANONICAL_IR_WIRE_VERSION_V6 {
             match &node.model {
                 Some(model) => {
                     sink.write_chunk(&[1, model.role.tag()]);
@@ -735,13 +750,14 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
                 }
                 None => sink.write_chunk(&[0]),
             }
-            match &node.tool {
-                Some(tool) => {
-                    sink.write_chunk(&[1]);
+            if canonical_wire_version(ir) == CANONICAL_IR_WIRE_VERSION_V6 {
+                sink.write_chunk(&[0]);
+            } else {
+                write_u64(sink, u64_from_usize(node.tools.len()));
+                for tool in &node.tools {
                     write_frame(sink, &tool.id);
                     write_frame(sink, &tool.version);
                 }
-                None => sink.write_chunk(&[0]),
             }
         }
     }
@@ -810,9 +826,9 @@ fn canonical_wire_version(ir: &WorkflowIr) -> u16 {
     if ir
         .nodes
         .iter()
-        .any(|node| node.model.is_some() || node.tool.is_some())
+        .any(|node| node.model.is_some() || !node.tools.is_empty())
     {
-        CANONICAL_IR_WIRE_VERSION_V6
+        CANONICAL_IR_WIRE_VERSION_V7
     } else if !ir.resources.is_empty()
         || ir
             .nodes

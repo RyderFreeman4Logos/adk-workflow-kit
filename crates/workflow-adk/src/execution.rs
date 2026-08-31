@@ -33,7 +33,7 @@ use workflow_runtime::{
     RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox, SandboxCapability,
     SqliteCheckpointStore, ToolBridge, ToolBridgeError, ToolBridgeErrorKind, ToolCallContext,
     ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance, ToolRegistration, WorkdirManager,
-    WorkflowRuntimeEventKindV1, contains_sensitive_key, redact_json_value,
+    WorkflowRuntimeEventKindV1, contains_sensitive_key, redact_json_value, selection_identity,
     verify_sandbox_capabilities,
 };
 use workflow_spec::{SourcePath, read_bounded_regular_file};
@@ -52,7 +52,7 @@ const MAX_STATE_BYTES: usize = 1024 * 1024;
 const ARTIFACT_LIMIT: u64 = 64 * 1024;
 const GRAPH_CONTINUATION_KEY: &str = "kit_graph_continuation_v1";
 static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
-type BoundTool = (String, Arc<AdkToolBridge<InMemoryArtifactStore>>);
+type BoundTool = (Vec<String>, Arc<AdkToolBridge<InMemoryArtifactStore>>);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -226,6 +226,8 @@ pub struct ExecutionProfileV1 {
     model: ModelWire,
     reviewer_model: Option<ModelWire>,
     tool: Option<ToolWire>,
+    #[serde(default)]
+    tools: Vec<ToolWire>,
     pure_transform: Option<PureTransformWire>,
     sandbox: SandboxWire,
 }
@@ -316,10 +318,10 @@ impl ExecutionProfileV1 {
                 }
             }
         }
+        let mut tool_names = BTreeSet::new();
         if profile
-            .tool
-            .as_ref()
-            .is_some_and(|tool| tool.name.is_empty())
+            .tool_wires()
+            .any(|tool| tool.name.is_empty() || !tool_names.insert(tool.name.as_str()))
             || profile
                 .pure_transform
                 .as_ref()
@@ -329,6 +331,10 @@ impl ExecutionProfileV1 {
         }
         profile.capabilities()?;
         Ok(profile)
+    }
+
+    fn tool_wires(&self) -> impl Iterator<Item = &ToolWire> {
+        self.tool.iter().chain(&self.tools)
     }
 
     fn capabilities(
@@ -341,9 +347,7 @@ impl ExecutionProfileV1 {
             .map(|value| parse_capability(value))
             .collect::<Result<Vec<_>, _>>()?;
         let required = self
-            .tool
-            .as_ref()
-            .into_iter()
+            .tool_wires()
             .flat_map(|tool| tool.required_capabilities.iter())
             .map(|value| parse_capability(value))
             .collect::<Result<Vec<_>, _>>()?;
@@ -460,8 +464,42 @@ impl ExecutionProfileV1 {
         }
     }
 
-    fn tool_binding(&self) -> Option<(&str, &str)> {
-        self.tool.as_ref().map(|tool| (tool.name.as_str(), "1"))
+    fn tool_registration(&self, tool: &ToolWire) -> Result<ToolRegistration, ExecutionError> {
+        let required_capabilities = tool
+            .required_capabilities
+            .iter()
+            .map(|capability| parse_capability(capability))
+            .collect::<Result<Vec<_>, _>>()?;
+        let implementation_digest = serde_json::to_vec(&tool.result)
+            .map(|result| format!("sha256:{:x}", Sha256::digest(result)))
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        ToolRegistration::for_types::<Value, Value>(
+            &tool.name,
+            ToolProvenance::new(&tool.name, "1"),
+            ToolFlags::new(true, true, true),
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))
+        .map(|registration| {
+            registration
+                .with_required_capabilities(required_capabilities)
+                .with_required_scopes(tool.required_scopes.iter().cloned())
+                .with_implementation_digest(implementation_digest)
+        })
+    }
+
+    fn tool_bindings(&self) -> Result<Vec<ResolvedBinding>, ExecutionError> {
+        self.tool_wires()
+            .map(|tool| {
+                let registration = self.tool_registration(tool)?;
+                let metadata_identity =
+                    selection_identity(std::iter::once((registration.name(), &registration)))
+                        .map_err(|_| {
+                            ExecutionError::new(ExecutionErrorKind::ImplementationBinding)
+                        })?;
+                Ok(ResolvedBinding::new(registration.name(), "1")
+                    .with_metadata_identity(metadata_identity))
+            })
+            .collect()
     }
 
     fn bind_resolved_model(
@@ -491,7 +529,7 @@ impl ExecutionProfileV1 {
                 Some(binding),
             ));
         }
-        let registry = ExecutionRuntimeRegistry::new(self);
+        let registry = ExecutionRuntimeRegistry::new(self)?;
         registry
             .resolve(
                 BindingCategory::Model,
@@ -505,31 +543,6 @@ impl ExecutionProfileV1 {
                 Some(binding),
             )
         })
-    }
-
-    fn select_resolved_tool<'a>(
-        &self,
-        plan: &'a ResolvedRuntimePlan,
-        node_id: &str,
-    ) -> Result<Option<&'a ResolvedBinding>, ExecutionError> {
-        let Some(binding) = plan.node_tool(node_id) else {
-            return Ok(None);
-        };
-        if self.tool_binding() != Some((binding.id(), binding.version())) {
-            return Err(ExecutionError::binding(
-                ExecutionErrorKind::MismatchedBinding,
-                BindingCategory::Tool,
-                Some(binding),
-            ));
-        }
-        let registry = ExecutionRuntimeRegistry::new(self);
-        registry
-            .resolve(
-                BindingCategory::Tool,
-                &BindingRef::new(binding.id(), binding.version()),
-            )
-            .map_err(|error| map_registry_error(error, Some(binding)))?;
-        Ok(Some(binding))
     }
 
     fn profile_identity(&self) -> String {
@@ -548,7 +561,7 @@ struct ExecutionRuntimeRegistry {
 }
 
 impl ExecutionRuntimeRegistry {
-    fn new(profile: &ExecutionProfileV1) -> Self {
+    fn new(profile: &ExecutionProfileV1) -> Result<Self, ExecutionError> {
         let mut candidates = BTreeMap::new();
         let (model, version) = profile.model_binding();
         let mut models = vec![ResolvedBinding::new(model, version)];
@@ -557,13 +570,11 @@ impl ExecutionRuntimeRegistry {
             models.push(ResolvedBinding::new(model, version));
         }
         candidates.insert(BindingCategory::Model, models);
-        if let Some((tool, version)) = profile.tool_binding() {
-            candidates.insert(
-                BindingCategory::Tool,
-                vec![ResolvedBinding::new(tool, version)],
-            );
+        let tools = profile.tool_bindings()?;
+        if !tools.is_empty() {
+            candidates.insert(BindingCategory::Tool, tools);
         }
-        ExecutionRuntimeRegistry { candidates }
+        Ok(ExecutionRuntimeRegistry { candidates })
     }
 }
 
@@ -624,7 +635,7 @@ fn resolve_runtime_plan(
     );
     request.set_capabilities(requested);
     request.set_effective_capabilities(effective);
-    ResolvedRuntimePlan::resolve(request, &ExecutionRuntimeRegistry::new(profile)).map_err(
+    ResolvedRuntimePlan::resolve(request, &ExecutionRuntimeRegistry::new(profile)?).map_err(
         |error| {
             let kind = match error.kind() {
                 workflow_compiler::PlanResolutionErrorKind::MissingBinding => {
@@ -728,41 +739,43 @@ impl Agent for ProfileAgent {
             return Err(adk_rust::AdkError::agent("model returned no events"));
         }
 
-        if let Some((name, bridge)) = &self.tool {
-            let call_id = format!("{}-tool", context.invocation_id());
-            let mut requested = Event::new(context.invocation_id());
-            requested.set_content(Content {
-                role: "model".to_owned(),
-                parts: vec![Part::FunctionCall {
-                    name: name.clone(),
-                    args: self.input.clone(),
-                    id: Some(call_id.clone()),
-                    thought_signature: None,
-                }],
-            });
-            events.push(Ok(requested));
-            let result = bridge
-                .invoke(workflow_runtime::ToolCall::new(
-                    name,
-                    &call_id,
-                    context.user_id(),
-                    self.input.clone(),
-                ))
-                .map_err(project_tool_execution_error)?;
-            let mut completed = Event::new(context.invocation_id());
-            completed.set_content(Content {
-                role: "function".to_owned(),
-                parts: vec![Part::FunctionResponse {
-                    function_response: FunctionResponseData::new(
+        if let Some((names, bridge)) = &self.tool {
+            for name in names {
+                let call_id = format!("{}-{name}-tool", context.invocation_id());
+                let mut requested = Event::new(context.invocation_id());
+                requested.set_content(Content {
+                    role: "model".to_owned(),
+                    parts: vec![Part::FunctionCall {
+                        name: name.clone(),
+                        args: self.input.clone(),
+                        id: Some(call_id.clone()),
+                        thought_signature: None,
+                    }],
+                });
+                events.push(Ok(requested));
+                let result = bridge
+                    .invoke(workflow_runtime::ToolCall::new(
                         name,
-                        serde_json::to_value(result)
-                            .map_err(|error| adk_rust::AdkError::tool(error.to_string()))?,
-                    ),
-                    id: Some(call_id),
-                    annotations: None,
-                }],
-            });
-            events.push(Ok(completed));
+                        &call_id,
+                        context.user_id(),
+                        self.input.clone(),
+                    ))
+                    .map_err(project_tool_execution_error)?;
+                let mut completed = Event::new(context.invocation_id());
+                completed.set_content(Content {
+                    role: "function".to_owned(),
+                    parts: vec![Part::FunctionResponse {
+                        function_response: FunctionResponseData::new(
+                            name,
+                            serde_json::to_value(result)
+                                .map_err(|error| adk_rust::AdkError::tool(error.to_string()))?,
+                        ),
+                        id: Some(call_id),
+                        annotations: None,
+                    }],
+                });
+                events.push(Ok(completed));
+            }
         }
         Ok(Box::pin(adk_rust::futures::stream::iter(events)))
     }
@@ -949,15 +962,6 @@ impl ExecutionBackend {
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let effective_capabilities = effective_sandbox_capabilities(&resolved_plan)?;
-        let tool_node = compiled
-            .ir()
-            .nodes()
-            .iter()
-            .find(|node| resolved_plan.node_tool(node.id().as_str()).is_some());
-        let resolved_tool = tool_node
-            .map(|node| profile.select_resolved_tool(&resolved_plan, node.id().as_str()))
-            .transpose()?
-            .flatten();
         let transform_module = profile.transform_module()?;
         let recursion_limit = compiled
             .ir()
@@ -979,7 +983,6 @@ impl ExecutionBackend {
             crate::canonical_ir_hash(compiled.ir()),
             &profile,
             &resolved_plan,
-            resolved_tool,
             transform_module.as_deref(),
         )?;
         let context = RunContext::new(run_id.clone(), run_limits());
@@ -1100,14 +1103,8 @@ impl ExecutionBackend {
             (|| {
                 let sandbox = RunSandbox::new(context, run_workdir, effective_capabilities.clone())
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::SandboxDenied))?;
-                let tool = build_tool(
-                    &profile,
-                    resolved_tool,
-                    sandbox,
-                    &effective_capabilities,
-                    &run_id,
-                    effect_journal.clone(),
-                )?;
+                let tool_registry =
+                    build_tool_registry(&profile, sandbox, &run_id, effect_journal.clone())?;
                 let agents = compiled
                     .ir()
                     .nodes()
@@ -1123,9 +1120,11 @@ impl ExecutionBackend {
                         let agent: Arc<dyn Agent> = Arc::new(ProfileAgent {
                             name: node.id().as_str().to_owned(),
                             model,
-                            tool: resolved_plan
-                                .node_tool(node.id().as_str())
-                                .and(tool.clone()),
+                            tool: build_toolset(
+                                &tool_registry,
+                                resolved_plan.node_tools(node.id().as_str()),
+                                &effective_capabilities,
+                            )?,
                             input: input.clone(),
                         });
                         Ok((node.id().as_str().to_owned(), agent))
@@ -1472,16 +1471,6 @@ impl ExecutionBackend {
         {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
-        let tool_node = compiled
-            .ir()
-            .nodes()
-            .iter()
-            .find(|node| resolved_plan.node_tool(node.id().as_str()).is_some());
-        let resolved_tool = tool_node
-            .map(|node| profile.select_resolved_tool(&resolved_plan, node.id().as_str()))
-            .transpose()
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
-            .flatten();
         let transform_module = profile.transform_module()?;
         let live_checkpoint_manifest = build_checkpoint_manifest(
             &run_identity,
@@ -1492,7 +1481,6 @@ impl ExecutionBackend {
             crate::canonical_ir_hash(compiled.ir()),
             &profile,
             &resolved_plan,
-            resolved_tool,
             transform_module.as_deref(),
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
@@ -1536,14 +1524,8 @@ impl ExecutionBackend {
             EffectJournal::open(root.join("effects.sqlite"))
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?,
         );
-        let tool = build_tool(
-            &profile,
-            resolved_tool,
-            sandbox,
-            &effective_capabilities,
-            &run_identity,
-            Some(effect_journal),
-        )?;
+        let tool_registry =
+            build_tool_registry(&profile, sandbox, &run_identity, Some(effect_journal))?;
         let agents = compiled
             .ir()
             .nodes()
@@ -1554,9 +1536,11 @@ impl ExecutionBackend {
                 let agent: Arc<dyn Agent> = Arc::new(ProfileAgent {
                     name: node.id().as_str().to_owned(),
                     model,
-                    tool: resolved_plan
-                        .node_tool(node.id().as_str())
-                        .and(tool.clone()),
+                    tool: build_toolset(
+                        &tool_registry,
+                        resolved_plan.node_tools(node.id().as_str()),
+                        &effective_capabilities,
+                    )?,
                     input: input.clone(),
                 });
                 Ok((node.id().as_str().to_owned(), agent))
@@ -1690,12 +1674,15 @@ fn build_checkpoint_manifest(
     workflow_hash: String,
     profile: &ExecutionProfileV1,
     plan: &ResolvedRuntimePlan,
-    resolved_tool: Option<&ResolvedBinding>,
     transform_module: Option<&[u8]>,
 ) -> Result<CheckpointManifestV1, ExecutionError> {
-    let profile_identity =
-        serde_json::to_vec(&(&profile.model, &profile.reviewer_model, &profile.tool))
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+    let profile_identity = serde_json::to_vec(&(
+        &profile.model,
+        &profile.reviewer_model,
+        &profile.tool,
+        &profile.tools,
+    ))
+    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
     let effective_capabilities = plan.effective_capabilities().as_slice().join("\n");
     let mut manifest = CheckpointManifestV1::new(run_id, workflow.0, workflow.1)
         .with_workflow_hash(workflow_hash.clone())
@@ -1710,11 +1697,8 @@ fn build_checkpoint_manifest(
             "sha256:{:x}",
             Sha256::digest(effective_capabilities.as_bytes())
         ))
+        .with_implementation("toolset", plan.resume_identity())
         .with_event_log_identity("workflow-runtime-events-v1");
-    if let Some(tool) = resolved_tool {
-        manifest =
-            manifest.with_implementation("tool", format!("{}:{}", tool.id(), tool.version()));
-    }
     if let Some(transform) = transform_module {
         manifest = manifest.with_resource_hash(
             "pure-transform",
@@ -1724,78 +1708,65 @@ fn build_checkpoint_manifest(
     Ok(manifest)
 }
 
-fn build_tool(
+fn build_tool_registry(
     profile: &ExecutionProfileV1,
-    resolved_tool: Option<&ResolvedBinding>,
     sandbox: RunSandbox,
-    required_capabilities: &[SandboxCapability],
     run_id: &RunId,
     effect_journal: Option<Arc<EffectJournal>>,
-) -> Result<Option<BoundTool>, ExecutionError> {
-    let Some(resolved_tool) = resolved_tool else {
-        return Ok(None);
-    };
-    let Some(tool) = &profile.tool else {
-        return Err(ExecutionError::binding(
-            ExecutionErrorKind::MissingBinding,
-            BindingCategory::Tool,
-            Some(resolved_tool),
-        ));
-    };
-    if tool.name != resolved_tool.id() || resolved_tool.version() != "1" {
-        return Err(ExecutionError::binding(
-            ExecutionErrorKind::MismatchedBinding,
-            BindingCategory::Tool,
-            Some(resolved_tool),
-        ));
-    }
-    let provenance = ToolProvenance::new(resolved_tool.id(), resolved_tool.version());
-    let registration = ToolRegistration::for_types::<Value, Value>(
-        resolved_tool.id(),
-        provenance.clone(),
-        ToolFlags::new(true, true, true),
-    )
-    .map_err(|_| {
-        ExecutionError::binding(
-            ExecutionErrorKind::ImplementationBinding,
-            BindingCategory::Tool,
-            Some(resolved_tool),
-        )
-    })?
-    .with_required_capabilities(required_capabilities.iter().copied())
-    .with_required_scopes(tool.required_scopes.iter().cloned());
+) -> Result<ToolBridge, ExecutionError> {
     let mut bridge = ToolBridge::new(sandbox);
-    bridge
-        .register(
-            registration,
-            StaticToolHandler {
-                result: tool.result.clone(),
-                provenance: provenance.clone(),
-                run_id: run_id.as_str().to_owned(),
-                node_id: resolved_tool.id().to_owned(),
-                effect_journal,
-            },
-        )
-        .map_err(|_| {
-            ExecutionError::binding(
-                ExecutionErrorKind::ImplementationBinding,
-                BindingCategory::Tool,
-                Some(resolved_tool),
+    for tool in profile.tool_wires() {
+        let registration = profile.tool_registration(tool)?;
+        let provenance = registration.provenance().clone();
+        bridge
+            .register(
+                registration,
+                StaticToolHandler {
+                    result: tool.result.clone(),
+                    provenance,
+                    run_id: run_id.as_str().to_owned(),
+                    node_id: tool.name.clone(),
+                    effect_journal: effect_journal.clone(),
+                },
             )
-        })?;
-    let adapter = AdkToolBridge::new(
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    }
+    Ok(bridge)
+}
+
+fn build_toolset(
+    bridge: &ToolBridge,
+    bindings: &[ResolvedBinding],
+    effective_capabilities: &[SandboxCapability],
+) -> Result<Option<BoundTool>, ExecutionError> {
+    if bindings.is_empty() {
+        return Ok(None);
+    }
+    let names = bindings
+        .iter()
+        .map(|binding| binding.id().to_owned())
+        .collect::<Vec<_>>();
+    let authority = CapabilityIntersection::new(
+        effective_capabilities.iter().copied(),
+        names.iter(),
+        names.iter(),
+        std::iter::empty::<String>(),
+        names.iter(),
+        names.iter(),
+        effective_capabilities.iter().copied(),
+    );
+    let adapter = AdkToolBridge::for_selected(
         bridge,
-        CapabilityIntersection::all_for_tool(
-            resolved_tool.id(),
-            required_capabilities.iter().copied(),
-        ),
+        names.iter().map(String::as_str),
+        authority,
         None,
         InMemoryArtifactStore::new(
             NonZeroU64::new(ARTIFACT_LIMIT).expect("positive artifact limit"),
             NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page limit"),
         ),
-    );
-    Ok(Some((resolved_tool.id().to_owned(), Arc::new(adapter))))
+    )
+    .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    Ok(Some((names, Arc::new(adapter))))
 }
 
 struct StaticToolHandler {

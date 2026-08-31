@@ -1080,7 +1080,7 @@ fn runtime_smoke_example_executes_full_provider_free_sequence() {
     assert_eq!(profile_value["sandbox"]["capabilities"], json!([]));
     assert_eq!(
         workflow_bytes.iter().filter(|byte| **byte == b'[').count(),
-        7
+        8
     );
 
     let replay_value: Value = serde_json::from_slice(replay_bytes).expect("replay JSON");

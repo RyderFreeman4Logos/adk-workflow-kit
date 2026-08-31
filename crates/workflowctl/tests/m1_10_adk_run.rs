@@ -47,7 +47,7 @@ entry = "agent"
 id = "agent"
 kind = "agent"
 model = { role = "worker", id = "worker", version = "1" }
-tool = { id = "echo", version = "1" }
+tools = [{ id = "echo", version = "1" }]
 [[nodes]]
 id = "action"
 kind = "action"
@@ -154,7 +154,10 @@ fn write_fixture(root: &Path, profile: Value) -> (PathBuf, PathBuf, PathBuf) {
         model["version"].as_str().unwrap_or("1")
     );
     if let Some(tool) = profile.get("tool").and_then(|tool| tool["name"].as_str()) {
-        binding.push_str(&format!("\ntool = {{ id = {:?}, version = \"1\" }}", tool));
+        binding.push_str(&format!(
+            "\ntools = [{{ id = {:?}, version = \"1\" }}]",
+            tool
+        ));
     }
     fs::write(
         &workflow,

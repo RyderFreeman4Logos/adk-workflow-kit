@@ -71,11 +71,12 @@ impl BindingRef {
     }
 }
 
-/// A successful resolution containing only the stable identity returned by a registry.
+/// A successful resolution containing the stable registry identity and metadata fingerprint.
 #[derive(Clone, Deserialize, Eq, PartialEq)]
 pub struct ResolvedBinding {
     id: String,
     version: String,
+    metadata_identity: String,
 }
 
 impl fmt::Debug for ResolvedBinding {
@@ -84,15 +85,17 @@ impl fmt::Debug for ResolvedBinding {
             .debug_struct("ResolvedBinding")
             .field("id", &"<redacted>")
             .field("version", &"<redacted>")
+            .field("metadata_identity", &"<redacted>")
             .finish()
     }
 }
 
 impl Serialize for ResolvedBinding {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut value = serializer.serialize_struct("ResolvedBinding", 2)?;
+        let mut value = serializer.serialize_struct("ResolvedBinding", 3)?;
         value.serialize_field("id", "<redacted>")?;
         value.serialize_field("version", "<redacted>")?;
+        value.serialize_field("metadata_identity", "<redacted>")?;
         value.end()
     }
 }
@@ -102,13 +105,21 @@ impl ResolvedBinding {
         Self {
             id: id.into(),
             version: version.into(),
+            metadata_identity: String::new(),
         }
+    }
+    pub fn with_metadata_identity(mut self, metadata_identity: impl Into<String>) -> Self {
+        self.metadata_identity = metadata_identity.into();
+        self
     }
     pub fn id(&self) -> &str {
         &self.id
     }
     pub fn version(&self) -> &str {
         &self.version
+    }
+    pub fn metadata_identity(&self) -> &str {
+        &self.metadata_identity
     }
 }
 
@@ -213,7 +224,7 @@ pub struct RuntimePlanRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NodeBindingRequest {
     model: Option<(IrModelRole, BindingRef)>,
-    tool: Option<BindingRef>,
+    tools: Vec<BindingRef>,
 }
 
 impl RuntimePlanRequest {
@@ -231,9 +242,11 @@ impl RuntimePlanRequest {
                             model: node.model().map(|model| {
                                 (model.role(), BindingRef::new(model.id(), model.version()))
                             }),
-                            tool: node
-                                .tool()
-                                .map(|tool| BindingRef::new(tool.id(), tool.version())),
+                            tools: node
+                                .tools()
+                                .iter()
+                                .map(|tool| BindingRef::new(tool.id(), tool.version()))
+                                .collect(),
                         },
                     )
                 })
@@ -320,7 +333,7 @@ pub struct ResolvedRuntimePlan {
 struct ResolvedNodeBinding {
     role: IrModelRole,
     model: ResolvedBinding,
-    tool: Option<ResolvedBinding>,
+    tools: Vec<ResolvedBinding>,
 }
 
 impl Serialize for ResolvedNodeBinding {
@@ -334,7 +347,7 @@ impl Serialize for ResolvedNodeBinding {
             },
         )?;
         value.serialize_field("model", &self.model)?;
-        value.serialize_field("tool", &self.tool)?;
+        value.serialize_field("tools", &self.tools)?;
         value.end()
     }
 }
@@ -424,16 +437,16 @@ impl ResolvedRuntimePlan {
                 model_ref,
                 node_id,
             )?;
-            if *role == IrModelRole::Reviewer && binding.tool.is_some() {
+            if *role == IrModelRole::Reviewer && !binding.tools.is_empty() {
                 return Err(PlanResolutionError::node(
                     PlanResolutionErrorKind::InvalidBinding,
                     BindingCategory::Tool,
                     node_id,
                 ));
             }
-            let tool = binding
-                .tool
-                .as_ref()
+            let tools = binding
+                .tools
+                .iter()
                 .map(|tool_ref| {
                     resolve_node_value(
                         registry,
@@ -443,13 +456,13 @@ impl ResolvedRuntimePlan {
                         node_id,
                     )
                 })
-                .transpose()?;
+                .collect::<Result<Vec<_>, _>>()?;
             node_bindings.insert(
                 node_id.clone(),
                 ResolvedNodeBinding {
                     role: *role,
                     model,
-                    tool,
+                    tools,
                 },
             );
         }
@@ -503,7 +516,7 @@ impl ResolvedRuntimePlan {
                                 IrModelRole::Reviewer => "reviewer".to_owned(),
                             },
                             model: binding_fingerprint(&binding.model),
-                            tool: binding.tool.as_ref().map(binding_fingerprint),
+                            tools: binding.tools.iter().map(binding_fingerprint).collect(),
                         },
                     )
                 })
@@ -554,10 +567,10 @@ impl ResolvedRuntimePlan {
             .get(node_id)
             .map(|binding| &binding.model)
     }
-    pub fn node_tool(&self, node_id: &str) -> Option<&ResolvedBinding> {
+    pub fn node_tools(&self, node_id: &str) -> &[ResolvedBinding] {
         self.node_bindings
             .get(node_id)
-            .and_then(|binding| binding.tool.as_ref())
+            .map_or(&[], |binding| binding.tools.as_slice())
     }
     pub fn validators(&self) -> &[ValidatorBindingProjection] {
         &self.validators
@@ -634,19 +647,21 @@ struct PlanFingerprint {
 struct NodeBindingFingerprint {
     role: String,
     model: BindingFingerprint,
-    tool: Option<BindingFingerprint>,
+    tools: Vec<BindingFingerprint>,
 }
 
 #[derive(Serialize)]
 struct BindingFingerprint {
     id: String,
     version: String,
+    metadata_identity: String,
 }
 
 fn binding_fingerprint(binding: &ResolvedBinding) -> BindingFingerprint {
     BindingFingerprint {
         id: binding.id.clone(),
         version: binding.version.clone(),
+        metadata_identity: binding.metadata_identity.clone(),
     }
 }
 

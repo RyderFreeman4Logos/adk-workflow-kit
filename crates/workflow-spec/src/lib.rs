@@ -372,7 +372,7 @@ pub struct Node {
     idempotent: bool,
     resources: Vec<ResourceReference>,
     model: Option<ModelReference>,
-    tool: Option<ToolReference>,
+    tools: Vec<ToolReference>,
 }
 
 impl Node {
@@ -411,9 +411,9 @@ impl Node {
         self.model.as_ref()
     }
 
-    /// Returns the declared static tool identity, when this node owns one.
-    pub fn tool(&self) -> Option<&ToolReference> {
-        self.tool.as_ref()
+    /// Returns the explicitly declared static tool subset in source order.
+    pub fn tools(&self) -> &[ToolReference] {
+        &self.tools
     }
 }
 
@@ -639,10 +639,7 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
         node.model
             .as_ref()
             .is_some_and(|model| model.id.is_empty() || model.version.is_empty())
-            || node
-                .tool
-                .as_ref()
-                .is_some_and(|tool| tool.id.is_empty() || tool.version.is_empty())
+            || !valid_tools(&node.tools)
     }) {
         return Err(SpecError::InvalidNodeBinding);
     }
@@ -684,10 +681,14 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
                     id: model.id,
                     version: model.version,
                 }),
-                tool: node.tool.map(|tool| ToolReference {
-                    id: tool.id,
-                    version: tool.version,
-                }),
+                tools: node
+                    .tools
+                    .into_iter()
+                    .map(|tool| ToolReference {
+                        id: tool.id,
+                        version: tool.version,
+                    })
+                    .collect(),
             })
             .collect(),
         edges: raw
@@ -734,6 +735,15 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
                 .collect(),
         }),
         resources: raw.resources.into_iter().map(resource).collect(),
+    })
+}
+
+fn valid_tools(tools: &[RawToolReference]) -> bool {
+    let mut identities = BTreeSet::new();
+    tools.iter().all(|tool| {
+        !tool.id.is_empty()
+            && !tool.version.is_empty()
+            && identities.insert((&tool.id, &tool.version))
     })
 }
 
@@ -857,7 +867,7 @@ struct RawNode {
     #[serde(default)]
     model: Option<RawModelReference>,
     #[serde(default)]
-    tool: Option<RawToolReference>,
+    tools: Vec<RawToolReference>,
 }
 
 #[derive(Deserialize)]

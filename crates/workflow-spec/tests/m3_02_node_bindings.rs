@@ -10,7 +10,7 @@ entry = "worker"
 id = "worker"
 kind = "agent"
 model = { role = "worker", id = "worker-model", version = "1" }
-tool = { id = "echo", version = "1" }
+tools = [{ id = "echo", version = "1" }]
 [[nodes]]
 id = "reviewer"
 kind = "agent"
@@ -38,7 +38,7 @@ fn parses_exact_agent_bindings() {
     assert_eq!(worker_model.role(), ModelRole::Worker);
     assert_eq!(worker_model.id(), "worker-model");
     assert_eq!(worker_model.version(), "1");
-    let tool = worker.tool().expect("worker tool");
+    let tool = worker.tools().first().expect("worker tool");
     assert_eq!(tool.id(), "echo");
     assert_eq!(tool.version(), "1");
 
@@ -51,7 +51,7 @@ fn parses_exact_agent_bindings() {
     assert_eq!(reviewer_model.role(), ModelRole::Reviewer);
     assert_eq!(reviewer_model.id(), "reviewer-model");
     assert_eq!(reviewer_model.version(), "1");
-    assert!(reviewer.tool().is_none());
+    assert!(reviewer.tools().is_empty());
 }
 
 #[test]
@@ -67,8 +67,8 @@ fn rejects_malformed_agent_bindings() {
         (
             "unknown tool field",
             WORKFLOW.replace(
-                "tool = { id = \"echo\", version = \"1\" }",
-                "tool = { id = \"echo\", version = \"1\", unknown = true }",
+                "tools = [{ id = \"echo\", version = \"1\" }]",
+                "tools = [{ id = \"echo\", version = \"1\", unknown = true }]",
             ),
         ),
         (
@@ -97,7 +97,7 @@ fn rejects_malformed_agent_bindings() {
         ),
         (
             "empty tool id",
-            WORKFLOW.replace("tool = { id = \"echo\"", "tool = { id = \"\""),
+            WORKFLOW.replace("tools = [{ id = \"echo\"", "tools = [{ id = \"\""),
         ),
     ];
     for (name, malformed) in identity_cases {

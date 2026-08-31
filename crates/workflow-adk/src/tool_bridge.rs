@@ -186,6 +186,22 @@ where
         }
     }
 
+    /// Creates an ADK view over exactly the named registrations of one runtime registry.
+    pub fn for_selected<'a>(
+        bridge: &ToolBridge,
+        names: impl IntoIterator<Item = &'a str>,
+        authority: CapabilityIntersection,
+        approvals: Option<ApprovalLedger>,
+        artifacts: S,
+    ) -> std::result::Result<Self, ToolBridgeError> {
+        Ok(Self::new(
+            bridge.select(names)?,
+            authority,
+            approvals,
+            artifacts,
+        ))
+    }
+
     /// Builds the production ADK script tool over exactly one run sandbox.
     pub fn for_registered_script(
         sandbox: RunSandbox,

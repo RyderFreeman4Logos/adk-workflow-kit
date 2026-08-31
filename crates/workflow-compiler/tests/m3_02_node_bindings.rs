@@ -17,7 +17,7 @@ entry = "worker"
 id = "worker"
 kind = "agent"
 model = { role = "worker", id = "worker-model", version = "1" }
-tool = { id = "echo", version = "1" }
+tools = [{ id = "echo", version = "1" }]
 [[nodes]]
 id = "reviewer"
 kind = "agent"
@@ -44,7 +44,7 @@ fn rejects_invalid_binding_placement_and_reviewer_tool() {
     ));
     let reviewer_tool = WORKFLOW.replace(
         "model = { role = \"reviewer\", id = \"reviewer-model\", version = \"1\" }",
-        "model = { role = \"reviewer\", id = \"reviewer-model\", version = \"1\" }\ntool = { id = \"echo\", version = \"1\" }",
+        "model = { role = \"reviewer\", id = \"reviewer-model\", version = \"1\" }\ntools = [{ id = \"echo\", version = \"1\" }]",
     );
     assert!(matches!(
         compile_str("reviewer-tool.toml", &reviewer_tool),
@@ -72,8 +72,8 @@ fn canonical_node_bindings_drive_ir_and_lock_identity() {
         (
             "tool version",
             WORKFLOW.replace(
-                "tool = { id = \"echo\", version = \"1\" }",
-                "tool = { id = \"echo\", version = \"2\" }",
+                "tools = [{ id = \"echo\", version = \"1\" }]",
+                "tools = [{ id = \"echo\", version = \"2\" }]",
             ),
         ),
     ];
@@ -119,7 +119,7 @@ fn canonical_node_bindings_drive_ir_and_lock_identity() {
         "moving the same identities between nodes must change lock identity"
     );
 
-    let worker_node = "[[nodes]]\nid = \"worker\"\nkind = \"agent\"\nmodel = { role = \"worker\", id = \"worker-model\", version = \"1\" }\ntool = { id = \"echo\", version = \"1\" }\n";
+    let worker_node = "[[nodes]]\nid = \"worker\"\nkind = \"agent\"\nmodel = { role = \"worker\", id = \"worker-model\", version = \"1\" }\ntools = [{ id = \"echo\", version = \"1\" }]\n";
     let reviewer_node = "[[nodes]]\nid = \"reviewer\"\nkind = \"agent\"\nmodel = { role = \"reviewer\", id = \"reviewer-model\", version = \"1\" }\n";
     let reordered = WORKFLOW.replace(
         &format!("{worker_node}{reviewer_node}"),
@@ -219,15 +219,18 @@ fn resolved_plan_preserves_per_node_mapping() {
         Some(IrModelRole::Reviewer)
     );
     assert_eq!((reviewer.id(), reviewer.version()), ("reviewer-model", "1"));
-    assert!(plan.node_tool("reviewer").is_none());
+    assert!(plan.node_tools("reviewer").is_empty());
     let worker = plan.node_model("worker").expect("worker binding");
     assert_eq!(plan.node_model_role("worker"), Some(IrModelRole::Worker));
     assert_eq!((worker.id(), worker.version()), ("worker-model", "1"));
-    let tool = plan.node_tool("worker").expect("worker tool binding");
+    let tool = plan
+        .node_tools("worker")
+        .first()
+        .expect("worker tool binding");
     assert_eq!((tool.id(), tool.version()), ("echo", "1"));
     assert_ne!(worker, reviewer);
     assert!(plan.node_model("done").is_none());
-    assert!(plan.node_tool("done").is_none());
+    assert!(plan.node_tools("done").is_empty());
 }
 
 #[test]

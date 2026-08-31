@@ -61,7 +61,7 @@ fn workflow_with_tool(root: &TestRoot, tool: &str) -> PathBuf {
         .expect("minimal workflow")
         .replace(
             "kind = \"agent\"",
-            &format!("kind = \"agent\"\ntool = {{ id = \"{tool}\", version = \"1\" }}"),
+            &format!("kind = \"agent\"\ntools = [{{ id = \"{tool}\", version = \"1\" }}]"),
         );
     let path = root.0.join("bound.workflow.toml");
     fs::write(&path, source).expect("bound workflow");
@@ -980,7 +980,7 @@ fn checkpoint_tool_identity_comes_from_the_resolved_projection() {
     )
     .expect("manifest should be JSON");
     assert_eq!(
-        manifest["checkpoint_manifest"]["implementation_identities"]["tool"],
-        "non-default-tool:1"
+        manifest["checkpoint_manifest"]["implementation_identities"]["toolset"],
+        receipt.resume_identity()
     );
 }

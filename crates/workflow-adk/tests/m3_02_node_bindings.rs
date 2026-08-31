@@ -46,7 +46,7 @@ entry = "worker"
 id = "worker"
 kind = "agent"
 model = { role = "worker", id = "worker-model", version = "1" }
-tool = { id = "echo", version = "1" }
+tools = [{ id = "echo", version = "1" }]
 [[nodes]]
 id = "reviewer"
 kind = "agent"
