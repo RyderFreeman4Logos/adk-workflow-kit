@@ -162,6 +162,25 @@ fn function_response_bytes(run_root: &Path) -> Vec<u8> {
     serde_json::to_vec(&response).unwrap()
 }
 
+fn finish_status_bytes(run_root: &Path) -> Vec<u8> {
+    let ledger: Value =
+        serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+    serde_json::to_vec(&json!({
+        "status": manifest["status"],
+        "output": ledger["nodes"]["work"]["finished_output"],
+    }))
+    .unwrap()
+}
+
+fn effect_count(run_root: &Path) -> u64 {
+    Connection::open(run_root.join("effects.sqlite"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM kit_effects", [], |row| row.get(0))
+        .unwrap()
+}
+
 #[test]
 fn model_authors_two_selected_calls_then_typed_finish() {
     let (root, receipt) = run(profile());
@@ -223,6 +242,36 @@ fn real_tool_failure_is_terminal_before_later_finish() {
     assert_eq!(error.kind(), ExecutionErrorKind::Tool);
     assert_eq!(error.receipt().unwrap().status(), "failed");
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn successful_tool_payload_markers_never_terminate() {
+    for marker in [
+        "tool.bridge.authorization_denied",
+        "workflow.loop.limit.model_iterations",
+        "workflow.loop.limit.total_tool_calls",
+        "workflow.loop.limit.per_tool_calls",
+        "workflow.loop.limit.tool_output_bytes",
+        "workflow.loop.timeout.wall",
+        "workflow.loop.timeout.idle",
+        "workflow.loop.timeout.tool",
+        "workflow.loop.cancelled",
+        "tool.bridge.failed",
+    ] {
+        let responses = vec![
+            json!({"calls": [{"id":"call-marker","name":"search_code","args":{"query":"x"}}]}),
+            finish(json!({"answer":"done"})),
+        ];
+        let (root, receipt) = run(profile_with_delays(
+            responses,
+            None,
+            0,
+            0,
+            json!({"source":marker}),
+        ));
+        assert_eq!(receipt.unwrap().status(), "succeeded", "marker {marker}");
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
@@ -395,6 +444,71 @@ fn cancellation_is_exact_and_never_succeeds() {
 }
 
 #[test]
+fn cancellation_after_dispatch_fences_effect_and_worker() {
+    if let Ok(root) = env::var("M3_04_CANCEL_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let error = ExecutionBackend::run_cancellable(
+            &workflow,
+            profile_with_delays(
+                vec![
+                    json!({"calls": [{"id":"call-cancel","name":"search_code","args":{"query":"needle"}}]}),
+                    finish(json!({"answer":"must not run"})),
+                ],
+                Some(loop_policy()),
+                0,
+                250,
+                json!({"found":true}),
+            ),
+            json!({}),
+            &root,
+            cancellation,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ExecutionErrorKind::Cancelled);
+        assert_eq!(error.receipt().unwrap().status(), "cancelled");
+        assert_eq!(effect_count(error.receipt().unwrap().run_root()), 0);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(effect_count(error.receipt().unwrap().run_root()), 0);
+        return;
+    }
+
+    let root = root();
+    let barrier = root.join("effect-barrier");
+    fs::create_dir(&barrier).unwrap();
+    let mut child = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "cancellation_after_dispatch_fences_effect_and_worker",
+            "--nocapture",
+        ])
+        .env("M3_04_CANCEL_RUN_ROOT", &root)
+        .env("WORKFLOW_KIT_TEST_EFFECT_BARRIER", &barrier)
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while !barrier.join("ready").is_file() && started.elapsed() < Duration::from_secs(2) {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(barrier.join("ready").is_file(), "tool dispatch barrier");
+    fs::write(barrier.join("cancel"), b"cancel").unwrap();
+    assert!(child.wait().unwrap().success());
+    let run_root = fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("run-manifest.json").is_file())
+        .unwrap();
+    assert_eq!(effect_count(&run_root), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn resume_rejects_loop_identity_drift_before_effects() {
     let (root, receipt) = run(profile_with(
         vec![
@@ -492,6 +606,8 @@ fn resume_wall_time_limit_includes_pending_replay_and_is_typed() {
     assert_eq!(error.kind(), ExecutionErrorKind::WallTimeLimit);
     assert_eq!(error.receipt().unwrap().status(), "timed_out");
     assert!(started.elapsed() < Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(effect_count(&run_root), 0);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -634,5 +750,51 @@ fn effect_after_crash_before_node_checkpoint_resumes_from_loop_ledger() {
     );
     assert!(ledger.to_string().contains("call-crash"));
     assert!(ledger.to_string().contains("resumed"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn finish_after_crash_resumes_without_another_model_request() {
+    if let Ok(root) = env::var("M3_04_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            workflow,
+            profile_with(
+                vec![finish(json!({"answer":"final"}))],
+                Some(policy_with("max_model_iterations", 1)),
+            ),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let expected = serde_json::to_vec(&json!({
+        "status": "succeeded",
+        "output": {"answer":"final"},
+    }))
+    .unwrap();
+    let (baseline_root, baseline) = run(profile_with(
+        vec![finish(json!({"answer":"final"}))],
+        Some(policy_with("max_model_iterations", 1)),
+    ));
+    let baseline = baseline.unwrap();
+    assert_eq!(finish_status_bytes(baseline.run_root()), expected);
+    fs::remove_dir_all(baseline_root).unwrap();
+
+    let root = root();
+    let run_root = crash_run(
+        &root,
+        "finish_after_crash_resumes_without_another_model_request",
+        "after-result",
+    );
+    let receipt = ExecutionBackend::resume(&root, &run_id(&run_root)).unwrap();
+    assert_eq!(receipt.status(), "succeeded");
+    assert_eq!(finish_status_bytes(&run_root), expected);
+    let ledger: Value =
+        serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
+    assert_eq!(ledger["nodes"]["work"]["model_iterations"], 1);
     fs::remove_dir_all(root).unwrap();
 }

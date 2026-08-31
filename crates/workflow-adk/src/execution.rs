@@ -66,6 +66,7 @@ struct LoopState {
     conversation: Vec<adk_rust::Content>,
     previous_response_id: Option<String>,
     pending_calls: VecDeque<PendingCall>,
+    finished_output: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -129,6 +130,10 @@ impl LoopLedgerStore {
 
     fn model_iterations(&self, node: &str) -> Result<u64, ExecutionError> {
         self.snapshot(node).map(|state| state.model_iterations)
+    }
+
+    fn finished_output(&self, node: &str) -> Result<Option<Value>, ExecutionError> {
+        self.snapshot(node).map(|state| state.finished_output)
     }
 
     fn pending_calls(&self) -> Result<Vec<(String, PendingCall)>, ExecutionError> {
@@ -378,7 +383,7 @@ impl LoopController {
             .lock()
             .map_err(|_| adk_rust::AdkError::agent("model call state poisoned"))?;
         let mut next = state.clone();
-        let mut has_finish = false;
+        let mut finished_output = None;
         let mut has_call = false;
         for part in &content.parts {
             match part {
@@ -387,8 +392,8 @@ impl LoopController {
                         adk_rust::AdkError::agent("model response missing typed finish")
                     })?;
                     let ModelFinish { status, output } = finish;
-                    let (FinishStatus::Finished, _) = (status, output);
-                    has_finish = true;
+                    let FinishStatus::Finished = status;
+                    finished_output = Some(output);
                 }
                 adk_rust::Part::FunctionCall { name, args, id, .. } => {
                     has_call = true;
@@ -435,11 +440,12 @@ impl LoopController {
                 "workflow.loop.limit.per_tool_calls",
             ));
         }
-        if !has_call && !has_finish {
+        if !has_call && finished_output.is_none() {
             return Err(adk_rust::AdkError::agent(
                 "model response missing typed finish",
             ));
         }
+        next.finished_output = finished_output;
         next.model_iterations += 1;
         next.conversation.push(content.clone());
         next.previous_response_id = response.interaction_id.clone();
@@ -1226,6 +1232,47 @@ fn parse_capability(value: &str) -> Result<SandboxCapability, ExecutionError> {
     }
 }
 
+struct RestoredFinishAgent {
+    name: String,
+    output: Value,
+}
+
+#[async_trait]
+impl Agent for RestoredFinishAgent {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        "durably restored workflow finish"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &[]
+    }
+
+    fn capabilities(&self) -> adk_rust::AgentCapabilities {
+        adk_rust::AgentCapabilities {
+            shared_state: true,
+            ..adk_rust::AgentCapabilities::default()
+        }
+    }
+
+    async fn run(
+        &self,
+        _context: Arc<dyn adk_rust::InvocationContext>,
+    ) -> adk_rust::Result<adk_rust::EventStream> {
+        let text = serde_json::to_string(&json!({
+            "status": "finished",
+            "output": self.output,
+        }))
+        .map_err(|_| adk_rust::AdkError::agent("restored finish unavailable"))?;
+        let mut event = adk_rust::Event::new(&self.name);
+        event.set_content(adk_rust::Content::new("assistant").with_text(text));
+        Ok(Box::pin(adk_rust::futures::stream::iter([Ok(event)])))
+    }
+}
+
 fn build_profile_agent(
     name: &str,
     model: Arc<ModelBinding>,
@@ -1766,9 +1813,23 @@ impl ExecutionBackend {
             (|| {
                 let sandbox = RunSandbox::new(context, run_workdir, effective_capabilities.clone())
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::SandboxDenied))?;
-                let tool_registry =
-                    build_tool_registry(&profile, sandbox, &run_id, effect_journal.clone())?;
+                let deadline = execution_deadline(&profile.run_limits())?;
                 let terminal_kind = Arc::new(Mutex::new(None));
+                let effect_fence = Arc::new(EffectFence {
+                    cancellation: Arc::clone(&cancellation),
+                    wall_deadline: deadline,
+                    tool_timeout: Duration::from_millis(
+                        profile.run_limits().max_tool_time_ms().get(),
+                    ),
+                    terminal: Arc::clone(&terminal_kind),
+                });
+                let tool_registry = build_tool_registry(
+                    &profile,
+                    sandbox,
+                    &run_id,
+                    effect_journal.clone(),
+                    effect_fence,
+                )?;
                 let agents = compiled
                     .ir()
                     .nodes()
@@ -1812,7 +1873,6 @@ impl ExecutionBackend {
                     .enable_all()
                     .build()
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
-                let deadline = execution_deadline(&profile.run_limits())?;
                 let state = invoke_graph_with_deadline(
                     &runtime,
                     deadline,
@@ -2202,14 +2262,22 @@ impl ExecutionBackend {
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?,
         );
         let deadline = execution_deadline(&profile.run_limits())?;
+        let terminal_kind = Arc::new(Mutex::new(None));
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let effect_fence = Arc::new(EffectFence {
+            cancellation: Arc::clone(&cancellation),
+            wall_deadline: deadline,
+            tool_timeout: Duration::from_millis(profile.run_limits().max_tool_time_ms().get()),
+            terminal: Arc::clone(&terminal_kind),
+        });
         let loop_ledger = Arc::new(LoopLedgerStore::open(root.join(LOOP_LEDGER_FILE))?);
         let tool_registry = build_tool_registry(
             &profile,
             sandbox,
             &run_identity,
             Some(Arc::clone(&effect_journal)),
+            effect_fence,
         )?;
-        let terminal_kind = Arc::new(Mutex::new(None));
         let toolsets = compiled
             .ir()
             .nodes()
@@ -2245,22 +2313,27 @@ impl ExecutionBackend {
             .iter()
             .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
             .map(|node| -> Result<_, ExecutionError> {
-                let completed_turns = loop_ledger.model_iterations(node.id().as_str())?;
-                let model = profile.bind_resolved_model(
-                    &resolved_plan,
-                    node.id().as_str(),
-                    completed_turns,
-                )?;
-                let agent = build_profile_agent(
-                    node.id().as_str(),
-                    model,
-                    toolsets.get(node.id().as_str()).cloned().flatten(),
-                    profile.run_limits(),
-                    Arc::clone(&loop_ledger),
-                    Arc::clone(&terminal_kind),
-                    Arc::new(AtomicBool::new(false)),
-                )?;
-                Ok((node.id().as_str().to_owned(), agent))
+                let name = node.id().as_str();
+                let agent = if let Some(output) = loop_ledger.finished_output(name)? {
+                    Arc::new(RestoredFinishAgent {
+                        name: name.to_owned(),
+                        output,
+                    }) as Arc<dyn Agent>
+                } else {
+                    let completed_turns = loop_ledger.model_iterations(name)?;
+                    let model =
+                        profile.bind_resolved_model(&resolved_plan, name, completed_turns)?;
+                    build_profile_agent(
+                        name,
+                        model,
+                        toolsets.get(name).cloned().flatten(),
+                        profile.run_limits(),
+                        Arc::clone(&loop_ledger),
+                        Arc::clone(&terminal_kind),
+                        Arc::clone(&cancellation),
+                    )?
+                };
+                Ok((name.to_owned(), agent))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let mut state = serde_json::from_slice::<State>(checkpoint.state())
@@ -2439,11 +2512,70 @@ fn build_checkpoint_manifest(
     Ok(manifest)
 }
 
+struct EffectFence {
+    cancellation: Arc<AtomicBool>,
+    wall_deadline: Instant,
+    tool_timeout: Duration,
+    terminal: Arc<Mutex<Option<ExecutionErrorKind>>>,
+}
+
+impl EffectFence {
+    fn wait(&self, delay: Duration) -> Result<Instant, ToolBridgeError> {
+        let tool_deadline = Instant::now()
+            .checked_add(self.tool_timeout)
+            .map_or(self.wall_deadline, |deadline| {
+                deadline.min(self.wall_deadline)
+            });
+        test_effect_barrier(&self.cancellation);
+        self.admit(tool_deadline)?;
+        std::thread::sleep(delay.min(tool_deadline.saturating_duration_since(Instant::now())));
+        self.admit(tool_deadline)?;
+        Ok(tool_deadline)
+    }
+
+    fn admit(&self, tool_deadline: Instant) -> Result<(), ToolBridgeError> {
+        let kind = if self.cancellation.load(Ordering::Acquire) {
+            Some(ExecutionErrorKind::Cancelled)
+        } else if Instant::now() >= self.wall_deadline {
+            Some(ExecutionErrorKind::WallTimeLimit)
+        } else if Instant::now() >= tool_deadline {
+            Some(ExecutionErrorKind::ToolTimeLimit)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            if let Ok(mut terminal) = self.terminal.lock()
+                && terminal.is_none()
+            {
+                *terminal = Some(kind);
+            }
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
+        }
+        Ok(())
+    }
+}
+
+fn test_effect_barrier(cancellation: &AtomicBool) {
+    let Ok(root) = std::env::var("WORKFLOW_KIT_TEST_EFFECT_BARRIER") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let _ = fs::write(root.join("ready"), b"ready");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !root.join("cancel").is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if root.join("cancel").is_file() {
+        cancellation.store(true, Ordering::Release);
+    }
+}
+
 fn build_tool_registry(
     profile: &ExecutionProfileV1,
     sandbox: RunSandbox,
     run_id: &RunId,
     effect_journal: Option<Arc<EffectJournal>>,
+    effect_fence: Arc<EffectFence>,
 ) -> Result<ToolBridge, ExecutionError> {
     let mut bridge = ToolBridge::new(sandbox);
     for tool in profile.tool_wires() {
@@ -2458,6 +2590,7 @@ fn build_tool_registry(
                     run_id: run_id.as_str().to_owned(),
                     node_id: tool.name.clone(),
                     effect_journal: effect_journal.clone(),
+                    effect_fence: Arc::clone(&effect_fence),
                     delay_ms: tool.delay_ms,
                     handler_error: tool.handler_error,
                 },
@@ -2515,8 +2648,7 @@ fn replay_pending_tools(
             .map(|(_, toolset)| toolset)
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let toolset = Arc::clone(toolset);
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .spawn(move || {
                 let response = toolset.invoke(ToolCall::new(
                     &pending.name,
@@ -2524,19 +2656,13 @@ fn replay_pending_tools(
                     &node,
                     pending.args.clone(),
                 ));
-                let _ = sender.send((node, pending, response));
+                (node, pending, response)
             })
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
-        let (node, pending, response) = receiver
-            .recv_timeout(remaining_wall_time(deadline)?)
-            .map_err(|error| match error {
-                std::sync::mpsc::RecvTimeoutError::Timeout => {
-                    ExecutionError::new(ExecutionErrorKind::WallTimeLimit)
-                }
-                std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                    ExecutionError::new(ExecutionErrorKind::Tool)
-                }
-            })?;
+        let (node, pending, response) = worker
+            .join()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
+        remaining_wall_time(deadline)?;
         let response = response.map_err(|error| {
             let kind = match error.kind() {
                 ToolBridgeErrorKind::CapabilityDenied | ToolBridgeErrorKind::ApprovalDenied => {
@@ -2601,6 +2727,7 @@ struct StaticToolHandler {
     run_id: String,
     node_id: String,
     effect_journal: Option<Arc<EffectJournal>>,
+    effect_fence: Arc<EffectFence>,
     delay_ms: u64,
     handler_error: bool,
 }
@@ -2615,10 +2742,13 @@ impl ToolHandler for StaticToolHandler {
         if self.handler_error {
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
         }
-        std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+        crash_barrier("before-effect");
+        let tool_deadline = self
+            .effect_fence
+            .wait(Duration::from_millis(self.delay_ms))?;
         let result = if let Some(journal) = &self.effect_journal {
             let key = EffectKey::new(&self.run_id, &self.node_id, &self.node_id, arguments);
-            crash_barrier("before-effect");
+            self.effect_fence.admit(tool_deadline)?;
             match journal.commit(&key, &self.result) {
                 Ok(EffectCommit::Committed) => self.result.clone(),
                 Ok(EffectCommit::AlreadyCommitted(result)) => result,
