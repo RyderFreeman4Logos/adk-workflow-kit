@@ -1,9 +1,11 @@
 use std::{cell::RefCell, collections::BTreeMap};
 
 use workflow_compiler::{
-    BindingCategory, BindingRef, PlanResolutionErrorKind, RegistryResolutionError, ResolvedBinding,
-    ResolvedRuntimePlan, RuntimePlanRegistry, RuntimePlanRequest, WorkflowLock, compile_str,
+    BindingCategory, BindingRef, BindingValidationError, CompileError, PlanResolutionErrorKind,
+    RegistryResolutionError, ResolvedBinding, ResolvedRuntimePlan, RuntimePlanRegistry,
+    RuntimePlanRequest, WorkflowLock, compile_str,
 };
+use workflow_ir::IrModelRole;
 
 const WORKFLOW: &str = r#"
 schema_version = 1
@@ -34,26 +36,106 @@ to = "done"
 #[test]
 fn rejects_invalid_binding_placement_and_reviewer_tool() {
     let non_agent = WORKFLOW.replace("kind = \"agent\"", "kind = \"action\"");
-    assert!(compile_str("non-agent.toml", &non_agent).is_err());
+    assert!(matches!(
+        compile_str("non-agent.toml", &non_agent),
+        Err(CompileError::Binding(
+            BindingValidationError::InvalidPlacement
+        ))
+    ));
     let reviewer_tool = WORKFLOW.replace(
         "model = { role = \"reviewer\", id = \"reviewer-model\", version = \"1\" }",
         "model = { role = \"reviewer\", id = \"reviewer-model\", version = \"1\" }\ntool = { id = \"echo\", version = \"1\" }",
     );
-    assert!(compile_str("reviewer-tool.toml", &reviewer_tool).is_err());
+    assert!(matches!(
+        compile_str("reviewer-tool.toml", &reviewer_tool),
+        Err(CompileError::Binding(BindingValidationError::ReviewerTool))
+    ));
 }
 
 #[test]
 fn canonical_node_bindings_drive_ir_and_lock_identity() {
-    let worker = compile_str("worker.toml", WORKFLOW).expect("worker compiles");
-    let changed = WORKFLOW.replace("worker-model", "other-model");
-    let other = compile_str("other.toml", &changed).expect("other compiles");
-    assert_ne!(worker.ir().canonical_hash(), other.ir().canonical_hash());
+    let baseline = compile_str("baseline.toml", WORKFLOW).expect("baseline compiles");
+    let variants = [
+        ("model id", WORKFLOW.replace("worker-model", "other-model")),
+        (
+            "model role",
+            WORKFLOW.replace("role = \"reviewer\"", "role = \"worker\""),
+        ),
+        (
+            "model version",
+            WORKFLOW.replacen("version = \"1\" }", "version = \"2\" }", 1),
+        ),
+        (
+            "tool id",
+            WORKFLOW.replace("id = \"echo\"", "id = \"other-tool\""),
+        ),
+        (
+            "tool version",
+            WORKFLOW.replace(
+                "tool = { id = \"echo\", version = \"1\" }",
+                "tool = { id = \"echo\", version = \"2\" }",
+            ),
+        ),
+    ];
+    for (name, source) in variants {
+        let changed = compile_str(format!("{name}.toml"), &source).expect("variant compiles");
+        assert_ne!(
+            baseline.ir().canonical_hash(),
+            changed.ir().canonical_hash(),
+            "{name} must change canonical identity"
+        );
+        assert_ne!(
+            WorkflowLock::try_from_plan(&baseline)
+                .expect("baseline lock")
+                .ir_hash(),
+            WorkflowLock::try_from_plan(&changed)
+                .expect("variant lock")
+                .ir_hash(),
+            "{name} must change lock identity"
+        );
+    }
+
+    let ownership_baseline = WORKFLOW.replace("role = \"reviewer\"", "role = \"worker\"");
+    let ownership_swapped = ownership_baseline
+        .replace("worker-model", "swap-model")
+        .replace("reviewer-model", "worker-model")
+        .replace("swap-model", "reviewer-model");
+    let ownership_baseline =
+        compile_str("ownership-baseline.toml", &ownership_baseline).expect("baseline compiles");
+    let ownership_swapped =
+        compile_str("ownership-swapped.toml", &ownership_swapped).expect("swap compiles");
     assert_ne!(
-        WorkflowLock::try_from_plan(&worker)
-            .expect("worker lock")
+        ownership_baseline.ir().canonical_hash(),
+        ownership_swapped.ir().canonical_hash(),
+        "moving the same identities between nodes must change canonical identity"
+    );
+    assert_ne!(
+        WorkflowLock::try_from_plan(&ownership_baseline)
+            .expect("ownership baseline lock")
             .ir_hash(),
-        WorkflowLock::try_from_plan(&other)
-            .expect("other lock")
+        WorkflowLock::try_from_plan(&ownership_swapped)
+            .expect("ownership swapped lock")
+            .ir_hash(),
+        "moving the same identities between nodes must change lock identity"
+    );
+
+    let worker_node = "[[nodes]]\nid = \"worker\"\nkind = \"agent\"\nmodel = { role = \"worker\", id = \"worker-model\", version = \"1\" }\ntool = { id = \"echo\", version = \"1\" }\n";
+    let reviewer_node = "[[nodes]]\nid = \"reviewer\"\nkind = \"agent\"\nmodel = { role = \"reviewer\", id = \"reviewer-model\", version = \"1\" }\n";
+    let reordered = WORKFLOW.replace(
+        &format!("{worker_node}{reviewer_node}"),
+        &format!("{reviewer_node}{worker_node}"),
+    );
+    let reordered = compile_str("reordered.toml", &reordered).expect("reordered compiles");
+    assert_eq!(
+        baseline.ir().canonical_hash(),
+        reordered.ir().canonical_hash()
+    );
+    assert_eq!(
+        WorkflowLock::try_from_plan(&baseline)
+            .expect("baseline lock")
+            .ir_hash(),
+        WorkflowLock::try_from_plan(&reordered)
+            .expect("reordered lock")
             .ir_hash()
     );
 }
@@ -131,9 +213,21 @@ fn resolved_plan_preserves_per_node_mapping() {
             (BindingCategory::Tool, "echo".into(), "1".into()),
         ]
     );
-    let projection = plan.explain();
-    assert!(projection.contains("reviewer"));
-    assert!(projection.contains("worker"));
+    let reviewer = plan.node_model("reviewer").expect("reviewer binding");
+    assert_eq!(
+        plan.node_model_role("reviewer"),
+        Some(IrModelRole::Reviewer)
+    );
+    assert_eq!((reviewer.id(), reviewer.version()), ("reviewer-model", "1"));
+    assert!(plan.node_tool("reviewer").is_none());
+    let worker = plan.node_model("worker").expect("worker binding");
+    assert_eq!(plan.node_model_role("worker"), Some(IrModelRole::Worker));
+    assert_eq!((worker.id(), worker.version()), ("worker-model", "1"));
+    let tool = plan.node_tool("worker").expect("worker tool binding");
+    assert_eq!((tool.id(), tool.version()), ("echo", "1"));
+    assert_ne!(worker, reviewer);
+    assert!(plan.node_model("done").is_none());
+    assert!(plan.node_tool("done").is_none());
 }
 
 #[test]
@@ -196,5 +290,30 @@ fn node_binding_resolution_fails_closed() {
         .expect_err("unknown tool must fail closed");
     assert_eq!(error.kind(), PlanResolutionErrorKind::MissingBinding);
     assert_eq!(error.category(), Some(BindingCategory::Tool));
+    assert_eq!(error.node_id(), Some("worker"));
     assert!(error.to_string().contains("worker"));
+
+    let error = ResolvedRuntimePlan::resolve(
+        request(WORKFLOW),
+        &Registry {
+            ambiguous: Some(BindingCategory::Tool),
+            ..Registry::all()
+        },
+    )
+    .expect_err("ambiguous tool must fail closed");
+    assert_eq!(error.kind(), PlanResolutionErrorKind::AmbiguousBinding);
+    assert_eq!(error.category(), Some(BindingCategory::Tool));
+    assert_eq!(error.node_id(), Some("worker"));
+
+    let error = ResolvedRuntimePlan::resolve(
+        request(WORKFLOW),
+        &Registry {
+            empty: Some(BindingCategory::Tool),
+            ..Registry::all()
+        },
+    )
+    .expect_err("empty tool identity must fail closed");
+    assert_eq!(error.kind(), PlanResolutionErrorKind::InvalidBinding);
+    assert_eq!(error.category(), Some(BindingCategory::Tool));
+    assert_eq!(error.node_id(), Some("worker"));
 }

@@ -125,12 +125,29 @@ fn dispatches_models_and_tool_by_resolved_node() {
     )
     .expect("node-owned bindings execute");
     let events = events(&receipt.run_root().join("events.jsonl"));
-    let model_nodes = events
+    let model_events = events
         .iter()
         .filter(|event| event["kind"] == "model_request_completed")
+        .collect::<Vec<_>>();
+    let model_nodes = model_events
+        .iter()
         .map(|event| event["node_id"].as_str().expect("node id"))
         .collect::<BTreeSet<_>>();
     assert_eq!(model_nodes, BTreeSet::from(["reviewer", "worker"]));
+    let worker_event = model_events
+        .iter()
+        .find(|event| event["node_id"] == "worker")
+        .expect("worker model event");
+    let reviewer_event = model_events
+        .iter()
+        .find(|event| event["node_id"] == "reviewer")
+        .expect("reviewer model event");
+    let worker_output = serde_json::to_string(worker_event).expect("worker event serializes");
+    let reviewer_output = serde_json::to_string(reviewer_event).expect("reviewer event serializes");
+    assert!(worker_output.contains("worker-response"));
+    assert!(!worker_output.contains("reviewer-response"));
+    assert!(reviewer_output.contains("reviewer-response"));
+    assert!(!reviewer_output.contains("worker-response"));
     let tool_nodes = events
         .iter()
         .filter(|event| event["kind"] == "tool_completed")
@@ -180,6 +197,24 @@ fn reviewer_cannot_receive_worker_tool() {
                 .as_str()
                 .is_some_and(|kind| kind.starts_with("tool_")))
     );
+
+    let mut worker_only = serde_json::to_value(profile(false)).expect("profile serializes");
+    worker_only
+        .as_object_mut()
+        .expect("profile object")
+        .remove("reviewer_model");
+    let worker_only = ExecutionProfileV1::parse(
+        &serde_json::to_vec(&worker_only).expect("worker-only profile serializes"),
+    )
+    .expect("worker-only profile parses");
+    let error = ExecutionBackend::run(
+        root.workflow(REVIEWER_ONLY),
+        worker_only,
+        json!({"request": "public"}),
+        &root.0,
+    )
+    .expect_err("reviewer cannot fall back to worker model");
+    assert_eq!(error.kind(), ExecutionErrorKind::MissingBinding);
 }
 
 #[test]
@@ -197,6 +232,8 @@ fn binding_drift_rejects_resume_before_effects() {
     let before = paths
         .each_ref()
         .map(|path| fs::read(path).expect("run state"));
+    let manifest_before =
+        fs::read(receipt.run_root().join("run-manifest.json")).expect("run manifest state");
     let workflow = receipt.run_root().join("workflow.toml");
     let changed = fs::read_to_string(&workflow)
         .expect("persisted workflow")
@@ -211,5 +248,9 @@ fn binding_drift_rejects_resume_before_effects() {
             .each_ref()
             .map(|path| fs::read(path).expect("run state")),
         before
+    );
+    assert_eq!(
+        fs::read(receipt.run_root().join("run-manifest.json")).expect("run manifest state"),
+        manifest_before
     );
 }
