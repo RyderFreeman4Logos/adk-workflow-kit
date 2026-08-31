@@ -14,10 +14,7 @@ use std::{
 
 use adk_rust::graph::prelude::{ExecutionConfig, State};
 use adk_rust::graph::{Checkpoint, Checkpointer, GraphError};
-use adk_rust::{
-    Agent, AgentCapabilities, Content, Event, EventStream, FunctionResponseData, InvocationContext,
-    LlmRequest, Part, async_trait, futures::StreamExt as _,
-};
+use adk_rust::{Agent, agent::LlmAgentBuilder, async_trait};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -45,7 +42,7 @@ use crate::{
         CredentialBroker, CredentialHandle, FakeModelProfile, ModelBinding, ModelProfileRegistry,
         OpenAiCompatibleProfile,
     },
-    tool_bridge::{AdkToolBridge, project_tool_execution_error},
+    tool_bridge::AdkToolBridge,
 };
 
 const MAX_STATE_BYTES: usize = 1024 * 1024;
@@ -239,7 +236,7 @@ enum ModelWire {
         name: String,
         version: String,
         model: String,
-        responses: Vec<String>,
+        responses: Vec<Value>,
     },
     OpenaiCompatible {
         name: String,
@@ -297,7 +294,14 @@ impl ExecutionProfileV1 {
                         .into_iter()
                         .any(|value| value.is_empty())
                         || responses.is_empty()
-                        || responses.iter().any(String::is_empty)
+                        || responses.iter().any(|response| match response {
+                            Value::String(value) => value.is_empty(),
+                            Value::Object(value) => value
+                                .get("calls")
+                                .and_then(Value::as_array)
+                                .is_none_or(Vec::is_empty),
+                            _ => true,
+                        })
                     {
                         return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
                     }
@@ -371,7 +375,7 @@ impl ExecutionProfileV1 {
                     model,
                     responses,
                 },
-            ) => ModelProfileRegistry::new().with_worker(FakeModelProfile::new(
+            ) => ModelProfileRegistry::new().with_worker(FakeModelProfile::from_values(
                 name,
                 version,
                 model,
@@ -385,7 +389,7 @@ impl ExecutionProfileV1 {
                     model,
                     responses,
                 },
-            ) => ModelProfileRegistry::new().with_reviewer(FakeModelProfile::new(
+            ) => ModelProfileRegistry::new().with_reviewer(FakeModelProfile::from_values(
                 name,
                 version,
                 model,
@@ -689,96 +693,84 @@ fn parse_capability(value: &str) -> Result<SandboxCapability, ExecutionError> {
     }
 }
 
-#[derive(Clone)]
-struct ProfileAgent {
-    name: String,
+fn build_profile_agent(
+    name: &str,
     model: Arc<ModelBinding>,
     tool: Option<BoundTool>,
-    input: Value,
-}
-
-#[async_trait]
-impl Agent for ProfileAgent {
-    fn name(&self) -> &str {
-        &self.name
+) -> Result<Arc<dyn Agent>, ExecutionError> {
+    let (names, toolset) = match tool {
+        Some((names, toolset)) => (names, Some(toolset)),
+        None => (Vec::new(), None),
+    };
+    let allowed = Arc::new(names.into_iter().collect::<BTreeSet<_>>());
+    let seen_ids = Arc::new(Mutex::new(BTreeSet::new()));
+    let seen_calls = Arc::new(Mutex::new(BTreeSet::new()));
+    let mut builder = LlmAgentBuilder::new(name)
+        .description("workflow-kit profile-driven agent")
+        .model(model.llm())
+        .max_iterations(100)
+        .after_model_callback(Box::new(move |_context, response| {
+            let allowed = Arc::clone(&allowed);
+            let seen_ids = Arc::clone(&seen_ids);
+            let seen_calls = Arc::clone(&seen_calls);
+            Box::pin(async move {
+                let content = response
+                    .content
+                    .as_ref()
+                    .ok_or_else(|| adk_rust::AdkError::agent("model response missing content"))?;
+                let mut has_finish = false;
+                let mut has_call = false;
+                for part in &content.parts {
+                    match part {
+                        adk_rust::Part::Text { text } if !text.is_empty() => has_finish = true,
+                        adk_rust::Part::FunctionCall { name, args, id, .. } => {
+                            has_call = true;
+                            let id =
+                                id.as_deref().filter(|id| !id.is_empty()).ok_or_else(|| {
+                                    adk_rust::AdkError::agent("model call missing ID")
+                                })?;
+                            if !allowed.contains(name.as_str()) || !args.is_object() {
+                                return Err(adk_rust::AdkError::agent(
+                                    "model call is unselected or schema-invalid",
+                                ));
+                            }
+                            if !seen_ids
+                                .lock()
+                                .map_err(|_| {
+                                    adk_rust::AdkError::agent("model call state poisoned")
+                                })?
+                                .insert(id.to_owned())
+                                || !seen_calls
+                                    .lock()
+                                    .map_err(|_| {
+                                        adk_rust::AdkError::agent("model call state poisoned")
+                                    })?
+                                    .insert((
+                                        name.clone(),
+                                        workflow_runtime::argument_fingerprint(args),
+                                    ))
+                            {
+                                return Err(adk_rust::AdkError::agent("repeated model tool call"));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !has_call && !has_finish {
+                    return Err(adk_rust::AdkError::agent(
+                        "model response missing typed finish",
+                    ));
+                }
+                Ok(None)
+            })
+        }));
+    if let Some(toolset) = toolset {
+        builder = builder.toolset(toolset);
     }
-
-    fn description(&self) -> &str {
-        "workflow-kit profile-driven agent"
-    }
-
-    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
-        &[]
-    }
-
-    fn capabilities(&self) -> AgentCapabilities {
-        AgentCapabilities {
-            shared_state: true,
-            ..AgentCapabilities::default()
-        }
-    }
-
-    async fn run(&self, context: Arc<dyn InvocationContext>) -> adk_rust::Result<EventStream> {
-        let request = LlmRequest::new(
-            self.model.resolved_model_identity(),
-            vec![Content::new("user").with_text(self.input.to_string())],
-        );
-        let mut responses = self
-            .model
-            .generate_content(request, false)
-            .await
-            .map_err(|error| adk_rust::AdkError::agent(error.to_string()))?;
-        let mut events = Vec::new();
-        while let Some(response) = responses.next().await {
-            let mut event = Event::new(context.invocation_id());
-            event.llm_response =
-                response.map_err(|error| adk_rust::AdkError::agent(error.to_string()))?;
-            events.push(Ok(event));
-        }
-        if events.is_empty() {
-            return Err(adk_rust::AdkError::agent("model returned no events"));
-        }
-
-        if let Some((names, bridge)) = &self.tool {
-            for name in names {
-                let call_id = format!("{}-{name}-tool", context.invocation_id());
-                let mut requested = Event::new(context.invocation_id());
-                requested.set_content(Content {
-                    role: "model".to_owned(),
-                    parts: vec![Part::FunctionCall {
-                        name: name.clone(),
-                        args: self.input.clone(),
-                        id: Some(call_id.clone()),
-                        thought_signature: None,
-                    }],
-                });
-                events.push(Ok(requested));
-                let result = bridge
-                    .invoke(workflow_runtime::ToolCall::new(
-                        name,
-                        &call_id,
-                        context.user_id(),
-                        self.input.clone(),
-                    ))
-                    .map_err(project_tool_execution_error)?;
-                let mut completed = Event::new(context.invocation_id());
-                completed.set_content(Content {
-                    role: "function".to_owned(),
-                    parts: vec![Part::FunctionResponse {
-                        function_response: FunctionResponseData::new(
-                            name,
-                            serde_json::to_value(result)
-                                .map_err(|error| adk_rust::AdkError::tool(error.to_string()))?,
-                        ),
-                        id: Some(call_id),
-                        annotations: None,
-                    }],
-                });
-                events.push(Ok(completed));
-            }
-        }
-        Ok(Box::pin(adk_rust::futures::stream::iter(events)))
-    }
+    builder
+        .build()
+        .map(|agent| Arc::new(agent) as Arc<dyn Agent>)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))
 }
 
 /// Stable terminal information returned by run, resume, and inspect.
@@ -1117,16 +1109,15 @@ impl ExecutionBackend {
                             .ok_or_else(|| {
                                 ExecutionError::new(ExecutionErrorKind::ImplementationBinding)
                             })?;
-                        let agent: Arc<dyn Agent> = Arc::new(ProfileAgent {
-                            name: node.id().as_str().to_owned(),
+                        let agent = build_profile_agent(
+                            node.id().as_str(),
                             model,
-                            tool: build_toolset(
+                            build_toolset(
                                 &tool_registry,
                                 resolved_plan.node_tools(node.id().as_str()),
                                 &effective_capabilities,
                             )?,
-                            input: input.clone(),
-                        });
+                        )?;
                         Ok((node.id().as_str().to_owned(), agent))
                     })
                     .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -1533,16 +1524,15 @@ impl ExecutionBackend {
             .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
             .map(|node| -> Result<_, ExecutionError> {
                 let model = profile.bind_resolved_model(&resolved_plan, node.id().as_str())?;
-                let agent: Arc<dyn Agent> = Arc::new(ProfileAgent {
-                    name: node.id().as_str().to_owned(),
+                let agent = build_profile_agent(
+                    node.id().as_str(),
                     model,
-                    tool: build_toolset(
+                    build_toolset(
                         &tool_registry,
                         resolved_plan.node_tools(node.id().as_str()),
                         &effective_capabilities,
                     )?,
-                    input: input.clone(),
-                });
+                )?;
                 Ok((node.id().as_str().to_owned(), agent))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;

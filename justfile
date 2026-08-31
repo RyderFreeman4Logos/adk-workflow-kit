@@ -61,6 +61,9 @@ m3-03-runtime test_name:
 m3-03-adk test_name:
     {{_io}} cargo +1.98.0 test -p workflow-adk --test m3_03_multi_tool_registry {{test_name}} --locked -- --exact --nocapture
 
+m3-04-adk test_name:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test m3_04_model_tool_loop {{test_name}} --locked -- --exact --nocapture
+
 # Focused M1-15 conformance contract tests.
 m1-15-test:
     {{_io}} cargo +1.98.0 test -p workflow-testkit --test m1_15_conformance --locked

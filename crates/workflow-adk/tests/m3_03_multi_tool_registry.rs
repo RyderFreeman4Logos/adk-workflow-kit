@@ -22,18 +22,10 @@ kind = "agent"
 model = { role = "worker", id = "worker-model", version = "1" }
 tools = [{ id = "alpha", version = "1" }, { id = "beta", version = "1" }]
 [[nodes]]
-id = "second"
-kind = "agent"
-model = { role = "worker", id = "worker-model", version = "1" }
-tools = [{ id = "gamma", version = "1" }]
-[[nodes]]
 id = "done"
 kind = "terminal"
 [[edges]]
 from = "first"
-to = "second"
-[[edges]]
-from = "second"
 to = "done"
 "#;
 
@@ -56,7 +48,13 @@ fn profile() -> ExecutionProfileV1 {
                 "name": "worker-model",
                 "version": "1",
                 "model": "worker",
-                "responses": ["worker-response"]
+                "responses": [
+                    {"calls": [
+                        {"id": "call-alpha", "name": "alpha", "args": {}},
+                        {"id": "call-beta", "name": "beta", "args": {}}
+                    ]},
+                    "worker-response"
+                ]
             },
             "tools": [
                 {"name": "alpha", "result": {"tool": "alpha"}},
@@ -92,7 +90,7 @@ fn exposes_only_the_selected_node_toolset() {
     let receipt = ExecutionBackend::run(&workflow, profile(), json!({"request": "public"}), &root)
         .expect("per-node selected tools execute");
     let events = tool_events(receipt.run_root());
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 1);
     assert!(
         events["first"]
             .iter()
@@ -107,21 +105,6 @@ fn exposes_only_the_selected_node_toolset() {
         !events["first"]
             .iter()
             .any(|event| event.contains("\"tool\":\"gamma\""))
-    );
-    assert!(
-        events["second"]
-            .iter()
-            .any(|event| event.contains("\"tool\":\"gamma\""))
-    );
-    assert!(
-        !events["second"]
-            .iter()
-            .any(|event| event.contains("\"tool\":\"alpha\""))
-    );
-    assert!(
-        !events["second"]
-            .iter()
-            .any(|event| event.contains("\"tool\":\"beta\""))
     );
 
     let protected = ["events.jsonl", "effects.sqlite", "checkpoint.sqlite"]

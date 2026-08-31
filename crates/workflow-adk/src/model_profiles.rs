@@ -3,15 +3,15 @@
 //! Profiles contain identities and policy only. Credentials are resolved at bind time and
 //! are never part of the serializable profile or registry.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adk_rust::async_trait;
 use adk_rust::futures::{Stream, StreamExt};
-use adk_rust::model::{MockLlm, OpenAICompatible, OpenAICompatibleConfig};
+use adk_rust::model::{OpenAICompatible, OpenAICompatibleConfig};
 use adk_rust::{AdkError, Content, ErrorCategory, Llm, LlmRequest, LlmResponse};
 use serde::{Deserialize, Serialize};
 use workflow_compiler::{ModelRegistry, RegistryCategory, RegistryEntry, RegistryNotFound};
@@ -289,8 +289,43 @@ impl fmt::Debug for CredentialBroker {
 pub struct FakeModelProfile {
     identity: ModelProfileIdentity,
     model: String,
-    responses: Vec<String>,
+    responses: Vec<serde_json::Value>,
     runtime: ModelRuntimeConfig,
+}
+
+struct QueuedFakeLlm {
+    name: String,
+    responses: Mutex<VecDeque<LlmResponse>>,
+}
+
+impl QueuedFakeLlm {
+    fn new(name: impl Into<String>, responses: VecDeque<LlmResponse>) -> Self {
+        Self {
+            name: name.into(),
+            responses: Mutex::new(responses),
+        }
+    }
+}
+
+#[async_trait]
+impl Llm for QueuedFakeLlm {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn generate_content(
+        &self,
+        _request: LlmRequest,
+        _stream: bool,
+    ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+        let response = self
+            .responses
+            .lock()
+            .map_err(|_| AdkError::agent("fake model response queue poisoned"))?
+            .pop_front()
+            .ok_or_else(|| AdkError::agent("fake model response script exhausted"))?;
+        Ok(Box::pin(adk_rust::futures::stream::iter([Ok(response)])))
+    }
 }
 
 impl FakeModelProfile {
@@ -307,13 +342,30 @@ impl FakeModelProfile {
         Self {
             identity: ModelProfileIdentity::new(name, version),
             model: model.into(),
-            responses: responses.into_iter().map(Into::into).collect(),
+            responses: responses
+                .into_iter()
+                .map(|response| serde_json::Value::String(response.into()))
+                .collect(),
             runtime: ModelRuntimeConfig::default(),
         }
     }
     pub fn with_runtime(mut self, runtime: ModelRuntimeConfig) -> Self {
         self.runtime = runtime;
         self
+    }
+
+    pub(crate) fn from_values(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        model: impl Into<String>,
+        responses: Vec<serde_json::Value>,
+    ) -> Self {
+        Self {
+            identity: ModelProfileIdentity::new(name, version),
+            model: model.into(),
+            responses,
+            runtime: ModelRuntimeConfig::default(),
+        }
     }
 }
 
@@ -558,14 +610,35 @@ impl ModelProfile {
     ) -> Result<ModelBinding, ModelProfileError> {
         let (llm, requested, provider) = match self {
             Self::Fake(value) => {
-                let mut llm = MockLlm::new(&value.model);
+                let mut responses = VecDeque::new();
                 for response in &value.responses {
-                    llm = llm.with_response(adk_rust::LlmResponse::new(
-                        Content::new("assistant").with_text(response),
-                    ));
+                    let content = match response {
+                        serde_json::Value::String(text) => {
+                            Content::new("assistant").with_text(text)
+                        }
+                        serde_json::Value::Object(object) => Content {
+                            role: "assistant".to_owned(),
+                            parts: object
+                                .get("calls")
+                                .and_then(serde_json::Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|call| {
+                                    Some(adk_rust::Part::FunctionCall {
+                                        name: call.get("name")?.as_str()?.to_owned(),
+                                        args: call.get("args")?.clone(),
+                                        id: call.get("id")?.as_str().map(str::to_owned),
+                                        thought_signature: None,
+                                    })
+                                })
+                                .collect(),
+                        },
+                        _ => return Err(ModelProfileError::invalid()),
+                    };
+                    responses.push_back(adk_rust::LlmResponse::new(content));
                 }
                 (
-                    Arc::new(llm) as Arc<dyn Llm>,
+                    Arc::new(QueuedFakeLlm::new(&value.model, responses)) as Arc<dyn Llm>,
                     value.model.clone(),
                     "fake".to_owned(),
                 )
