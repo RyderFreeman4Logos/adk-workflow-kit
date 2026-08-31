@@ -584,7 +584,16 @@ impl AdkGraph {
                         .as_deref()
                         .into_iter()
                         .chain(event.llm_response.error_message.as_deref())
-                        .find_map(terminal_graph_error);
+                        .find_map(terminal_graph_error)
+                        .or_else(|| {
+                            event.tool_results().iter().find_map(|result| {
+                                result
+                                    .response
+                                    .get("error")?
+                                    .as_str()
+                                    .and_then(terminal_graph_error)
+                            })
+                        });
                     if let Some(error) = terminal_error {
                         return Err(error);
                     }
