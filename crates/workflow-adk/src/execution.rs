@@ -1224,7 +1224,12 @@ fn build_profile_agent(
             let controller = Arc::clone(&tool_error_controller);
             Box::pin(async move {
                 let error = error.to_ascii_lowercase();
-                let (kind, code) = if error.contains("timeout") || error.contains("timed out") {
+                let (kind, code) = if error.contains("authorization_denied") {
+                    (
+                        ExecutionErrorKind::AuthorizationDenied,
+                        "tool.bridge.authorization_denied",
+                    )
+                } else if error.contains("timeout") || error.contains("timed out") {
                     (
                         ExecutionErrorKind::ToolTimeLimit,
                         "workflow.loop.timeout.tool",

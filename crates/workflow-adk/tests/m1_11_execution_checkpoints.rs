@@ -34,6 +34,10 @@ impl Drop for TestRoot {
     }
 }
 
+fn finish(output: Value) -> Value {
+    json!(serde_json::to_string(&json!({"status":"finished", "output":output})).unwrap())
+}
+
 fn profile() -> ExecutionProfileV1 {
     ExecutionProfileV1::parse(
         br#"{
@@ -43,7 +47,7 @@ fn profile() -> ExecutionProfileV1 {
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["done"]
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
             },
             "sandbox": {"capabilities": []}
         }"#,
@@ -103,11 +107,12 @@ fn capability_profile(backend: &[&str], requested: &[&str]) -> ExecutionProfileV
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["done"]
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
             },
             "tool": {
                 "name": "static-tool",
                 "result": {"ok": true},
+                "input_schema": {"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false},
                 "required_capabilities": requested
             },
             "sandbox": {"capabilities": backend}
@@ -183,7 +188,7 @@ fn execution_publishes_a_run_scoped_checkpoint_for_restart() {
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["done"]
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
             },
             "sandbox": {"capabilities": []}
         }"#,
@@ -256,7 +261,7 @@ fn resume_consumes_checkpoint_state_and_invokes_the_adk_graph() {
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["done"]
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
             },
             "sandbox": {"capabilities": []}
         }"#,
@@ -293,7 +298,7 @@ fn resume_restores_pending_retry_route_frontier_and_visits_without_reexecuting_c
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["done"]
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
             },
             "sandbox": {"capabilities": []}
         }"#,
@@ -373,7 +378,7 @@ fn truncated_events_resume_maps_to_incompatible_terminal_outcome() {
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["done"]
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
             },
             "sandbox": {"capabilities": []}
         }"#,
@@ -434,7 +439,7 @@ fn resume_rejects_missing_target_node_before_graph_invocation() {
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["done"]
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
             },
             "sandbox": {"capabilities": []}
         }"#,
@@ -484,7 +489,7 @@ fn resume_rejects_redacted_checkpoint_value_before_graph_invocation() {
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["done"]
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
             },
             "sandbox": {"capabilities": []}
         }"#,
@@ -550,7 +555,7 @@ to = "done"
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["done"]
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
             },
             "pure_transform": {"module": transform},
             "sandbox": {"capabilities": []}
@@ -583,7 +588,7 @@ fn workflow_hash_mismatch_fixture_rejects_changed_workflow_before_resume() {
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["done"]
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
             },
             "sandbox": {"capabilities": []}
         }"#,
@@ -620,7 +625,7 @@ fn tool_implementation_drift_fixture_rejects_changed_profile_before_resume() {
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["done"]
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
             },
             "sandbox": {"capabilities": []}
         }"#,
@@ -649,7 +654,7 @@ fn resume_preserves_artifact_references_from_prior_execution() {
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["x".repeat(5_000)]
+                "responses": [finish(json!("x".repeat(5_000)))]
             },
             "sandbox": {"capabilities": []}
         }))
@@ -714,7 +719,7 @@ fn resume_rejects_missing_or_tampered_first_checkpoint_artifact_before_graph_inv
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["x".repeat(5_000)]
+                "responses": [finish(json!("x".repeat(5_000)))]
             },
             "sandbox": {"capabilities": []}
         }))
@@ -767,7 +772,7 @@ fn resume_does_not_advance_checkpoint_when_event_persistence_fails() {
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["done"]
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
             },
             "sandbox": {"capabilities": []}
         }"#,
@@ -819,6 +824,7 @@ fn execution_graph_preserves_authorization_denial_before_handler_effect() {
             "tool": {
                 "name": "protected-tool",
                 "result": {"ok": true},
+                "input_schema": {"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false},
                 "required_scopes": ["scope.denied"]
             },
             "sandbox": {"capabilities": []}
@@ -858,7 +864,7 @@ fn execution_persists_resolved_runtime_plan_identity() {
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["done"]
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
             },
             "sandbox": {"capabilities": []}
         }"#,
@@ -956,11 +962,12 @@ fn checkpoint_tool_identity_comes_from_the_resolved_projection() {
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["done"]
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
             },
             "tool": {
                 "name": "non-default-tool",
                 "result": {"ok": true},
+                "input_schema": {"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false},
                 "required_capabilities": [],
                 "required_scopes": []
             },
