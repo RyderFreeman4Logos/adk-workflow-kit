@@ -31,6 +31,7 @@ pub use artifact::{
 pub use bridge::{
     CapabilityIntersection, CapabilityIntersectionError, EffectiveToolCapabilities, ToolBridge,
     ToolBridgeError, ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolHandler,
+    selection_identity,
 };
 pub use bubblewrap::{
     BubblewrapError, BubblewrapReceipt, BubblewrapRequest, BubblewrapRequestError,

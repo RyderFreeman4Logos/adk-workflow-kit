@@ -71,11 +71,12 @@ impl BindingRef {
     }
 }
 
-/// A successful resolution containing only the stable identity returned by a registry.
+/// A successful resolution containing the stable registry identity and metadata fingerprint.
 #[derive(Clone, Deserialize, Eq, PartialEq)]
 pub struct ResolvedBinding {
     id: String,
     version: String,
+    metadata_identity: String,
 }
 
 impl fmt::Debug for ResolvedBinding {
@@ -84,15 +85,17 @@ impl fmt::Debug for ResolvedBinding {
             .debug_struct("ResolvedBinding")
             .field("id", &"<redacted>")
             .field("version", &"<redacted>")
+            .field("metadata_identity", &"<redacted>")
             .finish()
     }
 }
 
 impl Serialize for ResolvedBinding {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut value = serializer.serialize_struct("ResolvedBinding", 2)?;
+        let mut value = serializer.serialize_struct("ResolvedBinding", 3)?;
         value.serialize_field("id", "<redacted>")?;
         value.serialize_field("version", "<redacted>")?;
+        value.serialize_field("metadata_identity", "<redacted>")?;
         value.end()
     }
 }
@@ -102,13 +105,21 @@ impl ResolvedBinding {
         Self {
             id: id.into(),
             version: version.into(),
+            metadata_identity: String::new(),
         }
+    }
+    pub fn with_metadata_identity(mut self, metadata_identity: impl Into<String>) -> Self {
+        self.metadata_identity = metadata_identity.into();
+        self
     }
     pub fn id(&self) -> &str {
         &self.id
     }
     pub fn version(&self) -> &str {
         &self.version
+    }
+    pub fn metadata_identity(&self) -> &str {
+        &self.metadata_identity
     }
 }
 
@@ -643,12 +654,14 @@ struct NodeBindingFingerprint {
 struct BindingFingerprint {
     id: String,
     version: String,
+    metadata_identity: String,
 }
 
 fn binding_fingerprint(binding: &ResolvedBinding) -> BindingFingerprint {
     BindingFingerprint {
         id: binding.id.clone(),
         version: binding.version.clone(),
+        metadata_identity: binding.metadata_identity.clone(),
     }
 }
 

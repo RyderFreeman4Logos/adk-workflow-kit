@@ -12,7 +12,7 @@ use workflow_runtime::{
     CapabilityIntersection, ChildSandbox, EffectCommit, EffectJournal, EffectKey,
     InMemoryArtifactStore, RunContext, RunId, RunLimits, RunSandbox, SandboxCapability, ToolBridge,
     ToolBridgeError, ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolEnvelope, ToolFlags,
-    ToolHandler, ToolProvenance, ToolRegistration, WorkdirManager,
+    ToolHandler, ToolProvenance, ToolRegistration, WorkdirManager, selection_identity,
 };
 
 fn sandbox() -> RunSandbox {
@@ -219,6 +219,18 @@ fn preserves_effect_identity_and_rejects_registry_or_subset_drift_on_resume() {
             .expect("subset drift identity"),
         "resume must reject a different node subset"
     );
+    for registration in [
+        registration("alpha").with_required_scopes(["scope-drift"]),
+        registration("alpha").with_paging(true),
+        registration("alpha").with_implementation_digest("changed"),
+    ] {
+        assert_ne!(
+            recorded,
+            selection_identity(std::iter::once((registration.name(), &registration)))
+                .expect("metadata drift identity"),
+            "resume identity includes complete registration metadata"
+        );
+    }
 
     let mut artifacts = InMemoryArtifactStore::new(
         NonZeroU64::new(4_096).expect("positive"),

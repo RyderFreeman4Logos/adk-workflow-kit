@@ -392,6 +392,15 @@ struct RegisteredTool {
     handler: Arc<dyn ToolHandler>,
 }
 
+/// Hashes deterministic registry metadata for one selected tool subset.
+pub fn selection_identity<'a>(
+    metadata: impl IntoIterator<Item = (&'a str, &'a ToolRegistration)>,
+) -> Result<String, ToolBridgeError> {
+    let bytes = serde_json::to_vec(&metadata.into_iter().collect::<Vec<_>>())
+        .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
 /// The policy-preserving registered-tool bridge.
 pub struct ToolBridge {
     sandbox: Arc<RunSandbox>,
@@ -448,14 +457,12 @@ impl ToolBridge {
         names: impl IntoIterator<Item = &'a str>,
     ) -> Result<String, ToolBridgeError> {
         let selected = self.select(names)?;
-        let metadata = selected
-            .tools
-            .iter()
-            .map(|(name, tool)| (name, &tool.registration))
-            .collect::<Vec<_>>();
-        let bytes = serde_json::to_vec(&metadata)
-            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
-        Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+        selection_identity(
+            selected
+                .tools
+                .iter()
+                .map(|(name, tool)| (name.as_str(), &tool.registration)),
+        )
     }
 
     /// Registers a shared handler without persisting ADK implementation types.
