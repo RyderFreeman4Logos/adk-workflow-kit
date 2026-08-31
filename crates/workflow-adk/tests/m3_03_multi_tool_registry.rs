@@ -53,13 +53,13 @@ fn profile() -> ExecutionProfileV1 {
                         {"id": "call-alpha", "name": "alpha", "args": {}},
                         {"id": "call-beta", "name": "beta", "args": {}}
                     ]},
-                    "worker-response"
+                    "{\"status\":\"finished\",\"output\":\"worker-response\"}"
                 ]
             },
             "tools": [
-                {"name": "alpha", "result": {"tool": "alpha"}},
-                {"name": "beta", "result": {"tool": "beta"}},
-                {"name": "gamma", "result": {"tool": "gamma"}}
+                {"name": "alpha", "result": {"tool": "alpha"}, "input_schema": {"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}},
+                {"name": "beta", "result": {"tool": "beta"}, "input_schema": {"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}},
+                {"name": "gamma", "result": {"tool": "gamma"}, "input_schema": {"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}}
             ],
             "sandbox": {"capabilities": []}
         }))
