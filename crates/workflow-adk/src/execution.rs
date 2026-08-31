@@ -512,7 +512,7 @@ impl ExecutionProfileV1 {
         plan: &'a ResolvedRuntimePlan,
         node_id: &str,
     ) -> Result<Option<&'a ResolvedBinding>, ExecutionError> {
-        let Some(binding) = plan.node_tool(node_id) else {
+        let Some(binding) = plan.node_tools(node_id).first() else {
             return Ok(None);
         };
         if self.tool_binding() != Some((binding.id(), binding.version())) {
@@ -953,7 +953,7 @@ impl ExecutionBackend {
             .ir()
             .nodes()
             .iter()
-            .find(|node| resolved_plan.node_tool(node.id().as_str()).is_some());
+            .find(|node| !resolved_plan.node_tools(node.id().as_str()).is_empty());
         let resolved_tool = tool_node
             .map(|node| profile.select_resolved_tool(&resolved_plan, node.id().as_str()))
             .transpose()?
@@ -1124,7 +1124,8 @@ impl ExecutionBackend {
                             name: node.id().as_str().to_owned(),
                             model,
                             tool: resolved_plan
-                                .node_tool(node.id().as_str())
+                                .node_tools(node.id().as_str())
+                                .first()
                                 .and(tool.clone()),
                             input: input.clone(),
                         });
@@ -1476,7 +1477,7 @@ impl ExecutionBackend {
             .ir()
             .nodes()
             .iter()
-            .find(|node| resolved_plan.node_tool(node.id().as_str()).is_some());
+            .find(|node| !resolved_plan.node_tools(node.id().as_str()).is_empty());
         let resolved_tool = tool_node
             .map(|node| profile.select_resolved_tool(&resolved_plan, node.id().as_str()))
             .transpose()
@@ -1555,7 +1556,8 @@ impl ExecutionBackend {
                     name: node.id().as_str().to_owned(),
                     model,
                     tool: resolved_plan
-                        .node_tool(node.id().as_str())
+                        .node_tools(node.id().as_str())
+                        .first()
                         .and(tool.clone()),
                     input: input.clone(),
                 });

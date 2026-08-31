@@ -18,7 +18,7 @@ entry = "done"
 id = "done"
 kind = "agent"
 model = { role = "worker", id = "model", version = "1" }
-tool = { id = "tool", version = "1" }
+tools = [{ id = "tool", version = "1" }]
 "#;
 
 fn request() -> RuntimePlanRequest {
@@ -162,7 +162,7 @@ fn resolution_covers_all_backend_neutral_projection_categories() {
         Some("model")
     );
     assert_eq!(
-        plan.node_tool("done").map(|binding| binding.id()),
+        plan.node_tools("done").first().map(|binding| binding.id()),
         Some("tool")
     );
     assert_eq!(plan.validators().len(), 1);
