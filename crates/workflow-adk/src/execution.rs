@@ -2200,6 +2200,14 @@ impl ExecutionBackend {
         {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
+        for node in compiled
+            .ir()
+            .nodes()
+            .iter()
+            .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
+        {
+            profile.bind_resolved_model(&resolved_plan, node.id().as_str(), 0)?;
+        }
         let transform_module = profile.transform_module()?;
         let live_checkpoint_manifest = build_checkpoint_manifest(
             &run_identity,
