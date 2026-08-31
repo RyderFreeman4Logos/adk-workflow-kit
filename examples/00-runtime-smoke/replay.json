@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "workflow_lock": {
+    "toml": "lock_version = 1\ncanonical_ir_wire_version = 1\nir_schema_version = 1\nworkflow_id = \"m3-00-runtime-smoke\"\nworkflow_version = \"1\"\nir_hash = \"sha256:78a4b84b40a64db617d980d30efeb2f76baf3277cb67b7ffc9f76dc4a1ac61c4\"\nsemantic_resource_hashes = []\n",
+    "sha256": "sha256:de7430f13a6a1327dc473570ab62d0f138492417f07d16fa2c411d37c99f9d5a"
+  },
+  "input_sha256": "sha256:c9f15e5b391af039214b698d5fd8513494b47f50ed7512d0078f994e4763158f",
+  "events": [
+    { "type": "node_started", "node_id": "agent" },
+    { "type": "policy_decision", "node_id": "agent", "requested": [], "effective": [], "allowed": false },
+    {
+      "type": "model_exchange",
+      "node_id": "agent",
+      "model_id": "m3-00-fake",
+      "request_sha256": "sha256:c9f15e5b391af039214b698d5fd8513494b47f50ed7512d0078f994e4763158f",
+      "response_sha256": "sha256:0eaa9e7283563ff3205955ffa167e9a910ab637fab51f44a6bb3a6f9140bd3a0",
+      "input_tokens": 2,
+      "output_tokens": 3,
+      "cached_input_tokens": 0
+    },
+    {
+      "type": "tool_exchange",
+      "node_id": "agent",
+      "tool_id": "echo",
+      "arguments_sha256": "sha256:6bfc944bc9da66ef033f33b7aa5f9e55cfec2bdac127803d3f62dcdc819e8778",
+      "result_sha256": "sha256:e957e4d3200a81c314d86d6047d6e700966a47e015192e4f8cfb7fd607885855"
+    },
+    { "type": "node_completed", "node_id": "agent" },
+    {
+      "type": "terminal",
+      "status": "completed",
+      "outcome_sha256": "sha256:81e6b72af737e9144b76cbff83a72e2013f15aaa8fff79259089604a3abb2cb0"
+    }
+  ],
+  "fixtures": [
+    {
+      "sha256": "sha256:c9f15e5b391af039214b698d5fd8513494b47f50ed7512d0078f994e4763158f",
+      "bytes": [123,34,114,101,113,117,101,115,116,34,58,34,114,117,110,116,105,109,101,32,115,109,111,107,101,34,125,10]
+    },
+    {
+      "sha256": "sha256:0eaa9e7283563ff3205955ffa167e9a910ab637fab51f44a6bb3a6f9140bd3a0",
+      "bytes": [114,117,110,116,105,109,101,32,115,109,111,107,101,32,99,111,109,112,108,101,116,101]
+    },
+    {
+      "sha256": "sha256:6bfc944bc9da66ef033f33b7aa5f9e55cfec2bdac127803d3f62dcdc819e8778",
+      "bytes": [123,34,114,101,113,117,101,115,116,34,58,34,114,117,110,116,105,109,101,32,115,109,111,107,101,34,125]
+    },
+    {
+      "sha256": "sha256:e957e4d3200a81c314d86d6047d6e700966a47e015192e4f8cfb7fd607885855",
+      "bytes": [123,34,101,99,104,111,34,58,34,114,117,110,116,105,109,101,32,115,109,111,107,101,34,125]
+    },
+    {
+      "sha256": "sha256:81e6b72af737e9144b76cbff83a72e2013f15aaa8fff79259089604a3abb2cb0",
+      "bytes": [123,34,115,116,97,116,117,115,34,58,34,99,111,109,112,108,101,116,101,100,34,44,34,109,101,115,115,97,103,101,34,58,34,114,117,110,116,105,109,101,32,115,109,111,107,101,32,99,111,109,112,108,101,116,101,34,125]
+    }
+  ],
+  "artifacts": []
+}

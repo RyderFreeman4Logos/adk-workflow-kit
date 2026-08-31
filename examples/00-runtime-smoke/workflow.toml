@@ -1,0 +1,18 @@
+schema_version = 1
+
+[workflow]
+id = "m3-00-runtime-smoke"
+version = "1"
+entry = "agent"
+
+[[nodes]]
+id = "agent"
+kind = "agent"
+
+[[nodes]]
+id = "terminal"
+kind = "terminal"
+
+[[edges]]
+from = "agent"
+to = "terminal"
