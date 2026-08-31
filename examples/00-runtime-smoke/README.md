@@ -8,15 +8,29 @@ per-node configuration example, or a live provider-conformance test.
 
 ## Run it
 
-Run the single authoritative command block below from the repository root. It
-establishes the example directory, uses one caller-overridable temporary
-workdir, and performs `validate → graph --format mermaid → lock → run --profile
-→ inspect → resume → replay` in that order. When `WORKDIR` is not provided,
-the block creates and removes a temporary directory; a caller-provided
-`WORKDIR` is created if needed and is not removed.
+Start the commands at the repository root and run the single authoritative
+block below with Bash. It requires Bash, Python 3, and an installed or built
+`workflowctl` executable on `PATH`. The block establishes the example
+directory, uses one caller-overridable temporary workdir, and performs
+`validate → graph --format mermaid → lock → run --profile → inspect → resume
+→ replay` in that order. When `WORKDIR` is not provided, the block creates and
+removes a temporary directory; a caller-provided `WORKDIR` is created if
+needed and is not removed.
 
-```sh
+```bash
 set -eu
+if [ -z "${BASH_VERSION:-}" ]; then
+    printf '%s\n' 'prerequisite missing: Bash' >&2
+    exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' 'prerequisite missing: python3' >&2
+    exit 1
+fi
+if ! command -v workflowctl >/dev/null 2>&1; then
+    printf '%s\n' 'prerequisite missing: workflowctl' >&2
+    exit 1
+fi
 EXAMPLE="$(pwd)/examples/00-runtime-smoke"
 test -d "$EXAMPLE"
 cd "$EXAMPLE"

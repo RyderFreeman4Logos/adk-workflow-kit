@@ -11,8 +11,9 @@ prints these outputs in this order:
    `artifact_id`, `run_root`, `resume_count: 0`, `plan_hash`, and
    `resume_identity`.
 5. A JSON `inspect` receipt with the same run fields and values as `run`.
-6. A JSON `resume` receipt with the same `run_id`, `plan_hash`, and
-   `resume_identity`, with `status: "succeeded"` and `resume_count: 1`.
+6. A JSON `resume` receipt with the same `run_id`, `workflow_id`, `artifact_id`,
+   `run_root`, `plan_hash`, and `resume_identity`, with `status: "succeeded"`
+   and `resume_count: 1`.
 7. A separate JSON `replay` receipt with `disposition: "replay_run"`, a
    nonzero `fixture_count`, and `payload_len`; it has no `run_id` and does not
    identify or depend on the dynamic `run_root`.
