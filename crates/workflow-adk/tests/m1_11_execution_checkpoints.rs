@@ -814,7 +814,7 @@ fn execution_graph_preserves_authorization_denial_before_handler_effect() {
                 "name": "fake-model",
                 "version": "1",
                 "model": "fake",
-                "responses": ["done"]
+                "responses": [{"calls":[{"id":"call-protected","name":"protected-tool","args":{}}]}]
             },
             "tool": {
                 "name": "protected-tool",

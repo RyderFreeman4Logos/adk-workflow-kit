@@ -17,6 +17,7 @@ clippy:
     {{_io}} cargo +1.98.0 clippy --workspace --all-targets --locked -- -D warnings
 
 test:
+    {{_io}} cargo +1.98.0 build -p workflowctl --locked
     {{_io}} cargo +1.98.0 test --workspace --locked
     ./target/debug/workflowctl test crates/workflowctl/tests/fixtures/cli004-test.json
     ./target/debug/workflowctl eval crates/workflowctl/tests/fixtures/cli004-eval.json

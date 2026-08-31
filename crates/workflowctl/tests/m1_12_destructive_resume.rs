@@ -56,7 +56,7 @@ fn profile(root: &Path) -> PathBuf {
     let path = root.join("profile.json");
     fs::write(
         &path,
-        br#"{"schema_version":1,"model":{"provider":"fake","name":"fake-model","version":"1","model":"fake","responses":["done"]},"tool":{"name":"send","result":{"accepted":true}},"sandbox":{"capabilities":[]}}"#,
+        br#"{"schema_version":1,"model":{"provider":"fake","name":"fake-model","version":"1","model":"fake","responses":[{"calls":[{"id":"call-send","name":"send","args":{"request":"public"}}]},"done"]},"tool":{"name":"send","result":{"accepted":true}},"sandbox":{"capabilities":[]}}"#,
     )
     .expect("profile write");
     path

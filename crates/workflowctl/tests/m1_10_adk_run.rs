@@ -181,7 +181,10 @@ fn fake_profile() -> Value {
             "name": "worker",
             "version": "1",
             "model": "fixture-model",
-            "responses": ["model-ok"]
+            "responses": [
+                {"calls":[{"id":"call-echo","name":"echo","args":{}}]},
+                "model-ok"
+            ]
         },
         "tool": {
             "name": "echo",

@@ -100,6 +100,10 @@ fn profile(with_tool: bool) -> ExecutionProfileV1 {
         "sandbox": {"capabilities": []}
     });
     if with_tool {
+        profile["model"]["responses"] = json!([
+            {"calls":[{"id":"call-echo","name":"echo","args":{}}]},
+            "worker-response"
+        ]);
         profile["tool"] = json!({"name": "echo", "result": {"ok": true}});
     }
     ExecutionProfileV1::parse(&serde_json::to_vec(&profile).expect("profile serializes"))

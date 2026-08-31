@@ -84,6 +84,9 @@ async fn fake_profile_returns_the_script_without_a_provider() {
         stream.next().await.unwrap().unwrap().content.unwrap().parts[0].text(),
         Some("first")
     );
+    assert!(stream.next().await.is_none());
+    let request = LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+    let mut stream = binding.generate_content(request, false).await.unwrap();
     assert_eq!(
         stream.next().await.unwrap().unwrap().content.unwrap().parts[0].text(),
         Some("second")

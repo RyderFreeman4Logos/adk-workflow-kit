@@ -227,6 +227,8 @@ pub struct ExecutionProfileV1 {
     tools: Vec<ToolWire>,
     pure_transform: Option<PureTransformWire>,
     sandbox: SandboxWire,
+    #[serde(default)]
+    loop_policy: Option<LoopPolicyWire>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -269,6 +271,19 @@ struct PureTransformWire {
 struct SandboxWire {
     #[serde(default)]
     capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LoopPolicyWire {
+    schema_version: u16,
+    max_model_iterations: u32,
+    max_total_tool_calls: u64,
+    max_tool_calls_per_tool: u64,
+    wall_time_ms: u64,
+    idle_time_ms: u64,
+    tool_time_ms: u64,
+    max_tool_output_bytes: u64,
 }
 
 impl ExecutionProfileV1 {
@@ -331,6 +346,18 @@ impl ExecutionProfileV1 {
                 .as_ref()
                 .is_some_and(|transform| transform.module.is_empty())
         {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+        }
+        if profile.loop_policy.as_ref().is_some_and(|policy| {
+            policy.schema_version != 1
+                || policy.max_model_iterations == 0
+                || policy.max_total_tool_calls == 0
+                || policy.max_tool_calls_per_tool == 0
+                || policy.wall_time_ms == 0
+                || policy.idle_time_ms == 0
+                || policy.tool_time_ms == 0
+                || policy.max_tool_output_bytes == 0
+        }) {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
         }
         profile.capabilities()?;
@@ -558,6 +585,26 @@ impl ExecutionProfileV1 {
             None => format!("worker={worker}:{worker_version}"),
         }
     }
+
+    fn model_iterations(&self) -> u32 {
+        self.loop_policy
+            .as_ref()
+            .map_or(100, |policy| policy.max_model_iterations)
+    }
+
+    fn run_limits(&self) -> RunLimits {
+        let positive = |value| NonZeroU64::new(value).expect("validated positive loop policy");
+        let policy = self.loop_policy.as_ref();
+        RunLimits::new(
+            positive(policy.map_or(100, |value| u64::from(value.max_model_iterations))),
+            positive(policy.map_or(100, |value| value.max_total_tool_calls)),
+            positive(policy.map_or(100, |value| value.max_tool_calls_per_tool)),
+            positive(policy.map_or(60_000, |value| value.wall_time_ms)),
+            positive(policy.map_or(60_000, |value| value.idle_time_ms)),
+            positive(policy.map_or(60_000, |value| value.tool_time_ms)),
+            positive(policy.map_or(ARTIFACT_LIMIT, |value| value.max_tool_output_bytes)),
+        )
+    }
 }
 
 struct ExecutionRuntimeRegistry {
@@ -697,6 +744,7 @@ fn build_profile_agent(
     name: &str,
     model: Arc<ModelBinding>,
     tool: Option<BoundTool>,
+    max_iterations: u32,
 ) -> Result<Arc<dyn Agent>, ExecutionError> {
     let (names, toolset) = match tool {
         Some((names, toolset)) => (names, Some(toolset)),
@@ -707,8 +755,8 @@ fn build_profile_agent(
     let seen_calls = Arc::new(Mutex::new(BTreeSet::new()));
     let mut builder = LlmAgentBuilder::new(name)
         .description("workflow-kit profile-driven agent")
-        .model(model.llm())
-        .max_iterations(100)
+        .model(model)
+        .max_iterations(max_iterations)
         .after_model_callback(Box::new(move |_context, response| {
             let allowed = Arc::clone(&allowed);
             let seen_ids = Arc::clone(&seen_ids);
@@ -722,7 +770,9 @@ fn build_profile_agent(
                 let mut has_call = false;
                 for part in &content.parts {
                     match part {
-                        adk_rust::Part::Text { text } if !text.is_empty() => has_finish = true,
+                        adk_rust::Part::Text { text } if !text.trim().is_empty() => {
+                            has_finish = true;
+                        }
                         adk_rust::Part::FunctionCall { name, args, id, .. } => {
                             has_call = true;
                             let id =
@@ -977,7 +1027,7 @@ impl ExecutionBackend {
             &resolved_plan,
             transform_module.as_deref(),
         )?;
-        let context = RunContext::new(run_id.clone(), run_limits());
+        let context = RunContext::new(run_id.clone(), profile.run_limits());
         let mut mapper = AdkEventMapper::new(run_id.as_str(), compiled.ir().workflow_id().as_str())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
         let run_workdir = manager
@@ -1117,6 +1167,7 @@ impl ExecutionBackend {
                                 resolved_plan.node_tools(node.id().as_str()),
                                 &effective_capabilities,
                             )?,
+                            profile.model_iterations(),
                         )?;
                         Ok((node.id().as_str().to_owned(), agent))
                     })
@@ -1144,6 +1195,7 @@ impl ExecutionBackend {
                         artifacts,
                     ))
                     .map_err(|error| {
+                        eprintln!("invoke_observed error: {error:?}");
                         ExecutionError::new(match error {
                             AdkGraphError::AuthorizationDenied => {
                                 ExecutionErrorKind::AuthorizationDenied
@@ -1506,7 +1558,7 @@ impl ExecutionBackend {
             ))
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let sandbox = RunSandbox::new(
-            RunContext::new(run_identity.clone(), run_limits()),
+            RunContext::new(run_identity.clone(), profile.run_limits()),
             run_workdir,
             effective_capabilities.clone(),
         )
@@ -1532,6 +1584,7 @@ impl ExecutionBackend {
                         resolved_plan.node_tools(node.id().as_str()),
                         &effective_capabilities,
                     )?,
+                    profile.model_iterations(),
                 )?;
                 Ok((node.id().as_str().to_owned(), agent))
             })
@@ -1671,6 +1724,7 @@ fn build_checkpoint_manifest(
         &profile.reviewer_model,
         &profile.tool,
         &profile.tools,
+        &profile.loop_policy,
     ))
     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
     let effective_capabilities = plan.effective_capabilities().as_slice().join("\n");
@@ -1814,19 +1868,6 @@ fn fresh_run_id() -> Result<RunId, ExecutionError> {
         NEXT_RUN.fetch_add(1, Ordering::Relaxed)
     ))
     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))
-}
-
-fn run_limits() -> RunLimits {
-    let positive = |value| NonZeroU64::new(value).expect("run limits are positive");
-    RunLimits::new(
-        positive(100),
-        positive(100),
-        positive(100),
-        positive(60_000),
-        positive(60_000),
-        positive(60_000),
-        positive(ARTIFACT_LIMIT),
-    )
 }
 
 fn bounded_terminal_artifact(

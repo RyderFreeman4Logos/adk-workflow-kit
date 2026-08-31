@@ -917,7 +917,10 @@ impl Llm for ModelBinding {
         let request = self.apply_runtime(request);
         adk_rust::tokio::time::timeout(
             self.runtime.timeout(),
-            self.llm.generate_content(request, stream),
+            self.llm.generate_content(
+                request,
+                stream && self.identity.provider != "openai-compatible",
+            ),
         )
         .await
         .map_err(|_| {

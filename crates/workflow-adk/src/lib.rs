@@ -525,6 +525,22 @@ impl AdkGraph {
                             events::AdkEventMappingErrorKind::InvalidObservation,
                         )
                     })?;
+                    let authorization_denied = event
+                        .llm_response
+                        .error_code
+                        .as_deref()
+                        .into_iter()
+                        .chain(event.llm_response.error_message.as_deref())
+                        .any(|value| value.contains("tool.bridge.authorization_denied"))
+                        || event.tool_results().iter().any(|result| {
+                            result
+                                .response
+                                .to_string()
+                                .contains("tool.bridge.authorization_denied")
+                        });
+                    if authorization_denied {
+                        return Err(AdkGraphError::AuthorizationDenied);
+                    }
                     if event.content().is_none() {
                         return Err(AdkGraphError::InvalidOutput { node });
                     }
