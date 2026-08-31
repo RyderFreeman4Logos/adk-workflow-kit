@@ -61,7 +61,7 @@ fn workflow_with_tool(root: &TestRoot, tool: &str) -> PathBuf {
         .expect("minimal workflow")
         .replace(
             "kind = \"agent\"",
-            &format!("kind = \"agent\"\ntool = {{ id = \"{tool}\", version = \"1\" }}"),
+            &format!("kind = \"agent\"\ntools = [{{ id = \"{tool}\", version = \"1\" }}]"),
         );
     let path = root.0.join("bound.workflow.toml");
     fs::write(&path, source).expect("bound workflow");
