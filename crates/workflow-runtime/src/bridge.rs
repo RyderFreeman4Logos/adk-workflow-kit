@@ -386,6 +386,7 @@ impl fmt::Display for ToolBridgeError {
 impl std::error::Error for ToolBridgeError {}
 
 /// A registered handler and its kit-owned metadata.
+#[derive(Clone)]
 struct RegisteredTool {
     registration: ToolRegistration,
     handler: Arc<dyn ToolHandler>,
@@ -417,6 +418,44 @@ impl ToolBridge {
         handler: H,
     ) -> Result<(), ToolBridgeError> {
         self.register_shared(registration, Arc::new(handler))
+    }
+
+    /// Creates a capability-preserving view over exactly the selected registrations.
+    pub fn select<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, ToolBridgeError> {
+        let mut tools = BTreeMap::new();
+        for name in names {
+            let tool = self
+                .tools
+                .get(name)
+                .cloned()
+                .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::UnknownTool))?;
+            tools.insert(name.to_owned(), tool);
+        }
+        Ok(Self {
+            sandbox: Arc::clone(&self.sandbox),
+            tools,
+            idempotent_results: HashMap::new(),
+            in_flight: HashMap::new(),
+        })
+    }
+
+    /// Returns a deterministic identity for one selected registry subset.
+    pub fn selection_identity<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<String, ToolBridgeError> {
+        let selected = self.select(names)?;
+        let metadata = selected
+            .tools
+            .iter()
+            .map(|(name, tool)| (name, &tool.registration))
+            .collect::<Vec<_>>();
+        let bytes = serde_json::to_vec(&metadata)
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+        Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
     }
 
     /// Registers a shared handler without persisting ADK implementation types.
