@@ -1,15 +1,15 @@
 //! Profile-driven execution and kit-owned run-state persistence.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt, fs,
     num::NonZeroU64,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use adk_rust::graph::prelude::{ExecutionConfig, State};
@@ -48,8 +48,399 @@ use crate::{
 const MAX_STATE_BYTES: usize = 1024 * 1024;
 const ARTIFACT_LIMIT: u64 = 64 * 1024;
 const GRAPH_CONTINUATION_KEY: &str = "kit_graph_continuation_v1";
+const LOOP_LEDGER_FILE: &str = "loop-ledger.json";
 static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
 type BoundTool = (Vec<String>, Arc<AdkToolBridge<InMemoryArtifactStore>>);
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LoopState {
+    model_iterations: u64,
+    total_tool_calls: u64,
+    tool_output_bytes: u64,
+    tool_calls: BTreeMap<String, u64>,
+    seen_ids: BTreeSet<String>,
+    seen_calls: BTreeSet<(String, String)>,
+    conversation: Vec<adk_rust::Content>,
+    previous_response_id: Option<String>,
+    pending_calls: VecDeque<PendingCall>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingCall {
+    id: String,
+    name: String,
+    args: Value,
+    fingerprint: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LoopLedgerV1 {
+    schema_version: u8,
+    nodes: BTreeMap<String, LoopState>,
+}
+
+struct LoopLedgerStore {
+    path: PathBuf,
+    nodes: Mutex<BTreeMap<String, LoopState>>,
+}
+
+impl LoopLedgerStore {
+    fn create(path: PathBuf) -> Result<Self, ExecutionError> {
+        let store = Self {
+            path,
+            nodes: Mutex::new(BTreeMap::new()),
+        };
+        store.persist()?;
+        Ok(store)
+    }
+
+    fn open(path: PathBuf) -> Result<Self, ExecutionError> {
+        let ledger = serde_json::from_slice::<LoopLedgerV1>(&bounded_read(&path)?)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if ledger.schema_version != 1 {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        Ok(Self {
+            path,
+            nodes: Mutex::new(ledger.nodes),
+        })
+    }
+
+    fn snapshot(&self, node: &str) -> Result<LoopState, ExecutionError> {
+        self.nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+            .map(|nodes| nodes.get(node).cloned().unwrap_or_default())
+    }
+
+    fn replace(&self, node: &str, state: LoopState) -> Result<(), ExecutionError> {
+        let mut nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        nodes.insert(node.to_owned(), state);
+        self.persist_locked(&nodes)
+    }
+
+    fn model_iterations(&self, node: &str) -> Result<u64, ExecutionError> {
+        self.snapshot(node).map(|state| state.model_iterations)
+    }
+
+    fn reconcile_effects(
+        &self,
+        journal: &EffectJournal,
+        run_id: &RunId,
+    ) -> Result<(), ExecutionError> {
+        let mut nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let mut changed = false;
+        for state in nodes.values_mut() {
+            let mut remaining = VecDeque::new();
+            while let Some(call) = state.pending_calls.pop_front() {
+                let key = EffectKey::new(run_id.as_str(), &call.name, &call.name, &call.args);
+                match journal
+                    .load(&key)
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+                {
+                    Some(response) => {
+                        state
+                            .conversation
+                            .push(tool_response_content(&call, response));
+                        changed = true;
+                    }
+                    None => remaining.push_back(call),
+                }
+            }
+            state.pending_calls = remaining;
+        }
+        if changed {
+            self.persist_locked(&nodes)?;
+        }
+        Ok(())
+    }
+
+    fn persist(&self) -> Result<(), ExecutionError> {
+        let nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        self.persist_locked(&nodes)
+    }
+
+    fn persist_locked(&self, nodes: &BTreeMap<String, LoopState>) -> Result<(), ExecutionError> {
+        write_json(
+            &self.path,
+            &LoopLedgerV1 {
+                schema_version: 1,
+                nodes: nodes.clone(),
+            },
+        )
+    }
+}
+
+fn tool_response_content(call: &PendingCall, response: Value) -> adk_rust::Content {
+    adk_rust::Content {
+        role: "function".to_owned(),
+        parts: vec![adk_rust::Part::FunctionResponse {
+            function_response: adk_rust::FunctionResponseData::from_tool_result(
+                &call.name, response,
+            ),
+            id: Some(call.id.clone()),
+            annotations: None,
+        }],
+    }
+}
+
+#[derive(Deserialize)]
+struct ModelFinish {
+    status: FinishStatus,
+    output: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FinishStatus {
+    Finished,
+}
+struct LoopController {
+    limits: RunLimits,
+    state: Mutex<LoopState>,
+    node: String,
+    ledger: Arc<LoopLedgerStore>,
+    terminal: Arc<Mutex<Option<ExecutionErrorKind>>>,
+    cancellation: Arc<AtomicBool>,
+    last_progress: Mutex<Instant>,
+}
+
+impl LoopController {
+    fn new(
+        node: impl Into<String>,
+        limits: RunLimits,
+        ledger: Arc<LoopLedgerStore>,
+        terminal: Arc<Mutex<Option<ExecutionErrorKind>>>,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<Self, ExecutionError> {
+        let node = node.into();
+        Ok(Self {
+            limits,
+            state: Mutex::new(ledger.snapshot(&node)?),
+            node,
+            ledger,
+            terminal,
+            cancellation,
+            last_progress: Mutex::new(Instant::now()),
+        })
+    }
+
+    fn fail(&self, kind: ExecutionErrorKind, marker: &'static str) -> adk_rust::AdkError {
+        if let Ok(mut terminal) = self.terminal.lock()
+            && (terminal.is_none()
+                || (*terminal == Some(ExecutionErrorKind::Tool)
+                    && kind == ExecutionErrorKind::ToolTimeLimit))
+        {
+            *terminal = Some(kind);
+        }
+        adk_rust::AdkError::agent(marker)
+    }
+
+    fn before_model(
+        &self,
+        mut request: adk_rust::LlmRequest,
+    ) -> adk_rust::Result<adk_rust::LlmRequest> {
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(self.fail(ExecutionErrorKind::Cancelled, "workflow.loop.cancelled"));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| adk_rust::AdkError::agent("model call state poisoned"))?;
+        if state.model_iterations >= self.limits.max_model_turns().get() {
+            return Err(self.fail(
+                ExecutionErrorKind::ModelIterationsLimit,
+                "workflow.loop.limit.model_iterations",
+            ));
+        }
+        if state.conversation.is_empty() {
+            state.conversation = request.contents.clone();
+            self.ledger
+                .replace(&self.node, state.clone())
+                .map_err(|_| {
+                    self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable")
+                })?;
+        } else {
+            request.contents = state.conversation.clone();
+            request.previous_response_id = state.previous_response_id.clone();
+        }
+        Ok(request)
+    }
+
+    fn observe_model(
+        &self,
+        response: &adk_rust::LlmResponse,
+        allowed: &BTreeSet<String>,
+    ) -> adk_rust::Result<()> {
+        let content = response
+            .content
+            .as_ref()
+            .ok_or_else(|| adk_rust::AdkError::agent("model response missing content"))?;
+        let mut last_progress = self
+            .last_progress
+            .lock()
+            .map_err(|_| adk_rust::AdkError::agent("model call state poisoned"))?;
+        if last_progress.elapsed().as_millis() as u64 >= self.limits.max_idle_time_ms().get() {
+            return Err(self.fail(
+                ExecutionErrorKind::IdleTimeLimit,
+                "workflow.loop.timeout.idle",
+            ));
+        }
+        *last_progress = Instant::now();
+        drop(last_progress);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| adk_rust::AdkError::agent("model call state poisoned"))?;
+        let mut next = state.clone();
+        let mut has_finish = false;
+        let mut has_call = false;
+        for part in &content.parts {
+            match part {
+                adk_rust::Part::Text { text } if !text.trim().is_empty() => {
+                    let finish: ModelFinish = serde_json::from_str(text).map_err(|_| {
+                        adk_rust::AdkError::agent("model response missing typed finish")
+                    })?;
+                    let ModelFinish { status, output } = finish;
+                    let (FinishStatus::Finished, _) = (status, output);
+                    has_finish = true;
+                }
+                adk_rust::Part::FunctionCall { name, args, id, .. } => {
+                    has_call = true;
+                    let id = id
+                        .as_deref()
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| adk_rust::AdkError::agent("model call missing ID"))?;
+                    if !allowed.contains(name) || !args.is_object() {
+                        return Err(adk_rust::AdkError::agent(
+                            "model call is unselected or schema-invalid",
+                        ));
+                    }
+                    let fingerprint = workflow_runtime::argument_fingerprint(args);
+                    if !next.seen_ids.insert(id.to_owned())
+                        || !next.seen_calls.insert((name.clone(), fingerprint.clone()))
+                    {
+                        return Err(adk_rust::AdkError::agent("repeated model tool call"));
+                    }
+                    next.total_tool_calls = next.total_tool_calls.saturating_add(1);
+                    *next.tool_calls.entry(name.clone()).or_default() += 1;
+                    next.pending_calls.push_back(PendingCall {
+                        id: id.to_owned(),
+                        name: name.clone(),
+                        args: args.clone(),
+                        fingerprint,
+                    });
+                }
+                _ => {}
+            }
+        }
+        if next.total_tool_calls > self.limits.max_tool_calls().get() {
+            return Err(self.fail(
+                ExecutionErrorKind::TotalToolCallsLimit,
+                "workflow.loop.limit.total_tool_calls",
+            ));
+        }
+        if next
+            .tool_calls
+            .values()
+            .any(|count| *count > self.limits.max_calls_per_tool().get())
+        {
+            return Err(self.fail(
+                ExecutionErrorKind::ToolCallsPerToolLimit,
+                "workflow.loop.limit.per_tool_calls",
+            ));
+        }
+        if !has_call && !has_finish {
+            return Err(adk_rust::AdkError::agent(
+                "model response missing typed finish",
+            ));
+        }
+        next.model_iterations += 1;
+        next.conversation.push(content.clone());
+        next.previous_response_id = response.interaction_id.clone();
+        self.ledger
+            .replace(&self.node, next.clone())
+            .map_err(|_| self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable"))?;
+        *state = next;
+        Ok(())
+    }
+
+    fn observe_tool(
+        &self,
+        context: &dyn adk_rust::CallbackContext,
+        response: &Value,
+    ) -> adk_rust::Result<()> {
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(self.fail(ExecutionErrorKind::Cancelled, "workflow.loop.cancelled"));
+        }
+        if let Ok(mut last_progress) = self.last_progress.lock() {
+            *last_progress = Instant::now();
+        }
+        let outcome = context
+            .tool_outcome()
+            .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+        if outcome.duration.as_millis() as u64 >= self.limits.max_tool_time_ms().get() {
+            return Err(self.fail(
+                ExecutionErrorKind::ToolTimeLimit,
+                "workflow.loop.timeout.tool",
+            ));
+        }
+        if !outcome.success {
+            return Err(self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"));
+        }
+        let bytes = serde_json::to_vec(response)
+            .map_err(|_| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| adk_rust::AdkError::agent("model call state poisoned"))?;
+        let mut next = state.clone();
+        next.tool_output_bytes = next
+            .tool_output_bytes
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        if next.tool_output_bytes > self.limits.max_tool_output_bytes().get() {
+            return Err(self.fail(
+                ExecutionErrorKind::ToolOutputBytesLimit,
+                "workflow.loop.limit.tool_output_bytes",
+            ));
+        }
+        let name = context
+            .tool_name()
+            .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+        let input = context
+            .tool_input()
+            .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+        let fingerprint = workflow_runtime::argument_fingerprint(input);
+        let index = next
+            .pending_calls
+            .iter()
+            .position(|call| call.name == name && call.fingerprint == fingerprint)
+            .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+        let call = next
+            .pending_calls
+            .remove(index)
+            .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+        next.conversation
+            .push(tool_response_content(&call, response.clone()));
+        self.ledger
+            .replace(&self.node, next.clone())
+            .map_err(|_| self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable"))?;
+        *state = next;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -239,6 +630,8 @@ enum ModelWire {
         version: String,
         model: String,
         responses: Vec<Value>,
+        #[serde(default)]
+        response_delay_ms: u64,
     },
     OpenaiCompatible {
         name: String,
@@ -254,6 +647,11 @@ enum ModelWire {
 struct ToolWire {
     name: String,
     result: Value,
+    input_schema: Value,
+    #[serde(default)]
+    delay_ms: u64,
+    #[serde(default)]
+    handler_error: bool,
     #[serde(default)]
     required_capabilities: Vec<String>,
     #[serde(default)]
@@ -304,11 +702,13 @@ impl ExecutionProfileV1 {
                     version,
                     model,
                     responses,
+                    response_delay_ms,
                 } => {
                     if [name, version, model]
                         .into_iter()
                         .any(|value| value.is_empty())
                         || responses.is_empty()
+                        || *response_delay_ms > 60_000
                         || responses.iter().any(|response| match response {
                             Value::String(value) => value.is_empty(),
                             Value::Object(value) => value
@@ -385,7 +785,11 @@ impl ExecutionProfileV1 {
         Ok((sandbox, required))
     }
 
-    fn bind_model(&self, role: IrModelRole) -> Result<Arc<ModelBinding>, ExecutionError> {
+    fn bind_model(
+        &self,
+        role: IrModelRole,
+        completed_turns: u64,
+    ) -> Result<Arc<ModelBinding>, ExecutionError> {
         let model = match role {
             IrModelRole::Worker => &self.model,
             IrModelRole::Reviewer => self
@@ -401,12 +805,18 @@ impl ExecutionProfileV1 {
                     version,
                     model,
                     responses,
+                    response_delay_ms,
                 },
             ) => ModelProfileRegistry::new().with_worker(FakeModelProfile::from_values(
                 name,
                 version,
                 model,
-                responses.clone(),
+                responses
+                    .iter()
+                    .skip(usize::try_from(completed_turns).unwrap_or(usize::MAX))
+                    .cloned()
+                    .collect(),
+                *response_delay_ms,
             )),
             (
                 IrModelRole::Reviewer,
@@ -415,12 +825,18 @@ impl ExecutionProfileV1 {
                     version,
                     model,
                     responses,
+                    response_delay_ms,
                 },
             ) => ModelProfileRegistry::new().with_reviewer(FakeModelProfile::from_values(
                 name,
                 version,
                 model,
-                responses.clone(),
+                responses
+                    .iter()
+                    .skip(usize::try_from(completed_turns).unwrap_or(usize::MAX))
+                    .cloned()
+                    .collect(),
+                *response_delay_ms,
             )),
             (
                 IrModelRole::Worker,
@@ -509,11 +925,13 @@ impl ExecutionProfileV1 {
             ToolProvenance::new(&tool.name, "1"),
             ToolFlags::new(true, true, true),
         )
+        .and_then(|registration| registration.with_input_schema(tool.input_schema.clone()))
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))
         .map(|registration| {
             registration
                 .with_required_capabilities(required_capabilities)
                 .with_required_scopes(tool.required_scopes.iter().cloned())
+                .with_timeout(self.run_limits().max_tool_time_ms())
                 .with_implementation_digest(implementation_digest)
         })
     }
@@ -537,6 +955,7 @@ impl ExecutionProfileV1 {
         &self,
         plan: &ResolvedRuntimePlan,
         node_id: &str,
+        completed_turns: u64,
     ) -> Result<Arc<ModelBinding>, ExecutionError> {
         let binding = plan.node_model(node_id).ok_or_else(|| {
             ExecutionError::binding(
@@ -567,7 +986,7 @@ impl ExecutionProfileV1 {
                 &BindingRef::new(binding.id(), binding.version()),
             )
             .map_err(|error| map_registry_error(error, Some(binding)))?;
-        self.bind_model(role).map_err(|_| {
+        self.bind_model(role, completed_turns).map_err(|_| {
             ExecutionError::binding(
                 ExecutionErrorKind::ImplementationBinding,
                 BindingCategory::Model,
@@ -584,12 +1003,6 @@ impl ExecutionProfileV1 {
             }
             None => format!("worker={worker}:{worker_version}"),
         }
-    }
-
-    fn model_iterations(&self) -> u32 {
-        self.loop_policy
-            .as_ref()
-            .map_or(100, |policy| policy.max_model_iterations)
     }
 
     fn run_limits(&self) -> RunLimits {
@@ -744,74 +1157,82 @@ fn build_profile_agent(
     name: &str,
     model: Arc<ModelBinding>,
     tool: Option<BoundTool>,
-    max_iterations: u32,
+    limits: RunLimits,
+    ledger: Arc<LoopLedgerStore>,
+    terminal: Arc<Mutex<Option<ExecutionErrorKind>>>,
+    cancellation: Arc<AtomicBool>,
 ) -> Result<Arc<dyn Agent>, ExecutionError> {
     let (names, toolset) = match tool {
         Some((names, toolset)) => (names, Some(toolset)),
         None => (Vec::new(), None),
     };
     let allowed = Arc::new(names.into_iter().collect::<BTreeSet<_>>());
-    let seen_ids = Arc::new(Mutex::new(BTreeSet::new()));
-    let seen_calls = Arc::new(Mutex::new(BTreeSet::new()));
+    let controller = Arc::new(LoopController::new(
+        name,
+        limits,
+        ledger,
+        terminal,
+        cancellation,
+    )?);
+    let before_controller = Arc::clone(&controller);
+    let tool_controller = Arc::clone(&controller);
+    let tool_error_controller = Arc::clone(&controller);
+    let tool_timeout = std::time::Duration::from_millis(controller.limits.max_tool_time_ms().get());
     let mut builder = LlmAgentBuilder::new(name)
         .description("workflow-kit profile-driven agent")
         .model(model)
-        .max_iterations(max_iterations)
+        .output_schema(json!({
+            "type": "object",
+            "properties": {
+                "status": {"const": "finished"},
+                "output": {}
+            },
+            "required": ["status", "output"],
+            "additionalProperties": false
+        }))
+        .output_max_retries(0)
+        .max_iterations(
+            u32::try_from(controller.limits.max_model_turns().get())
+                .unwrap_or(u32::MAX)
+                .saturating_add(1),
+        )
+        .tool_timeout(tool_timeout)
+        .before_model_callback(Box::new(move |_context, request| {
+            let controller = Arc::clone(&before_controller);
+            Box::pin(async move {
+                Ok(adk_rust::BeforeModelResult::Continue(
+                    controller.before_model(request)?,
+                ))
+            })
+        }))
         .after_model_callback(Box::new(move |_context, response| {
             let allowed = Arc::clone(&allowed);
-            let seen_ids = Arc::clone(&seen_ids);
-            let seen_calls = Arc::clone(&seen_calls);
+            let controller = Arc::clone(&controller);
             Box::pin(async move {
-                let content = response
-                    .content
-                    .as_ref()
-                    .ok_or_else(|| adk_rust::AdkError::agent("model response missing content"))?;
-                let mut has_finish = false;
-                let mut has_call = false;
-                for part in &content.parts {
-                    match part {
-                        adk_rust::Part::Text { text } if !text.trim().is_empty() => {
-                            has_finish = true;
-                        }
-                        adk_rust::Part::FunctionCall { name, args, id, .. } => {
-                            has_call = true;
-                            let id =
-                                id.as_deref().filter(|id| !id.is_empty()).ok_or_else(|| {
-                                    adk_rust::AdkError::agent("model call missing ID")
-                                })?;
-                            if !allowed.contains(name.as_str()) || !args.is_object() {
-                                return Err(adk_rust::AdkError::agent(
-                                    "model call is unselected or schema-invalid",
-                                ));
-                            }
-                            if !seen_ids
-                                .lock()
-                                .map_err(|_| {
-                                    adk_rust::AdkError::agent("model call state poisoned")
-                                })?
-                                .insert(id.to_owned())
-                                || !seen_calls
-                                    .lock()
-                                    .map_err(|_| {
-                                        adk_rust::AdkError::agent("model call state poisoned")
-                                    })?
-                                    .insert((
-                                        name.clone(),
-                                        workflow_runtime::argument_fingerprint(args),
-                                    ))
-                            {
-                                return Err(adk_rust::AdkError::agent("repeated model tool call"));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if !has_call && !has_finish {
-                    return Err(adk_rust::AdkError::agent(
-                        "model response missing typed finish",
-                    ));
-                }
+                controller.observe_model(&response, &allowed)?;
                 Ok(None)
+            })
+        }))
+        .after_tool_callback_full(Box::new(move |context, _tool, _args, response| {
+            let controller = Arc::clone(&tool_controller);
+            Box::pin(async move {
+                controller.observe_tool(context.as_ref(), &response)?;
+                Ok(None)
+            })
+        }))
+        .on_tool_error(Box::new(move |_context, _tool, _args, error| {
+            let controller = Arc::clone(&tool_error_controller);
+            Box::pin(async move {
+                let error = error.to_ascii_lowercase();
+                let (kind, code) = if error.contains("timeout") || error.contains("timed out") {
+                    (
+                        ExecutionErrorKind::ToolTimeLimit,
+                        "workflow.loop.timeout.tool",
+                    )
+                } else {
+                    (ExecutionErrorKind::Tool, "tool.bridge.failed")
+                };
+                Err(controller.fail(kind, code))
             })
         }));
     if let Some(toolset) = toolset {
@@ -903,10 +1324,48 @@ pub enum ExecutionErrorKind {
     Tool,
     Adk,
     AuthorizationDenied,
+    ModelIterationsLimit,
+    TotalToolCallsLimit,
+    ToolCallsPerToolLimit,
+    ToolOutputBytesLimit,
+    WallTimeLimit,
+    IdleTimeLimit,
+    ToolTimeLimit,
+    Cancelled,
     Persistence,
     RunNotFound,
     IncompatibleManifest,
     InvalidRunState,
+}
+
+fn execution_error_kind(error: AdkGraphError) -> ExecutionErrorKind {
+    match error {
+        AdkGraphError::AuthorizationDenied => ExecutionErrorKind::AuthorizationDenied,
+        AdkGraphError::ModelIterationsLimit => ExecutionErrorKind::ModelIterationsLimit,
+        AdkGraphError::TotalToolCallsLimit => ExecutionErrorKind::TotalToolCallsLimit,
+        AdkGraphError::ToolCallsPerToolLimit => ExecutionErrorKind::ToolCallsPerToolLimit,
+        AdkGraphError::ToolOutputBytesLimit => ExecutionErrorKind::ToolOutputBytesLimit,
+        AdkGraphError::WallTimeLimit => ExecutionErrorKind::WallTimeLimit,
+        AdkGraphError::IdleTimeLimit => ExecutionErrorKind::IdleTimeLimit,
+        AdkGraphError::ToolTimeLimit => ExecutionErrorKind::ToolTimeLimit,
+        AdkGraphError::Cancelled => ExecutionErrorKind::Cancelled,
+        AdkGraphError::ToolFailed => ExecutionErrorKind::Tool,
+        _ => ExecutionErrorKind::Adk,
+    }
+}
+
+fn execution_status(kind: ExecutionErrorKind) -> &'static str {
+    match kind {
+        ExecutionErrorKind::ModelIterationsLimit
+        | ExecutionErrorKind::TotalToolCallsLimit
+        | ExecutionErrorKind::ToolCallsPerToolLimit
+        | ExecutionErrorKind::ToolOutputBytesLimit => "limit_exceeded",
+        ExecutionErrorKind::WallTimeLimit
+        | ExecutionErrorKind::IdleTimeLimit
+        | ExecutionErrorKind::ToolTimeLimit => "timed_out",
+        ExecutionErrorKind::Cancelled => "cancelled",
+        _ => "failed",
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -973,6 +1432,22 @@ impl ExecutionBackend {
         input: Value,
         workdir_base: impl AsRef<Path>,
     ) -> Result<ExecutionReceipt, ExecutionError> {
+        Self::run_cancellable(
+            workflow,
+            profile,
+            input,
+            workdir_base,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    pub fn run_cancellable(
+        workflow: impl AsRef<Path>,
+        profile: ExecutionProfileV1,
+        input: Value,
+        workdir_base: impl AsRef<Path>,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
         let input_bytes = serde_json::to_vec(&input)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
         if input_bytes.len() > PureTransformRequest::MAX_JSON_BYTES {
@@ -999,7 +1474,7 @@ impl ExecutionBackend {
             .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
             .map(|node| {
                 profile
-                    .bind_resolved_model(&resolved_plan, node.id().as_str())
+                    .bind_resolved_model(&resolved_plan, node.id().as_str(), 0)
                     .map(|model| (node.id().as_str().to_owned(), model))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -1056,6 +1531,13 @@ impl ExecutionBackend {
         }
         let effect_journal = match EffectJournal::open(run_root.join("effects.sqlite")) {
             Ok(journal) => Some(Arc::new(journal)),
+            Err(_) => {
+                persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
+                None
+            }
+        };
+        let loop_ledger = match LoopLedgerStore::create(run_root.join(LOOP_LEDGER_FILE)) {
+            Ok(ledger) => Some(Arc::new(ledger)),
             Err(_) => {
                 persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
                 None
@@ -1142,11 +1624,14 @@ impl ExecutionBackend {
             Err(ExecutionError::new(ExecutionErrorKind::Persistence))
         } else {
             let artifacts = artifacts.as_mut().expect("artifact store must be present");
+            let loop_ledger =
+                Arc::clone(loop_ledger.as_ref().expect("loop ledger must be present"));
             (|| {
                 let sandbox = RunSandbox::new(context, run_workdir, effective_capabilities.clone())
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::SandboxDenied))?;
                 let tool_registry =
                     build_tool_registry(&profile, sandbox, &run_id, effect_journal.clone())?;
+                let terminal_kind = Arc::new(Mutex::new(None));
                 let agents = compiled
                     .ir()
                     .nodes()
@@ -1167,7 +1652,10 @@ impl ExecutionBackend {
                                 resolved_plan.node_tools(node.id().as_str()),
                                 &effective_capabilities,
                             )?,
-                            profile.model_iterations(),
+                            profile.run_limits(),
+                            Arc::clone(&loop_ledger),
+                            Arc::clone(&terminal_kind),
+                            Arc::clone(&cancellation),
                         )?;
                         Ok((node.id().as_str().to_owned(), agent))
                     })
@@ -1187,22 +1675,34 @@ impl ExecutionBackend {
                     .enable_all()
                     .build()
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
+                let wall_time =
+                    std::time::Duration::from_millis(profile.run_limits().max_wall_time_ms().get());
                 let state = runtime
-                    .block_on(graph.invoke_observed(
-                        State::new(),
-                        ExecutionConfig::new(run_id.as_str()).with_recursion_limit(recursion_limit),
-                        &mut mapper,
-                        artifacts,
-                    ))
+                    .block_on(async {
+                        adk_rust::tokio::time::timeout(
+                            wall_time,
+                            graph.invoke_observed(
+                                State::new(),
+                                ExecutionConfig::new(run_id.as_str())
+                                    .with_recursion_limit(recursion_limit),
+                                &mut mapper,
+                                artifacts,
+                            ),
+                        )
+                        .await
+                        .unwrap_or(Err(AdkGraphError::WallTimeLimit))
+                    })
                     .map_err(|error| {
-                        eprintln!("invoke_observed error: {error:?}");
-                        ExecutionError::new(match error {
-                            AdkGraphError::AuthorizationDenied => {
-                                ExecutionErrorKind::AuthorizationDenied
-                            }
-                            _ => ExecutionErrorKind::Adk,
-                        })
+                        let kind = terminal_kind
+                            .lock()
+                            .ok()
+                            .and_then(|terminal| *terminal)
+                            .unwrap_or_else(|| execution_error_kind(error));
+                        ExecutionError::new(kind)
                     })?;
+                if let Some(kind) = terminal_kind.lock().ok().and_then(|terminal| *terminal) {
+                    return Err(ExecutionError::new(kind));
+                }
                 let state = checkpoint_state(
                     state,
                     &continuation
@@ -1225,8 +1725,10 @@ impl ExecutionBackend {
                 WorkflowRuntimeEventKindV1::WorkflowFailed => Some("failed"),
                 _ => None,
             });
-        if execution.is_err() && status.is_none() {
-            status = Some("failed");
+        if let Err(error) = &execution
+            && status.is_none()
+        {
+            status = Some(execution_status(error.kind()));
             if mapper
                 .map(AdkRuntimeObservationV1::new(
                     "workflow-failed",
@@ -1567,15 +2069,27 @@ impl ExecutionBackend {
             EffectJournal::open(root.join("effects.sqlite"))
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?,
         );
-        let tool_registry =
-            build_tool_registry(&profile, sandbox, &run_identity, Some(effect_journal))?;
+        let loop_ledger = Arc::new(LoopLedgerStore::open(root.join(LOOP_LEDGER_FILE))?);
+        loop_ledger.reconcile_effects(&effect_journal, &run_identity)?;
+        let tool_registry = build_tool_registry(
+            &profile,
+            sandbox,
+            &run_identity,
+            Some(Arc::clone(&effect_journal)),
+        )?;
+        let terminal_kind = Arc::new(Mutex::new(None));
         let agents = compiled
             .ir()
             .nodes()
             .iter()
             .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
             .map(|node| -> Result<_, ExecutionError> {
-                let model = profile.bind_resolved_model(&resolved_plan, node.id().as_str())?;
+                let completed_turns = loop_ledger.model_iterations(node.id().as_str())?;
+                let model = profile.bind_resolved_model(
+                    &resolved_plan,
+                    node.id().as_str(),
+                    completed_turns,
+                )?;
                 let agent = build_profile_agent(
                     node.id().as_str(),
                     model,
@@ -1584,7 +2098,10 @@ impl ExecutionBackend {
                         resolved_plan.node_tools(node.id().as_str()),
                         &effective_capabilities,
                     )?,
-                    profile.model_iterations(),
+                    profile.run_limits(),
+                    Arc::clone(&loop_ledger),
+                    Arc::clone(&terminal_kind),
+                    Arc::new(AtomicBool::new(false)),
                 )?;
                 Ok((node.id().as_str().to_owned(), agent))
             })
@@ -1771,6 +2288,8 @@ fn build_tool_registry(
                     run_id: run_id.as_str().to_owned(),
                     node_id: tool.name.clone(),
                     effect_journal: effect_journal.clone(),
+                    delay_ms: tool.delay_ms,
+                    handler_error: tool.handler_error,
                 },
             )
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
@@ -1819,6 +2338,8 @@ struct StaticToolHandler {
     run_id: String,
     node_id: String,
     effect_journal: Option<Arc<EffectJournal>>,
+    delay_ms: u64,
+    handler_error: bool,
 }
 
 impl ToolHandler for StaticToolHandler {
@@ -1828,6 +2349,10 @@ impl ToolHandler for StaticToolHandler {
         _context: &ToolCallContext,
         arguments: &Value,
     ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        if self.handler_error {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
         let result = if let Some(journal) = &self.effect_journal {
             let key = EffectKey::new(&self.run_id, &self.node_id, &self.node_id, arguments);
             crash_barrier("before-effect");

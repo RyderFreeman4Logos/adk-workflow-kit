@@ -291,18 +291,26 @@ pub struct FakeModelProfile {
     model: String,
     responses: Vec<serde_json::Value>,
     runtime: ModelRuntimeConfig,
+    #[serde(default)]
+    response_delay: Duration,
 }
 
 struct QueuedFakeLlm {
     name: String,
     responses: Mutex<VecDeque<LlmResponse>>,
+    response_delay: Duration,
 }
 
 impl QueuedFakeLlm {
-    fn new(name: impl Into<String>, responses: VecDeque<LlmResponse>) -> Self {
+    fn new(
+        name: impl Into<String>,
+        responses: VecDeque<LlmResponse>,
+        response_delay: Duration,
+    ) -> Self {
         Self {
             name: name.into(),
             responses: Mutex::new(responses),
+            response_delay,
         }
     }
 }
@@ -318,6 +326,7 @@ impl Llm for QueuedFakeLlm {
         _request: LlmRequest,
         _stream: bool,
     ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+        adk_rust::tokio::time::sleep(self.response_delay).await;
         let response = self
             .responses
             .lock()
@@ -347,6 +356,7 @@ impl FakeModelProfile {
                 .map(|response| serde_json::Value::String(response.into()))
                 .collect(),
             runtime: ModelRuntimeConfig::default(),
+            response_delay: Duration::ZERO,
         }
     }
     pub fn with_runtime(mut self, runtime: ModelRuntimeConfig) -> Self {
@@ -359,12 +369,14 @@ impl FakeModelProfile {
         version: impl Into<String>,
         model: impl Into<String>,
         responses: Vec<serde_json::Value>,
+        response_delay_ms: u64,
     ) -> Self {
         Self {
             identity: ModelProfileIdentity::new(name, version),
             model: model.into(),
             responses,
             runtime: ModelRuntimeConfig::default(),
+            response_delay: Duration::from_millis(response_delay_ms),
         }
     }
 }
@@ -638,7 +650,11 @@ impl ModelProfile {
                     responses.push_back(adk_rust::LlmResponse::new(content));
                 }
                 (
-                    Arc::new(QueuedFakeLlm::new(&value.model, responses)) as Arc<dyn Llm>,
+                    Arc::new(QueuedFakeLlm::new(
+                        &value.model,
+                        responses,
+                        value.response_delay,
+                    )) as Arc<dyn Llm>,
                     value.model.clone(),
                     "fake".to_owned(),
                 )

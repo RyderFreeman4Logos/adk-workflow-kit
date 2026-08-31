@@ -1,7 +1,12 @@
 use std::{
-    fs,
+    env, fs,
+    os::unix::process::ExitStatusExt,
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use rusqlite::Connection;
@@ -53,13 +58,36 @@ fn loop_policy() -> Value {
     })
 }
 
+fn policy_with(key: &str, value: u64) -> Value {
+    let mut policy = loop_policy();
+    policy[key] = json!(value);
+    policy
+}
+
+fn finish(output: Value) -> Value {
+    json!(serde_json::to_string(&json!({"status":"finished", "output":output})).unwrap())
+}
+
 fn profile_with(responses: Vec<Value>, policy: Option<Value>) -> ExecutionProfileV1 {
+    profile_with_delays(responses, policy, 0, 0, json!({"found":true}))
+}
+
+fn profile_with_delays(
+    responses: Vec<Value>,
+    policy: Option<Value>,
+    model_delay_ms: u64,
+    tool_delay_ms: u64,
+    search_result: Value,
+) -> ExecutionProfileV1 {
+    let handler_error = search_result.get("artifact_id").is_some();
     let mut profile = json!({
         "schema_version": 1,
-        "model": { "provider": "fake", "name": "worker", "version": "1", "model": "worker", "responses": responses },
+        "model": { "provider": "fake", "name": "worker", "version": "1", "model": "worker", "responses": responses, "response_delay_ms": model_delay_ms },
         "tools": [
-            {"name":"search_code","result":{"found":true}},
-            {"name":"read_source_range","result":{"source":"ok"}}
+            {"name":"search_code","result":search_result,"delay_ms":tool_delay_ms,"handler_error":handler_error,
+             "input_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}},
+            {"name":"read_source_range","result":{"source":"ok"},
+             "input_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"path":{"type":"string"},"start":{"type":"integer"}},"required":["path","start"],"additionalProperties":false}}
         ],
         "sandbox": {"capabilities": []}
     });
@@ -74,7 +102,7 @@ fn profile() -> ExecutionProfileV1 {
         vec![
             json!({"calls": [{"id":"call-search","name":"search_code","args":{"query":"needle"}}]}),
             json!({"calls": [{"id":"call-read","name":"read_source_range","args":{"path":"src/lib.rs","start":1}}]}),
-            json!("done"),
+            finish(json!({"answer":"done"})),
         ],
         None,
     )
@@ -124,15 +152,53 @@ fn undeclared_or_unknown_call_fails_before_effect() {
 
 #[test]
 fn malformed_or_schema_invalid_arguments_fail_before_effect() {
+    for args in [
+        json!([]),
+        json!({}),
+        json!({"query":1}),
+        json!({"query":"x","extra":true}),
+    ] {
+        let responses = vec![
+            json!({"calls": [{"id":"call-bad","name":"search_code","args":args}]}),
+            finish(json!({"must_not":"succeed"})),
+        ];
+        let (root, error) = run(profile_with(responses, None));
+        let error = error.unwrap_err();
+        assert!(!events(&error).contains("tool_completed"));
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn real_tool_failure_is_terminal_before_later_finish() {
     let responses = vec![
-        json!({"calls": [{"id":"call-bad","name":"search_code","args":[]}]}),
-        json!("done"),
+        json!({"calls": [{"id":"call-fail","name":"search_code","args":{"query":"x"}}]}),
+        finish(json!({"must_not":"succeed"})),
     ];
-    let (root, error) = run(profile_with(responses, None));
+    let (root, error) = run(profile_with_delays(
+        responses,
+        None,
+        0,
+        0,
+        json!({"artifact_id":"forged"}),
+    ));
     let error = error.unwrap_err();
-    assert_eq!(error.kind(), ExecutionErrorKind::Adk);
-    assert!(!events(&error).contains("tool_completed"));
+    assert_eq!(error.kind(), ExecutionErrorKind::Tool);
+    assert_eq!(error.receipt().unwrap().status(), "failed");
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn non_json_or_wrong_finish_shape_never_succeeds() {
+    for response in [
+        json!("done"),
+        json!("{}"),
+        json!("{\"status\":\"finished\"}"),
+    ] {
+        let (root, error) = run(profile_with(vec![response], None));
+        assert!(error.is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
@@ -154,15 +220,140 @@ fn empty_response_missing_finish_and_repeated_call_fail_closed() {
 }
 
 #[test]
-fn each_limit_is_specific_and_exhaustion_is_blocked() {
-    let mut responses = (0..101)
-        .map(|index| json!({"calls": [{"id":format!("call-{index}"),"name":"search_code","args":{"index":index}}]}))
-        .collect::<Vec<_>>();
-    responses.push(json!("done"));
-    let (root, error) = run(profile_with(responses, None));
+fn total_tool_call_limit_is_exact_and_blocked() {
+    let responses = vec![json!({"calls": [
+        {"id":"call-1","name":"search_code","args":{"query":"one"}},
+        {"id":"call-2","name":"read_source_range","args":{"path":"src/lib.rs","start":1}}
+    ]})];
+    let (root, error) = run(profile_with(
+        responses,
+        Some(policy_with("max_total_tool_calls", 1)),
+    ));
     let error = error.unwrap_err();
-    assert_eq!(error.kind(), ExecutionErrorKind::Adk);
-    assert_eq!(error.receipt().unwrap().status(), "failed");
+    assert_eq!(error.kind(), ExecutionErrorKind::TotalToolCallsLimit);
+    assert_eq!(error.receipt().unwrap().status(), "limit_exceeded");
+    assert!(!events(&error).contains("tool_completed"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn per_tool_call_limit_is_exact_and_blocked() {
+    let responses = vec![json!({"calls": [
+        {"id":"call-1","name":"search_code","args":{"query":"one"}},
+        {"id":"call-2","name":"search_code","args":{"query":"two"}}
+    ]})];
+    let (root, error) = run(profile_with(
+        responses,
+        Some(policy_with("max_tool_calls_per_tool", 1)),
+    ));
+    let error = error.unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::ToolCallsPerToolLimit);
+    assert_eq!(error.receipt().unwrap().status(), "limit_exceeded");
+    assert!(!events(&error).contains("tool_completed"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn model_iteration_limit_is_exact_and_blocked() {
+    let responses = vec![
+        json!({"calls": [{"id":"call-1","name":"search_code","args":{"query":"one"}}]}),
+        finish(json!({"answer":"too-late"})),
+    ];
+    let (root, error) = run(profile_with(
+        responses,
+        Some(policy_with("max_model_iterations", 1)),
+    ));
+    let error = error.unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::ModelIterationsLimit);
+    assert_eq!(error.receipt().unwrap().status(), "limit_exceeded");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tool_output_byte_limit_is_exact_and_blocked() {
+    let root = root();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let error = ExecutionBackend::run(
+        &workflow,
+        profile_with_delays(
+            vec![
+                json!({"calls": [{"id":"call-large","name":"search_code","args":{"query":"one"}}]}),
+            ],
+            Some(policy_with("max_tool_output_bytes", 64)),
+            0,
+            0,
+            json!({"text":"x".repeat(1024)}),
+        ),
+        json!({}),
+        &root,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::ToolOutputBytesLimit);
+    assert_eq!(error.receipt().unwrap().status(), "limit_exceeded");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn wall_time_limit_is_exact_and_timed_out() {
+    let (root, error) = run(profile_with_delays(
+        vec![finish(json!({"answer":"late"}))],
+        Some(policy_with("wall_time_ms", 5)),
+        50,
+        0,
+        json!({"found":true}),
+    ));
+    let error = error.unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::WallTimeLimit);
+    assert_eq!(error.receipt().unwrap().status(), "timed_out");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn idle_time_limit_is_exact_and_timed_out() {
+    let (root, error) = run(profile_with_delays(
+        vec![finish(json!({"answer":"late"}))],
+        Some(policy_with("idle_time_ms", 5)),
+        50,
+        0,
+        json!({"found":true}),
+    ));
+    let error = error.unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::IdleTimeLimit);
+    assert_eq!(error.receipt().unwrap().status(), "timed_out");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tool_time_limit_is_exact_and_timed_out() {
+    let (root, error) = run(profile_with_delays(
+        vec![json!({"calls": [{"id":"call-slow","name":"search_code","args":{"query":"one"}}]})],
+        Some(policy_with("tool_time_ms", 5)),
+        0,
+        50,
+        json!({"found":true}),
+    ));
+    let error = error.unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::ToolTimeLimit);
+    assert_eq!(error.receipt().unwrap().status(), "timed_out");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cancellation_is_exact_and_never_succeeds() {
+    let root = root();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let error = ExecutionBackend::run_cancellable(
+        &workflow,
+        profile(),
+        json!({}),
+        &root,
+        Arc::new(AtomicBool::new(true)),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::Cancelled);
+    assert_eq!(error.receipt().unwrap().status(), "cancelled");
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -171,7 +362,7 @@ fn resume_rejects_loop_identity_drift_before_effects() {
     let (root, receipt) = run(profile_with(
         vec![
             json!({"calls": [{"id":"call-search","name":"search_code","args":{"query":"needle"}}]}),
-            json!("done"),
+            finish(json!({"answer":"done"})),
         ],
         Some(loop_policy()),
     ));
@@ -199,7 +390,7 @@ fn call_id_and_argument_fingerprint_survive_event_and_resume() {
     let (root, receipt) = run(profile_with(
         vec![
             json!({"calls": [{"id":"call-stable","name":"search_code","args":args}]}),
-            json!("done"),
+            finish(json!({"answer":"done"})),
         ],
         Some(loop_policy()),
     ));
@@ -223,5 +414,68 @@ fn call_id_and_argument_fingerprint_survive_event_and_resume() {
             .count(),
         1
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn effect_after_crash_before_node_checkpoint_resumes_from_loop_ledger() {
+    if let Ok(root) = env::var("M3_04_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            workflow,
+            profile_with(
+                vec![
+                    json!({"calls": [{"id":"call-crash","name":"search_code","args":{"query":"needle"}}]}),
+                    finish(json!({"answer":"resumed"})),
+                ],
+                Some(loop_policy()),
+            ),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let root = root();
+    let status = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "effect_after_crash_before_node_checkpoint_resumes_from_loop_ledger",
+            "--nocapture",
+        ])
+        .env("M3_04_CRASH_RUN_ROOT", &root)
+        .env("WORKFLOW_KIT_TEST_CRASH_BARRIER", "after-effect")
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+    let run_root = fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("run-manifest.json").is_file())
+        .unwrap();
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+    let run_id = manifest["run_id"].as_str().unwrap();
+    let receipt = ExecutionBackend::resume(&root, run_id).unwrap();
+    assert_eq!(receipt.status(), "succeeded");
+    assert_eq!(
+        Connection::open(run_root.join("effects.sqlite"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM kit_effects", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .unwrap(),
+        1
+    );
+    let ledger: Value =
+        serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
+    assert_eq!(ledger["nodes"]["work"]["model_iterations"], 2);
+    assert_eq!(ledger["nodes"]["work"]["pending_calls"], json!([]));
+    assert!(ledger.to_string().contains("call-crash"));
+    assert!(ledger.to_string().contains("resumed"));
     fs::remove_dir_all(root).unwrap();
 }
