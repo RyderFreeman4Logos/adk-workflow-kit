@@ -64,6 +64,7 @@ fn compiler_diagnostic_code(error: &CompileError) -> &'static str {
         CompileError::Parse(_) => "workflow.parse.invalid",
         CompileError::Graph(_) => "workflow.graph.invalid",
         CompileError::State(_) => "workflow.state.invalid",
+        CompileError::Binding(_) => "workflow.node.invalid_binding",
         CompileError::PredicateRegistryRequired => "workflow.predicate.registry_required",
         CompileError::Registry(_) => "workflow.predicate.registry_missing",
     }
