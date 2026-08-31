@@ -1746,16 +1746,11 @@ fn build_toolset(
         .iter()
         .map(|binding| binding.id().to_owned())
         .collect::<Vec<_>>();
-    let scopes = names
-        .iter()
-        .filter_map(|name| bridge.registration(name))
-        .flat_map(|registration| registration.required_scopes().iter().cloned())
-        .collect::<BTreeSet<_>>();
     let authority = CapabilityIntersection::new(
         effective_capabilities.iter().copied(),
         names.iter(),
         names.iter(),
-        scopes,
+        std::iter::empty::<String>(),
         names.iter(),
         names.iter(),
         effective_capabilities.iter().copied(),
