@@ -1,12 +1,13 @@
 use std::{
     env, fs,
     os::unix::process::ExitStatusExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use rusqlite::Connection;
@@ -123,6 +124,42 @@ fn run(profile: ExecutionProfileV1) -> (PathBuf, Result<ExecutionReceipt, Execut
 
 fn events(error: &ExecutionError) -> String {
     fs::read_to_string(error.receipt().unwrap().run_root().join("events.jsonl")).unwrap()
+}
+
+fn crash_run(root: &Path, test: &str, barrier: &str) -> PathBuf {
+    let status = Command::new(env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env("M3_04_CRASH_RUN_ROOT", root)
+        .env("WORKFLOW_KIT_TEST_CRASH_BARRIER", barrier)
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("run-manifest.json").is_file())
+        .unwrap()
+}
+
+fn run_id(run_root: &Path) -> String {
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+    manifest["run_id"].as_str().unwrap().to_owned()
+}
+
+fn function_response_bytes(run_root: &Path) -> Vec<u8> {
+    let ledger: Value =
+        serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
+    let response = ledger["nodes"]["work"]["conversation"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|content| content["parts"].as_array().unwrap())
+        .find_map(|part| part.get("functionResponse"))
+        .map(|response| response["response"].clone())
+        .unwrap();
+    serde_json::to_vec(&response).unwrap()
 }
 
 #[test]
@@ -418,6 +455,113 @@ fn call_id_and_argument_fingerprint_survive_event_and_resume() {
 }
 
 #[test]
+fn resume_wall_time_limit_includes_pending_replay_and_is_typed() {
+    if let Ok(root) = env::var("M3_04_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let mut policy = loop_policy();
+        policy["wall_time_ms"] = json!(25);
+        policy["tool_time_ms"] = json!(1000);
+        let _ = ExecutionBackend::run(
+            workflow,
+            profile_with_delays(
+                vec![
+                    json!({"calls": [{"id":"call-wall","name":"search_code","args":{"query":"needle"}}]}),
+                    finish(json!({"answer":"too late"})),
+                ],
+                Some(policy),
+                0,
+                250,
+                json!({"found":true}),
+            ),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let root = root();
+    let run_root = crash_run(
+        &root,
+        "resume_wall_time_limit_includes_pending_replay_and_is_typed",
+        "before-effect",
+    );
+    let started = Instant::now();
+    let error = ExecutionBackend::resume(&root, &run_id(&run_root)).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::WallTimeLimit);
+    assert_eq!(error.receipt().unwrap().status(), "timed_out");
+    assert!(started.elapsed() < Duration::from_millis(200));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resume_preserves_model_iteration_limit_and_status() {
+    if let Ok(root) = env::var("M3_04_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            workflow,
+            profile_with(
+                vec![
+                    json!({"calls": [{"id":"call-limit","name":"search_code","args":{"query":"needle"}}]}),
+                    finish(json!({"answer":"too late"})),
+                ],
+                Some(policy_with("max_model_iterations", 1)),
+            ),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let root = root();
+    let run_root = crash_run(
+        &root,
+        "resume_preserves_model_iteration_limit_and_status",
+        "after-effect",
+    );
+    let error = ExecutionBackend::resume(&root, &run_id(&run_root)).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::ModelIterationsLimit);
+    assert_eq!(error.receipt().unwrap().status(), "limit_exceeded");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn restored_effect_envelope_obeys_tool_output_byte_limit() {
+    if let Ok(root) = env::var("M3_04_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            workflow,
+            profile_with(
+                vec![
+                    json!({"calls": [{"id":"call-budget","name":"search_code","args":{"query":"needle"}}]}),
+                    finish(json!({"answer":"must not run"})),
+                ],
+                Some(policy_with("max_tool_output_bytes", 64)),
+            ),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let root = root();
+    let run_root = crash_run(
+        &root,
+        "restored_effect_envelope_obeys_tool_output_byte_limit",
+        "after-effect",
+    );
+    let error = ExecutionBackend::resume(&root, &run_id(&run_root)).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::ToolOutputBytesLimit);
+    assert_eq!(error.receipt().unwrap().status(), "limit_exceeded");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn effect_after_crash_before_node_checkpoint_resumes_from_loop_ledger() {
     if let Ok(root) = env::var("M3_04_CRASH_RUN_ROOT") {
         let root = PathBuf::from(root);
@@ -438,30 +582,37 @@ fn effect_after_crash_before_node_checkpoint_resumes_from_loop_ledger() {
         panic!("crash barrier did not terminate the child");
     }
 
-    let root = root();
-    let status = Command::new(env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "effect_after_crash_before_node_checkpoint_resumes_from_loop_ledger",
-            "--nocapture",
-        ])
-        .env("M3_04_CRASH_RUN_ROOT", &root)
-        .env("WORKFLOW_KIT_TEST_CRASH_BARRIER", "after-effect")
-        .status()
-        .unwrap();
-    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    let (baseline_root, baseline) = run(profile_with(
+        vec![
+            json!({"calls": [{"id":"call-crash","name":"search_code","args":{"query":"needle"}}]}),
+            finish(json!({"answer":"resumed"})),
+        ],
+        Some(loop_policy()),
+    ));
+    let baseline = baseline.unwrap();
+    let expected_response = function_response_bytes(baseline.run_root());
+    fs::remove_dir_all(baseline_root).unwrap();
 
-    let run_root = fs::read_dir(&root)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.join("run-manifest.json").is_file())
-        .unwrap();
-    let manifest: Value =
-        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
-    let run_id = manifest["run_id"].as_str().unwrap();
-    let receipt = ExecutionBackend::resume(&root, run_id).unwrap();
+    let root = root();
+    let run_root = crash_run(
+        &root,
+        "effect_after_crash_before_node_checkpoint_resumes_from_loop_ledger",
+        "after-effect",
+    );
+    let receipt = ExecutionBackend::resume(&root, &run_id(&run_root)).unwrap();
     assert_eq!(receipt.status(), "succeeded");
+    let expected_fingerprint = workflow_runtime::argument_fingerprint(&json!({"query":"needle"}));
+    let completed = fs::read_to_string(run_root.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["kind"] == "tool_completed")
+        .unwrap();
+    let correlation = &completed["payload"]["structured_output"][0];
+    assert_eq!(correlation["tool_call_id"], "call-crash");
+    assert_eq!(correlation["tool_name"], "search_code");
+    assert_eq!(correlation["argument_fingerprint"], expected_fingerprint);
+    assert_eq!(function_response_bytes(&run_root), expected_response);
     assert_eq!(
         Connection::open(run_root.join("effects.sqlite"))
             .unwrap()
@@ -475,6 +626,12 @@ fn effect_after_crash_before_node_checkpoint_resumes_from_loop_ledger() {
         serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
     assert_eq!(ledger["nodes"]["work"]["model_iterations"], 2);
     assert_eq!(ledger["nodes"]["work"]["pending_calls"], json!([]));
+    assert!(
+        ledger["nodes"]["work"]["tool_output_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
     assert!(ledger.to_string().contains("call-crash"));
     assert!(ledger.to_string().contains("resumed"));
     fs::remove_dir_all(root).unwrap();

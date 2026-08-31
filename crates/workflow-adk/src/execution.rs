@@ -3,13 +3,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt, fs,
+    future::Future,
     num::NonZeroU64,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use adk_rust::graph::prelude::{ExecutionConfig, State};
@@ -51,6 +52,7 @@ const GRAPH_CONTINUATION_KEY: &str = "kit_graph_continuation_v1";
 const LOOP_LEDGER_FILE: &str = "loop-ledger.json";
 static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
 type BoundTool = (Vec<String>, Arc<AdkToolBridge<InMemoryArtifactStore>>);
+type CompletedToolResponse = (String, String, String, String, Value);
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -146,26 +148,49 @@ impl LoopLedgerStore {
             .collect())
     }
 
-    fn completed_tool_responses(&self) -> Result<Vec<(String, String, Value)>, ExecutionError> {
+    fn completed_tool_responses(&self) -> Result<Vec<CompletedToolResponse>, ExecutionError> {
         let nodes = self
             .nodes
             .lock()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        Ok(nodes
-            .iter()
-            .flat_map(|(node, state)| {
-                state.conversation.iter().flat_map(move |content| {
-                    content.parts.iter().filter_map(move |part| match part {
-                        adk_rust::Part::FunctionResponse {
-                            function_response,
-                            id: Some(id),
-                            ..
-                        } => Some((node.clone(), id.clone(), function_response.response.clone())),
-                        _ => None,
-                    })
+        let mut completed = Vec::new();
+        for (node, state) in nodes.iter() {
+            let calls = state
+                .conversation
+                .iter()
+                .flat_map(|content| &content.parts)
+                .filter_map(|part| match part {
+                    adk_rust::Part::FunctionCall {
+                        name,
+                        args,
+                        id: Some(id),
+                        ..
+                    } => Some((
+                        id.clone(),
+                        (name.clone(), workflow_runtime::argument_fingerprint(args)),
+                    )),
+                    _ => None,
                 })
-            })
-            .collect())
+                .collect::<BTreeMap<_, _>>();
+            for part in state.conversation.iter().flat_map(|content| &content.parts) {
+                if let adk_rust::Part::FunctionResponse {
+                    function_response,
+                    id: Some(id),
+                    ..
+                } = part
+                    && let Some((name, fingerprint)) = calls.get(id)
+                {
+                    completed.push((
+                        node.clone(),
+                        id.clone(),
+                        name.clone(),
+                        fingerprint.clone(),
+                        function_response.response.clone(),
+                    ));
+                }
+            }
+        }
+        Ok(completed)
     }
 
     fn complete_pending(
@@ -210,41 +235,6 @@ impl LoopLedgerStore {
             .conversation
             .push(tool_response_content(&call, response));
         self.persist_locked(&nodes)
-    }
-
-    fn reconcile_effects(
-        &self,
-        journal: &EffectJournal,
-        run_id: &RunId,
-    ) -> Result<(), ExecutionError> {
-        let mut nodes = self
-            .nodes
-            .lock()
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let mut changed = false;
-        for state in nodes.values_mut() {
-            let mut remaining = VecDeque::new();
-            while let Some(call) = state.pending_calls.pop_front() {
-                let key = EffectKey::new(run_id.as_str(), &call.name, &call.name, &call.args);
-                match journal
-                    .load(&key)
-                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
-                {
-                    Some(response) => {
-                        state
-                            .conversation
-                            .push(tool_response_content(&call, response));
-                        changed = true;
-                    }
-                    None => remaining.push_back(call),
-                }
-            }
-            state.pending_calls = remaining;
-        }
-        if changed {
-            self.persist_locked(&nodes)?;
-        }
-        Ok(())
     }
 
     fn persist(&self) -> Result<(), ExecutionError> {
@@ -1456,6 +1446,65 @@ fn execution_status(kind: ExecutionErrorKind) -> &'static str {
     }
 }
 
+fn execution_deadline(limits: &RunLimits) -> Result<Instant, ExecutionError> {
+    Instant::now()
+        .checked_add(Duration::from_millis(limits.max_wall_time_ms().get()))
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::WallTimeLimit))
+}
+
+fn remaining_wall_time(deadline: Instant) -> Result<Duration, ExecutionError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::WallTimeLimit))
+}
+
+fn invoke_graph_with_deadline<F>(
+    runtime: &adk_rust::tokio::runtime::Runtime,
+    deadline: Instant,
+    terminal_kind: &Arc<Mutex<Option<ExecutionErrorKind>>>,
+    future: F,
+) -> Result<State, ExecutionError>
+where
+    F: Future<Output = Result<State, AdkGraphError>>,
+{
+    let remaining = remaining_wall_time(deadline)?;
+    runtime
+        .block_on(async {
+            adk_rust::tokio::time::timeout(remaining, future)
+                .await
+                .unwrap_or(Err(AdkGraphError::WallTimeLimit))
+        })
+        .map_err(|error| {
+            let kind = terminal_kind
+                .lock()
+                .ok()
+                .and_then(|terminal| *terminal)
+                .unwrap_or_else(|| execution_error_kind(error));
+            ExecutionError::new(kind)
+        })
+}
+
+fn resume_failure(
+    root: &Path,
+    events_path: &Path,
+    manifest: &mut RunManifestV2,
+    resume_count: u64,
+    mapper: &AdkEventMapper,
+    error: ExecutionError,
+) -> ExecutionError {
+    manifest.status = execution_status(error.kind()).to_owned();
+    manifest.resume_count = resume_count;
+    let events_result = write_events(events_path, mapper.events());
+    let manifest_result = write_json(&root.join("run-manifest.json"), manifest);
+    let receipt = manifest.receipt(root.to_path_buf());
+    if events_result.is_err() || manifest_result.is_err() {
+        ExecutionError::new(ExecutionErrorKind::Persistence).with_receipt(receipt)
+    } else {
+        error.with_receipt(receipt)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionError {
     kind: ExecutionErrorKind,
@@ -1763,31 +1812,18 @@ impl ExecutionBackend {
                     .enable_all()
                     .build()
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
-                let wall_time =
-                    std::time::Duration::from_millis(profile.run_limits().max_wall_time_ms().get());
-                let state = runtime
-                    .block_on(async {
-                        adk_rust::tokio::time::timeout(
-                            wall_time,
-                            graph.invoke_observed(
-                                State::new(),
-                                ExecutionConfig::new(run_id.as_str())
-                                    .with_recursion_limit(recursion_limit),
-                                &mut mapper,
-                                artifacts,
-                            ),
-                        )
-                        .await
-                        .unwrap_or(Err(AdkGraphError::WallTimeLimit))
-                    })
-                    .map_err(|error| {
-                        let kind = terminal_kind
-                            .lock()
-                            .ok()
-                            .and_then(|terminal| *terminal)
-                            .unwrap_or_else(|| execution_error_kind(error));
-                        ExecutionError::new(kind)
-                    })?;
+                let deadline = execution_deadline(&profile.run_limits())?;
+                let state = invoke_graph_with_deadline(
+                    &runtime,
+                    deadline,
+                    &terminal_kind,
+                    graph.invoke_observed(
+                        State::new(),
+                        ExecutionConfig::new(run_id.as_str()).with_recursion_limit(recursion_limit),
+                        &mut mapper,
+                        artifacts,
+                    ),
+                )?;
                 if let Some(kind) = terminal_kind.lock().ok().and_then(|terminal| *terminal) {
                     return Err(ExecutionError::new(kind));
                 }
@@ -2165,8 +2201,8 @@ impl ExecutionBackend {
             EffectJournal::open(root.join("effects.sqlite"))
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?,
         );
+        let deadline = execution_deadline(&profile.run_limits())?;
         let loop_ledger = Arc::new(LoopLedgerStore::open(root.join(LOOP_LEDGER_FILE))?);
-        loop_ledger.reconcile_effects(&effect_journal, &run_identity)?;
         let tool_registry = build_tool_registry(
             &profile,
             sandbox,
@@ -2190,7 +2226,18 @@ impl ExecutionBackend {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        replay_pending_tools(&loop_ledger, &toolsets, profile.run_limits())?;
+        if let Err(error) =
+            replay_pending_tools(&loop_ledger, &toolsets, profile.run_limits(), deadline)
+        {
+            return Err(resume_failure(
+                &root,
+                &events_path,
+                &mut manifest,
+                next,
+                &mapper,
+                error,
+            ));
+        }
         restore_tool_events(&loop_ledger, &tool_event_counts, &mut mapper)?;
         let agents = compiled
             .ir()
@@ -2256,18 +2303,31 @@ impl ExecutionBackend {
             .enable_all()
             .build()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let state = runtime
-            .block_on(
-                graph.invoke_observed(
-                    state,
-                    ExecutionConfig::new(run_id)
-                        .with_recursion_limit(recursion_limit)
-                        .with_resume_from(&restored.checkpoint_id),
-                    &mut mapper,
-                    &mut artifacts,
-                ),
-            )
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let state = match invoke_graph_with_deadline(
+            &runtime,
+            deadline,
+            &terminal_kind,
+            graph.invoke_observed(
+                state,
+                ExecutionConfig::new(run_id)
+                    .with_recursion_limit(recursion_limit)
+                    .with_resume_from(&restored.checkpoint_id),
+                &mut mapper,
+                &mut artifacts,
+            ),
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                return Err(resume_failure(
+                    &root,
+                    &events_path,
+                    &mut manifest,
+                    next,
+                    &mapper,
+                    error,
+                ));
+            }
+        };
         let state = checkpoint_state(
             state,
             &continuation
@@ -2446,6 +2506,7 @@ fn replay_pending_tools(
     ledger: &LoopLedgerStore,
     toolsets: &BTreeMap<String, Option<BoundTool>>,
     limits: RunLimits,
+    deadline: Instant,
 ) -> Result<(), ExecutionError> {
     for (node, pending) in ledger.pending_calls()? {
         let toolset = toolsets
@@ -2453,22 +2514,39 @@ fn replay_pending_tools(
             .and_then(Option::as_ref)
             .map(|(_, toolset)| toolset)
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let response = toolset
-            .invoke(ToolCall::new(
-                &pending.name,
-                &pending.id,
-                &node,
-                pending.args.clone(),
-            ))
-            .map_err(|error| {
-                let kind = match error.kind() {
-                    ToolBridgeErrorKind::CapabilityDenied | ToolBridgeErrorKind::ApprovalDenied => {
-                        ExecutionErrorKind::AuthorizationDenied
-                    }
-                    _ => ExecutionErrorKind::Tool,
-                };
-                ExecutionError::new(kind)
+        let toolset = Arc::clone(toolset);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .spawn(move || {
+                let response = toolset.invoke(ToolCall::new(
+                    &pending.name,
+                    &pending.id,
+                    &node,
+                    pending.args.clone(),
+                ));
+                let _ = sender.send((node, pending, response));
+            })
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
+        let (node, pending, response) = receiver
+            .recv_timeout(remaining_wall_time(deadline)?)
+            .map_err(|error| match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                    ExecutionError::new(ExecutionErrorKind::WallTimeLimit)
+                }
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    ExecutionError::new(ExecutionErrorKind::Tool)
+                }
             })?;
+        let response = response.map_err(|error| {
+            let kind = match error.kind() {
+                ToolBridgeErrorKind::CapabilityDenied | ToolBridgeErrorKind::ApprovalDenied => {
+                    ExecutionErrorKind::AuthorizationDenied
+                }
+                _ => ExecutionErrorKind::Tool,
+            };
+            ExecutionError::new(kind)
+        })?;
+        remaining_wall_time(deadline)?;
         let response = serde_json::to_value(response)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
         ledger.complete_pending(
@@ -2487,7 +2565,9 @@ fn restore_tool_events(
     mapper: &mut AdkEventMapper,
 ) -> Result<(), ExecutionError> {
     let mut seen = BTreeMap::new();
-    for (node, call_id, response) in ledger.completed_tool_responses()? {
+    for (node, call_id, tool_name, argument_fingerprint, response) in
+        ledger.completed_tool_responses()?
+    {
         let count = seen.entry(node.clone()).or_insert(0_usize);
         if *count >= existing.get(&node).copied().unwrap_or(0) {
             mapper
@@ -2501,7 +2581,12 @@ fn restore_tool_events(
                         AdkRuntimeObservationKindV1::ToolCompleted,
                     )
                     .with_node_id(&node)
-                    .with_response(response),
+                    .with_response(response)
+                    .with_structured_output(json!([{
+                        "tool_call_id": call_id,
+                        "tool_name": tool_name,
+                        "argument_fingerprint": argument_fingerprint,
+                    }])),
                 )
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
         }
