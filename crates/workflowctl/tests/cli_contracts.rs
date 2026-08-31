@@ -258,7 +258,7 @@ fn minimal_fixture_validates_and_emits_exact_graph_and_lock_bytes() {
     assert!(lock_output.status.success());
     assert_eq!(
         lock_output.stdout,
-        b"lock_version = 1\ncanonical_ir_wire_version = 6\nir_schema_version = 1\nworkflow_id = \"minimal\"\nworkflow_version = \"1\"\nir_hash = \"sha256:9c7efc302a9abbecce6929d9f770c22db8d63362e31a8c9dee95cc766d0360f9\"\nsemantic_resource_hashes = []\n"
+        b"lock_version = 1\ncanonical_ir_wire_version = 7\nir_schema_version = 1\nworkflow_id = \"minimal\"\nworkflow_version = \"1\"\nir_hash = \"sha256:cd7349e587da5ab11ba24341b1963d693e5fd40eaa970152b6282a4aba750a24\"\nsemantic_resource_hashes = []\n"
     );
     assert!(lock_output.stderr.is_empty());
 
