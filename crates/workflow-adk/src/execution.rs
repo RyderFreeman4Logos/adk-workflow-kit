@@ -79,6 +79,8 @@ struct LoopState {
     finish_admitted: bool,
     #[serde(default)]
     finished_output: Option<Value>,
+    #[serde(default)]
+    activated_skills: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -361,13 +363,23 @@ impl LoopLedgerStore {
     }
 
     fn persist_locked(&self, nodes: &BTreeMap<String, LoopState>) -> Result<(), ExecutionError> {
+        if !self.persist_raw_loop_state
+            && nodes.values().any(|state| {
+                state
+                    .pending_calls
+                    .iter()
+                    .any(|call| durable_pending_args(call).is_none())
+            })
+        {
+            return Ok(());
+        }
         let mut durable_nodes = nodes.clone();
         if !self.persist_raw_loop_state {
             for state in durable_nodes.values_mut() {
                 state.conversation.clear();
                 state.finished_output = None;
                 for call in &mut state.pending_calls {
-                    call.args = Value::Null;
+                    call.args = durable_pending_args(call).expect("checked pending calls");
                 }
             }
         }
@@ -382,7 +394,7 @@ impl LoopLedgerStore {
                 state.conversation.clear();
                 state.finished_output = None;
                 for call in &mut state.pending_calls {
-                    call.args = Value::Null;
+                    call.args = durable_pending_args(call).expect("checked pending calls");
                 }
             }
         }
@@ -433,7 +445,7 @@ impl LoopLedgerStore {
                 state.conversation.clear();
                 state.finished_output = None;
                 for call in &mut state.pending_calls {
-                    call.args = Value::Null;
+                    call.args = durable_pending_args(call).expect("checked pending calls");
                 }
             }
         }
@@ -449,6 +461,51 @@ impl LoopLedgerStore {
             Value::String(loop_ledger_digest(nodes)?),
         );
         Ok(())
+    }
+
+    fn activate_skill(&self, node: &str, skill: &str) -> Result<(), ExecutionError> {
+        let mut nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        nodes
+            .entry(node.to_owned())
+            .or_default()
+            .activated_skills
+            .insert(skill.to_owned());
+        self.persist_locked(&nodes)
+    }
+
+    fn is_skill_activated(&self, node: &str, skill: &str) -> Result<bool, ExecutionError> {
+        self.nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+            .map(|nodes| {
+                nodes
+                    .get(node)
+                    .is_some_and(|state| state.activated_skills.contains(skill))
+            })
+    }
+}
+
+fn durable_pending_args(call: &PendingCall) -> Option<Value> {
+    match call.name.as_str() {
+        "activate_skill" => serde_json::from_value::<ActivateSkillInput>(call.args.clone())
+            .ok()
+            .map(|input| json!({"skill_id": input.skill_id})),
+        "read_skill_resource" => {
+            serde_json::from_value::<ReadSkillResourceInput>(call.args.clone())
+                .ok()
+                .map(|input| {
+                    json!({
+                        "skill_id": input.skill_id,
+                        "resource_id": input.resource_id,
+                        "offset": input.offset,
+                        "limit": input.limit,
+                    })
+                })
+        }
+        _ => None,
     }
 }
 
@@ -546,7 +603,10 @@ fn valid_loop_state(state: &LoopState) -> bool {
             return false;
         };
         return state.finished_output.is_none()
-            && state.pending_calls.is_empty()
+            && state.pending_calls.iter().all(|call| {
+                durable_pending_args(call).as_ref() == Some(&call.args)
+                    && workflow_runtime::argument_fingerprint(&call.args) == call.fingerprint
+            })
             && state.total_tool_calls == tool_call_total
             && usize::try_from(state.total_tool_calls)
                 .ok()
@@ -807,6 +867,12 @@ impl LoopController {
         next.model_iterations += 1;
         next.conversation.push(content.clone());
         next.previous_response_id = response.interaction_id.clone();
+        let skill_call_admitted = next.pending_calls.iter().any(|call| {
+            matches!(
+                call.name.as_str(),
+                "activate_skill" | "read_skill_resource" | "run_skill_script"
+            )
+        });
         if let Some(kind) = self
             .ledger
             .tool_call_limit(&self.node, &next, &self.limits)
@@ -820,6 +886,9 @@ impl LoopController {
             return Err(self.fail(kind, marker));
         }
         *state = next;
+        if skill_call_admitted {
+            crash_barrier("after-skill-call-admission");
+        }
         *last_progress = Instant::now();
         Ok(())
     }
@@ -870,6 +939,11 @@ impl LoopController {
             .pending_calls
             .remove(index)
             .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+        if name == "activate_skill" {
+            let input = serde_json::from_value::<ActivateSkillInput>(input.clone())
+                .map_err(|_| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+            next.activated_skills.insert(input.skill_id);
+        }
         next.conversation
             .push(tool_response_content(&call, response.clone()));
         if self
@@ -1505,31 +1579,47 @@ impl ExecutionProfileV1 {
     }
 
     fn durable_fake_responses(responses: &Value) -> Value {
-        let identity = responses
-            .as_array()
-            .and_then(|responses| match responses.as_slice() {
-                [Value::String(response)] => serde_json::from_str::<Value>(response)
-                    .ok()
-                    .and_then(|response| {
-                        response
-                            .pointer("/output/kit_durable_model_response_sha256")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .filter(|identity| identity.starts_with("sha256:")),
-                _ => None,
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "sha256:{:x}",
-                    Sha256::digest(
-                        serde_json::to_vec(responses).expect("model responses serialize")
-                    )
-                )
-            });
+        if let Some(responses) = responses.as_array()
+            && let Some(responses) = responses
+                .iter()
+                .map(Self::durable_fake_response)
+                .collect::<Option<Vec<_>>>()
+        {
+            return Value::Array(responses);
+        }
+        let identity = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(responses).expect("model responses serialize")),
+        );
         Value::Array(vec![Value::String(format!(
             "{{\"status\":\"finished\",\"output\":{{\"kit_durable_model_response_sha256\":\"{identity}\"}}}}"
         ))])
+    }
+
+    fn durable_fake_response(response: &Value) -> Option<Value> {
+        if let Value::String(response) = response {
+            let identity = format!("sha256:{:x}", Sha256::digest(response));
+            return Some(Value::String(format!(
+                "{{\"status\":\"finished\",\"output\":{{\"kit_durable_model_response_sha256\":\"{identity}\"}}}}"
+            )));
+        }
+        let calls = response.get("calls")?.as_array()?;
+        let calls = calls
+            .iter()
+            .map(|call| {
+                let id = call.get("id")?.as_str()?.to_owned();
+                let name = call.get("name")?.as_str()?.to_owned();
+                let args = call.get("args")?.clone();
+                let args = durable_pending_args(&PendingCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    fingerprint: workflow_runtime::argument_fingerprint(&args),
+                    args,
+                })?;
+                Some(json!({"id": id, "name": name, "args": args}))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(json!({"calls": calls}))
     }
 
     fn durable_projection(&self, skill_snapshot: Option<&str>) -> Value {
@@ -2656,6 +2746,7 @@ impl ExecutionBackend {
                     &resolved_plan,
                     sandbox,
                     &run_id,
+                    Arc::clone(&loop_ledger),
                     effect_journal.clone(),
                     Arc::clone(&effect_fence),
                 )?;
@@ -3152,6 +3243,7 @@ impl ExecutionBackend {
             &resolved_plan,
             sandbox,
             &run_identity,
+            Arc::clone(&loop_ledger),
             Some(Arc::clone(&effect_journal)),
             Arc::clone(&effect_fence),
         )?;
@@ -3539,7 +3631,7 @@ enum SkillToolAction {
 
 struct SkillToolHandler {
     action: SkillToolAction,
-    activated_skills: Arc<Mutex<BTreeSet<(String, String)>>>,
+    ledger: Arc<LoopLedgerStore>,
     packages: BTreeMap<String, Arc<SkillPackage>>,
     plan: ResolvedRuntimePlan,
     provenance: ToolProvenance,
@@ -3582,13 +3674,11 @@ impl ToolHandler for SkillToolHandler {
         {
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
         }
-        let activation_key = (context.actor().to_owned(), skill_name);
         if !matches!(self.action, SkillToolAction::Activate)
             && !self
-                .activated_skills
-                .lock()
+                .ledger
+                .is_skill_activated(context.actor(), &skill_name)
                 .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?
-                .contains(&activation_key)
         {
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
         }
@@ -3602,10 +3692,10 @@ impl ToolHandler for SkillToolHandler {
                     "instructions_ref": format!("sha256:{:x}", Sha256::digest(activation.instructions())),
                     "instructions": activation.instructions(),
                 });
-                self.activated_skills
-                    .lock()
-                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?
-                    .insert(activation_key);
+                self.ledger
+                    .activate_skill(context.actor(), &skill_name)
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                crash_barrier("after-skill-activation");
                 payload
             }
             SkillToolAction::Read => {
@@ -3653,6 +3743,7 @@ fn build_tool_registry(
     plan: &ResolvedRuntimePlan,
     sandbox: RunSandbox,
     run_id: &RunId,
+    ledger: Arc<LoopLedgerStore>,
     effect_journal: Option<Arc<EffectJournal>>,
     effect_fence: Arc<EffectFence>,
 ) -> Result<ToolBridge, ExecutionError> {
@@ -3678,7 +3769,6 @@ fn build_tool_registry(
     }
     let packages = profile.skill_packages()?;
     if !packages.is_empty() {
-        let activated_skills = Arc::new(Mutex::new(BTreeSet::new()));
         let script_capabilities = packages
             .values()
             .flat_map(|package| package.capabilities())
@@ -3747,7 +3837,7 @@ fn build_tool_registry(
                     registration,
                     SkillToolHandler {
                         action,
-                        activated_skills: Arc::clone(&activated_skills),
+                        ledger: Arc::clone(&ledger),
                         packages: packages.clone(),
                         plan: plan.clone(),
                         provenance,

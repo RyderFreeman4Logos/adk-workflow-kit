@@ -184,6 +184,16 @@ fn profile(package: &std::path::Path) -> ExecutionProfileV1 {
     ExecutionProfileV1::parse(&serde_json::to_vec(&profile).unwrap()).unwrap()
 }
 
+fn resume_profile(package: &std::path::Path) -> ExecutionProfileV1 {
+    let mut value = serde_json::to_value(profile(package)).unwrap();
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+        {"calls": [{"id":"read","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/guide.txt","offset":0,"limit":64}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
+    ]);
+    ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
+}
+
 #[test]
 fn fake_model_activates_reads_and_runs_declared_skill() {
     let root = root();
@@ -609,6 +619,54 @@ fn large_skill_stdout_is_absent_from_every_durable_file() {
     );
     cleanup_test_root(&root);
     fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
+fn crashed_skill_admission_or_activation_resumes_without_widening() {
+    if let Ok(root) = env::var("M3_05_SKILL_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            &workflow,
+            resume_profile(&root.join("code-investigation")),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    for barrier in ["after-skill-call-admission", "after-skill-activation"] {
+        let root = root();
+        skill_package(&root);
+        let status = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "crashed_skill_admission_or_activation_resumes_without_widening",
+                "--nocapture",
+            ])
+            .env("M3_05_SKILL_CRASH_RUN_ROOT", &root)
+            .env("WORKFLOW_KIT_TEST_CRASH_BARRIER", barrier)
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{barrier}");
+        let run_root = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.join("run-manifest.json").is_file())
+            .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+        let resumed =
+            ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap();
+        assert_eq!(resumed.status(), "succeeded", "{barrier}");
+        let events = fs::read_to_string(run_root.join("events.jsonl")).unwrap();
+        assert!(events.contains("read_skill_resource"), "{barrier}");
+        assert!(!events.contains("authorization_denied"), "{barrier}");
+        cleanup_test_root(&root);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
 }
 
 #[test]
