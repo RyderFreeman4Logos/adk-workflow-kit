@@ -317,3 +317,26 @@ fn node_skill_subset_denies_sibling_skill_before_effect() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn skill_tool_unknown_fields_fail_before_effect() {
+    let root = root();
+    let package = skill_package(&root);
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let mut value = serde_json::to_value(profile(&package)).unwrap();
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation","unexpected":true}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"must_not":"run"}})).unwrap()
+    ]);
+    let profile = ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let error = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::AuthorizationDenied);
+    assert!(
+        !fs::read_to_string(error.receipt().unwrap().run_root().join("events.jsonl"))
+            .unwrap()
+            .contains("skill_activated")
+    );
+    let _ = fs::remove_dir_all(root);
+}

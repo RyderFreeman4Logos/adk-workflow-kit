@@ -3260,6 +3260,30 @@ enum SkillToolAction {
     Run,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivateSkillInput {
+    skill_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadSkillResourceInput {
+    skill_id: String,
+    resource_id: String,
+    #[serde(default)]
+    offset: u64,
+    limit: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunSkillScriptInput {
+    skill_id: String,
+    script_id: String,
+    input: Value,
+}
+
 struct SkillToolHandler {
     action: SkillToolAction,
     packages: BTreeMap<String, Arc<SkillPackage>>,
@@ -3274,10 +3298,24 @@ impl ToolHandler for SkillToolHandler {
         context: &ToolCallContext,
         arguments: &Value,
     ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
-        let skill_id = arguments
-            .get("skill_id")
-            .and_then(Value::as_str)
-            .and_then(|id| self.packages.get(id))
+        let skill_name = match self.action {
+            SkillToolAction::Activate => {
+                serde_json::from_value::<ActivateSkillInput>(arguments.clone())
+                    .map(|input| input.skill_id)
+            }
+            SkillToolAction::Read => {
+                serde_json::from_value::<ReadSkillResourceInput>(arguments.clone())
+                    .map(|input| input.skill_id)
+            }
+            SkillToolAction::Run => {
+                serde_json::from_value::<RunSkillScriptInput>(arguments.clone())
+                    .map(|input| input.skill_id)
+            }
+        }
+        .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+        let skill_id = self
+            .packages
+            .get(&skill_name)
             .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
         let binding = skill_id
             .binding()
@@ -3301,33 +3339,25 @@ impl ToolHandler for SkillToolHandler {
                 })
             }
             SkillToolAction::Read => {
-                let resource_id = arguments
-                    .get("resource_id")
-                    .and_then(Value::as_str)
-                    .and_then(|id| SkillResourceId::new(id).ok())
+                let input = serde_json::from_value::<ReadSkillResourceInput>(arguments.clone())
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+                let resource_id = SkillResourceId::new(&input.resource_id)
+                    .ok()
                     .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
-                let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0);
-                let limit = arguments
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .and_then(NonZeroU64::new)
+                let limit = NonZeroU64::new(input.limit)
                     .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
-                skill_id.read_resource(&resource_id, PageRequest::new(offset, limit))?
+                skill_id.read_resource(&resource_id, PageRequest::new(input.offset, limit))?
             }
             SkillToolAction::Run => {
-                let script_id = arguments
-                    .get("script_id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
-                let input = arguments
-                    .get("input")
-                    .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
-                let input = serde_json::to_vec(input)
+                let input = serde_json::from_value::<RunSkillScriptInput>(arguments.clone())
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+                let script_id = input.script_id;
+                let input = serde_json::to_vec(&input.input)
                     .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
                 let receipt = execute_registered_script_in_child(
                     &skill_id.runtime,
                     &skill_id.lock,
-                    script_id,
+                    &script_id,
                     &input,
                     sandbox,
                 )
