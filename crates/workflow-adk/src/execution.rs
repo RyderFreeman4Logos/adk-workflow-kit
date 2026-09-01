@@ -1559,6 +1559,20 @@ fn package_file_test_barrier(relative: &str) {
 #[cfg(not(debug_assertions))]
 fn package_file_test_barrier(_: &str) {}
 
+#[cfg(debug_assertions)]
+fn package_file_test_read_len(relative: &str, length: usize) {
+    if relative != "scripts/replacement.bin" {
+        return;
+    }
+    let Ok(root) = std::env::var("WORKFLOW_KIT_TEST_PACKAGE_FILE_BARRIER") else {
+        return;
+    };
+    let _ = fs::write(PathBuf::from(root).join("read-len"), length.to_string());
+}
+
+#[cfg(not(debug_assertions))]
+fn package_file_test_read_len(_: &str, _: usize) {}
+
 fn package_file(
     root: &Path,
     root_identity: PackageIdentity,
@@ -1601,8 +1615,14 @@ fn package_file(
         ));
     }
     package_file_test_barrier(relative);
-    let bytes = fs::read(&path)
+    let bytes = read_bounded_regular_file(&SourcePath::from(path.as_path()), 65_536)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    if bytes.is_empty() {
+        return Err(ExecutionError::new(
+            ExecutionErrorKind::ImplementationBinding,
+        ));
+    }
+    package_file_test_read_len(relative, bytes.len());
     if checked.into_iter().all(|(path, identity)| {
         fs::symlink_metadata(path).is_ok_and(|metadata| {
             !metadata.file_type().is_symlink()

@@ -1,5 +1,6 @@
 use std::{
     env, fs,
+    io::Write,
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::Command,
@@ -1139,6 +1140,57 @@ fn initial_run_uses_sealed_skill_snapshot_after_package_replacement() {
         fs::read_to_string(receipt.run_root().join("checkpoint-manifest.json")).unwrap();
     assert!(checkpoint_manifest.contains(&digest(SCRIPT)));
     assert!(!checkpoint_manifest.contains(&digest(replacement_script)));
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
+fn package_file_growth_is_bounded_before_execution() {
+    let root = root();
+    let package = skill_package(&root);
+    let runtime_path = package.join("skill.runtime.toml");
+    let runtime = fs::read_to_string(&runtime_path).unwrap();
+    fs::write(package.join("scripts/replacement.bin"), SCRIPT).unwrap();
+    fs::write(
+        &runtime_path,
+        format!(
+            "{runtime}[[scripts]]\nid = \"replacement\"\npath = \"scripts/replacement.bin\"\nruntime = \"python3\"\nsha256 = \"{}\"\ninput_schema = \"references/schema.json\"\noutput_schema = \"references/schema.json\"\ncapabilities = [\"filesystem.read\", \"process.spawn\", \"limit.output_bytes\"]\n",
+            digest(SCRIPT),
+        ),
+    )
+    .unwrap();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let barrier = root.join("growth-barrier");
+    fs::create_dir(&barrier).unwrap();
+    let grown_file = package.join("scripts/replacement.bin");
+    let growth_barrier = barrier.clone();
+    let growth_worker = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !growth_barrier.join("ready").is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(growth_barrier.join("ready").is_file());
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(grown_file)
+            .unwrap();
+        file.write_all(&vec![b'x'; 65_537]).unwrap();
+        fs::write(growth_barrier.join("continue"), b"continue").unwrap();
+    });
+    unsafe {
+        env::set_var("WORKFLOW_KIT_TEST_PACKAGE_FILE_BARRIER", &barrier);
+    }
+    let error = ExecutionBackend::run(&workflow, profile(&package), json!({}), &root).unwrap_err();
+    unsafe {
+        env::remove_var("WORKFLOW_KIT_TEST_PACKAGE_FILE_BARRIER");
+    }
+    growth_worker.join().unwrap();
+    assert_eq!(error.kind(), ExecutionErrorKind::ImplementationBinding);
+    assert!(
+        !barrier.join("read-len").exists(),
+        "package file read was not capped before rejection"
+    );
     cleanup_test_root(&root);
     fs::remove_dir_all(root).expect("test cleanup");
 }
