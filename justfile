@@ -65,6 +65,9 @@ m3-03-adk test_name:
 m3-04-adk test_name:
     {{_io}} cargo +1.98.0 test -p workflow-adk --test m3_04_model_tool_loop {{test_name}} --locked -- --exact --nocapture
 
+m3-04-unit test_name:
+    {{_io}} cargo +1.98.0 test -p workflow-adk {{test_name}} --lib --locked -- --exact --nocapture
+
 m3-04-cli test_name:
     {{_io}} cargo +1.98.0 test -p workflowctl --test m1_12_destructive_resume {{test_name}} --locked -- --exact --nocapture
 

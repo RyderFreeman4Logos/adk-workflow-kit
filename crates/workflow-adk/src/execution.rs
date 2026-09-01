@@ -159,7 +159,7 @@ impl LoopLedgerStore {
         candidate: &LoopState,
         limits: &RunLimits,
     ) -> Result<Option<ExecutionErrorKind>, ExecutionError> {
-        let nodes = self
+        let mut nodes = self
             .nodes
             .lock()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
@@ -182,10 +182,15 @@ impl LoopLedgerStore {
                     .saturating_add(*count);
             }
         }
-        Ok(per_tool
+        if per_tool
             .values()
             .any(|count| *count > limits.max_calls_per_tool().get())
-            .then_some(ExecutionErrorKind::ToolCallsPerToolLimit))
+        {
+            return Ok(Some(ExecutionErrorKind::ToolCallsPerToolLimit));
+        }
+        nodes.insert(node.to_owned(), candidate.clone());
+        self.persist_locked(&nodes)?;
+        Ok(None)
     }
 
     fn output_byte_limit(
@@ -194,17 +199,22 @@ impl LoopLedgerStore {
         candidate: &LoopState,
         limit: u64,
     ) -> Result<bool, ExecutionError> {
-        let nodes = self
+        let mut nodes = self
             .nodes
             .lock()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-        Ok(nodes
+        let total = nodes
             .iter()
             .map(|(name, state)| if name == node { candidate } else { state })
             .fold(0_u64, |total, state| {
                 total.saturating_add(state.tool_output_bytes)
-            })
-            > limit)
+            });
+        if total > limit {
+            return Ok(true);
+        }
+        nodes.insert(node.to_owned(), candidate.clone());
+        self.persist_locked(&nodes)?;
+        Ok(false)
     }
 
     fn replace(&self, node: &str, state: LoopState) -> Result<(), ExecutionError> {
@@ -722,6 +732,11 @@ impl LoopController {
                 });
             }
         }
+        next.finish_admitted = finished_output.is_some();
+        next.finished_output = finished_output;
+        next.model_iterations += 1;
+        next.conversation.push(content.clone());
+        next.previous_response_id = response.interaction_id.clone();
         if let Some(kind) = self
             .ledger
             .tool_call_limit(&self.node, &next, &self.limits)
@@ -734,14 +749,6 @@ impl LoopController {
             };
             return Err(self.fail(kind, marker));
         }
-        next.finish_admitted = finished_output.is_some();
-        next.finished_output = finished_output;
-        next.model_iterations += 1;
-        next.conversation.push(content.clone());
-        next.previous_response_id = response.interaction_id.clone();
-        self.ledger
-            .replace(&self.node, next.clone())
-            .map_err(|_| self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable"))?;
         *state = next;
         *last_progress = Instant::now();
         Ok(())
@@ -777,16 +784,6 @@ impl LoopController {
         next.tool_output_bytes = next
             .tool_output_bytes
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        if self
-            .ledger
-            .output_byte_limit(&self.node, &next, self.limits.max_tool_output_bytes().get())
-            .map_err(|_| self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable"))?
-        {
-            return Err(self.fail(
-                ExecutionErrorKind::ToolOutputBytesLimit,
-                "workflow.loop.limit.tool_output_bytes",
-            ));
-        }
         let name = context
             .tool_name()
             .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
@@ -805,9 +802,16 @@ impl LoopController {
             .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
         next.conversation
             .push(tool_response_content(&call, response.clone()));
-        self.ledger
-            .replace(&self.node, next.clone())
-            .map_err(|_| self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable"))?;
+        if self
+            .ledger
+            .output_byte_limit(&self.node, &next, self.limits.max_tool_output_bytes().get())
+            .map_err(|_| self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable"))?
+        {
+            return Err(self.fail(
+                ExecutionErrorKind::ToolOutputBytesLimit,
+                "workflow.loop.limit.tool_output_bytes",
+            ));
+        }
         *state = next;
         Ok(())
     }
@@ -3385,7 +3389,173 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ExecutionError> {
 
 #[cfg(test)]
 mod execution_registry_tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
+
+    fn fanout_ledger() -> (PathBuf, Arc<LoopLedgerStore>) {
+        let root = std::env::temp_dir().join(format!(
+            "workflow-adk-fanout-{}",
+            NEXT_RUN.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).expect("fan-out fixture directory");
+        let run_id = RunId::new("fanout-limits".to_owned()).expect("valid fixture run ID");
+        let manifest = CheckpointManifestV1::new(&run_id, "fanout", "1");
+        let checkpoint_path = root.join("checkpoint.sqlite");
+        let mut checkpoints = SqliteCheckpointStore::open(&checkpoint_path, manifest.clone())
+            .expect("fan-out checkpoint store");
+        checkpoints
+            .save_checkpoint(
+                DurableCheckpointV1::new(
+                    run_id.clone(),
+                    "fanout",
+                    0,
+                    serde_json::to_vec(&State::new()).expect("checkpoint state"),
+                    BTreeSet::<String>::new(),
+                )
+                .expect("fan-out checkpoint"),
+            )
+            .expect("save fan-out checkpoint");
+        let ledger = LoopLedgerStore::create(
+            root.join(LOOP_LEDGER_FILE),
+            checkpoint_path,
+            "fanout".to_owned(),
+            manifest,
+            run_id,
+        )
+        .expect("fan-out ledger");
+        ledger
+            .replace("left", LoopState::default())
+            .expect("left sibling state");
+        ledger
+            .replace("right", LoopState::default())
+            .expect("right sibling state");
+        (root, Arc::new(ledger))
+    }
+
+    fn limits(max_tool_calls: u64, max_calls_per_tool: u64) -> RunLimits {
+        let limit = |value| NonZeroU64::new(value).expect("positive limit");
+        RunLimits::new(
+            limit(100),
+            limit(max_tool_calls),
+            limit(max_calls_per_tool),
+            limit(100),
+            limit(100),
+            limit(100),
+            limit(100),
+        )
+    }
+
+    fn sibling_fanout<T: Send>(
+        ledger: &Arc<LoopLedgerStore>,
+        candidate: &LoopState,
+        admit: impl Fn(&LoopLedgerStore, &str, &LoopState) -> T + Send + Sync,
+    ) -> [T; 2] {
+        let barrier = Arc::new(Barrier::new(2));
+        std::thread::scope(|scope| {
+            let left_barrier = Arc::clone(&barrier);
+            let left_admit = &admit;
+            let left = scope.spawn(move || {
+                left_barrier.wait();
+                left_admit(ledger, "left", candidate)
+            });
+            let right_barrier = Arc::clone(&barrier);
+            let right_admit = &admit;
+            let right = scope.spawn(move || {
+                right_barrier.wait();
+                right_admit(ledger, "right", candidate)
+            });
+            [
+                left.join().expect("left sibling"),
+                right.join().expect("right sibling"),
+            ]
+        })
+    }
+
+    #[test]
+    fn sibling_fanout_limit_admission_persists_once() {
+        let call = LoopState {
+            total_tool_calls: 1,
+            tool_calls: BTreeMap::from([(String::from("search_code"), 1)]),
+            ..LoopState::default()
+        };
+        let (root, ledger) = fanout_ledger();
+        let outcomes = sibling_fanout(&ledger, &call, |ledger, node, candidate| {
+            ledger.tool_call_limit(node, candidate, &limits(1, 2))
+        });
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.as_ref().expect("ledger").is_none())
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter_map(|outcome| *outcome.as_ref().expect("ledger"))
+                .collect::<Vec<_>>(),
+            vec![ExecutionErrorKind::TotalToolCallsLimit]
+        );
+        assert_eq!(
+            ledger.snapshot("left").unwrap().total_tool_calls
+                + ledger.snapshot("right").unwrap().total_tool_calls,
+            1
+        );
+        assert_eq!(
+            serde_json::from_slice::<LoopLedgerV1>(&fs::read(root.join(LOOP_LEDGER_FILE)).unwrap())
+                .unwrap()
+                .nodes
+                .values()
+                .map(|state| state.total_tool_calls)
+                .sum::<u64>(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+
+        let (root, ledger) = fanout_ledger();
+        let outcomes = sibling_fanout(&ledger, &call, |ledger, node, candidate| {
+            ledger.tool_call_limit(node, candidate, &limits(2, 1))
+        });
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.as_ref().expect("ledger").is_none())
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter_map(|outcome| *outcome.as_ref().expect("ledger"))
+                .collect::<Vec<_>>(),
+            vec![ExecutionErrorKind::ToolCallsPerToolLimit]
+        );
+        fs::remove_dir_all(root).unwrap();
+
+        let bytes = LoopState {
+            tool_output_bytes: 5,
+            ..LoopState::default()
+        };
+        let (root, ledger) = fanout_ledger();
+        let outcomes = sibling_fanout(&ledger, &bytes, |ledger, node, candidate| {
+            ledger.output_byte_limit(node, candidate, 5)
+        });
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| !*outcome.as_ref().expect("ledger"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            ledger.snapshot("left").unwrap().tool_output_bytes
+                + ledger.snapshot("right").unwrap().tool_output_bytes,
+            5
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn registry_with(candidates: &[(BindingCategory, &str, &str)]) -> ExecutionRuntimeRegistry {
         let mut grouped = BTreeMap::new();
