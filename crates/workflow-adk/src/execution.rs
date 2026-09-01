@@ -2389,6 +2389,7 @@ impl ExecutionBackend {
                 });
                 let tool_registry = build_tool_registry(
                     &profile,
+                    &resolved_plan,
                     sandbox,
                     &run_id,
                     effect_journal.clone(),
@@ -2411,6 +2412,7 @@ impl ExecutionBackend {
                             model,
                             build_toolset(
                                 &tool_registry,
+                                node.id().as_str(),
                                 resolved_plan.node_tools(node.id().as_str()),
                                 resolved_plan.node_skills(node.id().as_str()),
                                 &effective_capabilities,
@@ -2876,6 +2878,7 @@ impl ExecutionBackend {
         )?);
         let tool_registry = build_tool_registry(
             &profile,
+            &resolved_plan,
             sandbox,
             &run_identity,
             Some(Arc::clone(&effect_journal)),
@@ -2891,6 +2894,7 @@ impl ExecutionBackend {
                     node.id().as_str().to_owned(),
                     build_toolset(
                         &tool_registry,
+                        node.id().as_str(),
                         resolved_plan.node_tools(node.id().as_str()),
                         resolved_plan.node_skills(node.id().as_str()),
                         &effective_capabilities,
@@ -3259,6 +3263,7 @@ enum SkillToolAction {
 struct SkillToolHandler {
     action: SkillToolAction,
     packages: BTreeMap<String, Arc<SkillPackage>>,
+    plan: ResolvedRuntimePlan,
     provenance: ToolProvenance,
 }
 
@@ -3266,7 +3271,7 @@ impl ToolHandler for SkillToolHandler {
     fn execute(
         &self,
         sandbox: &workflow_runtime::ChildSandbox<'_>,
-        _context: &ToolCallContext,
+        context: &ToolCallContext,
         arguments: &Value,
     ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
         let skill_id = arguments
@@ -3274,6 +3279,17 @@ impl ToolHandler for SkillToolHandler {
             .and_then(Value::as_str)
             .and_then(|id| self.packages.get(id))
             .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+        let binding = skill_id
+            .binding()
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+        if !self
+            .plan
+            .node_skills(context.actor())
+            .iter()
+            .any(|allowed| allowed == &binding)
+        {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
+        }
         let payload = match self.action {
             SkillToolAction::Activate => {
                 let activation = activate_skill(skill_id.as_ref(), &skill_id.id, &skill_id.version)
@@ -3346,6 +3362,7 @@ fn skill_tool_registration(
 
 fn build_tool_registry(
     profile: &ExecutionProfileV1,
+    plan: &ResolvedRuntimePlan,
     sandbox: RunSandbox,
     run_id: &RunId,
     effect_journal: Option<Arc<EffectJournal>>,
@@ -3398,6 +3415,7 @@ fn build_tool_registry(
                     SkillToolHandler {
                         action,
                         packages: packages.clone(),
+                        plan: plan.clone(),
                         provenance,
                     },
                 )
@@ -3409,6 +3427,7 @@ fn build_tool_registry(
 
 fn build_toolset(
     bridge: &ToolBridge,
+    node_id: &str,
     bindings: &[ResolvedBinding],
     skills: &[ResolvedBinding],
     effective_capabilities: &[SandboxCapability],
@@ -3439,6 +3458,7 @@ fn build_toolset(
     let adapter = AdkToolBridge::for_selected(
         bridge,
         names.iter().map(String::as_str),
+        node_id,
         authority,
         None,
         InMemoryArtifactStore::new(

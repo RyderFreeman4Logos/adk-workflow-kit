@@ -89,6 +89,52 @@ fn skill_package(root: &std::path::Path) -> PathBuf {
     package
 }
 
+fn skill_package_named(root: &std::path::Path, id: &str) -> PathBuf {
+    let package = root.join(id);
+    fs::create_dir(&package).unwrap();
+    fs::create_dir(package.join("scripts")).unwrap();
+    fs::create_dir(package.join("references")).unwrap();
+    fs::create_dir(package.join("assets")).unwrap();
+    fs::write(
+        package.join("SKILL.md"),
+        String::from_utf8(SKILL.to_vec())
+            .unwrap()
+            .replace("code-investigation", id),
+    )
+    .unwrap();
+    fs::write(package.join("scripts/content.bin"), SCRIPT).unwrap();
+    fs::write(package.join("references/schema.json"), SCHEMA).unwrap();
+    fs::write(package.join("assets/guide.txt"), GUIDE).unwrap();
+    fs::write(
+        package.join("skill.runtime.toml"),
+        format!(
+            "schema_version = 1\n\
+             [skill]\n\
+             id = \"{id}\"\n\
+             version = \"1\"\n\
+             [[scripts]]\n\
+             id = \"answer\"\n\
+             path = \"scripts/content.bin\"\n\
+             runtime = \"python3\"\n\
+             sha256 = \"{}\"\n\
+             input_schema = \"references/schema.json\"\n\
+             output_schema = \"references/schema.json\"\n\
+             capabilities = [\"filesystem.read\", \"process.spawn\", \"limit.output_bytes\"]\n\
+             [[resources]]\n\
+             id = \"references/schema.json\"\n\
+             sha256 = \"{}\"\n\
+             [[resources]]\n\
+             id = \"assets/guide.txt\"\n\
+             sha256 = \"{}\"\n",
+            digest(SCRIPT),
+            digest(SCHEMA),
+            digest(GUIDE),
+        ),
+    )
+    .unwrap();
+    package
+}
+
 fn profile(package: &std::path::Path) -> ExecutionProfileV1 {
     let profile = json!({
         "schema_version": 1,
@@ -241,5 +287,33 @@ fn changed_skill_content_rejects_resume() {
     .unwrap();
     let error = ExecutionBackend::resume(&root, receipt.run_id()).unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn node_skill_subset_denies_sibling_skill_before_effect() {
+    let root = root();
+    let allowed = skill_package(&root);
+    let sibling = skill_package_named(&root, "sibling-skill");
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let mut value = serde_json::to_value(profile(&allowed)).unwrap();
+    value["skills"] = json!([
+        {"id":"code-investigation","version":"1","root":allowed},
+        {"id":"sibling-skill","version":"1","root":sibling}
+    ]);
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"sibling-skill"}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"must_not":"run"}})).unwrap()
+    ]);
+    let denied_profile = ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let error = ExecutionBackend::run(&workflow, denied_profile, json!({}), &root).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::AuthorizationDenied);
+    assert!(
+        !fs::read_to_string(error.receipt().unwrap().run_root().join("events.jsonl"))
+            .unwrap()
+            .contains("skill_activated")
+    );
     let _ = fs::remove_dir_all(root);
 }
