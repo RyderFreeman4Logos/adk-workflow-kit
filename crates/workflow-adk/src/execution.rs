@@ -2477,6 +2477,14 @@ impl ExecutionBackend {
         workdir_base: impl AsRef<Path>,
         run_id: &str,
     ) -> Result<ExecutionReceipt, ExecutionError> {
+        Self::resume_cancellable(workdir_base, run_id, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn resume_cancellable(
+        workdir_base: impl AsRef<Path>,
+        run_id: &str,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
         let (root, mut manifest) = find_run(workdir_base.as_ref(), run_id)?;
         if !matches!(manifest.status.as_str(), "running" | "succeeded") {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
@@ -2629,7 +2637,6 @@ impl ExecutionBackend {
         );
         let deadline = execution_deadline(&profile.run_limits())?;
         let terminal_kind = Arc::new(Mutex::new(None));
-        let cancellation = Arc::new(AtomicBool::new(false));
         let last_progress = Arc::new(Mutex::new(Instant::now()));
         let effect_fence = Arc::new(EffectFence {
             cancellation: Arc::clone(&cancellation),

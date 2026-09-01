@@ -818,6 +818,124 @@ fn resume_idle_limit_fences_pending_replay_before_commit() {
 }
 
 #[test]
+fn resume_pending_replay_selects_mid_wait_cancellation() {
+    if let Ok(root) = env::var("M3_04_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            workflow,
+            profile_with_delays(
+                vec![
+                    json!({"calls": [{"id":"call-cancel-replay","name":"search_code","args":{"query":"needle"}}]}),
+                ],
+                Some(loop_policy()),
+                0,
+                1000,
+                json!({"found":true}),
+            ),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let root = root();
+    let run_root = crash_run(
+        &root,
+        "resume_pending_replay_selects_mid_wait_cancellation",
+        "before-effect",
+    );
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let worker_cancellation = Arc::clone(&cancellation);
+    let worker_root = root.clone();
+    let run_id = run_id(&run_root);
+    let worker = std::thread::spawn(move || {
+        ExecutionBackend::resume_cancellable(&worker_root, &run_id, worker_cancellation)
+    });
+    std::thread::sleep(Duration::from_millis(250));
+    let started = Instant::now();
+    cancellation.store(true, Ordering::Release);
+    let error = worker.join().unwrap().unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::Cancelled);
+    assert_eq!(error.receipt().unwrap().status(), "cancelled");
+    assert_eq!(effect_count(&run_root), 0);
+    assert!(!events(&error).contains("tool_completed"));
+    assert!(started.elapsed() < Duration::from_millis(100));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resume_model_wait_selects_mid_wait_cancellation() {
+    if let Ok(root) = env::var("M3_04_RESUME_MODEL_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            workflow,
+            profile_with_delays(
+                vec![finish(json!({"answer":"late"}))],
+                Some(loop_policy()),
+                1000,
+                0,
+                json!({"found":true}),
+            ),
+            json!({}),
+            root,
+        );
+        panic!("model wait did not terminate the child");
+    }
+
+    let root = root();
+    let mut child = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "resume_model_wait_selects_mid_wait_cancellation",
+            "--nocapture",
+        ])
+        .env("M3_04_RESUME_MODEL_RUN_ROOT", &root)
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    let run_root = loop {
+        if let Some(run_root) = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.join("run-manifest.json").is_file())
+        {
+            break run_root;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "model wait started"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    child.kill().unwrap();
+    assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let worker_cancellation = Arc::clone(&cancellation);
+    let worker_root = root.clone();
+    let run_id = run_id(&run_root);
+    let worker = std::thread::spawn(move || {
+        ExecutionBackend::resume_cancellable(&worker_root, &run_id, worker_cancellation)
+    });
+    std::thread::sleep(Duration::from_millis(250));
+    let started = Instant::now();
+    cancellation.store(true, Ordering::Release);
+    let error = worker.join().unwrap().unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::Cancelled);
+    assert_eq!(error.receipt().unwrap().status(), "cancelled");
+    assert_eq!(effect_count(&run_root), 0);
+    assert!(!events(&error).contains("tool_completed"));
+    assert!(started.elapsed() < Duration::from_millis(100));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn resume_rejects_unverified_multiple_mixed_finish_before_dispatch() {
     if let Ok(root) = env::var("M3_04_CRASH_RUN_ROOT") {
         let root = PathBuf::from(root);

@@ -1,5 +1,12 @@
 use std::{
-    ffi::OsString, fmt, io::Write, num::NonZeroU64, path::Path, process::exit, time::Instant,
+    ffi::OsString,
+    fmt,
+    io::Write,
+    num::NonZeroU64,
+    path::Path,
+    process::exit,
+    sync::{Arc, atomic::AtomicBool},
+    time::Instant,
 };
 
 use clap::{Arg, ArgAction, Command};
@@ -906,7 +913,11 @@ pub(crate) fn run() {
                 exit_invalid_arguments(json);
             };
             let result = if matches.subcommand_name() == Some("resume") {
-                ExecutionBackend::resume(workdir, run_id)
+                ExecutionBackend::resume_cancellable(
+                    workdir,
+                    run_id,
+                    Arc::new(AtomicBool::new(false)),
+                )
             } else {
                 ExecutionBackend::inspect(workdir, run_id)
             };
