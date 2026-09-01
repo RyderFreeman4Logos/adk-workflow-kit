@@ -1065,10 +1065,6 @@ impl SkillPackage {
             scripts,
             resources,
         };
-        let activation = activate_skill(&package, &package.id, &package.version)
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
-        SkillRuntimeManifest::parse_for_activation(&activation, &runtime_bytes)
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
         Ok(package)
     }
 
@@ -3300,6 +3296,7 @@ struct RunSkillScriptInput {
 
 struct SkillToolHandler {
     action: SkillToolAction,
+    activated_skills: Arc<Mutex<BTreeSet<(String, String)>>>,
     packages: BTreeMap<String, Arc<SkillPackage>>,
     plan: ResolvedRuntimePlan,
     provenance: ToolProvenance,
@@ -3342,16 +3339,31 @@ impl ToolHandler for SkillToolHandler {
         {
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
         }
+        let activation_key = (context.actor().to_owned(), skill_name);
+        if !matches!(self.action, SkillToolAction::Activate)
+            && !self
+                .activated_skills
+                .lock()
+                .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?
+                .contains(&activation_key)
+        {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
+        }
         let payload = match self.action {
             SkillToolAction::Activate => {
                 let activation = activate_skill(skill_id.as_ref(), &skill_id.id, &skill_id.version)
                     .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
-                json!({
+                let payload = json!({
                     "skill_id": activation.id().as_str(),
                     "version": activation.version(),
                     "instructions_ref": format!("sha256:{:x}", Sha256::digest(activation.instructions())),
                     "instructions": activation.instructions(),
-                })
+                });
+                self.activated_skills
+                    .lock()
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?
+                    .insert(activation_key);
+                payload
             }
             SkillToolAction::Read => {
                 let input = serde_json::from_value::<ReadSkillResourceInput>(arguments.clone())
@@ -3446,6 +3458,7 @@ fn build_tool_registry(
     }
     let packages = profile.skill_packages()?;
     if !packages.is_empty() {
+        let activated_skills = Arc::new(Mutex::new(BTreeSet::new()));
         let script_capabilities = packages
             .values()
             .flat_map(|package| package.capabilities())
@@ -3483,6 +3496,7 @@ fn build_tool_registry(
                     registration,
                     SkillToolHandler {
                         action,
+                        activated_skills: Arc::clone(&activated_skills),
                         packages: packages.clone(),
                         plan: plan.clone(),
                         provenance,

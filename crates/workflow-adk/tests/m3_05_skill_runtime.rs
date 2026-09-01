@@ -356,6 +356,29 @@ fn skill_tool_unknown_fields_fail_before_effect() {
 }
 
 #[test]
+fn skill_instructions_are_not_loaded_before_activate() {
+    let root = root();
+    let package = skill_package(&root);
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let mut value = serde_json::to_value(profile(&package)).unwrap();
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"read","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/guide.txt","offset":0,"limit":64}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"must_not":"run"}})).unwrap()
+    ]);
+    let profile = ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let error = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::AuthorizationDenied);
+    assert!(
+        !fs::read_to_string(error.receipt().unwrap().run_root().join("events.jsonl"))
+            .unwrap()
+            .contains("# Instructions")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn run_skill_script_is_not_read_only_when_script_declares_effects() {
     let root = root();
     let package = skill_package(&root);
