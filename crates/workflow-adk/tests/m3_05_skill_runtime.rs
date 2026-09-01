@@ -819,12 +819,8 @@ fn crashed_skill_admission_or_activation_resumes_without_widening() {
     let baseline_package = skill_package(&baseline_root);
     let baseline_workflow = baseline_root.join("workflow.toml");
     fs::write(&baseline_workflow, WORKFLOW).unwrap();
-    let baseline_digest_path = baseline_root.join("model-contents-digest");
     unsafe {
-        env::set_var(
-            "WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST",
-            &baseline_digest_path,
-        );
+        env::set_var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST", "1");
     }
     let baseline = ExecutionBackend::run(
         &baseline_workflow,
@@ -836,7 +832,8 @@ fn crashed_skill_admission_or_activation_resumes_without_widening() {
     unsafe {
         env::remove_var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST");
     }
-    let baseline_digest = fs::read_to_string(&baseline_digest_path).unwrap();
+    let baseline_digest =
+        fs::read_to_string(baseline.run_root().join("model-contents-digest")).unwrap();
     assert_eq!(baseline.status(), "succeeded");
     cleanup_test_root(&baseline_root);
     fs::remove_dir_all(baseline_root).expect("baseline cleanup");
@@ -849,7 +846,6 @@ fn crashed_skill_admission_or_activation_resumes_without_widening() {
     ] {
         let root = root();
         skill_package(&root);
-        let digest_path = root.join("model-contents-digest");
         let status = Command::new(env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -858,7 +854,7 @@ fn crashed_skill_admission_or_activation_resumes_without_widening() {
             ])
             .env("M3_05_SKILL_CRASH_RUN_ROOT", &root)
             .env("WORKFLOW_KIT_TEST_CRASH_BARRIER", barrier)
-            .env("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST", &digest_path)
+            .env("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST", "1")
             .status()
             .unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL), "{barrier}");
@@ -868,10 +864,11 @@ fn crashed_skill_admission_or_activation_resumes_without_widening() {
             .map(|entry| entry.path())
             .find(|path| path.join("run-manifest.json").is_file())
             .unwrap();
+        let digest_path = run_root.join("model-contents-digest");
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
         unsafe {
-            env::set_var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST", &digest_path);
+            env::set_var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST", "1");
         }
         let resumed =
             ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap();

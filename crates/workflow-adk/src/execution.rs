@@ -905,8 +905,11 @@ fn ledger_checkpoint_identity(
 }
 
 #[cfg(debug_assertions)]
-fn model_contents_test_digest(request: &adk_rust::LlmRequest) {
-    let Ok(path) = std::env::var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST") else {
+fn model_contents_test_digest(request: &adk_rust::LlmRequest, ledger_path: &Path) {
+    if std::env::var_os("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST").is_none() {
+        return;
+    }
+    let Some(root) = ledger_path.parent() else {
         return;
     };
     let transcript = request
@@ -923,11 +926,14 @@ fn model_contents_test_digest(request: &adk_rust::LlmRequest) {
     let Ok(contents) = serde_json::to_vec(&transcript) else {
         return;
     };
-    let _ = fs::write(path, format!("sha256:{:x}", Sha256::digest(contents)));
+    let _ = fs::write(
+        root.join("model-contents-digest"),
+        format!("sha256:{:x}", Sha256::digest(contents)),
+    );
 }
 
 #[cfg(not(debug_assertions))]
-fn model_contents_test_digest(_: &adk_rust::LlmRequest) {}
+fn model_contents_test_digest(_: &adk_rust::LlmRequest, _: &Path) {}
 
 struct LoopController {
     limits: RunLimits,
@@ -1009,7 +1015,7 @@ impl LoopController {
             request.contents = state.conversation.clone();
             request.previous_response_id = state.previous_response_id.clone();
         }
-        model_contents_test_digest(&request);
+        model_contents_test_digest(&request, &self.ledger.path);
         Ok(request)
     }
 
