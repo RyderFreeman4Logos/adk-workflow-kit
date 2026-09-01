@@ -239,6 +239,36 @@ fn resume_profile(package: &std::path::Path) -> ExecutionProfileV1 {
     ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
 }
 
+fn large_read_profile(
+    package: &std::path::Path,
+    page_bytes: u64,
+    read_count: u64,
+) -> ExecutionProfileV1 {
+    let mut value = serde_json::to_value(profile(package)).unwrap();
+    value["loop_policy"] = json!({
+        "schema_version": 1,
+        "max_model_iterations": 4,
+        "max_total_tool_calls": 3,
+        "max_tool_calls_per_tool": 3,
+        "wall_time_ms": 1_000,
+        "idle_time_ms": 1_000,
+        "tool_time_ms": 1_000,
+        "max_tool_output_bytes": 262_144
+    });
+    let mut responses = vec![
+        json!({"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]}),
+        json!({"calls": [{"id":"read-0","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/guide.txt","offset":0,"limit":page_bytes}}]}),
+    ];
+    if read_count == 2 {
+        responses.push(json!({"calls": [{"id":"read-1","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/guide.txt","offset":page_bytes,"limit":page_bytes}}]}));
+    }
+    responses.push(json!(
+        serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
+    ));
+    value["model"]["responses"] = json!(responses);
+    ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
+}
+
 fn script_only_profile(package: &std::path::Path) -> ExecutionProfileV1 {
     let mut value = serde_json::to_value(profile(package)).unwrap();
     value["model"]["responses"] = json!([
@@ -890,6 +920,89 @@ fn crashed_skill_admission_or_activation_resumes_without_widening() {
         let ledger: serde_json::Value =
             serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
         assert_paired_skill_transcript(&ledger);
+        cleanup_test_root(&root);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+}
+
+#[test]
+fn completed_skill_resource_reads_resume_without_recharging_budget() {
+    if let Ok(root) = env::var("M3_05_LARGE_READ_CRASH_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let page_bytes = env::var("M3_05_LARGE_READ_BYTES").unwrap().parse().unwrap();
+        let read_count = env::var("M3_05_LARGE_READ_COUNT").unwrap().parse().unwrap();
+        match ExecutionBackend::run(
+            &workflow,
+            large_read_profile(&root.join("code-investigation"), page_bytes, read_count),
+            json!({}),
+            root,
+        ) {
+            Ok(_) => panic!("crash barrier did not terminate the child"),
+            Err(error) => panic!("crash barrier was not reached: {:?}", error.kind()),
+        }
+    }
+
+    for (page_bytes, read_count) in [(40 * 1_024, 1), (32 * 1_024, 2)] {
+        let root = root();
+        let package = skill_package(&root);
+        let charged_bytes = page_bytes * read_count;
+        let guide = vec![b'x'; charged_bytes];
+        fs::write(package.join("assets/guide.txt"), &guide).unwrap();
+        let runtime_path = package.join("skill.runtime.toml");
+        fs::write(
+            &runtime_path,
+            format!(
+                "schema_version = 1\n\
+                 [skill]\n\
+                 id = \"code-investigation\"\n\
+                 version = \"1\"\n\
+                 [[resources]]\n\
+                 id = \"assets/guide.txt\"\n\
+                 sha256 = \"{}\"\n",
+                digest(&guide),
+            ),
+        )
+        .unwrap();
+        let status = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "completed_skill_resource_reads_resume_without_recharging_budget",
+                "--nocapture",
+            ])
+            .env("M3_05_LARGE_READ_CRASH_ROOT", &root)
+            .env("M3_05_LARGE_READ_BYTES", page_bytes.to_string())
+            .env("M3_05_LARGE_READ_COUNT", read_count.to_string())
+            .env(
+                "WORKFLOW_KIT_TEST_CRASH_BARRIER",
+                if read_count == 1 {
+                    "after-skill-call-completion-read_skill_resource"
+                } else {
+                    "after-skill-call-completion-read_skill_resource#2"
+                },
+            )
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{charged_bytes}");
+        let run_root = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.join("run-manifest.json").is_file())
+            .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+        let resumed =
+            ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap();
+        assert_eq!(resumed.status(), "succeeded", "{charged_bytes}");
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
+        assert_eq!(
+            ledger["nodes"]["work"]["skill_resource_read_bytes"]["code-investigation"],
+            charged_bytes,
+            "completed read must not be charged twice"
+        );
         cleanup_test_root(&root);
         fs::remove_dir_all(root).expect("test cleanup");
     }

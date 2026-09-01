@@ -61,6 +61,8 @@ const LOOP_LEDGER_FILE: &str = "loop-ledger.json";
 const SKILL_SNAPSHOT_FILE: &str = "sealed-skill-snapshot.json";
 const LOOP_LEDGER_DIGEST_KEY: &str = "kit_loop_ledger_digest_v1";
 static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
+#[cfg(debug_assertions)]
+static CRASH_BARRIER_HITS: AtomicU64 = AtomicU64::new(0);
 type BoundTool = (Vec<String>, Arc<AdkToolBridge<InMemoryArtifactStore>>);
 type CompletedToolResponse = (String, String, String, String, Value);
 
@@ -3640,11 +3642,15 @@ impl ExecutionBackend {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        if let Err(error) = restore_completed_skill_calls(&loop_ledger, &toolsets, &effect_fence)
-            .and_then(|()| {
-                replay_pending_tools(&loop_ledger, &toolsets, profile.run_limits(), &effect_fence)
-            })
-        {
+        if let Err(error) = restore_completed_skill_calls(
+            &loop_ledger,
+            &toolsets,
+            &profile.skill_packages()?,
+            &effect_fence,
+        )
+        .and_then(|()| {
+            replay_pending_tools(&loop_ledger, &toolsets, profile.run_limits(), &effect_fence)
+        }) {
             return Err(resume_failure(
                 &root,
                 &events_path,
@@ -4364,6 +4370,7 @@ fn invoke_restored_tool(
 fn restore_completed_skill_calls(
     ledger: &LoopLedgerStore,
     toolsets: &BTreeMap<String, Option<BoundTool>>,
+    packages: &BTreeMap<String, Arc<SkillPackage>>,
     effect_fence: &EffectFence,
 ) -> Result<(), ExecutionError> {
     for (node, completed) in ledger.completed_skill_calls()? {
@@ -4375,7 +4382,30 @@ fn restore_completed_skill_calls(
             .and_then(Option::as_ref)
             .map(|(_, toolset)| Arc::clone(toolset))
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let response = invoke_restored_tool(&node, &completed, toolset, effect_fence)?;
+        let response = if completed.name == "read_skill_resource" {
+            let input = serde_json::from_value::<ReadSkillResourceInput>(completed.args.clone())
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+            let resource_id = SkillResourceId::new(&input.resource_id)
+                .ok()
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+            packages
+                .get(&input.skill_id)
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+                .read_resource(
+                    &resource_id,
+                    PageRequest::new(
+                        input.offset,
+                        NonZeroU64::new(input.limit).ok_or_else(|| {
+                            ExecutionError::new(ExecutionErrorKind::InvalidRunState)
+                        })?,
+                    ),
+                    NonZeroU64::new(SKILL_RESOURCE_READ_LIMIT)
+                        .expect("positive resource read limit"),
+                )
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+        } else {
+            invoke_restored_tool(&node, &completed, toolset, effect_fence)?
+        };
         ledger.restore_completed_skill_call(&node, &completed, response)?;
     }
     Ok(())
@@ -4487,7 +4517,12 @@ impl ToolHandler for StaticToolHandler {
 
 fn crash_barrier(name: &str) {
     let configured = std::env::var("WORKFLOW_KIT_TEST_CRASH_BARRIER").ok();
-    if configured.as_deref() != Some(name) {
+    let (configured, hit) = configured
+        .as_deref()
+        .and_then(|value| value.rsplit_once('#'))
+        .and_then(|(value, hit)| hit.parse::<u64>().ok().map(|hit| (value, hit)))
+        .unwrap_or((configured.as_deref().unwrap_or_default(), 1));
+    if configured != name || CRASH_BARRIER_HITS.fetch_add(1, Ordering::Relaxed) + 1 != hit {
         return;
     }
     #[cfg(unix)]
