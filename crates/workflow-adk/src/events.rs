@@ -244,8 +244,17 @@ impl AdkEventMapper {
             let encoded = serde_json::to_vec(&output).map_err(|_| {
                 AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
             })?;
-            if encoded.len() > MAX_INLINE_STRUCTURED_OUTPUT_BYTES {
-                if observation.artifact_reference.is_none() {
+            if (observation.kind == AdkRuntimeObservationKindV1::ToolCompleted
+                && output.as_array().is_some_and(|results| {
+                    results.iter().any(|result| {
+                        result.get("tool_name").and_then(Value::as_str) == Some("run_skill_script")
+                    })
+                }))
+                || encoded.len() > MAX_INLINE_STRUCTURED_OUTPUT_BYTES
+            {
+                if encoded.len() > MAX_INLINE_STRUCTURED_OUTPUT_BYTES
+                    && observation.artifact_reference.is_none()
+                {
                     return Err(AdkEventMappingError::new(
                         AdkEventMappingErrorKind::LargePayloadMissingArtifact,
                     ));

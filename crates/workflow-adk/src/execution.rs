@@ -69,11 +69,13 @@ struct LoopState {
     tool_calls: BTreeMap<String, u64>,
     seen_ids: BTreeSet<String>,
     seen_calls: BTreeSet<(String, String)>,
+    #[serde(skip_serializing, default)]
     conversation: Vec<adk_rust::Content>,
     previous_response_id: Option<String>,
     pending_calls: VecDeque<PendingCall>,
     #[serde(default)]
     finish_admitted: bool,
+    #[serde(skip_serializing, default)]
     finished_output: Option<Value>,
 }
 
@@ -82,6 +84,7 @@ struct LoopState {
 struct PendingCall {
     id: String,
     name: String,
+    #[serde(skip_serializing, default)]
     args: Value,
     fingerprint: String,
 }
@@ -1315,6 +1318,13 @@ impl ExecutionProfileV1 {
         Ok(profile)
     }
 
+    fn durable_projection(&self) -> Value {
+        json!({
+            "schema_version": self.schema_version,
+            "profile_identity": self.profile_identity(),
+        })
+    }
+
     fn tool_wires(&self) -> impl Iterator<Item = &ToolWire> {
         self.tool.iter().chain(&self.tools)
     }
@@ -2254,7 +2264,11 @@ impl ExecutionBackend {
         if workflow_source
             .as_deref()
             .is_none_or(|source| write_atomic(&run_root.join("workflow.toml"), source).is_err())
-            || write_json(&run_root.join("execution-profile.json"), &profile).is_err()
+            || write_json(
+                &run_root.join("execution-profile.json"),
+                &profile.durable_projection(),
+            )
+            .is_err()
             || write_json(&run_root.join("execution-input.json"), &input).is_err()
         {
             persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));

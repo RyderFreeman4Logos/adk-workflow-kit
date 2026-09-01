@@ -415,3 +415,45 @@ fn selected_script_id_not_lexicographic_first_is_executed() {
     assert_eq!(receipt.status(), "succeeded");
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn durable_surfaces_omit_paths_raw_args_and_stdout() {
+    let root = root();
+    let package = skill_package(&root);
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let mut value = serde_json::to_value(profile(&package)).unwrap();
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+        {"calls": [{"id":"run","name":"run_skill_script","args":{"skill_id":"code-investigation","script_id":"answer","input":{"value":"raw-argument-marker"}}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
+    ]);
+    let profile = ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let receipt = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap();
+    let durable = [
+        "events.jsonl",
+        "loop-ledger.json",
+        "checkpoint-manifest.json",
+        "execution-profile.json",
+        "run-manifest.json",
+    ]
+    .into_iter()
+    .map(|name| fs::read(receipt.run_root().join(name)).unwrap())
+    .collect::<Vec<_>>();
+    for marker in [package.to_string_lossy().as_ref(), "raw-argument-marker"] {
+        assert!(
+            durable
+                .iter()
+                .all(|bytes| !String::from_utf8_lossy(bytes).contains(marker)),
+            "durable surface retained {marker}",
+        );
+    }
+    assert!(
+        durable
+            .iter()
+            .any(|bytes| String::from_utf8_lossy(bytes).contains(&digest(SCRIPT))),
+        "durable surfaces lost script identity",
+    );
+    let _ = fs::remove_dir_all(root);
+}
