@@ -782,6 +782,89 @@ fn admitted_script_call_is_bound_or_resume_fails_closed() {
     fs::remove_dir_all(root).expect("test cleanup");
 }
 
+#[test]
+fn package_replacements_between_validation_and_read_fail_closed() {
+    for replacement in ["leaf", "intermediate", "root"] {
+        let root = root();
+        let package = skill_package(&root);
+        let runtime_path = package.join("skill.runtime.toml");
+        let runtime = fs::read_to_string(&runtime_path).unwrap();
+        fs::write(package.join("scripts/replacement.bin"), SCRIPT).unwrap();
+        fs::write(
+            &runtime_path,
+            format!(
+                "{runtime}[[scripts]]\nid = \"replacement\"\npath = \"scripts/replacement.bin\"\nruntime = \"python3\"\nsha256 = \"{}\"\ninput_schema = \"references/schema.json\"\noutput_schema = \"references/schema.json\"\ncapabilities = [\"filesystem.read\", \"process.spawn\", \"limit.output_bytes\"]\n",
+                digest(SCRIPT),
+            ),
+        )
+        .unwrap();
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let profile = profile(&package);
+        let barrier = root.join("replacement-barrier");
+        fs::create_dir(&barrier).unwrap();
+        let replacement_root = root.clone();
+        let replacement_package = package.clone();
+        let replacement_worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !replacement_root.join("replacement-barrier/ready").is_file()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(replacement_root.join("replacement-barrier/ready").is_file());
+            match replacement {
+                "leaf" => {
+                    fs::rename(
+                        replacement_package.join("scripts/replacement.bin"),
+                        replacement_package.join("scripts/replacement-original.bin"),
+                    )
+                    .unwrap();
+                    fs::write(replacement_package.join("scripts/replacement.bin"), SCRIPT).unwrap();
+                }
+                "intermediate" => {
+                    fs::rename(
+                        replacement_package.join("scripts"),
+                        replacement_package.join("scripts-original"),
+                    )
+                    .unwrap();
+                    fs::create_dir(replacement_package.join("scripts")).unwrap();
+                    fs::write(replacement_package.join("scripts/content.bin"), SCRIPT).unwrap();
+                    fs::write(replacement_package.join("scripts/replacement.bin"), SCRIPT).unwrap();
+                }
+                "root" => {
+                    let displaced = replacement_root.join("displaced-package");
+                    fs::rename(&replacement_package, &displaced).unwrap();
+                    fs::create_dir(&replacement_package).unwrap();
+                    fs::create_dir(replacement_package.join("scripts")).unwrap();
+                    fs::write(replacement_package.join("scripts/replacement.bin"), SCRIPT).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            fs::write(
+                replacement_root.join("replacement-barrier/continue"),
+                b"continue",
+            )
+            .unwrap();
+        });
+        unsafe {
+            env::set_var("WORKFLOW_KIT_TEST_PACKAGE_FILE_BARRIER", &barrier);
+        }
+        let error = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap_err();
+        unsafe {
+            env::remove_var("WORKFLOW_KIT_TEST_PACKAGE_FILE_BARRIER");
+        }
+        replacement_worker.join().unwrap();
+        assert_eq!(
+            error.kind(),
+            ExecutionErrorKind::ImplementationBinding,
+            "{replacement}"
+        );
+        cleanup_test_root(&root);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn package_file_symlinks_fail_closed_before_effect() {

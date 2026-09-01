@@ -1435,6 +1435,27 @@ fn package_directory_identity(path: &Path) -> Result<PackageIdentity, ExecutionE
     })
 }
 
+#[cfg(debug_assertions)]
+fn package_file_test_barrier(relative: &str) {
+    if relative != "scripts/replacement.bin" {
+        return;
+    }
+    let Ok(root) = std::env::var("WORKFLOW_KIT_TEST_PACKAGE_FILE_BARRIER") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    if fs::write(root.join("ready"), b"ready").is_err() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !root.join("continue").is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn package_file_test_barrier(_: &str) {}
+
 fn package_file(
     root: &Path,
     root_identity: PackageIdentity,
@@ -1476,6 +1497,7 @@ fn package_file(
             ExecutionErrorKind::ImplementationBinding,
         ));
     }
+    package_file_test_barrier(relative);
     let bytes = fs::read(&path)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
     if checked.into_iter().all(|(path, identity)| {
