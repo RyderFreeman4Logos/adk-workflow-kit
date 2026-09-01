@@ -366,6 +366,71 @@ fn activate_and_read_deliver_bounded_content_to_agent() {
 }
 
 #[test]
+fn concurrent_skill_resource_reads_reserve_budget_before_delivery() {
+    let root = root();
+    let package = skill_package(&root);
+    let first = format!("first-resource-canary{}", "a".repeat(40 * 1_024));
+    let second = format!("second-resource-canary{}", "b".repeat(40 * 1_024));
+    fs::write(package.join("assets/first.txt"), &first).unwrap();
+    fs::write(package.join("assets/second.txt"), &second).unwrap();
+    fs::write(
+        package.join("skill.runtime.toml"),
+        format!(
+            "schema_version = 1\n\
+             [skill]\n\
+             id = \"code-investigation\"\n\
+             version = \"1\"\n\
+             [[resources]]\n\
+             id = \"assets/first.txt\"\n\
+             sha256 = \"{}\"\n\
+             [[resources]]\n\
+             id = \"assets/second.txt\"\n\
+             sha256 = \"{}\"\n",
+            digest(first.as_bytes()),
+            digest(second.as_bytes()),
+        ),
+    )
+    .unwrap();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let mut value = serde_json::to_value(profile(&package)).unwrap();
+    value["loop_policy"] = json!({
+        "schema_version": 1,
+        "max_model_iterations": 3,
+        "max_total_tool_calls": 3,
+        "max_tool_calls_per_tool": 3,
+        "wall_time_ms": 1_000,
+        "idle_time_ms": 1_000,
+        "tool_time_ms": 1_000,
+        "max_tool_output_bytes": 262_144
+    });
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+        {"calls": [
+            {"id":"read-first","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/first.txt","offset":0,"limit":first.len()}},
+            {"id":"read-second","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/second.txt","offset":0,"limit":second.len()}}
+        ]}
+    ]);
+
+    let error = ExecutionBackend::run(
+        &workflow,
+        ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap(),
+        json!({}),
+        &root,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::Tool);
+    let events =
+        fs::read_to_string(error.receipt().unwrap().run_root().join("events.jsonl")).unwrap();
+    assert!(
+        !events.contains("first-resource-canary") || !events.contains("second-resource-canary"),
+        "both over-budget resource pages reached the delivery surface"
+    );
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
 fn read_skill_resource_enforces_one_budget_per_activation() {
     let root = root();
     let package = skill_package(&root);

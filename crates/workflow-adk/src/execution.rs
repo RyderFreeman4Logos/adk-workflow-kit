@@ -422,19 +422,14 @@ impl LoopLedgerStore {
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
             let page_bytes = skill_page_byte_len(&response)
                 .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-            let total = state
+            let reserved = state
                 .skill_resource_read_bytes
                 .get(&input.skill_id)
                 .copied()
-                .unwrap_or_default()
-                .checked_add(page_bytes)
-                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Tool))?;
-            if total > SKILL_RESOURCE_READ_LIMIT {
-                return Err(ExecutionError::new(ExecutionErrorKind::Tool));
+                .unwrap_or_default();
+            if reserved < page_bytes {
+                return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
             }
-            state
-                .skill_resource_read_bytes
-                .insert(input.skill_id, total);
         }
         state
             .conversation
@@ -574,6 +569,39 @@ impl LoopLedgerStore {
                     .get(node)
                     .is_some_and(|state| state.activated_skills.contains(skill))
             })
+    }
+
+    fn reserve_skill_resource_read(
+        &self,
+        node: &str,
+        skill: &str,
+        page_bytes: u64,
+    ) -> Result<u64, ExecutionError> {
+        let mut nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let total = {
+            let state = nodes
+                .get_mut(node)
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+            let total = state
+                .skill_resource_read_bytes
+                .get(skill)
+                .copied()
+                .unwrap_or_default()
+                .checked_add(page_bytes)
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Tool))?;
+            if total > SKILL_RESOURCE_READ_LIMIT {
+                return Err(ExecutionError::new(ExecutionErrorKind::Tool));
+            }
+            state
+                .skill_resource_read_bytes
+                .insert(skill.to_owned(), total);
+            total
+        };
+        self.persist_locked(&nodes)?;
+        Ok(total)
     }
 
     fn skill_resource_read_bytes(&self, node: &str, skill: &str) -> Result<u64, ExecutionError> {
@@ -1162,19 +1190,16 @@ impl LoopController {
         if name == "read_skill_resource" {
             let input = serde_json::from_value::<ReadSkillResourceInput>(input.clone())
                 .map_err(|_| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
-            let page_bytes = skill_page_byte_len(response)
+            skill_page_byte_len(response)
                 .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
-            let total = next
-                .skill_resource_read_bytes
-                .get(&input.skill_id)
-                .copied()
-                .unwrap_or_default()
-                .checked_add(page_bytes)
-                .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
-            if total > SKILL_RESOURCE_READ_LIMIT {
-                return Err(self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"));
-            }
-            next.skill_resource_read_bytes.insert(input.skill_id, total);
+            let reserved = self
+                .ledger
+                .skill_resource_read_bytes(&self.node, &input.skill_id)
+                .map_err(|_| {
+                    self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable")
+                })?;
+            next.skill_resource_read_bytes
+                .insert(input.skill_id, reserved);
         }
         let completion_barrier = match name {
             "activate_skill" => Some("after-skill-call-completion-activate_skill"),
@@ -4206,19 +4231,20 @@ impl ToolHandler for SkillToolHandler {
                     .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
                 let limit = NonZeroU64::new(input.limit)
                     .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
-                let consumed = self
-                    .ledger
-                    .skill_resource_read_bytes(context.actor(), &skill_name)
-                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
-                let remaining = SKILL_RESOURCE_READ_LIMIT
-                    .checked_sub(consumed)
-                    .and_then(NonZeroU64::new)
-                    .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
-                skill_id.read_resource(
+                let payload = skill_id.read_resource(
                     &resource_id,
                     PageRequest::new(input.offset, limit),
-                    remaining,
-                )?
+                    NonZeroU64::new(SKILL_RESOURCE_READ_LIMIT)
+                        .expect("positive resource read limit"),
+                )?;
+                let page_bytes = payload
+                    .get("page_byte_len")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                self.ledger
+                    .reserve_skill_resource_read(context.actor(), &skill_name, page_bytes)
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                payload
             }
             SkillToolAction::Run => {
                 let input = serde_json::from_value::<RunSkillScriptInput>(arguments.clone())
@@ -4938,6 +4964,32 @@ mod execution_registry_tests {
             ledger.snapshot("left").unwrap().tool_output_bytes
                 + ledger.snapshot("right").unwrap().tool_output_bytes,
             5
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn same_activation_resource_read_reservations_are_atomic() {
+        let (root, ledger) = fanout_ledger();
+        let barrier = Arc::new(Barrier::new(2));
+        let outcomes = std::thread::scope(|scope| {
+            let reserve = || {
+                let barrier = Arc::clone(&barrier);
+                let ledger = Arc::clone(&ledger);
+                scope.spawn(move || {
+                    barrier.wait();
+                    ledger.reserve_skill_resource_read("left", "skill", 40 * 1_024)
+                })
+            };
+            let first = reserve();
+            let second = reserve();
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            ledger.snapshot("left").unwrap().skill_resource_read_bytes["skill"],
+            40 * 1_024
         );
         fs::remove_dir_all(root).unwrap();
     }
