@@ -6,6 +6,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use rusqlite::Connection;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use workflow_adk::execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1};
@@ -22,6 +23,26 @@ entry = "work"
 id = "work"
 kind = "agent"
 model = { role = "worker", id = "worker", version = "1" }
+skills = [{ id = "code-investigation", version = "1" }]
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "work"
+to = "done"
+"#;
+
+const MIXED_WORKFLOW: &str = r#"
+schema_version = 1
+[workflow]
+id = "mixed-skill-tools"
+version = "1"
+entry = "work"
+[[nodes]]
+id = "work"
+kind = "agent"
+model = { role = "worker", id = "worker", version = "1" }
+tools = [{ id = "search_code", version = "1" }]
 skills = [{ id = "code-investigation", version = "1" }]
 [[nodes]]
 id = "done"
@@ -198,6 +219,29 @@ fn script_only_profile(package: &std::path::Path) -> ExecutionProfileV1 {
     let mut value = serde_json::to_value(profile(package)).unwrap();
     value["model"]["responses"] = json!([
         {"calls": [{"id":"run","name":"run_skill_script","args":{"skill_id":"code-investigation","script_id":"answer","input":{"value":"admitted-script-input-must-not-persist"}}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
+    ]);
+    ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
+}
+
+fn mixed_profile(package: &std::path::Path) -> ExecutionProfileV1 {
+    let mut value = serde_json::to_value(profile(package)).unwrap();
+    value["tools"] = json!([{
+        "name": "search_code",
+        "result": {"found": true},
+        "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": false
+        }
+    }]);
+    value["model"]["responses"] = json!([
+        {"calls": [
+            {"id":"ordinary","name":"search_code","args":{"query":"must-not-persist"}},
+            {"id":"skill","name":"run_skill_script","args":{"skill_id":"code-investigation","script_id":"answer","input":{"value":"must-not-run"}}}
+        ]},
         serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
     ]);
     ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
@@ -778,6 +822,98 @@ fn admitted_script_call_is_bound_or_resume_fails_closed() {
         serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
     let error = ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
+fn changed_skill_sandbox_capabilities_reject_crash_resume_before_effect() {
+    if let Ok(root) = env::var("M3_05_SANDBOX_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            &workflow,
+            script_only_profile(&root.join("code-investigation")),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let root = root();
+    skill_package(&root);
+    let status = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "changed_skill_sandbox_capabilities_reject_crash_resume_before_effect",
+            "--nocapture",
+        ])
+        .env("M3_05_SANDBOX_CRASH_RUN_ROOT", &root)
+        .env(
+            "WORKFLOW_KIT_TEST_CRASH_BARRIER",
+            "after-skill-call-admission",
+        )
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    let run_root = fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("run-manifest.json").is_file())
+        .unwrap();
+    let profile_path = run_root.join("execution-profile.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&profile_path).unwrap()).unwrap();
+    stored["sandbox"]["capabilities"] = json!([
+        "filesystem.read",
+        "network",
+        "process.spawn",
+        "limit.output_bytes"
+    ]);
+    fs::write(&profile_path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+    let error = ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(
+        Connection::open(run_root.join("effects.sqlite"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM kit_effects", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
+fn mixed_ordinary_and_skill_calls_fail_before_effect_when_not_durable() {
+    let root = root();
+    let package = skill_package(&root);
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, MIXED_WORKFLOW).unwrap();
+
+    let error =
+        ExecutionBackend::run(&workflow, mixed_profile(&package), json!({}), &root).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::Persistence);
+    let run_root = error.receipt().unwrap().run_root();
+    assert_eq!(
+        Connection::open(run_root.join("effects.sqlite"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM kit_effects", [], |row| row
+                .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(
+        !fs::read_to_string(run_root.join("loop-ledger.json"))
+            .unwrap()
+            .contains("ordinary")
+    );
     cleanup_test_root(&root);
     fs::remove_dir_all(root).expect("test cleanup");
 }

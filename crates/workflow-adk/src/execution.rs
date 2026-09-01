@@ -372,7 +372,7 @@ impl LoopLedgerStore {
                     .any(|call| durable_pending_args(call).is_none())
             })
         {
-            return Ok(());
+            return Err(ExecutionError::new(ExecutionErrorKind::Persistence));
         }
         let mut durable_nodes = nodes.clone();
         if !self.persist_raw_loop_state {
@@ -493,7 +493,8 @@ fn durable_pending_args(call: &PendingCall) -> Option<Value> {
     match call.name.as_str() {
         "activate_skill" => serde_json::from_value::<ActivateSkillInput>(call.args.clone())
             .ok()
-            .map(|input| json!({"skill_id": input.skill_id})),
+            .map(|input| json!({"skill_id": input.skill_id}))
+            .or_else(|| Some(json!({"invalid": true}))),
         "read_skill_resource" => {
             serde_json::from_value::<ReadSkillResourceInput>(call.args.clone())
                 .ok()
@@ -505,6 +506,7 @@ fn durable_pending_args(call: &PendingCall) -> Option<Value> {
                         "limit": input.limit,
                     })
                 })
+                .or_else(|| Some(json!({"invalid": true})))
         }
         "run_skill_script" => {
             if let Ok(input) = serde_json::from_value::<RunSkillScriptInput>(call.args.clone()) {
@@ -514,13 +516,16 @@ fn durable_pending_args(call: &PendingCall) -> Option<Value> {
                     "argument_fingerprint": call.fingerprint,
                 }));
             }
-            let args = call.args.as_object()?;
+            let Some(args) = call.args.as_object() else {
+                return Some(json!({"invalid": true}));
+            };
             (args.len() == 3
                 && args.get("skill_id").is_some_and(Value::is_string)
                 && args.get("script_id").is_some_and(Value::is_string)
                 && args.get("argument_fingerprint")
                     == Some(&Value::String(call.fingerprint.clone())))
             .then(|| call.args.clone())
+            .or_else(|| Some(json!({"invalid": true})))
         }
         _ => None,
     }
@@ -1781,12 +1786,14 @@ impl ExecutionProfileV1 {
     fn capabilities(
         &self,
     ) -> Result<(Vec<SandboxCapability>, Vec<SandboxCapability>), ExecutionError> {
-        let sandbox = self
+        let mut sandbox = self
             .sandbox
             .capabilities
             .iter()
             .map(|value| parse_capability(value))
             .collect::<Result<Vec<_>, _>>()?;
+        sandbox.sort_unstable_by_key(SandboxCapability::as_str);
+        sandbox.dedup();
         let mut required = self
             .tool_wires()
             .flat_map(|tool| tool.required_capabilities.iter())
@@ -3559,7 +3566,13 @@ fn build_checkpoint_manifest(
         &durable_profile["loop_policy"],
     ))
     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-    let effective_capabilities = plan.effective_capabilities().as_slice().join("\n");
+    let sandbox_capabilities = profile
+        .capabilities()?
+        .0
+        .iter()
+        .map(SandboxCapability::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut manifest = CheckpointManifestV1::new(run_id, workflow.0, workflow.1)
         .with_workflow_hash(workflow_hash.clone())
         .with_resource_hash("workflow.ir", workflow_hash)
@@ -3572,7 +3585,7 @@ fn build_checkpoint_manifest(
         )
         .with_sandbox_policy_hash(format!(
             "sha256:{:x}",
-            Sha256::digest(effective_capabilities.as_bytes())
+            Sha256::digest(sandbox_capabilities.as_bytes())
         ))
         .with_implementation("toolset", plan.resume_identity())
         .with_event_log_identity("workflow-runtime-events-v1");
