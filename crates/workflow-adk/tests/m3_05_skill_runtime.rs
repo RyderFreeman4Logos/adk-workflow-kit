@@ -1,6 +1,7 @@
 use std::{
     fs,
-    path::PathBuf,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -43,6 +44,17 @@ fn root() -> PathBuf {
     ));
     fs::create_dir(&root).unwrap();
     root
+}
+
+fn cleanup_test_root(path: &Path) {
+    let metadata = fs::symlink_metadata(path).expect("test root metadata");
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        for entry in fs::read_dir(path).expect("test root entries") {
+            cleanup_test_root(&entry.expect("test root entry").path());
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("test root directory unlock");
+    }
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -171,7 +183,8 @@ fn fake_model_activates_reads_and_runs_declared_skill() {
         assert!(events.contains(name), "missing {name} event");
         assert!(ledger.contains(name), "missing {name} ledger entry");
     }
-    let _ = fs::remove_dir_all(root);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
 }
 
 #[test]
@@ -185,7 +198,8 @@ fn activate_and_read_deliver_bounded_content_to_agent() {
     let events = fs::read_to_string(receipt.run_root().join("events.jsonl")).unwrap();
     assert!(events.contains("# Instructions"));
     assert!(events.contains("Declared guide"));
-    let _ = fs::remove_dir_all(root);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
 }
 
 #[test]
@@ -214,7 +228,8 @@ fn undeclared_skill_resource_or_capability_fails_before_effect() {
     let profile = ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
     let error = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::SandboxDenied);
-    let _ = fs::remove_dir_all(root);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
 }
 
 #[test]
@@ -258,7 +273,8 @@ fn child_sandbox_denies_widening_and_bounds_output() {
             .unwrap()
             .contains("tool_completed")
     );
-    let _ = fs::remove_dir_all(root);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
 }
 
 #[test]
@@ -301,7 +317,8 @@ fn changed_skill_content_rejects_resume() {
     .unwrap();
     let error = ExecutionBackend::resume(&root, receipt.run_id()).unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
-    let _ = fs::remove_dir_all(root);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
 }
 
 #[test]
@@ -329,7 +346,8 @@ fn node_skill_subset_denies_sibling_skill_before_effect() {
             .unwrap()
             .contains("skill_activated")
     );
-    let _ = fs::remove_dir_all(root);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
 }
 
 #[test]
@@ -352,7 +370,8 @@ fn skill_tool_unknown_fields_fail_before_effect() {
             .unwrap()
             .contains("skill_activated")
     );
-    let _ = fs::remove_dir_all(root);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
 }
 
 #[test]
@@ -375,7 +394,8 @@ fn skill_instructions_are_not_loaded_before_activate() {
             .unwrap()
             .contains("# Instructions")
     );
-    let _ = fs::remove_dir_all(root);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
 }
 
 #[test]
@@ -405,7 +425,8 @@ fn run_skill_script_is_not_read_only_when_script_declares_effects() {
 
     let error = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::AuthorizationDenied);
-    let _ = fs::remove_dir_all(root);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
 }
 
 #[test]
@@ -436,7 +457,8 @@ fn selected_script_id_not_lexicographic_first_is_executed() {
 
     let receipt = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap();
     assert_eq!(receipt.status(), "succeeded");
-    let _ = fs::remove_dir_all(root);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
 }
 
 #[test]
@@ -478,7 +500,8 @@ fn durable_surfaces_omit_paths_raw_args_and_stdout() {
             .any(|bytes| String::from_utf8_lossy(bytes).contains(&digest(SCRIPT))),
         "durable surfaces lost script identity",
     );
-    let _ = fs::remove_dir_all(root);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
 }
 
 #[test]
@@ -496,5 +519,6 @@ fn symlink_or_replaced_package_fails_closed_before_effect() {
 
     let error = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::ImplementationBinding);
-    let _ = fs::remove_dir_all(root);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
 }
