@@ -6,7 +6,7 @@ use std::{
     sync::Mutex,
 };
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -187,6 +187,28 @@ impl EffectJournal {
         let result = serde_json::from_slice(&stored)
             .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Corrupt))?;
         Ok(EffectCommit::AlreadyCommitted(result))
+    }
+
+    /// Loads a previously committed effect result without creating an effect.
+    pub fn load(&self, key: &EffectKey) -> Result<Option<Value>, EffectJournalError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Unavailable))?;
+        let stored = connection
+            .query_row(
+                "SELECT result_json FROM kit_effects WHERE effect_key = ?1",
+                [key.as_str()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Corrupt))?;
+        stored
+            .map(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Corrupt))
+            })
+            .transpose()
     }
 
     /// Returns the number of physically committed effects.

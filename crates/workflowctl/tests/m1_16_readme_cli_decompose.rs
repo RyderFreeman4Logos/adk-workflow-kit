@@ -45,7 +45,7 @@ fn documented_commands_smoke_the_real_adk_path() {
     .expect("write workflow");
     fs::write(
         &profile,
-        r#"{"schema_version":1,"model":{"provider":"fake","name":"docs","version":"1","model":"fake","responses":["done"]},"tool":{"name":"echo","result":{"ok":true},"required_capabilities":[]},"sandbox":{"capabilities":[]}}"#,
+        r#"{"schema_version":1,"model":{"provider":"fake","name":"docs","version":"1","model":"fake","responses":["{\"status\":\"finished\",\"output\":\"done\"}"]},"tool":{"name":"echo","result":{"ok":true},"input_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false},"required_capabilities":[]},"sandbox":{"capabilities":[]}}"#,
     )
     .expect("write profile");
     fs::create_dir(&workdir).expect("write workdir");

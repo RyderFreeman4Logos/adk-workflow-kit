@@ -428,6 +428,22 @@ impl ToolRegistration {
         })
     }
 
+    /// Replaces the generated input schema for a dynamically configured tool.
+    pub fn with_input_schema(mut self, schema: Value) -> Result<Self, ToolRegistrationError> {
+        self.input_schema = validate_schema(
+            schema,
+            ToolRegistrationError::InvalidInputSchema,
+            ToolRegistrationError::InputSchemaTooLarge,
+        )?;
+        self.implementation_digest = implementation_digest(
+            &self.name,
+            &self.provenance,
+            &self.input_schema,
+            &self.output_schema,
+        );
+        Ok(self)
+    }
+
     /// Returns the validated tool name.
     pub fn name(&self) -> &str {
         &self.name

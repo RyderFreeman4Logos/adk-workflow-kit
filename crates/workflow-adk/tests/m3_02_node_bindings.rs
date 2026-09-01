@@ -88,19 +88,27 @@ fn profile(with_tool: bool) -> ExecutionProfileV1 {
             "name": "worker-model",
             "version": "1",
             "model": "worker",
-            "responses": ["worker-response"]
+            "responses": ["{\"status\":\"finished\",\"output\":\"worker-response\"}"]
         },
         "reviewer_model": {
             "provider": "fake",
             "name": "reviewer-model",
             "version": "1",
             "model": "reviewer",
-            "responses": ["reviewer-response"]
+            "responses": ["{\"status\":\"finished\",\"output\":\"reviewer-response\"}"]
         },
         "sandbox": {"capabilities": []}
     });
     if with_tool {
-        profile["tool"] = json!({"name": "echo", "result": {"ok": true}});
+        profile["model"]["responses"] = json!([
+            {"calls":[{"id":"call-echo","name":"echo","args":{}}]},
+            "{\"status\":\"finished\",\"output\":\"worker-response\"}"
+        ]);
+        profile["tool"] = json!({
+            "name": "echo",
+            "result": {"ok": true},
+            "input_schema": {"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}
+        });
     }
     ExecutionProfileV1::parse(&serde_json::to_vec(&profile).expect("profile serializes"))
         .expect("profile parses")

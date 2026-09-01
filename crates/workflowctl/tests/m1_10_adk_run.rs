@@ -181,11 +181,15 @@ fn fake_profile() -> Value {
             "name": "worker",
             "version": "1",
             "model": "fixture-model",
-            "responses": ["model-ok"]
+            "responses": [
+                {"calls":[{"id":"call-echo","name":"echo","args":{}}]},
+                "{\"status\":\"finished\",\"output\":\"model-ok\"}"
+            ]
         },
         "tool": {
             "name": "echo",
             "result": {"echo": "tool-ok"},
+            "input_schema": {"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false},
             "required_capabilities": []
         },
         "sandbox": {"capabilities": []}
@@ -554,7 +558,7 @@ fn serve_oracle_request_until_child_done(
         }
     };
     let observation = read_model_request(&mut socket, deadline, canary)?;
-    let body = r#"{"choices":[{"message":{"role":"assistant","content":"oracle-ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+    let body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"status\":\"finished\",\"output\":\"oracle-ok\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
         body.len(),

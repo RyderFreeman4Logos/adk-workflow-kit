@@ -5,11 +5,12 @@
     "name": "m3-00-fake",
     "version": "1",
     "model": "fake-runtime",
-    "responses": ["runtime smoke complete"]
+    "responses": ["{\"status\":\"finished\",\"output\":\"runtime smoke complete\"}"]
   },
   "tool": {
     "name": "echo",
     "result": {"echo": "runtime smoke"},
+    "input_schema": {"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false},
     "required_capabilities": [],
     "required_scopes": []
   },

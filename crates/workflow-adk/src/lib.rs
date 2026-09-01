@@ -244,6 +244,14 @@ impl TerminalOutcome {
         match kind {
             ExecutionErrorKind::InvalidRunState => Self::IncompatibleResume,
             ExecutionErrorKind::AuthorizationDenied => Self::AuthorizationDenied,
+            ExecutionErrorKind::ModelIterationsLimit
+            | ExecutionErrorKind::TotalToolCallsLimit
+            | ExecutionErrorKind::ToolCallsPerToolLimit
+            | ExecutionErrorKind::ToolOutputBytesLimit => Self::LimitExceeded,
+            ExecutionErrorKind::WallTimeLimit
+            | ExecutionErrorKind::IdleTimeLimit
+            | ExecutionErrorKind::ToolTimeLimit => Self::TimedOut,
+            ExecutionErrorKind::Cancelled => Self::Cancelled,
             _ => Self::Failed,
         }
     }
@@ -313,6 +321,15 @@ pub enum AdkGraphError {
     VisitBound { max_visits: usize },
     Observation(events::AdkEventMappingErrorKind),
     AuthorizationDenied,
+    ModelIterationsLimit,
+    TotalToolCallsLimit,
+    ToolCallsPerToolLimit,
+    ToolOutputBytesLimit,
+    WallTimeLimit,
+    IdleTimeLimit,
+    ToolTimeLimit,
+    Cancelled,
+    ToolFailed,
     InvalidOutput { node: String },
     Failed,
 }
@@ -334,6 +351,15 @@ impl fmt::Display for AdkGraphError {
             }
             Self::Observation(_) => write!(f, "ADK event observation failed"),
             Self::AuthorizationDenied => write!(f, "authorization denied"),
+            Self::ModelIterationsLimit => write!(f, "model iteration limit exceeded"),
+            Self::TotalToolCallsLimit => write!(f, "total tool-call limit exceeded"),
+            Self::ToolCallsPerToolLimit => write!(f, "per-tool call limit exceeded"),
+            Self::ToolOutputBytesLimit => write!(f, "tool-output byte limit exceeded"),
+            Self::WallTimeLimit => write!(f, "wall-time limit exceeded"),
+            Self::IdleTimeLimit => write!(f, "idle-time limit exceeded"),
+            Self::ToolTimeLimit => write!(f, "tool-time limit exceeded"),
+            Self::Cancelled => write!(f, "execution cancelled"),
+            Self::ToolFailed => write!(f, "tool execution failed"),
             Self::InvalidOutput { node } => write!(f, "invalid output from node {node:?}"),
             Self::Failed => write!(f, "graph execution failed"),
         }
@@ -344,6 +370,38 @@ impl std::error::Error for AdkGraphError {}
 const IR_DEFAULT_KEY: &str = "__ir_default__";
 const UNKNOWN_ROUTE_ERROR_PREFIX: &str = "workflow unknown route selector: ";
 const UNKNOWN_ROUTE_NODE_PREFIX: &str = "__workflow_unknown_route_";
+
+fn terminal_graph_error(message: &str) -> Option<AdkGraphError> {
+    [
+        (
+            "tool.bridge.authorization_denied",
+            AdkGraphError::AuthorizationDenied,
+        ),
+        (
+            "workflow.loop.limit.model_iterations",
+            AdkGraphError::ModelIterationsLimit,
+        ),
+        (
+            "workflow.loop.limit.total_tool_calls",
+            AdkGraphError::TotalToolCallsLimit,
+        ),
+        (
+            "workflow.loop.limit.per_tool_calls",
+            AdkGraphError::ToolCallsPerToolLimit,
+        ),
+        (
+            "workflow.loop.limit.tool_output_bytes",
+            AdkGraphError::ToolOutputBytesLimit,
+        ),
+        ("workflow.loop.timeout.wall", AdkGraphError::WallTimeLimit),
+        ("workflow.loop.timeout.idle", AdkGraphError::IdleTimeLimit),
+        ("workflow.loop.timeout.tool", AdkGraphError::ToolTimeLimit),
+        ("workflow.loop.cancelled", AdkGraphError::Cancelled),
+        ("tool.bridge.failed", AdkGraphError::ToolFailed),
+    ]
+    .into_iter()
+    .find_map(|(marker, error)| message.contains(marker).then_some(error))
+}
 
 /// Explicit state input mapping owned by the adapter.
 #[derive(Clone, Copy, Debug, Default)]
@@ -478,16 +536,11 @@ impl AdkGraph {
         let mut stream = Box::pin(self.graph.stream(state, config, StreamMode::Custom));
         let mut output = None;
         while let Some(item) = stream.next().await {
-            match item.map_err(|error| {
-                if matches!(
-                    &error,
-                    GraphError::NodeExecutionFailed { message, .. }
-                        if message.contains("tool.bridge.authorization_denied")
-                ) {
-                    AdkGraphError::AuthorizationDenied
-                } else {
-                    AdkGraphError::Failed
+            match item.map_err(|error| match &error {
+                GraphError::NodeExecutionFailed { message, .. } => {
+                    terminal_graph_error(message).unwrap_or(AdkGraphError::Failed)
                 }
+                _ => AdkGraphError::Failed,
             })? {
                 StreamEvent::NodeStart { node, step } => {
                     mapper
@@ -525,6 +578,25 @@ impl AdkGraph {
                             events::AdkEventMappingErrorKind::InvalidObservation,
                         )
                     })?;
+                    let terminal_error = event
+                        .llm_response
+                        .error_code
+                        .as_deref()
+                        .into_iter()
+                        .chain(event.llm_response.error_message.as_deref())
+                        .find_map(terminal_graph_error)
+                        .or_else(|| {
+                            event.tool_results().iter().find_map(|result| {
+                                result
+                                    .response
+                                    .get("error")?
+                                    .as_str()
+                                    .and_then(terminal_graph_error)
+                            })
+                        });
+                    if let Some(error) = terminal_error {
+                        return Err(error);
+                    }
                     if event.content().is_none() {
                         return Err(AdkGraphError::InvalidOutput { node });
                     }
@@ -571,8 +643,8 @@ impl AdkGraph {
                         .map_err(|error| AdkGraphError::Observation(error.kind()))?;
                 }
                 StreamEvent::Error { message, node } => {
-                    if message.contains("tool.bridge.authorization_denied") {
-                        return Err(AdkGraphError::AuthorizationDenied);
+                    if let Some(error) = terminal_graph_error(&message) {
+                        return Err(error);
                     }
                     mapper
                         .map_stream_observation(

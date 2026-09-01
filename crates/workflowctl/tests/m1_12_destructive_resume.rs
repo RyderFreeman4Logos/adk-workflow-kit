@@ -56,9 +56,18 @@ fn profile(root: &Path) -> PathBuf {
     let path = root.join("profile.json");
     fs::write(
         &path,
-        br#"{"schema_version":1,"model":{"provider":"fake","name":"fake-model","version":"1","model":"fake","responses":["done"]},"tool":{"name":"send","result":{"accepted":true}},"sandbox":{"capabilities":[]}}"#,
+        br#"{"schema_version":1,"model":{"provider":"fake","name":"fake-model","version":"1","model":"fake","responses":[{"calls":[{"id":"call-send","name":"send","args":{"request":"public"}}]},"{\"status\":\"finished\",\"output\":\"done\"}","{\"status\":\"finished\",\"output\":\"done\"}"]},"tool":{"name":"send","result":{"accepted":true},"input_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"request":{"type":"string"}},"required":["request"],"additionalProperties":false}},"sandbox":{"capabilities":[]}}"#,
     )
     .expect("profile write");
+    path
+}
+
+fn delayed_profile(root: &Path, tool_delay_ms: u64) -> PathBuf {
+    let path = profile(root);
+    let mut profile: Value =
+        serde_json::from_slice(&fs::read(&path).expect("profile read")).expect("profile JSON");
+    profile["tool"]["delay_ms"] = Value::from(tool_delay_ms);
+    fs::write(&path, serde_json::to_vec(&profile).expect("profile JSON")).expect("profile write");
     path
 }
 
@@ -264,6 +273,57 @@ fn sigkill_matrix_resumes_in_fresh_process_without_duplicate_effects() {
         );
         assert_eq!(kinds.last(), Some(&"workflow_completed"));
     }
+}
+
+#[test]
+fn sigint_cancels_pending_replay_before_a_long_tool_effect() {
+    let root = TestRoot::new();
+    let profile = delayed_profile(&root.0, 10_000);
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("workdir");
+    let mut run = run_args(&profile, &workdir);
+    run.env("WORKFLOW_KIT_TEST_CRASH_BARRIER", "before-effect");
+    let (child, _) = spawn_and_capture(run);
+    assert_eq!(wait(child).status.signal(), Some(libc::SIGKILL));
+
+    let run_root = run_root(&workdir);
+    let id = run_id(&run_root);
+    let barrier = root.0.join("resume-dispatch");
+    fs::create_dir(&barrier).expect("resume dispatch barrier");
+    let mut resume = command();
+    resume
+        .arg("resume")
+        .arg("--run-id")
+        .arg(&id)
+        .arg("--workdir")
+        .arg(&workdir)
+        .env("WORKFLOW_KIT_TEST_EFFECT_BARRIER", &barrier);
+    let (mut child, _) = spawn_and_capture(resume);
+    let started = std::time::Instant::now();
+    while !barrier.join("ready").is_file() {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "pending replay dispatched"
+        );
+        assert!(child.try_wait().expect("resume status").is_none());
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let resumed = wait(child);
+    assert_eq!(resumed.status.code(), Some(2));
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).expect("manifest"))
+            .expect("manifest JSON");
+    assert_eq!(manifest["status"], "cancelled");
+    let journal = EffectJournal::open(run_root.join("effects.sqlite")).expect("journal");
+    assert_eq!(journal.committed_count().expect("effect count"), 0);
+    assert!(
+        !fs::read_to_string(run_root.join("events.jsonl"))
+            .expect("events")
+            .contains("tool_completed")
+    );
 }
 
 #[test]

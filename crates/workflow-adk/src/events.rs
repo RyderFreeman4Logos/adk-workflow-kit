@@ -4,7 +4,8 @@ use serde_json::{Map, Value};
 use workflow_runtime::{
     ArtifactStore, ProtectedArtifactReferenceV1, REDACTION_MARKER, SensitiveSnapshot,
     WorkflowRuntimeEventError, WorkflowRuntimeEventErrorKind, WorkflowRuntimeEventKindV1,
-    WorkflowRuntimeEventLogV1, WorkflowRuntimeEventV1, redacted_json_digest,
+    WorkflowRuntimeEventLogV1, WorkflowRuntimeEventV1, argument_fingerprint, redact_json_value,
+    redacted_json_digest,
 };
 
 const MAX_INLINE_STRUCTURED_OUTPUT_BYTES: usize = 4 * 1024;
@@ -313,11 +314,61 @@ impl AdkEventMapper {
                 AdkEventMappingErrorKind::InvalidObservation,
             ));
         };
-        let structured_output = event
-            .content()
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|_| AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation))?;
+        let calls = event.tool_calls();
+        let results = event.tool_results();
+        let structured_output = if results.is_empty() {
+            None
+        } else {
+            Some(Value::Array(
+                results
+                    .into_iter()
+                    .map(|result| {
+                        serde_json::json!({
+                            "tool_name": result.name,
+                            "response": redact_json_value(result.response),
+                        })
+                    })
+                    .collect(),
+            ))
+        };
+        let structured_output = if structured_output.is_some() {
+            structured_output
+        } else if calls.is_empty() {
+            event
+                .content()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|_| {
+                    AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
+                })?
+        } else {
+            Some(Value::Array(
+                calls
+                    .into_iter()
+                    .filter(|call| {
+                        !self.log.events().iter().any(|prior| {
+                            prior
+                                .payload()
+                                .get("structured_output")
+                                .and_then(Value::as_array)
+                                .is_some_and(|items| {
+                                    items.iter().any(|item| {
+                                        item.get("tool_call_id").and_then(Value::as_str)
+                                            == call.call_id
+                                    })
+                                })
+                        })
+                    })
+                    .map(|call| {
+                        serde_json::json!({
+                            "tool_call_id": call.call_id,
+                            "tool_name": call.name,
+                            "argument_fingerprint": argument_fingerprint(call.args),
+                        })
+                    })
+                    .collect(),
+            ))
+        };
         let request = event
             .llm_request
             .as_deref()
