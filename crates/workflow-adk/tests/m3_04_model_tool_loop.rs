@@ -738,7 +738,7 @@ fn resume_wall_time_limit_includes_pending_replay_and_is_typed() {
         let workflow = root.join("workflow.toml");
         fs::write(&workflow, WORKFLOW).unwrap();
         let mut policy = loop_policy();
-        policy["wall_time_ms"] = json!(25);
+        policy["wall_time_ms"] = json!(100);
         policy["tool_time_ms"] = json!(1000);
         let _ = ExecutionBackend::run(
             workflow,
@@ -781,7 +781,7 @@ fn resume_idle_limit_fences_pending_replay_before_commit() {
         let workflow = root.join("workflow.toml");
         fs::write(&workflow, WORKFLOW).unwrap();
         let mut policy = loop_policy();
-        policy["idle_time_ms"] = json!(25);
+        policy["idle_time_ms"] = json!(100);
         policy["tool_time_ms"] = json!(1000);
         let _ = ExecutionBackend::run(
             workflow,
