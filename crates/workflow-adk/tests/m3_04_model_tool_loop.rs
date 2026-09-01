@@ -831,7 +831,7 @@ fn resume_pending_replay_selects_mid_wait_cancellation() {
                 ],
                 Some(loop_policy()),
                 0,
-                1000,
+                10_000,
                 json!({"found":true}),
             ),
             json!({}),
@@ -861,7 +861,7 @@ fn resume_pending_replay_selects_mid_wait_cancellation() {
     assert_eq!(error.receipt().unwrap().status(), "cancelled");
     assert_eq!(effect_count(&run_root), 0);
     assert!(!events(&error).contains("tool_completed"));
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_secs(2));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -876,7 +876,7 @@ fn resume_model_wait_selects_mid_wait_cancellation() {
             profile_with_delays(
                 vec![finish(json!({"answer":"late"}))],
                 Some(loop_policy()),
-                1000,
+                10_000,
                 0,
                 json!({"found":true}),
             ),
@@ -931,7 +931,7 @@ fn resume_model_wait_selects_mid_wait_cancellation() {
     assert_eq!(error.receipt().unwrap().status(), "cancelled");
     assert_eq!(effect_count(&run_root), 0);
     assert!(!events(&error).contains("tool_completed"));
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_secs(2));
     fs::remove_dir_all(root).unwrap();
 }
 

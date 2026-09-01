@@ -5,7 +5,10 @@ use std::{
     num::NonZeroU64,
     path::Path,
     process::exit,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicPtr, Ordering},
+    },
     time::Instant,
 };
 
@@ -31,6 +34,33 @@ use workflow_testkit::{EvalEnvelope, EvalFixture, EvalInput, ReplayBundle, compi
 
 const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> [--profile <PATH> | --module <PATH>] --input <JSON> --workdir <DIR>\n  resume --run-id <ID> --workdir <DIR>\n  inspect --run-id <ID> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --current-workflow <PATH> --current-module <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const JSON_ERROR: &str = "{\"diagnostic_version\":1,\"code\":\"workflow.cli.invalid_arguments\",\"message\":\"invalid command-line arguments\",\"location\":null,\"details\":{}}";
+
+static INTERRUPT_CANCELLATION: AtomicPtr<AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
+static INTERRUPT_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" {
+    fn signal(signal: i32, handler: extern "C" fn(i32)) -> usize;
+}
+
+extern "C" fn cancel_on_sigint(_: i32) {
+    let cancellation = INTERRUPT_CANCELLATION.load(Ordering::Relaxed);
+    if !cancellation.is_null() {
+        // SAFETY: `interrupt_cancellation` retains one Arc until process exit.
+        unsafe { (*cancellation).store(true, Ordering::Release) };
+    }
+}
+
+fn interrupt_cancellation() -> Arc<AtomicBool> {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    // The CLI executes one command per process; keep the signal target alive.
+    let retained = Arc::into_raw(Arc::clone(&cancellation)).cast_mut();
+    INTERRUPT_CANCELLATION.store(retained, Ordering::Release);
+    if !INTERRUPT_HANDLER_INSTALLED.swap(true, Ordering::AcqRel) {
+        // SAFETY: installs a C-ABI SIGINT handler that only performs atomic operations.
+        unsafe { signal(2, cancel_on_sigint) };
+    }
+    cancellation
+}
 
 fn command() -> Command {
     Command::new("workflowctl")
@@ -837,7 +867,9 @@ pub(crate) fn run() {
                     Ok(input) => input,
                     Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
                 };
-                match ExecutionBackend::run(path, profile, input, workdir) {
+                let cancellation = interrupt_cancellation();
+                match ExecutionBackend::run_cancellable(path, profile, input, workdir, cancellation)
+                {
                     Ok(receipt) => write_execution_receipt(&receipt, json),
                     Err(error) => {
                         if let Some(receipt) = error.receipt() {
@@ -913,11 +945,8 @@ pub(crate) fn run() {
                 exit_invalid_arguments(json);
             };
             let result = if matches.subcommand_name() == Some("resume") {
-                ExecutionBackend::resume_cancellable(
-                    workdir,
-                    run_id,
-                    Arc::new(AtomicBool::new(false)),
-                )
+                let cancellation = interrupt_cancellation();
+                ExecutionBackend::resume_cancellable(workdir, run_id, cancellation)
             } else {
                 ExecutionBackend::inspect(workdir, run_id)
             };
