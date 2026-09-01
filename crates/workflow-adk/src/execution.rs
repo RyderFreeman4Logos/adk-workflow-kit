@@ -95,6 +95,8 @@ struct LoopState {
     activated_skills: BTreeSet<String>,
     #[serde(default)]
     skill_resource_read_bytes: BTreeMap<String, u64>,
+    #[serde(default)]
+    skill_resource_read_reservations: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -411,6 +413,22 @@ impl LoopLedgerStore {
                     && pending.fingerprint == call.fingerprint
             })
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let pending = state
+            .pending_calls
+            .get(index)
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if pending.name == "read_skill_resource" {
+            let page_bytes = skill_page_byte_len(&response)
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+            if state
+                .skill_resource_read_reservations
+                .get(&pending.fingerprint)
+                .copied()
+                != Some(page_bytes)
+            {
+                return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+            }
+        }
         let call = state
             .pending_calls
             .remove(index)
@@ -432,6 +450,9 @@ impl LoopLedgerStore {
             if reserved < page_bytes {
                 return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
             }
+            state
+                .skill_resource_read_reservations
+                .remove(&call.fingerprint);
         }
         state
             .conversation
@@ -577,16 +598,27 @@ impl LoopLedgerStore {
         &self,
         node: &str,
         skill: &str,
+        fingerprint: &str,
         page_bytes: u64,
     ) -> Result<u64, ExecutionError> {
         let mut nodes = self
             .nodes
             .lock()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let state = nodes
+            .get_mut(node)
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if let Some(reserved) = state.skill_resource_read_reservations.get(fingerprint) {
+            if *reserved != page_bytes {
+                return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+            }
+            return Ok(state
+                .skill_resource_read_bytes
+                .get(skill)
+                .copied()
+                .unwrap_or_default());
+        }
         let total = {
-            let state = nodes
-                .get_mut(node)
-                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
             let total = state
                 .skill_resource_read_bytes
                 .get(skill)
@@ -600,20 +632,13 @@ impl LoopLedgerStore {
             state
                 .skill_resource_read_bytes
                 .insert(skill.to_owned(), total);
+            state
+                .skill_resource_read_reservations
+                .insert(fingerprint.to_owned(), page_bytes);
             total
         };
         self.persist_locked(&nodes)?;
         Ok(total)
-    }
-
-    fn skill_resource_read_bytes(&self, node: &str, skill: &str) -> Result<u64, ExecutionError> {
-        self.snapshot(node).map(|state| {
-            state
-                .skill_resource_read_bytes
-                .get(skill)
-                .copied()
-                .unwrap_or_default()
-        })
     }
 }
 
@@ -672,6 +697,45 @@ fn valid_completed_skill_call(call: &PendingCall) -> bool {
     durable_pending_args(call).as_ref() == Some(&call.args)
         && (is_redacted_script_pending(call)
             || workflow_runtime::argument_fingerprint(&call.args) == call.fingerprint)
+}
+
+fn valid_skill_resource_read_accounting(state: &LoopState) -> bool {
+    if state
+        .skill_resource_read_bytes
+        .iter()
+        .any(|(skill, bytes)| skill.is_empty() || *bytes > SKILL_RESOURCE_READ_LIMIT)
+    {
+        return false;
+    }
+    let mut pending_bytes = BTreeMap::<String, u64>::new();
+    for (fingerprint, page_bytes) in &state.skill_resource_read_reservations {
+        let Some(call) = state
+            .pending_calls
+            .iter()
+            .find(|call| call.name == "read_skill_resource" && call.fingerprint == *fingerprint)
+        else {
+            return false;
+        };
+        let Ok(input) = serde_json::from_value::<ReadSkillResourceInput>(call.args.clone()) else {
+            return false;
+        };
+        let Some(total) = pending_bytes
+            .get(&input.skill_id)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(*page_bytes)
+        else {
+            return false;
+        };
+        pending_bytes.insert(input.skill_id, total);
+    }
+    pending_bytes.iter().all(|(skill, bytes)| {
+        *bytes > 0
+            && state
+                .skill_resource_read_bytes
+                .get(skill)
+                .is_some_and(|total| total >= bytes)
+    })
 }
 
 fn loop_ledger_digest(nodes: &BTreeMap<String, LoopState>) -> Result<String, ExecutionError> {
@@ -783,6 +847,9 @@ fn valid_terminal_state(state: &LoopState) -> bool {
 }
 
 fn valid_loop_state(state: &LoopState) -> bool {
+    if !valid_skill_resource_read_accounting(state) {
+        return false;
+    }
     if state.conversation.is_empty() {
         let Some(tool_call_total) = state
             .tool_calls
@@ -1203,18 +1270,25 @@ impl LoopController {
             next.activated_skills.insert(input.skill_id);
         }
         if name == "read_skill_resource" {
-            let input = serde_json::from_value::<ReadSkillResourceInput>(input.clone())
+            serde_json::from_value::<ReadSkillResourceInput>(input.clone())
                 .map_err(|_| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
-            skill_page_byte_len(response)
+            let page_bytes = skill_page_byte_len(response)
                 .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
-            let reserved = self
-                .ledger
-                .skill_resource_read_bytes(&self.node, &input.skill_id)
-                .map_err(|_| {
-                    self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable")
-                })?;
-            next.skill_resource_read_bytes
-                .insert(input.skill_id, reserved);
+            let persisted = self.ledger.snapshot(&self.node).map_err(|_| {
+                self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable")
+            })?;
+            if persisted
+                .skill_resource_read_reservations
+                .get(&call.fingerprint)
+                .copied()
+                != Some(page_bytes)
+            {
+                return Err(self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"));
+            }
+            next.skill_resource_read_bytes = persisted.skill_resource_read_bytes;
+            next.skill_resource_read_reservations = persisted.skill_resource_read_reservations;
+            next.skill_resource_read_reservations
+                .remove(&call.fingerprint);
         }
         let completion_barrier = match name {
             "activate_skill" => Some("after-skill-call-completion-activate_skill"),
@@ -4258,8 +4332,14 @@ impl ToolHandler for SkillToolHandler {
                     .and_then(Value::as_u64)
                     .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
                 self.ledger
-                    .reserve_skill_resource_read(context.actor(), &skill_name, page_bytes)
+                    .reserve_skill_resource_read(
+                        context.actor(),
+                        &skill_name,
+                        context.argument_fingerprint(),
+                        page_bytes,
+                    )
                     .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                crash_barrier("after-skill-resource-read-reservation");
                 payload
             }
             SkillToolAction::Run => {
@@ -5006,7 +5086,7 @@ mod execution_registry_tests {
     }
 
     #[test]
-    fn same_activation_resource_read_reservations_are_atomic() {
+    fn same_call_resource_read_reservations_are_idempotent() {
         let (root, ledger) = fanout_ledger();
         let barrier = Arc::new(Barrier::new(2));
         let outcomes = std::thread::scope(|scope| {
@@ -5015,7 +5095,12 @@ mod execution_registry_tests {
                 let ledger = Arc::clone(&ledger);
                 scope.spawn(move || {
                     barrier.wait();
-                    ledger.reserve_skill_resource_read("left", "skill", 40 * 1_024)
+                    ledger.reserve_skill_resource_read(
+                        "left",
+                        "skill",
+                        "call-fingerprint",
+                        40 * 1_024,
+                    )
                 })
             };
             let first = reserve();
@@ -5023,10 +5108,12 @@ mod execution_registry_tests {
             [first.join().unwrap(), second.join().unwrap()]
         });
 
-        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 2);
+        let state = ledger.snapshot("left").unwrap();
+        assert_eq!(state.skill_resource_read_bytes["skill"], 40 * 1_024);
         assert_eq!(
-            ledger.snapshot("left").unwrap().skill_resource_read_bytes["skill"],
-            40 * 1_024
+            state.skill_resource_read_reservations["call-fingerprint"],
+            40 * 1_024,
         );
         fs::remove_dir_all(root).unwrap();
     }

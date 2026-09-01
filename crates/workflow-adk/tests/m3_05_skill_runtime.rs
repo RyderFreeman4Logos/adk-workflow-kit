@@ -1260,6 +1260,78 @@ fn completed_skill_resource_reads_resume_without_recharging_budget() {
 }
 
 #[test]
+fn pending_skill_resource_read_reservation_resumes_without_recharging_budget() {
+    if let Ok(root) = env::var("M3_05_PENDING_READ_CRASH_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            &workflow,
+            large_read_profile(&root.join("code-investigation"), 40 * 1_024, 1),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let root = root();
+    let package = skill_package(&root);
+    let page_bytes = 40 * 1_024;
+    let guide = vec![b'x'; page_bytes];
+    fs::write(package.join("assets/guide.txt"), &guide).unwrap();
+    fs::write(
+        package.join("skill.runtime.toml"),
+        format!(
+            "schema_version = 1\n\
+             [skill]\n\
+             id = \"code-investigation\"\n\
+             version = \"1\"\n\
+             [[resources]]\n\
+             id = \"assets/guide.txt\"\n\
+             sha256 = \"{}\"\n",
+            digest(&guide),
+        ),
+    )
+    .unwrap();
+    let status = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "pending_skill_resource_read_reservation_resumes_without_recharging_budget",
+            "--nocapture",
+        ])
+        .env("M3_05_PENDING_READ_CRASH_ROOT", &root)
+        .env(
+            "WORKFLOW_KIT_TEST_CRASH_BARRIER",
+            "after-skill-resource-read-reservation",
+        )
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    let run_root = fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("run-manifest.json").is_file())
+        .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+    let resumed = ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap();
+    assert_eq!(resumed.status(), "succeeded");
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
+    assert_eq!(
+        ledger["nodes"]["work"]["skill_resource_read_bytes"]["code-investigation"],
+        page_bytes,
+    );
+    assert_eq!(
+        ledger["nodes"]["work"]["skill_resource_read_reservations"],
+        json!({}),
+    );
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
 fn admitted_script_call_is_bound_or_resume_fails_closed() {
     if let Ok(root) = env::var("M3_05_SCRIPT_CRASH_RUN_ROOT") {
         let root = PathBuf::from(root);
