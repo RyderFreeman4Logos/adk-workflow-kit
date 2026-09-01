@@ -434,7 +434,20 @@ impl LoopLedgerStore {
             .remove(index)
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         state.tool_output_bytes = total;
-        if state.conversation.is_empty() {
+        if matches!(
+            call.name.as_str(),
+            "activate_skill" | "read_skill_resource" | "run_skill_script"
+        ) {
+            state.completed_skill_calls.push(call.clone());
+        }
+        if !state
+            .conversation
+            .iter()
+            .flat_map(|content| &content.parts)
+            .any(|part| {
+                matches!(part, adk_rust::Part::FunctionCall { id: Some(id), .. } if id == &call.id)
+            })
+        {
             state.conversation.push(tool_call_content(&call));
         }
         if call.name == "read_skill_resource" {
@@ -1046,6 +1059,38 @@ fn model_contents_test_digest(request: &adk_rust::LlmRequest, ledger_path: &Path
 #[cfg(not(debug_assertions))]
 fn model_contents_test_digest(_: &adk_rust::LlmRequest, _: &Path) {}
 
+#[cfg(debug_assertions)]
+fn model_contents_test_pairs(request: &adk_rust::LlmRequest, ledger_path: &Path) {
+    if std::env::var_os("WORKFLOW_KIT_TEST_MODEL_CONTENTS_PAIRS").is_none() {
+        return;
+    }
+    let mut calls = BTreeSet::new();
+    let mut responses = Vec::new();
+    let mut paired = true;
+    for part in request.contents.iter().flat_map(|content| &content.parts) {
+        match part {
+            adk_rust::Part::FunctionCall { id: Some(id), .. } => {
+                calls.insert(id);
+            }
+            adk_rust::Part::FunctionResponse { id: Some(id), .. } => {
+                paired &= calls.contains(id);
+                responses.push(id);
+            }
+            _ => {}
+        }
+    }
+    if let Some(root) = ledger_path.parent() {
+        let _ = fs::write(
+            root.join("model-contents-pairs"),
+            serde_json::to_vec(&json!({"paired": paired, "responses": responses}))
+                .expect("test model pairs serialize"),
+        );
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn model_contents_test_pairs(_: &adk_rust::LlmRequest, _: &Path) {}
+
 struct LoopController {
     limits: RunLimits,
     state: Mutex<LoopState>,
@@ -1127,6 +1172,7 @@ impl LoopController {
             request.previous_response_id = state.previous_response_id.clone();
         }
         model_contents_test_digest(&request, &self.ledger.path);
+        model_contents_test_pairs(&request, &self.ledger.path);
         Ok(request)
     }
 

@@ -335,6 +335,19 @@ fn large_read_profile(
     ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
 }
 
+fn simultaneous_reads_profile(package: &std::path::Path, page_bytes: u64) -> ExecutionProfileV1 {
+    let mut value = serde_json::to_value(large_read_profile(package, page_bytes, 2)).unwrap();
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+        {"calls": [
+            {"id":"read-0","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/guide.txt","offset":0,"limit":page_bytes}},
+            {"id":"read-1","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/guide.txt","offset":page_bytes,"limit":page_bytes}}
+        ]},
+        serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
+    ]);
+    ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
+}
+
 fn script_only_profile(package: &std::path::Path) -> ExecutionProfileV1 {
     let mut value = serde_json::to_value(profile(package)).unwrap();
     value["model"]["responses"] = json!([
@@ -1308,25 +1321,37 @@ fn completed_skill_resource_reads_resume_without_recharging_budget() {
     }
 }
 
-#[test]
-fn pending_skill_resource_read_reservation_resumes_without_recharging_budget() {
+fn assert_pending_reads_resume(test_name: &str, read_count: u64, barrier: &str) {
     if let Ok(root) = env::var("M3_05_PENDING_READ_CRASH_ROOT") {
         let root = PathBuf::from(root);
         let workflow = root.join("workflow.toml");
         fs::write(&workflow, WORKFLOW).unwrap();
-        let _ = ExecutionBackend::run(
-            &workflow,
-            large_read_profile(&root.join("code-investigation"), 40 * 1_024, 1),
-            json!({}),
-            root,
-        );
+        let page_bytes: u64 = env::var("M3_05_PENDING_READ_BYTES")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let read_count: u64 = env::var("M3_05_PENDING_READ_COUNT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let profile = if read_count == 1 {
+            large_read_profile(&root.join("code-investigation"), page_bytes, 1)
+        } else {
+            simultaneous_reads_profile(&root.join("code-investigation"), page_bytes)
+        };
+        let _ = ExecutionBackend::run(&workflow, profile, json!({}), root);
         panic!("crash barrier did not terminate the child");
     }
 
     let root = root();
     let package = skill_package(&root);
-    let page_bytes = 40 * 1_024;
-    let guide = vec![b'x'; page_bytes];
+    let page_bytes = if read_count == 1 {
+        40 * 1_024
+    } else {
+        32 * 1_024
+    };
+    let charged_bytes = page_bytes * read_count;
+    let guide = vec![b'x'; charged_bytes as usize];
     fs::write(package.join("assets/guide.txt"), &guide).unwrap();
     fs::write(
         package.join("skill.runtime.toml"),
@@ -1343,16 +1368,11 @@ fn pending_skill_resource_read_reservation_resumes_without_recharging_budget() {
     )
     .unwrap();
     let status = Command::new(env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "pending_skill_resource_read_reservation_resumes_without_recharging_budget",
-            "--nocapture",
-        ])
+        .args(["--exact", test_name, "--nocapture"])
         .env("M3_05_PENDING_READ_CRASH_ROOT", &root)
-        .env(
-            "WORKFLOW_KIT_TEST_CRASH_BARRIER",
-            "after-skill-resource-read-reservation",
-        )
+        .env("M3_05_PENDING_READ_BYTES", page_bytes.to_string())
+        .env("M3_05_PENDING_READ_COUNT", read_count.to_string())
+        .env("WORKFLOW_KIT_TEST_CRASH_BARRIER", barrier)
         .status()
         .unwrap();
     assert_eq!(status.signal(), Some(libc::SIGKILL));
@@ -1364,20 +1384,56 @@ fn pending_skill_resource_read_reservation_resumes_without_recharging_budget() {
         .unwrap();
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+    unsafe {
+        env::set_var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_PAIRS", "1");
+    }
     let resumed = ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap();
+    unsafe {
+        env::remove_var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_PAIRS");
+    }
     assert_eq!(resumed.status(), "succeeded");
+    let model_pairs: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_root.join("model-contents-pairs")).unwrap()).unwrap();
     let ledger: serde_json::Value =
         serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
     assert_eq!(
         ledger["nodes"]["work"]["skill_resource_read_bytes"]["code-investigation"],
-        page_bytes,
+        charged_bytes,
     );
     assert_eq!(
         ledger["nodes"]["work"]["skill_resource_read_reservations"],
         json!({}),
     );
+    let mut expected = vec!["activate".to_owned()];
+    expected.extend((0..read_count).map(|index| format!("read-{index}")));
+    assert_eq!(model_pairs["paired"], true);
+    assert_eq!(model_pairs["responses"], json!(expected));
+    assert_eq!(
+        ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap())
+            .unwrap()
+            .status(),
+        "succeeded"
+    );
     cleanup_test_root(&root);
     fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
+fn completed_activation_and_pending_read_resume_with_paired_transcript() {
+    assert_pending_reads_resume(
+        "completed_activation_and_pending_read_resume_with_paired_transcript",
+        1,
+        "after-skill-resource-read-reservation",
+    );
+}
+
+#[test]
+fn two_pending_reads_resume_in_deterministic_paired_order() {
+    assert_pending_reads_resume(
+        "two_pending_reads_resume_in_deterministic_paired_order",
+        2,
+        "after-skill-call-admission#2",
+    );
 }
 
 #[test]
