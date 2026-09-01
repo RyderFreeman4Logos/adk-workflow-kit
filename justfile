@@ -75,6 +75,9 @@ m3-05-ir test_name:
 m3-05-compiler test_name:
     {{_io}} cargo +1.98.0 test -p workflow-compiler --test m3_05_skill_runtime {{test_name}} --locked -- --exact --nocapture
 
+m3-05-adk test_name:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test m3_05_skill_runtime {{test_name}} --locked -- --exact --nocapture
+
 m3-04-unit test_name:
     {{_io}} cargo +1.98.0 test -p workflow-adk {{test_name}} --lib --locked -- --exact --nocapture
 

@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt, fs,
     future::Future,
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -21,19 +21,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use workflow_compiler::{
-    BindingCategory, BindingRef, CapabilitySet, RegistryResolutionError, ResolvedBinding,
-    ResolvedRuntimePlan, RuntimePlanRegistry, RuntimePlanRequest, compile_file,
+    BindingCategory, BindingRef, CapabilitySet, RegistryEntry, RegistryNotFound,
+    RegistryResolutionError, ResolvedBinding, ResolvedRuntimePlan, RuntimePlanRegistry,
+    RuntimePlanRequest, SkillId, SkillManifest, SkillRegistry, SkillResourceId, SkillResourceInput,
+    SkillResourceLimits, SkillRuntimeLock, SkillRuntimeManifest, activate_skill, compile_file,
+    execute_registered_script_in_child,
 };
 use workflow_ir::IrModelRole;
 use workflow_runtime::{
     ArtifactId, ArtifactStore, BackendCapabilities, CapabilityIntersection, CheckpointManifestV1,
     DurableCheckpointV1, EffectCommit, EffectJournal, EffectKey, FilesystemArtifactStore,
-    InMemoryArtifactStore, PageRequest, ProtectedArtifactReferenceV1, PureTransformRequest,
-    RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox, SandboxCapability,
-    SqliteCheckpointStore, ToolBridge, ToolBridgeError, ToolBridgeErrorKind, ToolCall,
-    ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance, ToolRegistration,
-    WorkdirManager, WorkflowRuntimeEventKindV1, contains_sensitive_key, redact_json_value,
-    selection_identity, verify_sandbox_capabilities,
+    InMemoryArtifactStore, Materialization, PageRequest, PolicyCapabilities,
+    ProtectedArtifactReferenceV1, PureTransformRequest, RequestedCapabilities, RunContext, RunId,
+    RunLimits, RunSandbox, SandboxCapability, SqliteCheckpointStore, ToolBridge, ToolBridgeError,
+    ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler,
+    ToolProvenance, ToolRegistration, WorkdirManager, WorkflowRuntimeEventKindV1,
+    contains_sensitive_key, intersect_policy_capabilities, redact_json_value, selection_identity,
+    verify_sandbox_capabilities,
 };
 use workflow_spec::{SourcePath, read_bounded_regular_file};
 
@@ -981,6 +985,170 @@ fn restore_checkpoint_state(
         .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SkillWire {
+    id: String,
+    version: String,
+    root: PathBuf,
+}
+
+struct SkillPackage {
+    id: SkillId,
+    version: String,
+    manifest: SkillManifest,
+    runtime: SkillRuntimeManifest,
+    lock: SkillRuntimeLock,
+    scripts: BTreeMap<String, Vec<u8>>,
+    resources: BTreeMap<SkillResourceId, Vec<u8>>,
+}
+
+impl SkillPackage {
+    fn load(wire: &SkillWire) -> Result<Self, ExecutionError> {
+        let id = SkillId::new(&wire.id)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
+        if wire.version.is_empty() {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+        }
+        let skill_markdown = package_file(&wire.root, "SKILL.md")?;
+        let manifest = SkillManifest::parse(&wire.root, &skill_markdown)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        let runtime_bytes = package_file(&wire.root, "skill.runtime.toml")?;
+        let runtime = SkillRuntimeManifest::parse(&runtime_bytes)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        if runtime.skill_id() != &id || runtime.skill_version() != wire.version {
+            return Err(ExecutionError::new(
+                ExecutionErrorKind::ImplementationBinding,
+            ));
+        }
+        let mut scripts = BTreeMap::new();
+        for script in runtime.scripts() {
+            scripts.insert(
+                script.id().as_str().to_owned(),
+                package_file(&wire.root, script.path())?,
+            );
+        }
+        let mut resources = BTreeMap::new();
+        for resource in runtime.resources() {
+            resources.insert(
+                resource.id().clone(),
+                package_file(&wire.root, resource.id().as_str())?,
+            );
+        }
+        let lock = SkillRuntimeLock::try_from_declared_bytes(
+            &runtime,
+            &skill_markdown,
+            scripts
+                .iter()
+                .map(|(id, bytes)| (id.as_str(), bytes.as_slice())),
+            resources.iter().map(|(id, bytes)| (id, bytes.as_slice())),
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        let package = Self {
+            id,
+            version: wire.version.clone(),
+            manifest,
+            runtime,
+            lock,
+            scripts,
+            resources,
+        };
+        let activation = activate_skill(&package, &package.id, &package.version)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        SkillRuntimeManifest::parse_for_activation(&activation, &runtime_bytes)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        Ok(package)
+    }
+
+    fn binding(&self) -> Result<ResolvedBinding, ExecutionError> {
+        let identity = self
+            .lock
+            .to_toml()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        Ok(ResolvedBinding::new(self.id.as_str(), &self.version)
+            .with_metadata_identity(format!("sha256:{:x}", Sha256::digest(identity))))
+    }
+
+    fn capabilities(&self) -> impl Iterator<Item = SandboxCapability> + '_ {
+        self.runtime
+            .scripts()
+            .iter()
+            .flat_map(|script| script.capabilities().iter().copied())
+    }
+
+    fn read_resource(
+        &self,
+        id: &SkillResourceId,
+        request: PageRequest,
+    ) -> Result<Value, ToolBridgeError> {
+        let activation = activate_skill(self, &self.id, &self.version)
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+        let capabilities = intersect_policy_capabilities(
+            &RequestedCapabilities::new([SandboxCapability::FilesystemRead]),
+            &[PolicyCapabilities::new([SandboxCapability::FilesystemRead])],
+        )
+        .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+        let mut resources = activation
+            .attach_resources(
+                &capabilities,
+                SkillResourceLimits::new(
+                    NonZeroUsize::new(self.resources.len().max(1))
+                        .expect("positive resource limit"),
+                    NonZeroU64::new(65_536).expect("positive resource limit"),
+                    NonZeroU64::new(65_536).expect("positive page limit"),
+                    NonZeroU64::new(65_536).expect("positive read limit"),
+                ),
+                self.resources
+                    .iter()
+                    .map(|(id, bytes)| SkillResourceInput::file(id.clone(), bytes.clone())),
+            )
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+        let read = resources
+            .read_skill_resource(id, request)
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+        Ok(json!({
+            "resource_id": read.metadata().id().as_str(),
+            "result_ref": read.metadata().artifact_id().as_str(),
+        }))
+    }
+}
+
+impl SkillRegistry for SkillPackage {
+    type Implementation = SkillManifest;
+
+    fn resolve(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<RegistryEntry<'_, Self::Implementation>, RegistryNotFound> {
+        if id == self.id.as_str() && version == self.version {
+            Ok(RegistryEntry::new(
+                &self.manifest,
+                self.id.as_str(),
+                &self.version,
+            ))
+        } else {
+            Err(RegistryNotFound::new(
+                workflow_compiler::RegistryCategory::Skill,
+                id,
+                version,
+            ))
+        }
+    }
+}
+
+fn package_file(root: &Path, relative: &str) -> Result<Vec<u8>, ExecutionError> {
+    let path = root.join(relative);
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > 65_536 {
+        return Err(ExecutionError::new(
+            ExecutionErrorKind::ImplementationBinding,
+        ));
+    }
+    fs::read(path).map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))
+}
+
 /// A validated runtime profile supplied to the reusable ADK executor.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -991,6 +1159,8 @@ pub struct ExecutionProfileV1 {
     tool: Option<ToolWire>,
     #[serde(default)]
     tools: Vec<ToolWire>,
+    #[serde(default)]
+    skills: Vec<SkillWire>,
     pure_transform: Option<PureTransformWire>,
     sandbox: SandboxWire,
     #[serde(default)]
@@ -1143,6 +1313,17 @@ impl ExecutionProfileV1 {
         self.tool.iter().chain(&self.tools)
     }
 
+    fn skill_packages(&self) -> Result<BTreeMap<String, Arc<SkillPackage>>, ExecutionError> {
+        let mut packages = BTreeMap::new();
+        for wire in &self.skills {
+            let package = Arc::new(SkillPackage::load(wire)?);
+            if packages.insert(wire.id.clone(), package).is_some() {
+                return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+            }
+        }
+        Ok(packages)
+    }
+
     fn capabilities(
         &self,
     ) -> Result<(Vec<SandboxCapability>, Vec<SandboxCapability>), ExecutionError> {
@@ -1152,11 +1333,18 @@ impl ExecutionProfileV1 {
             .iter()
             .map(|value| parse_capability(value))
             .collect::<Result<Vec<_>, _>>()?;
-        let required = self
+        let mut required = self
             .tool_wires()
             .flat_map(|tool| tool.required_capabilities.iter())
             .map(|value| parse_capability(value))
             .collect::<Result<Vec<_>, _>>()?;
+        required.extend(
+            self.skill_packages()?
+                .values()
+                .flat_map(|package| package.capabilities()),
+        );
+        required.sort_unstable_by_key(SandboxCapability::as_str);
+        required.dedup();
         Ok((sandbox, required))
     }
 
@@ -1412,6 +1600,14 @@ impl ExecutionRuntimeRegistry {
         let tools = profile.tool_bindings()?;
         if !tools.is_empty() {
             candidates.insert(BindingCategory::Tool, tools);
+        }
+        let skills = profile
+            .skill_packages()?
+            .values()
+            .map(|package| package.binding())
+            .collect::<Result<Vec<_>, _>>()?;
+        if !skills.is_empty() {
+            candidates.insert(BindingCategory::Skill, skills);
         }
         Ok(ExecutionRuntimeRegistry { candidates })
     }
@@ -2027,9 +2223,23 @@ impl ExecutionBackend {
         let context = RunContext::new(run_id.clone(), profile.run_limits());
         let mut mapper = AdkEventMapper::new(run_id.as_str(), compiled.ir().workflow_id().as_str())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-        let run_workdir = manager
-            .allocate(&run_id)
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
+        let skill_bytes = profile
+            .skill_packages()?
+            .values()
+            .flat_map(|package| package.scripts.values())
+            .next()
+            .cloned();
+        let run_workdir = match skill_bytes {
+            Some(bytes) => manager.materialize(
+                &run_id,
+                &Materialization {
+                    skills: Some(bytes),
+                    ..Materialization::default()
+                },
+            ),
+            None => manager.allocate(&run_id),
+        }
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let run_root = run_workdir.root().to_path_buf();
         let workdir_id = run_workdir.id().as_str().to_owned();
         let workflow_source = fs::read(workflow.as_ref())
@@ -2197,6 +2407,7 @@ impl ExecutionBackend {
                             build_toolset(
                                 &tool_registry,
                                 resolved_plan.node_tools(node.id().as_str()),
+                                resolved_plan.node_skills(node.id().as_str()),
                                 &effective_capabilities,
                             )?,
                             profile.run_limits(),
@@ -2676,6 +2887,7 @@ impl ExecutionBackend {
                     build_toolset(
                         &tool_registry,
                         resolved_plan.node_tools(node.id().as_str()),
+                        resolved_plan.node_skills(node.id().as_str()),
                         &effective_capabilities,
                     )?,
                 ))
@@ -3008,6 +3220,101 @@ fn test_effect_barrier(cancellation: &AtomicBool) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SkillToolAction {
+    Activate,
+    Read,
+    Run,
+}
+
+struct SkillToolHandler {
+    action: SkillToolAction,
+    packages: BTreeMap<String, Arc<SkillPackage>>,
+    provenance: ToolProvenance,
+}
+
+impl ToolHandler for SkillToolHandler {
+    fn execute(
+        &self,
+        sandbox: &workflow_runtime::ChildSandbox<'_>,
+        _context: &ToolCallContext,
+        arguments: &Value,
+    ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        let skill_id = arguments
+            .get("skill_id")
+            .and_then(Value::as_str)
+            .and_then(|id| self.packages.get(id))
+            .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+        let payload = match self.action {
+            SkillToolAction::Activate => {
+                let activation = activate_skill(skill_id.as_ref(), &skill_id.id, &skill_id.version)
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                json!({
+                    "skill_id": activation.id().as_str(),
+                    "version": activation.version(),
+                    "instructions_ref": format!("sha256:{:x}", Sha256::digest(activation.instructions())),
+                })
+            }
+            SkillToolAction::Read => {
+                let resource_id = arguments
+                    .get("resource_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| SkillResourceId::new(id).ok())
+                    .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0);
+                let limit = arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(NonZeroU64::new)
+                    .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                skill_id.read_resource(&resource_id, PageRequest::new(offset, limit))?
+            }
+            SkillToolAction::Run => {
+                let script_id = arguments
+                    .get("script_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                let input = arguments
+                    .get("input")
+                    .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                let input = serde_json::to_vec(input)
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                let receipt = execute_registered_script_in_child(
+                    &skill_id.runtime,
+                    &skill_id.lock,
+                    script_id,
+                    &input,
+                    sandbox,
+                )
+                .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                if !receipt.exit_success() {
+                    return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
+                }
+                serde_json::from_slice(receipt.stdout())
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?
+            }
+        };
+        Ok(ToolEnvelope::success(payload, self.provenance.clone()))
+    }
+}
+
+fn skill_tool_registration(
+    name: &str,
+    capabilities: impl IntoIterator<Item = SandboxCapability>,
+) -> Result<ToolRegistration, ExecutionError> {
+    ToolRegistration::for_types::<Value, Value>(
+        name,
+        ToolProvenance::new("skill.runtime", "1"),
+        ToolFlags::new(true, true, true),
+    )
+    .map(|registration| {
+        registration
+            .with_required_capabilities(capabilities)
+            .with_timeout(NonZeroU64::new(60_000).expect("positive timeout"))
+    })
+    .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))
+}
+
 fn build_tool_registry(
     profile: &ExecutionProfileV1,
     sandbox: RunSandbox,
@@ -3035,21 +3342,62 @@ fn build_tool_registry(
             )
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
     }
+    let packages = profile.skill_packages()?;
+    if !packages.is_empty() {
+        let script_capabilities = packages
+            .values()
+            .flat_map(|package| package.capabilities())
+            .collect::<Vec<_>>();
+        for (name, action, capabilities) in [
+            ("activate_skill", SkillToolAction::Activate, Vec::new()),
+            (
+                "read_skill_resource",
+                SkillToolAction::Read,
+                vec![SandboxCapability::FilesystemRead],
+            ),
+            (
+                "run_skill_script",
+                SkillToolAction::Run,
+                script_capabilities,
+            ),
+        ] {
+            let registration = skill_tool_registration(name, capabilities)?;
+            let provenance = registration.provenance().clone();
+            bridge
+                .register(
+                    registration,
+                    SkillToolHandler {
+                        action,
+                        packages: packages.clone(),
+                        provenance,
+                    },
+                )
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        }
+    }
     Ok(bridge)
 }
 
 fn build_toolset(
     bridge: &ToolBridge,
     bindings: &[ResolvedBinding],
+    skills: &[ResolvedBinding],
     effective_capabilities: &[SandboxCapability],
 ) -> Result<Option<BoundTool>, ExecutionError> {
-    if bindings.is_empty() {
+    if bindings.is_empty() && skills.is_empty() {
         return Ok(None);
     }
-    let names = bindings
+    let mut names = bindings
         .iter()
         .map(|binding| binding.id().to_owned())
         .collect::<Vec<_>>();
+    if !names.iter().any(|name| name == "activate_skill") {
+        names.extend([
+            "activate_skill".to_owned(),
+            "read_skill_resource".to_owned(),
+            "run_skill_script".to_owned(),
+        ]);
+    }
     let authority = CapabilityIntersection::new(
         effective_capabilities.iter().copied(),
         names.iter(),
