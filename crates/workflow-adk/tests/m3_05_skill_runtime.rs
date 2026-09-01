@@ -815,9 +815,41 @@ fn crashed_skill_admission_or_activation_resumes_without_widening() {
         panic!("crash barrier did not terminate the child");
     }
 
-    for barrier in ["after-skill-call-admission", "after-skill-activation"] {
+    let baseline_root = root();
+    let baseline_package = skill_package(&baseline_root);
+    let baseline_workflow = baseline_root.join("workflow.toml");
+    fs::write(&baseline_workflow, WORKFLOW).unwrap();
+    let baseline_digest_path = baseline_root.join("model-contents-digest");
+    unsafe {
+        env::set_var(
+            "WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST",
+            &baseline_digest_path,
+        );
+    }
+    let baseline = ExecutionBackend::run(
+        &baseline_workflow,
+        resume_profile(&baseline_package),
+        json!({}),
+        &baseline_root,
+    )
+    .unwrap();
+    unsafe {
+        env::remove_var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST");
+    }
+    let baseline_digest = fs::read_to_string(&baseline_digest_path).unwrap();
+    assert_eq!(baseline.status(), "succeeded");
+    cleanup_test_root(&baseline_root);
+    fs::remove_dir_all(baseline_root).expect("baseline cleanup");
+
+    for (barrier, exact_transcript) in [
+        ("after-skill-call-admission", false),
+        ("after-skill-activation", false),
+        ("after-skill-call-completion-activate_skill", true),
+        ("after-skill-call-completion-read_skill_resource", true),
+    ] {
         let root = root();
         skill_package(&root);
+        let digest_path = root.join("model-contents-digest");
         let status = Command::new(env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -826,6 +858,7 @@ fn crashed_skill_admission_or_activation_resumes_without_widening() {
             ])
             .env("M3_05_SKILL_CRASH_RUN_ROOT", &root)
             .env("WORKFLOW_KIT_TEST_CRASH_BARRIER", barrier)
+            .env("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST", &digest_path)
             .status()
             .unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL), "{barrier}");
@@ -837,11 +870,25 @@ fn crashed_skill_admission_or_activation_resumes_without_widening() {
             .unwrap();
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+        unsafe {
+            env::set_var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST", &digest_path);
+        }
         let resumed =
             ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap();
+        unsafe {
+            env::remove_var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST");
+        }
         assert_eq!(resumed.status(), "succeeded", "{barrier}");
         let events = fs::read_to_string(run_root.join("events.jsonl")).unwrap();
-        assert!(events.contains("read_skill_resource"), "{barrier}");
+        if exact_transcript {
+            assert_eq!(
+                fs::read_to_string(&digest_path).unwrap(),
+                baseline_digest,
+                "{barrier}"
+            );
+        } else {
+            assert!(events.contains("read_skill_resource"), "{barrier}");
+        }
         assert!(!events.contains("authorization_denied"), "{barrier}");
         let ledger: serde_json::Value =
             serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
@@ -857,46 +904,58 @@ fn admitted_script_call_is_bound_or_resume_fails_closed() {
         let root = PathBuf::from(root);
         let workflow = root.join("workflow.toml");
         fs::write(&workflow, WORKFLOW).unwrap();
-        let _ = ExecutionBackend::run(
-            &workflow,
-            script_only_profile(&root.join("code-investigation")),
-            json!({}),
-            root,
-        );
+        let crash_barrier = env::var("M3_05_SCRIPT_CRASH_BARRIER").unwrap();
+        let profile = if crash_barrier == "after-skill-call-completion-run_skill_script" {
+            profile(&root.join("code-investigation"))
+        } else {
+            script_only_profile(&root.join("code-investigation"))
+        };
+        let _ = ExecutionBackend::run(&workflow, profile, json!({}), root);
         panic!("crash barrier did not terminate the child");
     }
 
-    let root = root();
-    skill_package(&root);
-    let status = Command::new(env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "admitted_script_call_is_bound_or_resume_fails_closed",
-            "--nocapture",
-        ])
-        .env("M3_05_SCRIPT_CRASH_RUN_ROOT", &root)
-        .env(
-            "WORKFLOW_KIT_TEST_CRASH_BARRIER",
-            "after-skill-call-admission",
-        )
-        .status()
-        .unwrap();
-    assert_eq!(status.signal(), Some(libc::SIGKILL));
-    let run_root = fs::read_dir(&root)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.join("run-manifest.json").is_file())
-        .unwrap();
-    let ledger = fs::read_to_string(run_root.join("loop-ledger.json")).unwrap();
-    assert!(ledger.contains("run_skill_script"));
-    assert!(!ledger.contains("admitted-script-input-must-not-persist"));
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
-    let error = ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap_err();
-    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
-    cleanup_test_root(&root);
-    fs::remove_dir_all(root).expect("test cleanup");
+    for barrier in [
+        "after-skill-call-admission",
+        "after-skill-call-completion-run_skill_script",
+    ] {
+        let root = root();
+        skill_package(&root);
+        let status = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "admitted_script_call_is_bound_or_resume_fails_closed",
+                "--nocapture",
+            ])
+            .env("M3_05_SCRIPT_CRASH_RUN_ROOT", &root)
+            .env("M3_05_SCRIPT_CRASH_BARRIER", barrier)
+            .env("WORKFLOW_KIT_TEST_CRASH_BARRIER", barrier)
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{barrier}");
+        let run_root = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.join("run-manifest.json").is_file())
+            .unwrap();
+        let ledger = fs::read_to_string(run_root.join("loop-ledger.json")).unwrap();
+        assert!(ledger.contains("run_skill_script"), "{barrier}");
+        assert!(
+            !ledger.contains("admitted-script-input-must-not-persist"),
+            "{barrier}"
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+        let error =
+            ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            ExecutionErrorKind::InvalidRunState,
+            "{barrier}"
+        );
+        cleanup_test_root(&root);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
 }
 
 #[test]

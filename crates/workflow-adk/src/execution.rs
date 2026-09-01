@@ -75,8 +75,11 @@ struct LoopState {
     seen_calls: BTreeSet<(String, String)>,
     #[serde(default)]
     conversation: Vec<adk_rust::Content>,
+    #[serde(skip)]
+    conversation_reconstructed: bool,
     previous_response_id: Option<String>,
     pending_calls: VecDeque<PendingCall>,
+    completed_skill_calls: Vec<PendingCall>,
     #[serde(default)]
     finish_admitted: bool,
     #[serde(default)]
@@ -148,7 +151,7 @@ impl LoopLedgerStore {
     ) -> Result<Self, ExecutionError> {
         let ledger = serde_json::from_slice::<LoopLedgerV1>(&bounded_read(&path)?)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        if ledger.schema_version != 2
+        if ledger.schema_version != 3
             || ledger.checkpoint_identity != checkpoint_identity
             || checkpoint_digest != loop_ledger_digest(&ledger.nodes)?
             || ledger.nodes.values().any(|state| !valid_loop_state(state))
@@ -269,6 +272,51 @@ impl LoopLedgerStore {
                     .map(|call| (node.clone(), call))
             })
             .collect())
+    }
+
+    fn completed_skill_calls(&self) -> Result<Vec<(String, PendingCall)>, ExecutionError> {
+        let nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        Ok(nodes
+            .iter()
+            .flat_map(|(node, state)| {
+                state
+                    .completed_skill_calls
+                    .iter()
+                    .cloned()
+                    .map(|call| (node.clone(), call))
+            })
+            .collect())
+    }
+
+    fn restore_completed_skill_call(
+        &self,
+        node: &str,
+        call: &PendingCall,
+        response: Value,
+    ) -> Result<(), ExecutionError> {
+        let mut nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let state = nodes
+            .get_mut(node)
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if !state.completed_skill_calls.iter().any(|completed| {
+            completed.id == call.id
+                && completed.name == call.name
+                && completed.fingerprint == call.fingerprint
+        }) {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        state.conversation.push(tool_call_content(call));
+        state
+            .conversation
+            .push(tool_response_content(call, response));
+        state.conversation_reconstructed = true;
+        Ok(())
     }
 
     fn completed_tool_responses(&self) -> Result<Vec<CompletedToolResponse>, ExecutionError> {
@@ -407,6 +455,9 @@ impl LoopLedgerStore {
                 for call in &mut state.pending_calls {
                     call.args = durable_pending_args(call).expect("checked pending calls");
                 }
+                for call in &mut state.completed_skill_calls {
+                    call.args = durable_pending_args(call).expect("checked completed Skill calls");
+                }
             }
         }
         self.persist_ledger(&durable_nodes)?;
@@ -422,12 +473,15 @@ impl LoopLedgerStore {
                 for call in &mut state.pending_calls {
                     call.args = durable_pending_args(call).expect("checked pending calls");
                 }
+                for call in &mut state.completed_skill_calls {
+                    call.args = durable_pending_args(call).expect("checked completed Skill calls");
+                }
             }
         }
         write_json(
             &self.path,
             &LoopLedgerV1 {
-                schema_version: 2,
+                schema_version: 3,
                 checkpoint_identity: self.checkpoint_identity.clone(),
                 nodes,
             },
@@ -472,6 +526,9 @@ impl LoopLedgerStore {
                 state.finished_output = None;
                 for call in &mut state.pending_calls {
                     call.args = durable_pending_args(call).expect("checked pending calls");
+                }
+                for call in &mut state.completed_skill_calls {
+                    call.args = durable_pending_args(call).expect("checked completed Skill calls");
                 }
             }
         }
@@ -575,8 +632,14 @@ fn is_redacted_script_pending(call: &PendingCall) -> bool {
             == Some(call.fingerprint.as_str())
 }
 
+fn valid_completed_skill_call(call: &PendingCall) -> bool {
+    durable_pending_args(call).as_ref() == Some(&call.args)
+        && (is_redacted_script_pending(call)
+            || workflow_runtime::argument_fingerprint(&call.args) == call.fingerprint)
+}
+
 fn loop_ledger_digest(nodes: &BTreeMap<String, LoopState>) -> Result<String, ExecutionError> {
-    let canonical = serde_json::to_vec(&(2_u8, nodes))
+    let canonical = serde_json::to_vec(&(3_u8, nodes))
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
     Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
 }
@@ -686,12 +749,32 @@ fn valid_loop_state(state: &LoopState) -> bool {
         else {
             return false;
         };
+        let disposed = state
+            .pending_calls
+            .iter()
+            .chain(&state.completed_skill_calls)
+            .collect::<Vec<_>>();
+        let disposed_ids = disposed
+            .iter()
+            .map(|call| call.id.clone())
+            .collect::<BTreeSet<_>>();
+        let disposed_calls = disposed
+            .iter()
+            .map(|call| (call.name.clone(), call.fingerprint.clone()))
+            .collect::<BTreeSet<_>>();
         return state.finished_output.is_none()
             && state.pending_calls.iter().all(|call| {
                 durable_pending_args(call).as_ref() == Some(&call.args)
                     && workflow_runtime::argument_fingerprint(&call.args) == call.fingerprint
             })
+            && state
+                .completed_skill_calls
+                .iter()
+                .all(valid_completed_skill_call)
             && state.total_tool_calls == tool_call_total
+            && disposed.len() == disposed_ids.len()
+            && disposed_ids == state.seen_ids
+            && disposed_calls == state.seen_calls
             && usize::try_from(state.total_tool_calls)
                 .ok()
                 .is_some_and(|count| {
@@ -820,6 +903,31 @@ fn ledger_checkpoint_identity(
     Ok(format!("sha256:{:x}", Sha256::digest(manifest)))
 }
 
+#[cfg(debug_assertions)]
+fn model_contents_test_digest(request: &adk_rust::LlmRequest) {
+    let Ok(path) = std::env::var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST") else {
+        return;
+    };
+    let transcript = request
+        .contents
+        .iter()
+        .flat_map(|content| &content.parts)
+        .filter(|part| {
+            matches!(
+                part,
+                adk_rust::Part::FunctionCall { .. } | adk_rust::Part::FunctionResponse { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    let Ok(contents) = serde_json::to_vec(&transcript) else {
+        return;
+    };
+    let _ = fs::write(path, format!("sha256:{:x}", Sha256::digest(contents)));
+}
+
+#[cfg(not(debug_assertions))]
+fn model_contents_test_digest(_: &adk_rust::LlmRequest) {}
+
 struct LoopController {
     limits: RunLimits,
     state: Mutex<LoopState>,
@@ -891,9 +999,16 @@ impl LoopController {
                     self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable")
                 })?;
         } else {
+            if state.conversation_reconstructed {
+                let mut conversation = request.contents.clone();
+                conversation.append(&mut state.conversation);
+                state.conversation = conversation;
+                state.conversation_reconstructed = false;
+            }
             request.contents = state.conversation.clone();
             request.previous_response_id = state.previous_response_id.clone();
         }
+        model_contents_test_digest(&request);
         Ok(request)
     }
 
@@ -1049,6 +1164,15 @@ impl LoopController {
             }
             next.skill_resource_read_bytes.insert(input.skill_id, total);
         }
+        let completion_barrier = match name {
+            "activate_skill" => Some("after-skill-call-completion-activate_skill"),
+            "read_skill_resource" => Some("after-skill-call-completion-read_skill_resource"),
+            "run_skill_script" => Some("after-skill-call-completion-run_skill_script"),
+            _ => None,
+        };
+        if completion_barrier.is_some() {
+            next.completed_skill_calls.push(call.clone());
+        }
         next.conversation
             .push(tool_response_content(&call, response.clone()));
         if self
@@ -1060,6 +1184,9 @@ impl LoopController {
                 ExecutionErrorKind::ToolOutputBytesLimit,
                 "workflow.loop.limit.tool_output_bytes",
             ));
+        }
+        if let Some(marker) = completion_barrier {
+            crash_barrier(marker);
         }
         *state = next;
         Ok(())
@@ -3493,8 +3620,10 @@ impl ExecutionBackend {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        if let Err(error) =
-            replay_pending_tools(&loop_ledger, &toolsets, profile.run_limits(), &effect_fence)
+        if let Err(error) = restore_completed_skill_calls(&loop_ledger, &toolsets, &effect_fence)
+            .and_then(|()| {
+                replay_pending_tools(&loop_ledger, &toolsets, profile.run_limits(), &effect_fence)
+            })
         {
             return Err(resume_failure(
                 &root,
@@ -3705,7 +3834,7 @@ fn build_checkpoint_manifest(
         .with_resource_hash("workflow.ir", workflow_hash)
         .with_implementation("model", profile.profile_identity())
         .with_implementation("adk-rust", "2.1.0")
-        .with_implementation("loop-ledger", "v2")
+        .with_implementation("loop-ledger", "v3")
         .with_implementation(
             "execution-profile",
             format!("sha256:{:x}", Sha256::digest(profile_identity)),
@@ -4164,6 +4293,74 @@ fn build_toolset(
     Ok(Some((names, Arc::new(adapter))))
 }
 
+fn invoke_restored_tool(
+    node: &str,
+    call: &PendingCall,
+    toolset: Arc<AdkToolBridge<InMemoryArtifactStore>>,
+    effect_fence: &EffectFence,
+) -> Result<Value, ExecutionError> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let node = node.to_owned();
+    let call = call.clone();
+    std::thread::Builder::new()
+        .spawn(move || {
+            let response = toolset.invoke(ToolCall::new(
+                &call.name,
+                &call.id,
+                &node,
+                call.args.clone(),
+            ));
+            let _ = sender.send(response);
+        })
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
+    let tool_deadline = effect_fence.tool_deadline();
+    let response = loop {
+        effect_fence
+            .admit(tool_deadline)
+            .map_err(|_| effect_fence.execution_error())?;
+        match receiver.recv_timeout(Duration::from_millis(1)) {
+            Ok(response) => break response,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ExecutionError::new(ExecutionErrorKind::Tool));
+            }
+        }
+    };
+    effect_fence
+        .admit(tool_deadline)
+        .map_err(|_| effect_fence.execution_error())?;
+    let response = response.map_err(|error| {
+        let kind = match error.kind() {
+            ToolBridgeErrorKind::CapabilityDenied
+            | ToolBridgeErrorKind::ApprovalDenied
+            | ToolBridgeErrorKind::InvalidInput => ExecutionErrorKind::AuthorizationDenied,
+            _ => ExecutionErrorKind::Tool,
+        };
+        ExecutionError::new(kind)
+    })?;
+    serde_json::to_value(response).map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))
+}
+
+fn restore_completed_skill_calls(
+    ledger: &LoopLedgerStore,
+    toolsets: &BTreeMap<String, Option<BoundTool>>,
+    effect_fence: &EffectFence,
+) -> Result<(), ExecutionError> {
+    for (node, completed) in ledger.completed_skill_calls()? {
+        if is_redacted_script_pending(&completed) {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        let toolset = toolsets
+            .get(&node)
+            .and_then(Option::as_ref)
+            .map(|(_, toolset)| Arc::clone(toolset))
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let response = invoke_restored_tool(&node, &completed, toolset, effect_fence)?;
+        ledger.restore_completed_skill_call(&node, &completed, response)?;
+    }
+    Ok(())
+}
+
 fn replay_pending_tools(
     ledger: &LoopLedgerStore,
     toolsets: &BTreeMap<String, Option<BoundTool>>,
@@ -4177,48 +4374,9 @@ fn replay_pending_tools(
         let toolset = toolsets
             .get(&node)
             .and_then(Option::as_ref)
-            .map(|(_, toolset)| toolset)
+            .map(|(_, toolset)| Arc::clone(toolset))
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let toolset = Arc::clone(toolset);
-        let (sender, receiver) = mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .spawn(move || {
-                let response = toolset.invoke(ToolCall::new(
-                    &pending.name,
-                    &pending.id,
-                    &node,
-                    pending.args.clone(),
-                ));
-                let _ = sender.send((node, pending, response));
-            })
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
-        let tool_deadline = effect_fence.tool_deadline();
-        let (node, pending, response) = loop {
-            effect_fence
-                .admit(tool_deadline)
-                .map_err(|_| effect_fence.execution_error())?;
-            match receiver.recv_timeout(Duration::from_millis(1)) {
-                Ok(result) => break result,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(ExecutionError::new(ExecutionErrorKind::Tool));
-                }
-            }
-        };
-        effect_fence
-            .admit(tool_deadline)
-            .map_err(|_| effect_fence.execution_error())?;
-        let response = response.map_err(|error| {
-            let kind = match error.kind() {
-                ToolBridgeErrorKind::CapabilityDenied
-                | ToolBridgeErrorKind::ApprovalDenied
-                | ToolBridgeErrorKind::InvalidInput => ExecutionErrorKind::AuthorizationDenied,
-                _ => ExecutionErrorKind::Tool,
-            };
-            ExecutionError::new(kind)
-        })?;
-        let response = serde_json::to_value(response)
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
+        let response = invoke_restored_tool(&node, &pending, toolset, effect_fence)?;
         ledger.complete_pending(
             &node,
             &pending,
