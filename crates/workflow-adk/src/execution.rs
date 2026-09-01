@@ -501,6 +501,32 @@ fn valid_terminal_state(state: &LoopState) -> bool {
 }
 
 fn valid_loop_state(state: &LoopState) -> bool {
+    if state.conversation.is_empty() {
+        let Some(tool_call_total) = state
+            .tool_calls
+            .values()
+            .try_fold(0_u64, |total, count| total.checked_add(*count))
+        else {
+            return false;
+        };
+        return state.finished_output.is_none()
+            && state.pending_calls.is_empty()
+            && state.total_tool_calls == tool_call_total
+            && usize::try_from(state.total_tool_calls)
+                .ok()
+                .is_some_and(|count| {
+                    count == state.seen_ids.len() && count == state.seen_calls.len()
+                })
+            && state
+                .tool_calls
+                .iter()
+                .all(|(name, count)| !name.is_empty() && *count > 0)
+            && state.seen_ids.iter().all(|id| !id.is_empty())
+            && state
+                .seen_calls
+                .iter()
+                .all(|(name, fingerprint)| !name.is_empty() && !fingerprint.is_empty());
+    }
     if !valid_terminal_state(state) {
         return false;
     }
@@ -1322,11 +1348,49 @@ impl ExecutionProfileV1 {
         Ok(profile)
     }
 
+    fn durable_fake_responses(responses: &Value) -> Value {
+        let identity = responses
+            .as_array()
+            .and_then(|responses| match responses.as_slice() {
+                [Value::String(response)] => serde_json::from_str::<Value>(response)
+                    .ok()
+                    .and_then(|response| {
+                        response
+                            .pointer("/output/kit_durable_model_response_sha256")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .filter(|identity| identity.starts_with("sha256:")),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "sha256:{:x}",
+                    Sha256::digest(
+                        serde_json::to_vec(responses).expect("model responses serialize")
+                    )
+                )
+            });
+        Value::Array(vec![Value::String(format!(
+            "{{\"status\":\"finished\",\"output\":{{\"kit_durable_model_response_sha256\":\"{identity}\"}}}}"
+        ))])
+    }
+
     fn durable_projection(&self) -> Value {
-        json!({
-            "schema_version": self.schema_version,
-            "profile_identity": self.profile_identity(),
-        })
+        let mut projection = serde_json::to_value(self).expect("execution profile serializes");
+        {
+            let projection = projection
+                .as_object_mut()
+                .expect("execution profile is an object");
+            projection.insert("skills".to_owned(), Value::Array(Vec::new()));
+            for model in ["model", "reviewer_model"] {
+                if projection[model]["provider"] == "fake" {
+                    projection[model]["responses"] =
+                        Self::durable_fake_responses(&projection[model]["responses"]);
+                }
+            }
+        }
+        projection
     }
 
     fn tool_wires(&self) -> impl Iterator<Item = &ToolWire> {
@@ -2850,6 +2914,7 @@ impl ExecutionBackend {
             });
         let mut mapper = AdkEventMapper::resume(run_id, &manifest.workflow_id, events)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+
         let next = manifest.resume_count + 1;
         mapper
             .map(AdkRuntimeObservationV1::new(
@@ -2858,16 +2923,19 @@ impl ExecutionBackend {
                 AdkRuntimeObservationKindV1::WorkflowResumed,
             ))
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+
         let sandbox = RunSandbox::new(
             RunContext::new(run_identity.clone(), profile.run_limits()),
             run_workdir,
             effective_capabilities.clone(),
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+
         let effect_journal = Arc::new(
             EffectJournal::open(root.join("effects.sqlite"))
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?,
         );
+
         let deadline = execution_deadline(&profile.run_limits())?;
         let terminal_kind = Arc::new(Mutex::new(None));
         let last_progress = Arc::new(Mutex::new(Instant::now()));
@@ -2895,6 +2963,7 @@ impl ExecutionBackend {
             Some(Arc::clone(&effect_journal)),
             Arc::clone(&effect_fence),
         )?;
+
         let toolsets = compiled
             .ir()
             .nodes()
@@ -2926,6 +2995,7 @@ impl ExecutionBackend {
             ));
         }
         restore_tool_events(&loop_ledger, &tool_event_counts, &mut mapper)?;
+
         let agents = compiled
             .ir()
             .nodes()
@@ -3101,12 +3171,13 @@ fn build_checkpoint_manifest(
     plan: &ResolvedRuntimePlan,
     transform_module: Option<&[u8]>,
 ) -> Result<CheckpointManifestV1, ExecutionError> {
+    let durable_profile = profile.durable_projection();
     let profile_identity = serde_json::to_vec(&(
-        &profile.model,
-        &profile.reviewer_model,
-        &profile.tool,
-        &profile.tools,
-        &profile.loop_policy,
+        &durable_profile["model"],
+        &durable_profile["reviewer_model"],
+        &durable_profile["tool"],
+        &durable_profile["tools"],
+        &durable_profile["loop_policy"],
     ))
     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
     let effective_capabilities = plan.effective_capabilities().as_slice().join("\n");
