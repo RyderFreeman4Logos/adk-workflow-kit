@@ -200,3 +200,46 @@ fn child_sandbox_denies_widening_and_bounds_output() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn changed_skill_content_rejects_resume() {
+    let root = root();
+    let package = skill_package(&root);
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let receipt = ExecutionBackend::run(&workflow, profile(&package), json!({}), &root).unwrap();
+
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("checkpoint-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["implementation_identities"]["skill.code-investigation.activation"],
+        "code-investigation:1"
+    );
+    assert_eq!(
+        manifest["resource_hashes"]["skill.code-investigation.skill_markdown"],
+        digest(SKILL)
+    );
+    assert_eq!(
+        manifest["resource_hashes"]["skill.code-investigation.script.answer"],
+        digest(SCRIPT)
+    );
+    assert_eq!(
+        manifest["resource_hashes"]["skill.code-investigation.resource.assets/guide.txt"],
+        digest(GUIDE)
+    );
+
+    let changed = b"import json\nprint(json.dumps({'value': 'changed'}))\n";
+    fs::write(package.join("scripts/content.bin"), changed).unwrap();
+    let runtime_path = package.join("skill.runtime.toml");
+    let runtime = fs::read_to_string(&runtime_path).unwrap();
+    fs::write(
+        &runtime_path,
+        runtime.replace(&digest(SCRIPT), &digest(changed)),
+    )
+    .unwrap();
+    let error = ExecutionBackend::resume(&root, receipt.run_id()).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    let _ = fs::remove_dir_all(root);
+}

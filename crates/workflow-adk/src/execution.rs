@@ -997,6 +997,7 @@ struct SkillPackage {
     id: SkillId,
     version: String,
     manifest: SkillManifest,
+    skill_markdown: Vec<u8>,
     runtime: SkillRuntimeManifest,
     lock: SkillRuntimeLock,
     scripts: BTreeMap<String, Vec<u8>>,
@@ -1048,6 +1049,7 @@ impl SkillPackage {
             id,
             version: wire.version.clone(),
             manifest,
+            skill_markdown,
             runtime,
             lock,
             scripts,
@@ -3114,6 +3116,30 @@ fn build_checkpoint_manifest(
             "pure-transform",
             format!("sha256:{:x}", Sha256::digest(transform)),
         );
+    }
+    for package in profile.skill_packages()?.values() {
+        let prefix = format!("skill.{}", package.id.as_str());
+        manifest = manifest
+            .with_implementation(
+                format!("{prefix}.activation"),
+                format!("{}:{}", package.id.as_str(), package.version),
+            )
+            .with_resource_hash(
+                format!("{prefix}.skill_markdown"),
+                format!("sha256:{:x}", Sha256::digest(&package.skill_markdown)),
+            );
+        for (id, bytes) in &package.scripts {
+            manifest = manifest.with_resource_hash(
+                format!("{prefix}.script.{id}"),
+                format!("sha256:{:x}", Sha256::digest(bytes)),
+            );
+        }
+        for (id, bytes) in &package.resources {
+            manifest = manifest.with_resource_hash(
+                format!("{prefix}.resource.{}", id.as_str()),
+                format!("sha256:{:x}", Sha256::digest(bytes)),
+            );
+        }
     }
     Ok(manifest)
 }
