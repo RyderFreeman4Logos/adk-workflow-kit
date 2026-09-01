@@ -282,9 +282,10 @@ impl LoopLedgerStore {
         Ok(nodes
             .iter()
             .flat_map(|(node, state)| {
-                state
-                    .completed_skill_calls
-                    .iter()
+                (!state.finish_admitted)
+                    .then_some(&state.completed_skill_calls)
+                    .into_iter()
+                    .flatten()
                     .cloned()
                     .map(|call| (node.clone(), call))
             })
