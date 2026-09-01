@@ -1114,6 +1114,7 @@ impl SkillPackage {
         Ok(json!({
             "resource_id": read.metadata().id().as_str(),
             "result_ref": read.metadata().artifact_id().as_str(),
+            "content": String::from_utf8_lossy(read.page().bytes()),
         }))
     }
 }
@@ -3336,6 +3337,7 @@ impl ToolHandler for SkillToolHandler {
                     "skill_id": activation.id().as_str(),
                     "version": activation.version(),
                     "instructions_ref": format!("sha256:{:x}", Sha256::digest(activation.instructions())),
+                    "instructions": activation.instructions(),
                 })
             }
             SkillToolAction::Read => {

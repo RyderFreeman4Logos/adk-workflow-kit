@@ -175,6 +175,20 @@ fn fake_model_activates_reads_and_runs_declared_skill() {
 }
 
 #[test]
+fn activate_and_read_deliver_bounded_content_to_agent() {
+    let root = root();
+    let package = skill_package(&root);
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+
+    let receipt = ExecutionBackend::run(&workflow, profile(&package), json!({}), &root).unwrap();
+    let events = fs::read_to_string(receipt.run_root().join("events.jsonl")).unwrap();
+    assert!(events.contains("# Instructions"));
+    assert!(events.contains("Declared guide"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn undeclared_skill_resource_or_capability_fails_before_effect() {
     let root = root();
     let package = skill_package(&root);
