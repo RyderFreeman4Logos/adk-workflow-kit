@@ -1,5 +1,8 @@
 use std::{fs, path::Path, process::Command};
 
+#[path = "support/owned_tree.rs"]
+mod owned_tree;
+
 const CANARY_SCAFFOLD_NEW_57: &str = "CANARY_SCAFFOLD_NEW_57";
 const CANARY_SCAFFOLD_MISS_57: &str = "CANARY_SCAFFOLD_MISS_57";
 const CANARY_SKILL_INVALID_57: &str = "CANARY_SKILL_INVALID_57";
@@ -65,7 +68,7 @@ fn invalid_developer_skill_fails_closed_without_clean_load() {
     assert_eq!(invalid_output.status.code(), Some(2));
     assert!(invalid_stderr.contains("skill.cli.invalid_manifest"));
     assert!(!invalid_stderr.contains(CANARY_SKILL_INVALID_57));
-    fs::remove_dir_all(invalid).expect("remove invalid skill");
+    owned_tree::remove_dir_all(&invalid).expect("remove invalid skill");
 }
 
 fn tempfile_skill() -> std::path::PathBuf {

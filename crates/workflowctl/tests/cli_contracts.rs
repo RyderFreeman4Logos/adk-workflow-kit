@@ -11,6 +11,9 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
+#[path = "support/owned_tree.rs"]
+mod owned_tree;
+
 const HELP: &str = "Thin workflow CLI over reusable libraries\n\nUsage: workflowctl [OPTIONS] <COMMAND>\n\nCommands:\n  validate <PATH>\n  graph <PATH> --format mermaid\n  lock <PATH>\n  skill lint <PATH>\n  skill test <PATH>\n  test <PATH>\n  eval <PATH>\n  replay <PATH>\n  audit\n  run <PATH> [--profile <PATH> | --module <PATH>] --input <JSON> --workdir <DIR>\n  resume --run-id <ID> --workdir <DIR>\n  inspect --run-id <ID> --workdir <DIR>\n  explain-run <PATH> --module <PATH> --input <JSON>\n  reload <PATH> --current-workflow <PATH> --current-module <PATH> --module <PATH> --input <JSON>\n\nOptions:\n      --json  Emit diagnostics as JSON\n  -h, --help  Print help\n";
 const HUMAN_ERROR: &str =
     "[workflow.cli.invalid_arguments] invalid command-line arguments location=null details={}\n";
@@ -487,7 +490,7 @@ fn skill_fifo_paths_fail_closed_with_typed_diagnostics_without_blocking() {
         assert!(stderr.contains("\"code\":\"skill.cli.invalid_manifest\""));
     }
 
-    fs::remove_dir_all(&root).expect("FIFO skill root should be removable");
+    owned_tree::remove_dir_all(&root).expect("FIFO skill root should be removable");
 }
 
 #[test]

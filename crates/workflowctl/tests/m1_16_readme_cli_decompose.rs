@@ -1,5 +1,8 @@
 use std::{fs, process::Command};
 
+#[path = "support/owned_tree.rs"]
+mod owned_tree;
+
 fn workspace() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -68,7 +71,7 @@ fn documented_commands_smoke_the_real_adk_path() {
         "documented ADK run must succeed: {}",
         String::from_utf8_lossy(&run.stderr)
     );
-    fs::remove_dir_all(root).expect("remove test root");
+    owned_tree::remove_dir_all(&root).expect("remove test root");
 }
 
 #[test]

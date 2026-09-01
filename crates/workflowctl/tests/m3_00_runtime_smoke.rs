@@ -17,6 +17,9 @@ use std::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+#[path = "support/owned_tree.rs"]
+mod owned_tree;
+
 static TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 static NON_REAPING_OBSERVATION_USED: AtomicBool = AtomicBool::new(false);
 
@@ -53,7 +56,7 @@ impl TempRoot {
 
 impl Drop for TempRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = owned_tree::remove_dir_all(&self.0);
     }
 }
 

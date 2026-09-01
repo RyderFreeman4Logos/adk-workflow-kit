@@ -1,7 +1,6 @@
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
@@ -18,6 +17,9 @@ use workflow_runtime::{
     ArtifactStore, CheckpointManifestV1, FilesystemArtifactStore, PageRequest, RunId,
     SqliteCheckpointStore, WorkflowRuntimeEventV1,
 };
+
+#[path = "support/owned_tree.rs"]
+mod owned_tree;
 
 static TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -122,28 +124,7 @@ impl TempRoot {
         {
             return Err("test root cleanup identity mismatch");
         }
-        make_owner_writable(&self.path);
-        fs::remove_dir_all(&self.path).map_err(|_| "test root cleanup failed")
-    }
-}
-
-fn make_owner_writable(path: &Path) {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return;
-    };
-    if metadata.file_type().is_symlink() {
-        return;
-    }
-    let mut permissions = metadata.permissions();
-    permissions.set_mode(permissions.mode() | if metadata.is_dir() { 0o700 } else { 0o200 });
-    if fs::set_permissions(path, permissions).is_err() || !metadata.is_dir() {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(path) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        make_owner_writable(&entry.path());
+        owned_tree::remove_dir_all(&self.path).map_err(|_| "test root cleanup failed")
     }
 }
 
@@ -1711,7 +1692,7 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
             .expect("UTF-8 abort root"),
     );
     let sentinel_survived = fixture_root.join("sentinel").is_file();
-    let _ = fs::remove_dir_all(&fixture_root);
+    let _ = owned_tree::remove_dir_all(&fixture_root);
 
     assert!(!output.status.success(), "unproven reap must abort");
     assert!(
@@ -1764,8 +1745,8 @@ fn temp_root_cleanup_refuses_replacement_directory() {
     let cleanup_result = root.cleanup();
     drop(root);
     let substitute_survived = original.join("sentinel").is_file();
-    let _ = fs::remove_dir_all(&original);
-    let _ = fs::remove_dir_all(&owned);
+    let _ = owned_tree::remove_dir_all(&original);
+    let _ = owned_tree::remove_dir_all(&owned);
     assert!(matches!(
         cleanup_result,
         Err("test root cleanup identity mismatch")

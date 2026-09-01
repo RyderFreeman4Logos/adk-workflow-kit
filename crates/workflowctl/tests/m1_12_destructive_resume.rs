@@ -15,6 +15,9 @@ use serde_json::Value;
 use sha2::Digest;
 use workflow_runtime::EffectJournal;
 
+#[path = "support/owned_tree.rs"]
+mod owned_tree;
+
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
 struct TestRoot(PathBuf);
@@ -33,7 +36,7 @@ impl TestRoot {
 
 impl Drop for TestRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = owned_tree::remove_dir_all(&self.0);
     }
 }
 

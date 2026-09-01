@@ -5,6 +5,9 @@ use std::os::unix::fs::symlink;
 
 use sha2::{Digest, Sha256};
 
+#[path = "support/owned_tree.rs"]
+mod owned_tree;
+
 const CANARY_MANIFEST_55: &str = "CANARY_MANIFEST_55";
 const CANARY_SCRIPT_55: &str = "CANARY_SCRIPT_55";
 const SCHEMA: &str =
@@ -68,7 +71,7 @@ fn invalid_manifest_fails_clearly_with_typed_redacted_diagnostic() {
     assert!(stderr.contains("skill.cli.invalid_manifest"));
     assert!(!stderr.contains(CANARY_MANIFEST_55));
     assert!(output.stdout.is_empty());
-    fs::remove_dir_all(path).expect("remove test skill directory");
+    owned_tree::remove_dir_all(&path).expect("remove test skill directory");
 }
 
 #[test]
@@ -94,7 +97,7 @@ fn invalid_script_fails_clearly_with_typed_redacted_diagnostic() {
     );
     assert!(!stderr.contains(CANARY_SCRIPT_55));
     assert!(output.stdout.is_empty());
-    fs::remove_dir_all(path).expect("remove test skill directory");
+    owned_tree::remove_dir_all(&path).expect("remove test skill directory");
 }
 
 #[cfg(unix)]
@@ -115,7 +118,7 @@ fn leaf_symlink_escape_is_rejected_without_echoing_target() {
     assert!(stderr.contains("skill.cli.invalid_script"));
     assert!(!stderr.contains(target.to_str().expect("utf8 target")));
     assert!(output.stdout.is_empty());
-    fs::remove_dir_all(path).expect("remove test skill directory");
+    owned_tree::remove_dir_all(&path).expect("remove test skill directory");
     fs::remove_file(target).expect("remove outside script");
 }
 
@@ -139,6 +142,6 @@ fn intermediate_directory_symlink_escape_is_rejected_without_echoing_target() {
     assert!(stderr.contains("skill.cli.invalid_script"));
     assert!(!stderr.contains(target.to_str().expect("utf8 target")));
     assert!(output.stdout.is_empty());
-    fs::remove_dir_all(path).expect("remove test skill directory");
-    fs::remove_dir_all(target).expect("remove outside script directory");
+    owned_tree::remove_dir_all(&path).expect("remove test skill directory");
+    owned_tree::remove_dir_all(&target).expect("remove outside script directory");
 }

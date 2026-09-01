@@ -5,6 +5,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+#[path = "support/owned_tree.rs"]
+mod owned_tree;
+
 static TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 const WORKFLOW_FIXTURE: &str = concat!(
@@ -102,7 +105,7 @@ fn run_executes_fixture_and_publishes_non_empty_artifact() {
         );
     }
 
-    fs::remove_dir_all(&root).expect("temp root must be removed");
+    owned_tree::remove_dir_all(&root).expect("temp root must be removed");
 }
 
 #[test]
@@ -149,7 +152,7 @@ fn explain_run_emits_deterministic_plan_without_mutating_artifact_state() {
         "explain-run must not add or remove artifact files"
     );
 
-    fs::remove_dir_all(&root).expect("temp root must be removed");
+    owned_tree::remove_dir_all(&root).expect("temp root must be removed");
 }
 
 #[test]
@@ -184,7 +187,7 @@ fn run_rejects_oversized_module_with_typed_diagnostic_before_execution() {
         "oversized module must be rejected as unsupported input, stderr: {stderr}"
     );
 
-    fs::remove_dir_all(&root).expect("temp root must be removed");
+    owned_tree::remove_dir_all(&root).expect("temp root must be removed");
 }
 
 #[test]
@@ -243,7 +246,7 @@ fn run_rejects_non_regular_module_without_blocking() {
         "non-regular module must be rejected as unsupported input, stderr: {stderr}"
     );
 
-    fs::remove_dir_all(&root).expect("temp root must be removed");
+    owned_tree::remove_dir_all(&root).expect("temp root must be removed");
 }
 
 #[test]
@@ -287,7 +290,7 @@ fn run_fails_with_typed_diagnostic_when_artifact_root_is_unusable() {
         "artifact root failure must not panic, stderr: {stderr}"
     );
 
-    fs::remove_dir_all(&root).expect("temp root must be removed");
+    owned_tree::remove_dir_all(&root).expect("temp root must be removed");
 }
 
 #[test]
@@ -320,5 +323,5 @@ fn run_fails_with_typed_diagnostic_when_execution_input_is_unsupported() {
         "typed run diagnostic expected, stderr: {stderr}"
     );
 
-    fs::remove_dir_all(&root).expect("temp root must be removed");
+    owned_tree::remove_dir_all(&root).expect("temp root must be removed");
 }
