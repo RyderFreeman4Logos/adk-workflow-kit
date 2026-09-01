@@ -340,3 +340,33 @@ fn skill_tool_unknown_fields_fail_before_effect() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn run_skill_script_is_not_read_only_when_script_declares_effects() {
+    let root = root();
+    let package = skill_package(&root);
+    let runtime_path = package.join("skill.runtime.toml");
+    let runtime = fs::read_to_string(&runtime_path).unwrap();
+    fs::write(
+        &runtime_path,
+        runtime.replace(
+            "capabilities = [\"filesystem.read\", \"process.spawn\", \"limit.output_bytes\"]",
+            "capabilities = [\"filesystem.read\", \"filesystem.write\", \"process.spawn\", \"limit.output_bytes\"]",
+        ),
+    )
+    .unwrap();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let mut value = serde_json::to_value(profile(&package)).unwrap();
+    value["sandbox"]["capabilities"] = json!([
+        "filesystem.read",
+        "filesystem.write",
+        "process.spawn",
+        "limit.output_bytes"
+    ]);
+    let profile = ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let error = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::AuthorizationDenied);
+    let _ = fs::remove_dir_all(root);
+}

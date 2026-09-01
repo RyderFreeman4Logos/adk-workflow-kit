@@ -3376,16 +3376,22 @@ impl ToolHandler for SkillToolHandler {
 fn skill_tool_registration(
     name: &str,
     capabilities: impl IntoIterator<Item = SandboxCapability>,
+    read_only: bool,
 ) -> Result<ToolRegistration, ExecutionError> {
     ToolRegistration::for_types::<Value, Value>(
         name,
         ToolProvenance::new("skill.runtime", "1"),
-        ToolFlags::new(true, true, true),
+        ToolFlags::new(read_only, true, true),
     )
     .map(|registration| {
         registration
             .with_required_capabilities(capabilities)
             .with_timeout(NonZeroU64::new(60_000).expect("positive timeout"))
+            .with_idempotency(if read_only {
+                workflow_runtime::ToolIdempotency::NotRequired
+            } else {
+                workflow_runtime::ToolIdempotency::StableKey
+            })
     })
     .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))
 }
@@ -3424,20 +3430,33 @@ fn build_tool_registry(
             .values()
             .flat_map(|package| package.capabilities())
             .collect::<Vec<_>>();
-        for (name, action, capabilities) in [
-            ("activate_skill", SkillToolAction::Activate, Vec::new()),
+        let script_is_read_only = !script_capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                SandboxCapability::FilesystemWrite | SandboxCapability::Network
+            )
+        });
+        for (name, action, capabilities, read_only) in [
+            (
+                "activate_skill",
+                SkillToolAction::Activate,
+                Vec::new(),
+                true,
+            ),
             (
                 "read_skill_resource",
                 SkillToolAction::Read,
                 vec![SandboxCapability::FilesystemRead],
+                true,
             ),
             (
                 "run_skill_script",
                 SkillToolAction::Run,
                 script_capabilities,
+                script_is_read_only,
             ),
         ] {
-            let registration = skill_tool_registration(name, capabilities)?;
+            let registration = skill_tool_registration(name, capabilities, read_only)?;
             let provenance = registration.provenance().clone();
             bridge
                 .register(
