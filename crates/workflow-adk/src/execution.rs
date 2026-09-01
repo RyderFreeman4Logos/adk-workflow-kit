@@ -87,6 +87,8 @@ struct LoopState {
     pending_calls: VecDeque<PendingCall>,
     completed_skill_calls: Vec<PendingCall>,
     #[serde(default)]
+    completed_ordinary_calls: Vec<PendingCall>,
+    #[serde(default)]
     finish_admitted: bool,
     #[serde(default)]
     finished_output: Option<Value>,
@@ -312,6 +314,24 @@ impl LoopLedgerStore {
             .collect())
     }
 
+    fn completed_ordinary_calls(&self) -> Result<Vec<(String, PendingCall)>, ExecutionError> {
+        let nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        Ok(nodes
+            .iter()
+            .flat_map(|(node, state)| {
+                (!state.finish_admitted)
+                    .then_some(&state.completed_ordinary_calls)
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+                    .map(|call| (node.clone(), call))
+            })
+            .collect())
+    }
+
     fn restore_completed_skill_call(
         &self,
         node: &str,
@@ -326,6 +346,34 @@ impl LoopLedgerStore {
             .get_mut(node)
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         if !state.completed_skill_calls.iter().any(|completed| {
+            completed.id == call.id
+                && completed.name == call.name
+                && completed.fingerprint == call.fingerprint
+        }) {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        state.conversation.push(tool_call_content(call));
+        state
+            .conversation
+            .push(tool_response_content(call, response));
+        state.conversation_reconstructed = true;
+        Ok(())
+    }
+
+    fn restore_completed_ordinary_call(
+        &self,
+        node: &str,
+        call: &PendingCall,
+        response: Value,
+    ) -> Result<(), ExecutionError> {
+        let mut nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let state = nodes
+            .get_mut(node)
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if !state.completed_ordinary_calls.iter().any(|completed| {
             completed.id == call.id
                 && completed.name == call.name
                 && completed.fingerprint == call.fingerprint
@@ -450,6 +498,8 @@ impl LoopLedgerStore {
             "activate_skill" | "read_skill_resource" | "run_skill_script"
         ) {
             state.completed_skill_calls.push(call.clone());
+        } else {
+            state.completed_ordinary_calls.push(call.clone());
         }
         if !state
             .conversation
@@ -506,6 +556,10 @@ impl LoopLedgerStore {
                 for call in &mut state.completed_skill_calls {
                     call.args = durable_pending_args(call).expect("checked completed Skill calls");
                 }
+                for call in &mut state.completed_ordinary_calls {
+                    call.args =
+                        durable_pending_args(call).expect("checked completed ordinary calls");
+                }
             }
         }
         self.persist_ledger_with_checkpoint_generation(&durable_nodes)?;
@@ -557,6 +611,10 @@ impl LoopLedgerStore {
                 }
                 for call in &mut state.completed_skill_calls {
                     call.args = durable_pending_args(call).expect("checked completed Skill calls");
+                }
+                for call in &mut state.completed_ordinary_calls {
+                    call.args =
+                        durable_pending_args(call).expect("checked completed ordinary calls");
                 }
             }
         }
@@ -612,6 +670,10 @@ impl LoopLedgerStore {
                 }
                 for call in &mut state.completed_skill_calls {
                     call.args = durable_pending_args(call).expect("checked completed Skill calls");
+                }
+                for call in &mut state.completed_ordinary_calls {
+                    call.args =
+                        durable_pending_args(call).expect("checked completed ordinary calls");
                 }
             }
         }
@@ -739,8 +801,21 @@ fn durable_pending_args(call: &PendingCall) -> Option<Value> {
             .then(|| call.args.clone())
             .or_else(|| Some(json!({"invalid": true})))
         }
+        _ if !call.name.is_empty() => Some(json!({
+            "argument_fingerprint": call.fingerprint,
+        })),
         _ => None,
     }
+}
+
+fn is_redacted_ordinary_pending(call: &PendingCall) -> bool {
+    !matches!(
+        call.name.as_str(),
+        "activate_skill" | "read_skill_resource" | "run_skill_script"
+    ) && call.args.as_object().is_some_and(|args| {
+        args.len() == 1
+            && args.get("argument_fingerprint") == Some(&Value::String(call.fingerprint.clone()))
+    })
 }
 
 fn is_redacted_script_pending(call: &PendingCall) -> bool {
@@ -756,6 +831,10 @@ fn valid_completed_skill_call(call: &PendingCall) -> bool {
     durable_pending_args(call).as_ref() == Some(&call.args)
         && (is_redacted_script_pending(call)
             || workflow_runtime::argument_fingerprint(&call.args) == call.fingerprint)
+}
+
+fn valid_completed_ordinary_call(call: &PendingCall) -> bool {
+    durable_pending_args(call).as_ref() == Some(&call.args) && is_redacted_ordinary_pending(call)
 }
 
 fn valid_skill_resource_read_accounting(state: &LoopState) -> bool {
@@ -921,6 +1000,7 @@ fn valid_loop_state(state: &LoopState) -> bool {
             .pending_calls
             .iter()
             .chain(&state.completed_skill_calls)
+            .chain(&state.completed_ordinary_calls)
             .collect::<Vec<_>>();
         let disposed_ids = disposed
             .iter()
@@ -936,12 +1016,17 @@ fn valid_loop_state(state: &LoopState) -> bool {
                 || (state.model_iterations > 0 && state.pending_calls.is_empty()))
             && state.pending_calls.iter().all(|call| {
                 durable_pending_args(call).as_ref() == Some(&call.args)
-                    && workflow_runtime::argument_fingerprint(&call.args) == call.fingerprint
+                    && (is_redacted_ordinary_pending(call)
+                        || workflow_runtime::argument_fingerprint(&call.args) == call.fingerprint)
             })
             && state
                 .completed_skill_calls
                 .iter()
                 .all(valid_completed_skill_call)
+            && state
+                .completed_ordinary_calls
+                .iter()
+                .all(valid_completed_ordinary_call)
             && state.total_tool_calls == tool_call_total
             && disposed.len() == disposed_ids.len()
             && disposed_ids == state.seen_ids
@@ -1390,6 +1475,8 @@ impl LoopController {
         };
         if completion_barrier.is_some() {
             next.completed_skill_calls.push(call.clone());
+        } else {
+            next.completed_ordinary_calls.push(call.clone());
         }
         next.conversation
             .push(tool_response_content(&call, response.clone()));
@@ -1405,6 +1492,8 @@ impl LoopController {
         }
         if let Some(marker) = completion_barrier {
             crash_barrier(marker);
+        } else {
+            crash_barrier("after-ordinary-call-completion");
         }
         *state = next;
         Ok(())
@@ -4012,8 +4101,17 @@ impl ExecutionBackend {
             &profile.skill_packages()?,
             &effect_fence,
         )
+        .and_then(|()| restore_completed_ordinary_calls(&loop_ledger, &profile))
         .and_then(|()| {
-            replay_pending_tools(&loop_ledger, &toolsets, profile.run_limits(), &effect_fence)
+            replay_pending_tools(
+                &loop_ledger,
+                &toolsets,
+                &profile,
+                &effect_journal,
+                &run_identity,
+                profile.run_limits(),
+                &effect_fence,
+            )
         }) {
             return Err(resume_failure(
                 &root,
@@ -4807,9 +4905,70 @@ fn restore_completed_skill_calls(
     Ok(())
 }
 
+fn restore_completed_ordinary_calls(
+    ledger: &LoopLedgerStore,
+    profile: &ExecutionProfileV1,
+) -> Result<(), ExecutionError> {
+    for (node, completed) in ledger.completed_ordinary_calls()? {
+        let tool = profile
+            .tool_wires()
+            .find(|tool| tool.name == completed.name)
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let provenance = profile.tool_registration(tool)?.provenance().clone();
+        let response = serde_json::to_value(ToolEnvelope::success(tool.result.clone(), provenance))
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        ledger.restore_completed_ordinary_call(&node, &completed, response)?;
+    }
+    Ok(())
+}
+
+fn invoke_restored_ordinary_tool(
+    profile: &ExecutionProfileV1,
+    call: &PendingCall,
+    effect_journal: &EffectJournal,
+    run_id: &RunId,
+    effect_fence: &EffectFence,
+) -> Result<Value, ExecutionError> {
+    let tool = profile
+        .tool_wires()
+        .find(|tool| tool.name == call.name)
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+    if tool.handler_error {
+        return Err(ExecutionError::new(ExecutionErrorKind::Tool));
+    }
+    let tool_deadline = effect_fence
+        .wait(Duration::from_millis(tool.delay_ms))
+        .map_err(|_| effect_fence.execution_error())?;
+    effect_fence
+        .admit(tool_deadline)
+        .map_err(|_| effect_fence.execution_error())?;
+    let key = EffectKey::from_argument_fingerprint(
+        run_id.as_str(),
+        &tool.name,
+        &tool.name,
+        &call.fingerprint,
+    );
+    let result = match effect_journal
+        .commit(&key, &tool.result)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?
+    {
+        EffectCommit::Committed => tool.result.clone(),
+        EffectCommit::AlreadyCommitted(result) => result,
+    };
+    effect_fence
+        .mark_progress()
+        .map_err(|_| effect_fence.execution_error())?;
+    let provenance = profile.tool_registration(tool)?.provenance().clone();
+    serde_json::to_value(ToolEnvelope::success(result, provenance))
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))
+}
+
 fn replay_pending_tools(
     ledger: &LoopLedgerStore,
     toolsets: &BTreeMap<String, Option<BoundTool>>,
+    profile: &ExecutionProfileV1,
+    effect_journal: &EffectJournal,
+    run_id: &RunId,
     limits: RunLimits,
     effect_fence: &EffectFence,
 ) -> Result<(), ExecutionError> {
@@ -4817,12 +4976,18 @@ fn replay_pending_tools(
         if is_redacted_script_pending(&pending) {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
-        let toolset = toolsets
+        let (names, toolset) = toolsets
             .get(&node)
             .and_then(Option::as_ref)
-            .map(|(_, toolset)| Arc::clone(toolset))
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let response = invoke_restored_tool(&node, &pending, toolset, effect_fence)?;
+        if !names.contains(&pending.name) {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        let response = if is_redacted_ordinary_pending(&pending) {
+            invoke_restored_ordinary_tool(profile, &pending, effect_journal, run_id, effect_fence)?
+        } else {
+            invoke_restored_tool(&node, &pending, Arc::clone(toolset), effect_fence)?
+        };
         ledger.complete_pending(
             &node,
             &pending,

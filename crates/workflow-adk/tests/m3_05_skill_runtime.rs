@@ -385,9 +385,21 @@ fn mixed_profile(package: &std::path::Path) -> ExecutionProfileV1 {
         }
     }]);
     value["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+        {"calls": [{"id":"ordinary","name":"search_code","args":{"query":"ordinary-raw-argument"}}]},
+        {"calls": [{"id":"skill","name":"run_skill_script","args":{"skill_id":"code-investigation","script_id":"answer","input":{"value":"done"}}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
+    ]);
+    ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
+}
+
+fn simultaneous_mixed_profile(package: &std::path::Path) -> ExecutionProfileV1 {
+    let mut value = serde_json::to_value(mixed_profile(package)).unwrap();
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
         {"calls": [
-            {"id":"ordinary","name":"search_code","args":{"query":"must-not-persist"}},
-            {"id":"skill","name":"run_skill_script","args":{"skill_id":"code-investigation","script_id":"answer","input":{"value":"must-not-run"}}}
+            {"id":"ordinary","name":"search_code","args":{"query":"ordinary-raw-argument"}},
+            {"id":"skill","name":"run_skill_script","args":{"skill_id":"code-investigation","script_id":"answer","input":{"value":"done"}}}
         ]},
         serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
     ]);
@@ -1648,31 +1660,97 @@ fn changed_skill_sandbox_capabilities_reject_crash_resume_before_effect() {
 }
 
 #[test]
-fn mixed_ordinary_and_skill_calls_fail_before_effect_when_not_durable() {
-    let root = root();
-    let package = skill_package(&root);
-    let workflow = root.join("workflow.toml");
-    fs::write(&workflow, MIXED_WORKFLOW).unwrap();
+fn sequential_and_simultaneous_mixed_calls_are_durable() {
+    for simultaneous in [false, true] {
+        let root = root();
+        let package = skill_package(&root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, MIXED_WORKFLOW).unwrap();
+        let profile = if simultaneous {
+            simultaneous_mixed_profile(&package)
+        } else {
+            mixed_profile(&package)
+        };
 
-    let error =
-        ExecutionBackend::run(&workflow, mixed_profile(&package), json!({}), &root).unwrap_err();
-    assert_eq!(error.kind(), ExecutionErrorKind::Persistence);
-    let run_root = error.receipt().unwrap().run_root();
-    assert_eq!(
-        Connection::open(run_root.join("effects.sqlite"))
+        let receipt = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap();
+        assert_eq!(receipt.status(), "succeeded", "simultaneous={simultaneous}");
+        let ledger = fs::read_to_string(receipt.run_root().join("loop-ledger.json")).unwrap();
+        assert!(ledger.contains("search_code"));
+        assert!(!ledger.contains("ordinary-raw-argument"));
+        assert_eq!(
+            Connection::open(receipt.run_root().join("effects.sqlite"))
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM kit_effects", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        cleanup_test_root(&root);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+}
+
+#[test]
+fn sequential_and_simultaneous_mixed_calls_crash_resume() {
+    if let Ok(root) = env::var("M3_05_MIXED_CRASH_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, MIXED_WORKFLOW).unwrap();
+        let profile = if env::var_os("M3_05_MIXED_SIMULTANEOUS").is_some() {
+            simultaneous_mixed_profile(&root.join("code-investigation"))
+        } else {
+            mixed_profile(&root.join("code-investigation"))
+        };
+        let _ = ExecutionBackend::run(&workflow, profile, json!({}), root);
+        panic!("crash barrier did not terminate the child");
+    }
+
+    for (simultaneous, barrier) in [
+        (false, "after-ordinary-call-completion"),
+        (true, "after-skill-call-admission"),
+    ] {
+        let root = root();
+        skill_package(&root);
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "sequential_and_simultaneous_mixed_calls_crash_resume",
+                "--nocapture",
+            ])
+            .env("M3_05_MIXED_CRASH_ROOT", &root)
+            .env("WORKFLOW_KIT_TEST_CRASH_BARRIER", barrier);
+        if simultaneous {
+            command.env("M3_05_MIXED_SIMULTANEOUS", "1");
+        }
+        let status = command.status().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{barrier}");
+        let run_root = fs::read_dir(&root)
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM kit_effects", [], |row| row
-                .get::<_, u64>(0))
-            .unwrap(),
-        0
-    );
-    assert!(
-        !fs::read_to_string(run_root.join("loop-ledger.json"))
-            .unwrap()
-            .contains("ordinary")
-    );
-    cleanup_test_root(&root);
-    fs::remove_dir_all(root).expect("test cleanup");
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.join("run-manifest.json").is_file())
+            .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+        let resumed =
+            ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap();
+        assert_eq!(resumed.status(), "succeeded", "{barrier}");
+        let ledger = fs::read_to_string(run_root.join("loop-ledger.json")).unwrap();
+        assert!(ledger.contains("search_code"), "{barrier}");
+        assert!(!ledger.contains("ordinary-raw-argument"), "{barrier}");
+        assert_eq!(
+            Connection::open(run_root.join("effects.sqlite"))
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM kit_effects", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            1,
+            "{barrier}"
+        );
+        cleanup_test_root(&root);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
 }
 
 #[test]
