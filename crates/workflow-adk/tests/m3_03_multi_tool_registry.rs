@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -37,6 +38,17 @@ fn test_root() -> PathBuf {
     ));
     fs::create_dir(&root).expect("unique test root");
     root
+}
+
+fn cleanup_test_root(path: &Path) {
+    let metadata = fs::symlink_metadata(path).expect("test root metadata");
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        for entry in fs::read_dir(path).expect("test root entries") {
+            cleanup_test_root(&entry.expect("test root entry").path());
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("test root directory unlock");
+    }
 }
 
 fn profile() -> ExecutionProfileV1 {
@@ -132,5 +144,6 @@ fn exposes_only_the_selected_node_toolset() {
             .map(|path| fs::read(path).expect("run state")),
         before
     );
+    cleanup_test_root(&root);
     fs::remove_dir_all(root).expect("test cleanup");
 }
