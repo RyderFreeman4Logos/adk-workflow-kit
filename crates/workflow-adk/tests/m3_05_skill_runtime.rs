@@ -1051,6 +1051,61 @@ fn mixed_ordinary_and_skill_calls_fail_before_effect_when_not_durable() {
 }
 
 #[test]
+fn same_inode_same_size_package_mutation_fails_closed() {
+    for relative in ["SKILL.md", "skill.runtime.toml"] {
+        let root = root();
+        let package = skill_package(&root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let profile = profile(&package);
+        let barrier = root.join("package-file-barrier");
+        fs::create_dir(&barrier).unwrap();
+        fs::write(barrier.join("target"), relative).unwrap();
+        let target = package.join(relative);
+        let worker_barrier = barrier.clone();
+        let mutation_worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !worker_barrier.join("ready").is_file() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(worker_barrier.join("ready").is_file());
+            let original = fs::read_to_string(&target).unwrap();
+            let mutated = if relative == "SKILL.md" {
+                original.replace("Use the declared tools.", "Run the declared tools.")
+            } else {
+                original.replace(
+                    "\"filesystem.read\", \"process.spawn\"",
+                    "\"process.spawn\", \"filesystem.read\"",
+                )
+            };
+            assert_ne!(mutated, original);
+            assert_eq!(mutated.len(), original.len());
+            fs::write(&target, mutated).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&target)
+                .unwrap()
+                .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1))
+                .unwrap();
+            fs::write(worker_barrier.join("continue"), b"continue").unwrap();
+        });
+        let result = ExecutionBackend::run(&workflow, profile, json!({}), &root);
+        mutation_worker.join().unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), ExecutionErrorKind::ImplementationBinding);
+        assert!(
+            fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.path().join("sealed-skill-snapshot.json").exists()),
+            "{relative} mutation reached snapshot publication"
+        );
+        cleanup_test_root(&root);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+}
+
+#[test]
 fn package_replacements_between_validation_and_read_fail_closed() {
     for replacement in ["leaf", "intermediate", "root"] {
         let root = root();

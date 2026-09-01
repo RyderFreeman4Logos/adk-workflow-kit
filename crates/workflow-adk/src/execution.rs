@@ -1649,6 +1649,29 @@ fn skill_snapshot_test_barrier() {}
 struct PackageIdentity {
     dev: u64,
     ino: u64,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl PackageIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+
+    fn matches(self, metadata: &fs::Metadata) -> bool {
+        self == Self::from_metadata(metadata)
+    }
 }
 
 fn package_directory_identity(path: &Path) -> Result<PackageIdentity, ExecutionError> {
@@ -1659,21 +1682,20 @@ fn package_directory_identity(path: &Path) -> Result<PackageIdentity, ExecutionE
             ExecutionErrorKind::ImplementationBinding,
         ));
     }
-    Ok(PackageIdentity {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-    })
+    Ok(PackageIdentity::from_metadata(&metadata))
 }
 
 #[cfg(debug_assertions)]
 fn package_file_test_barrier(package_root: &Path, relative: &str) {
-    if relative != "scripts/replacement.bin" {
-        return;
-    }
     let Some(parent) = package_root.parent() else {
         return;
     };
     let root = parent.join("package-file-barrier");
+    let target = fs::read_to_string(root.join("target"))
+        .unwrap_or_else(|_| "scripts/replacement.bin".to_owned());
+    if relative != target {
+        return;
+    }
     if fs::write(root.join("ready"), b"ready").is_err() {
         return;
     }
@@ -1705,11 +1727,8 @@ fn package_file_test_read_len(_: &Path, _: &str, _: usize) {}
 
 fn package_paths_match(checked: &[(PathBuf, PackageIdentity)]) -> bool {
     checked.iter().all(|(path, identity)| {
-        fs::symlink_metadata(path).is_ok_and(|metadata| {
-            !metadata.file_type().is_symlink()
-                && metadata.dev() == identity.dev
-                && metadata.ino() == identity.ino
-        })
+        fs::symlink_metadata(path)
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink() && identity.matches(&metadata))
     })
 }
 
@@ -1739,13 +1758,7 @@ fn package_file(
                 ExecutionErrorKind::ImplementationBinding,
             ));
         }
-        checked.push((
-            path.clone(),
-            PackageIdentity {
-                dev: metadata.dev(),
-                ino: metadata.ino(),
-            },
-        ));
+        checked.push((path.clone(), PackageIdentity::from_metadata(&metadata)));
     }
     let metadata = fs::symlink_metadata(&path)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
