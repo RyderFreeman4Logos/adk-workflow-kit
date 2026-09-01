@@ -160,6 +160,19 @@ fn terminal_value_bytes(run_root: &Path) -> Vec<u8> {
     serde_json::to_vec(&artifact["terminal"]).unwrap()
 }
 
+fn terminal_artifact_bytes(run_root: &Path) -> Vec<u8> {
+    let connection = Connection::open(run_root.join("checkpoint.sqlite")).unwrap();
+    let state: Vec<u8> = connection
+        .query_row("SELECT state FROM kit_checkpoints", [], |row| row.get(0))
+        .unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&state).unwrap();
+    serde_json::to_vec(&json!({
+        "terminal": state["terminal"],
+        "work": state["node:work"],
+    }))
+    .unwrap()
+}
+
 fn skill_package(root: &std::path::Path) -> PathBuf {
     let package = root.join("code-investigation");
     fs::create_dir(&package).unwrap();
@@ -300,6 +313,7 @@ fn resume_profile(package: &std::path::Path) -> ExecutionProfileV1 {
     value["model"]["responses"] = json!([
         {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
         {"calls": [{"id":"read","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/guide.txt","offset":0,"limit":64}}]},
+        {"calls": [{"id":"run","name":"run_skill_script","args":{"skill_id":"code-investigation","script_id":"answer","input":{"value":"done"}}}]},
         serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
     ]);
     ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
@@ -1177,15 +1191,32 @@ fn crashed_skill_admission_or_activation_resumes_without_widening() {
     }
     let baseline_digest =
         fs::read_to_string(baseline.run_root().join("model-contents-digest")).unwrap();
+    let baseline_terminal = terminal_artifact_bytes(baseline.run_root());
     assert_eq!(baseline.status(), "succeeded");
     cleanup_test_root(&baseline_root);
     fs::remove_dir_all(baseline_root).expect("baseline cleanup");
 
-    for (barrier, exact_transcript) in [
-        ("after-skill-call-admission", false),
-        ("after-skill-activation", false),
-        ("after-skill-call-completion-activate_skill", true),
-        ("after-skill-call-completion-read_skill_resource", true),
+    for (barrier, exact_transcript, remaining_calls) in [
+        (
+            "after-skill-call-admission",
+            false,
+            &["activate_skill", "read_skill_resource", "run_skill_script"][..],
+        ),
+        (
+            "after-skill-activation",
+            false,
+            &["activate_skill", "read_skill_resource", "run_skill_script"][..],
+        ),
+        (
+            "after-skill-call-completion-activate_skill",
+            true,
+            &["read_skill_resource", "run_skill_script"][..],
+        ),
+        (
+            "after-skill-call-completion-read_skill_resource",
+            true,
+            &["run_skill_script"][..],
+        ),
     ] {
         let root = root();
         skill_package(&root);
@@ -1219,7 +1250,18 @@ fn crashed_skill_admission_or_activation_resumes_without_widening() {
             env::remove_var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST");
         }
         assert_eq!(resumed.status(), "succeeded", "{barrier}");
+        assert_eq!(
+            terminal_artifact_bytes(&run_root),
+            baseline_terminal,
+            "{barrier} changed the successful terminal artifact"
+        );
         let events = fs::read_to_string(run_root.join("events.jsonl")).unwrap();
+        for call in remaining_calls {
+            assert!(
+                events.contains(call),
+                "{barrier} skipped intended remaining call {call}"
+            );
+        }
         if exact_transcript {
             assert_eq!(
                 fs::read_to_string(&digest_path).unwrap(),

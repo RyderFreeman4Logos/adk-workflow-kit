@@ -1717,6 +1717,8 @@ impl SkillRegistry for SkillPackage {
 struct SealedSkillSnapshotV1 {
     schema_version: u8,
     packages: Vec<SealedSkillPackageV1>,
+    model_responses: Option<Vec<u8>>,
+    reviewer_model_responses: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1734,6 +1736,8 @@ struct SealedSkillPackageV1 {
 impl SealedSkillSnapshotV1 {
     fn from_packages(
         packages: BTreeMap<String, Arc<SkillPackage>>,
+        model: &ModelWire,
+        reviewer_model: Option<&ModelWire>,
     ) -> Result<Option<Self>, ExecutionError> {
         if packages.is_empty() {
             return Ok(None);
@@ -1746,9 +1750,15 @@ impl SealedSkillSnapshotV1 {
                     .into_sealed()
             })
             .collect::<Result<Vec<_>, ExecutionError>>()?;
+        let reviewer_model_responses = reviewer_model
+            .map(ModelWire::sealed_fake_responses)
+            .transpose()?
+            .flatten();
         Ok(Some(Self {
             schema_version: 1,
             packages,
+            model_responses: model.sealed_fake_responses()?,
+            reviewer_model_responses,
         }))
     }
 
@@ -1759,11 +1769,25 @@ impl SealedSkillSnapshotV1 {
     }
 
     fn restore(
-        self,
+        mut self,
         expected_identity: &str,
+        profile: &mut ExecutionProfileV1,
     ) -> Result<BTreeMap<String, Arc<SkillPackage>>, ExecutionError> {
         if self.schema_version != 1 || self.identity()? != expected_identity {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        profile
+            .model
+            .restore_fake_responses(self.model_responses.take())?;
+        match (
+            &mut profile.reviewer_model,
+            self.reviewer_model_responses.take(),
+        ) {
+            (Some(model), responses) => model.restore_fake_responses(responses)?,
+            (None, None) => {}
+            (None, Some(_)) => {
+                return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+            }
         }
         self.into_packages()
     }
@@ -2035,6 +2059,29 @@ enum ModelWire {
     },
 }
 
+impl ModelWire {
+    fn sealed_fake_responses(&self) -> Result<Option<Vec<u8>>, ExecutionError> {
+        match self {
+            Self::Fake { responses, .. } => serde_json::to_vec(responses)
+                .map(Some)
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile)),
+            Self::OpenaiCompatible { .. } => Ok(None),
+        }
+    }
+
+    fn restore_fake_responses(&mut self, sealed: Option<Vec<u8>>) -> Result<(), ExecutionError> {
+        match (self, sealed) {
+            (Self::Fake { responses, .. }, Some(sealed)) => {
+                *responses = serde_json::from_slice(&sealed)
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                Ok(())
+            }
+            (Self::OpenaiCompatible { .. }, None) => Ok(()),
+            _ => Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ToolWire {
@@ -2207,7 +2254,7 @@ impl ExecutionProfileV1 {
             let projection = projection
                 .as_object_mut()
                 .expect("execution profile is an object");
-            let redact_fake_responses = !self.skills.is_empty();
+            let redact_fake_responses = !self.skills.is_empty() || self.skill_snapshot.is_some();
             projection.insert("skills".to_owned(), Value::Array(Vec::new()));
             projection.insert(
                 "skill_snapshot".to_owned(),
@@ -2272,7 +2319,7 @@ impl ExecutionProfileV1 {
     }
 
     fn restore_skill_snapshot(&mut self, root: &Path) -> Result<(), ExecutionError> {
-        let Some(identity) = self.skill_snapshot.as_deref() else {
+        let Some(identity) = self.skill_snapshot.clone() else {
             return Ok(());
         };
         if !self.skills.is_empty() {
@@ -2282,7 +2329,7 @@ impl ExecutionProfileV1 {
             &root.join(SKILL_SNAPSHOT_FILE),
         )?)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        self.sealed_skills = Some(snapshot.restore(identity)?);
+        self.sealed_skills = Some(snapshot.restore(&identity, self)?);
         Ok(())
     }
 
@@ -3130,8 +3177,11 @@ impl ExecutionBackend {
         }
         let compiled = compile_file(workflow.as_ref().to_string_lossy().as_ref())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Compile))?;
-        let skill_snapshot =
-            SealedSkillSnapshotV1::from_packages(profile.planned_skill_packages(compiled.ir())?)?;
+        let skill_snapshot = SealedSkillSnapshotV1::from_packages(
+            profile.planned_skill_packages(compiled.ir())?,
+            &profile.model,
+            profile.reviewer_model.as_ref(),
+        )?;
         let (skill_snapshot_bytes, skill_snapshot_identity) = match skill_snapshot {
             Some(snapshot) => {
                 let bytes = serde_json::to_vec(&snapshot)
