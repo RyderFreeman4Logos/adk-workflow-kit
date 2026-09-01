@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    os::unix::process::ExitStatusExt,
+    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -17,6 +17,53 @@ use workflow_adk::execution::{
 };
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+struct TestRoot(PathBuf);
+
+impl AsRef<Path> for TestRoot {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for TestRoot {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for TestRoot {
+    fn drop(&mut self) {
+        make_owner_writable(&self.0);
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn make_owner_writable(path: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(permissions.mode() | if metadata.is_dir() { 0o700 } else { 0o200 });
+    if fs::set_permissions(path, permissions).is_err() {
+        return;
+    }
+    if !metadata.is_dir() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        make_owner_writable(&entry.path());
+    }
+}
+
 const WORKFLOW: &str = r#"
 schema_version = 1
 [workflow]
@@ -63,14 +110,14 @@ from = "second"
 to = "done"
 "#;
 
-fn root() -> PathBuf {
+fn root() -> TestRoot {
     let root = std::env::temp_dir().join(format!(
         "m3-04-{}-{}",
         std::process::id(),
         NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir(&root).unwrap();
-    root
+    TestRoot(root)
 }
 
 fn loop_policy() -> Value {
@@ -136,7 +183,7 @@ fn profile() -> ExecutionProfileV1 {
     )
 }
 
-fn run(profile: ExecutionProfileV1) -> (PathBuf, Result<ExecutionReceipt, ExecutionError>) {
+fn run(profile: ExecutionProfileV1) -> (TestRoot, Result<ExecutionReceipt, ExecutionError>) {
     let root = root();
     let workflow = root.join("workflow.toml");
     fs::write(&workflow, WORKFLOW).unwrap();
@@ -151,7 +198,7 @@ fn run(profile: ExecutionProfileV1) -> (PathBuf, Result<ExecutionReceipt, Execut
 
 fn run_two_nodes(
     profile: ExecutionProfileV1,
-) -> (PathBuf, Result<ExecutionReceipt, ExecutionError>) {
+) -> (TestRoot, Result<ExecutionReceipt, ExecutionError>) {
     let root = root();
     let workflow = root.join("workflow.toml");
     fs::write(&workflow, TWO_NODE_WORKFLOW).unwrap();
@@ -220,14 +267,13 @@ fn effect_count(run_root: &Path) -> u64 {
 
 #[test]
 fn model_authors_two_selected_calls_then_typed_finish() {
-    let (root, receipt) = run(profile());
+    let (_root, receipt) = run(profile());
     let receipt = receipt.unwrap();
     let events = fs::read_to_string(receipt.run_root().join("events.jsonl")).unwrap();
     assert!(events.contains("call-search"));
     assert!(events.contains("call-read"));
     assert!(events.find("call-search") < events.find("call-read"));
     assert!(!events.contains("must not become args"));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -236,11 +282,10 @@ fn undeclared_or_unknown_call_fails_before_effect() {
         json!({"calls": [{"id":"call-unknown","name":"unknown","args":{}}]}),
         json!("done"),
     ];
-    let (root, error) = run(profile_with(responses, None));
+    let (_root, error) = run(profile_with(responses, None));
     let error = error.unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::Adk);
     assert!(!events(&error).contains("tool_completed"));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -255,10 +300,9 @@ fn malformed_or_schema_invalid_arguments_fail_before_effect() {
             json!({"calls": [{"id":"call-bad","name":"search_code","args":args}]}),
             finish(json!({"must_not":"succeed"})),
         ];
-        let (root, error) = run(profile_with(responses, None));
+        let (_root, error) = run(profile_with(responses, None));
         let error = error.unwrap_err();
         assert!(!events(&error).contains("tool_completed"));
-        fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -268,7 +312,7 @@ fn real_tool_failure_is_terminal_before_later_finish() {
         json!({"calls": [{"id":"call-fail","name":"search_code","args":{"query":"x"}}]}),
         finish(json!({"must_not":"succeed"})),
     ];
-    let (root, error) = run(profile_with_delays(
+    let (_root, error) = run(profile_with_delays(
         responses,
         None,
         0,
@@ -278,7 +322,6 @@ fn real_tool_failure_is_terminal_before_later_finish() {
     let error = error.unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::Tool);
     assert_eq!(error.receipt().unwrap().status(), "failed");
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -299,7 +342,7 @@ fn successful_tool_payload_markers_never_terminate() {
             json!({"calls": [{"id":"call-marker","name":"search_code","args":{"query":"x"}}]}),
             finish(json!({"answer":"done"})),
         ];
-        let (root, receipt) = run(profile_with_delays(
+        let (_root, receipt) = run(profile_with_delays(
             responses,
             None,
             0,
@@ -307,7 +350,6 @@ fn successful_tool_payload_markers_never_terminate() {
             json!({"source":marker}),
         ));
         assert_eq!(receipt.unwrap().status(), "succeeded", "marker {marker}");
-        fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -318,9 +360,8 @@ fn non_json_or_wrong_finish_shape_never_succeeds() {
         json!("{}"),
         json!("{\"status\":\"finished\"}"),
     ] {
-        let (root, error) = run(profile_with(vec![response], None));
+        let (_root, error) = run(profile_with(vec![response], None));
         assert!(error.is_err());
-        fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -354,7 +395,6 @@ fn extra_field_finish_run_and_resume_fail_closed_before_dispatch() {
         ),
         before
     );
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -367,11 +407,10 @@ fn empty_response_missing_finish_and_repeated_call_fail_closed() {
             json!("done"),
         ],
     ] {
-        let (root, error) = run(profile_with(responses, None));
+        let (_root, error) = run(profile_with(responses, None));
         let error = error.unwrap_err();
         assert_eq!(error.kind(), ExecutionErrorKind::Adk);
         assert_eq!(error.receipt().unwrap().status(), "failed");
-        fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -381,7 +420,7 @@ fn total_tool_call_limit_is_exact_and_blocked() {
         {"id":"call-1","name":"search_code","args":{"query":"one"}},
         {"id":"call-2","name":"read_source_range","args":{"path":"src/lib.rs","start":1}}
     ]})];
-    let (root, error) = run(profile_with(
+    let (_root, error) = run(profile_with(
         responses,
         Some(policy_with("max_total_tool_calls", 1)),
     ));
@@ -389,7 +428,6 @@ fn total_tool_call_limit_is_exact_and_blocked() {
     assert_eq!(error.kind(), ExecutionErrorKind::TotalToolCallsLimit);
     assert_eq!(error.receipt().unwrap().status(), "limit_exceeded");
     assert!(!events(&error).contains("tool_completed"));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -398,7 +436,7 @@ fn per_tool_call_limit_is_exact_and_blocked() {
         {"id":"call-1","name":"search_code","args":{"query":"one"}},
         {"id":"call-2","name":"search_code","args":{"query":"two"}}
     ]})];
-    let (root, error) = run(profile_with(
+    let (_root, error) = run(profile_with(
         responses,
         Some(policy_with("max_tool_calls_per_tool", 1)),
     ));
@@ -406,7 +444,6 @@ fn per_tool_call_limit_is_exact_and_blocked() {
     assert_eq!(error.kind(), ExecutionErrorKind::ToolCallsPerToolLimit);
     assert_eq!(error.receipt().unwrap().status(), "limit_exceeded");
     assert!(!events(&error).contains("tool_completed"));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -415,14 +452,13 @@ fn model_iteration_limit_is_exact_and_blocked() {
         json!({"calls": [{"id":"call-1","name":"search_code","args":{"query":"one"}}]}),
         finish(json!({"answer":"too-late"})),
     ];
-    let (root, error) = run(profile_with(
+    let (_root, error) = run(profile_with(
         responses,
         Some(policy_with("max_model_iterations", 1)),
     ));
     let error = error.unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::ModelIterationsLimit);
     assert_eq!(error.receipt().unwrap().status(), "limit_exceeded");
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -447,7 +483,6 @@ fn tool_output_byte_limit_is_exact_and_blocked() {
     .unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::ToolOutputBytesLimit);
     assert_eq!(error.receipt().unwrap().status(), "limit_exceeded");
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -466,7 +501,7 @@ fn run_limits_span_sequential_agent_nodes() {
             ExecutionErrorKind::ToolOutputBytesLimit,
         ),
     ] {
-        let (root, result) = run_two_nodes(profile_with(
+        let (_root, result) = run_two_nodes(profile_with(
             vec![
                 json!({"calls": [{"id":"call-search","name":"search_code","args":{"query":"needle"}}]}),
                 finish(json!({"answer":"done"})),
@@ -477,13 +512,12 @@ fn run_limits_span_sequential_agent_nodes() {
         assert_eq!(error.kind(), expected);
         assert_eq!(effect_count(error.receipt().unwrap().run_root()), 1);
         assert!(!events(&error).contains("tool_completed\"}\n{\"sequence\":3"));
-        fs::remove_dir_all(root).unwrap();
     }
 }
 
 #[test]
 fn wall_time_limit_is_exact_and_timed_out() {
-    let (root, error) = run(profile_with_delays(
+    let (_root, error) = run(profile_with_delays(
         vec![finish(json!({"answer":"late"}))],
         Some(policy_with("wall_time_ms", 5)),
         50,
@@ -493,13 +527,12 @@ fn wall_time_limit_is_exact_and_timed_out() {
     let error = error.unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::WallTimeLimit);
     assert_eq!(error.receipt().unwrap().status(), "timed_out");
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn idle_time_limit_is_exact_and_timed_out() {
     let started = Instant::now();
-    let (root, error) = run(profile_with_delays(
+    let (_root, error) = run(profile_with_delays(
         vec![finish(json!({"answer":"late"}))],
         Some(policy_with("idle_time_ms", 5)),
         1000,
@@ -512,13 +545,11 @@ fn idle_time_limit_is_exact_and_timed_out() {
     assert_eq!(effect_count(error.receipt().unwrap().run_root()), 0);
     assert!(!events(&error).contains("tool_completed"));
     assert!(started.elapsed() < Duration::from_secs(5));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn model_wait_selects_mid_run_cancellation() {
     let root = root();
-    let cleanup = root.clone();
     let workflow = root.join("workflow.toml");
     fs::write(&workflow, WORKFLOW).unwrap();
     let cancellation = Arc::new(AtomicBool::new(false));
@@ -545,12 +576,11 @@ fn model_wait_selects_mid_run_cancellation() {
     assert_eq!(error.kind(), ExecutionErrorKind::Cancelled);
     assert_eq!(error.receipt().unwrap().status(), "cancelled");
     assert!(started.elapsed() < Duration::from_secs(5));
-    fs::remove_dir_all(cleanup).unwrap();
 }
 
 #[test]
 fn tool_time_limit_is_exact_and_timed_out() {
-    let (root, error) = run(profile_with_delays(
+    let (_root, error) = run(profile_with_delays(
         vec![json!({"calls": [{"id":"call-slow","name":"search_code","args":{"query":"one"}}]})],
         Some(policy_with("tool_time_ms", 5)),
         0,
@@ -560,7 +590,6 @@ fn tool_time_limit_is_exact_and_timed_out() {
     let error = error.unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::ToolTimeLimit);
     assert_eq!(error.receipt().unwrap().status(), "timed_out");
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -569,7 +598,7 @@ fn tool_idle_limit_fences_effect_before_commit() {
     policy["idle_time_ms"] = json!(25);
     policy["tool_time_ms"] = json!(1000);
     let started = Instant::now();
-    let (root, error) = run(profile_with_delays(
+    let (_root, error) = run(profile_with_delays(
         vec![
             json!({"calls": [{"id":"call-idle","name":"search_code","args":{"query":"one"}}]}),
             finish(json!({"answer":"must not run"})),
@@ -585,7 +614,6 @@ fn tool_idle_limit_fences_effect_before_commit() {
     assert_eq!(effect_count(error.receipt().unwrap().run_root()), 0);
     assert!(!events(&error).contains("tool_completed"));
     assert!(started.elapsed() < Duration::from_secs(5));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -603,7 +631,6 @@ fn cancellation_is_exact_and_never_succeeds() {
     .unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::Cancelled);
     assert_eq!(error.receipt().unwrap().status(), "cancelled");
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -647,7 +674,7 @@ fn cancellation_after_dispatch_fences_effect_and_worker() {
             "cancellation_after_dispatch_fences_effect_and_worker",
             "--nocapture",
         ])
-        .env("M3_04_CANCEL_RUN_ROOT", &root)
+        .env("M3_04_CANCEL_RUN_ROOT", &*root)
         .env("WORKFLOW_KIT_TEST_EFFECT_BARRIER", &barrier)
         .spawn()
         .unwrap();
@@ -668,7 +695,6 @@ fn cancellation_after_dispatch_fences_effect_and_worker() {
         .find(|path| path.join("run-manifest.json").is_file())
         .unwrap();
     assert_eq!(effect_count(&run_root), 0);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -694,7 +720,6 @@ fn resume_rejects_loop_identity_drift_before_effects() {
         protected.each_ref().map(|path| fs::read(path).unwrap()),
         before
     );
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -728,7 +753,6 @@ fn call_id_and_argument_fingerprint_survive_event_and_resume() {
             .count(),
         1
     );
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -771,7 +795,6 @@ fn resume_wall_time_limit_includes_pending_replay_and_is_typed() {
     assert!(started.elapsed() < Duration::from_secs(5));
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(effect_count(&run_root), 0);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -814,7 +837,6 @@ fn resume_idle_limit_fences_pending_replay_before_commit() {
     assert_eq!(effect_count(&run_root), 0);
     assert!(!events(&error).contains("tool_completed"));
     assert!(started.elapsed() < Duration::from_secs(5));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -848,7 +870,7 @@ fn resume_pending_replay_selects_mid_wait_cancellation() {
     );
     let cancellation = Arc::new(AtomicBool::new(false));
     let worker_cancellation = Arc::clone(&cancellation);
-    let worker_root = root.clone();
+    let worker_root = root.0.clone();
     let run_id = run_id(&run_root);
     let worker = std::thread::spawn(move || {
         ExecutionBackend::resume_cancellable(&worker_root, &run_id, worker_cancellation)
@@ -862,7 +884,6 @@ fn resume_pending_replay_selects_mid_wait_cancellation() {
     assert_eq!(effect_count(&run_root), 0);
     assert!(!events(&error).contains("tool_completed"));
     assert!(started.elapsed() < Duration::from_secs(2));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -893,7 +914,7 @@ fn resume_model_wait_selects_mid_wait_cancellation() {
             "resume_model_wait_selects_mid_wait_cancellation",
             "--nocapture",
         ])
-        .env("M3_04_RESUME_MODEL_RUN_ROOT", &root)
+        .env("M3_04_RESUME_MODEL_RUN_ROOT", &*root)
         .spawn()
         .unwrap();
     let started = Instant::now();
@@ -918,7 +939,7 @@ fn resume_model_wait_selects_mid_wait_cancellation() {
 
     let cancellation = Arc::new(AtomicBool::new(false));
     let worker_cancellation = Arc::clone(&cancellation);
-    let worker_root = root.clone();
+    let worker_root = root.0.clone();
     let run_id = run_id(&run_root);
     let worker = std::thread::spawn(move || {
         ExecutionBackend::resume_cancellable(&worker_root, &run_id, worker_cancellation)
@@ -932,7 +953,6 @@ fn resume_model_wait_selects_mid_wait_cancellation() {
     assert_eq!(effect_count(&run_root), 0);
     assert!(!events(&error).contains("tool_completed"));
     assert!(started.elapsed() < Duration::from_secs(2));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -995,7 +1015,6 @@ fn resume_rejects_unverified_multiple_mixed_finish_before_dispatch() {
         ),
         before
     );
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1028,7 +1047,6 @@ fn resume_preserves_model_iteration_limit_and_status() {
     let error = ExecutionBackend::resume(&root, &run_id(&run_root)).unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::ModelIterationsLimit);
     assert_eq!(error.receipt().unwrap().status(), "limit_exceeded");
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1061,7 +1079,6 @@ fn restored_effect_envelope_obeys_tool_output_byte_limit() {
     let error = ExecutionBackend::resume(&root, &run_id(&run_root)).unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::ToolOutputBytesLimit);
     assert_eq!(error.receipt().unwrap().status(), "limit_exceeded");
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1109,7 +1126,6 @@ fn resume_rejects_tampered_pending_ledger_before_effect() {
             .unwrap()
             .contains("tool_completed")
     );
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1163,7 +1179,6 @@ fn resume_rejects_coordinated_ledger_tamper_before_effect() {
             .unwrap()
             .contains("tool_completed")
     );
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1239,7 +1254,6 @@ fn effect_after_crash_before_node_checkpoint_resumes_from_loop_ledger() {
     );
     assert!(ledger.to_string().contains("call-crash"));
     assert!(ledger.to_string().contains("resumed"));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1285,5 +1299,4 @@ fn finish_after_crash_resumes_without_another_model_request() {
     let ledger: Value =
         serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
     assert_eq!(ledger["nodes"]["work"]["model_iterations"], 1);
-    fs::remove_dir_all(root).unwrap();
 }
