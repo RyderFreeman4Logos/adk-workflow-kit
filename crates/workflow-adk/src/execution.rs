@@ -5,6 +5,7 @@ use std::{
     fmt, fs,
     future::Future,
     num::{NonZeroU64, NonZeroUsize},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -1172,22 +1173,16 @@ struct SkillPackage {
 
 impl SkillPackage {
     fn load(wire: &SkillWire) -> Result<Self, ExecutionError> {
-        let metadata = fs::symlink_metadata(&wire.root)
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(ExecutionError::new(
-                ExecutionErrorKind::ImplementationBinding,
-            ));
-        }
+        let root_identity = package_directory_identity(&wire.root)?;
         let id = SkillId::new(&wire.id)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
         if wire.version.is_empty() {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
         }
-        let skill_markdown = package_file(&wire.root, "SKILL.md")?;
+        let skill_markdown = package_file(&wire.root, root_identity, "SKILL.md")?;
         let manifest = SkillManifest::parse(&wire.root, &skill_markdown)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
-        let runtime_toml = package_file(&wire.root, "skill.runtime.toml")?;
+        let runtime_toml = package_file(&wire.root, root_identity, "skill.runtime.toml")?;
         let runtime = SkillRuntimeManifest::parse(&runtime_toml)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
         if runtime.skill_id() != &id || runtime.skill_version() != wire.version {
@@ -1199,14 +1194,14 @@ impl SkillPackage {
         for script in runtime.scripts() {
             scripts.insert(
                 script.id().as_str().to_owned(),
-                package_file(&wire.root, script.path())?,
+                package_file(&wire.root, root_identity, script.path())?,
             );
         }
         let mut resources = BTreeMap::new();
         for resource in runtime.resources() {
             resources.insert(
                 resource.id().clone(),
-                package_file(&wire.root, resource.id().as_str())?,
+                package_file(&wire.root, root_identity, resource.id().as_str())?,
             );
         }
         let lock = SkillRuntimeLock::try_from_declared_bytes(
@@ -1427,33 +1422,82 @@ impl SealedSkillSnapshotV1 {
     }
 }
 
-fn package_file(root: &Path, relative: &str) -> Result<Vec<u8>, ExecutionError> {
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct PackageIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+fn package_directory_identity(path: &Path) -> Result<PackageIdentity, ExecutionError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(ExecutionError::new(
+            ExecutionErrorKind::ImplementationBinding,
+        ));
+    }
+    Ok(PackageIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+fn package_file(
+    root: &Path,
+    root_identity: PackageIdentity,
+    relative: &str,
+) -> Result<Vec<u8>, ExecutionError> {
+    let mut checked = vec![(root.to_path_buf(), root_identity)];
     let mut path = root.to_path_buf();
-    for component in Path::new(relative).components() {
+    let components = Path::new(relative).components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
         let std::path::Component::Normal(component) = component else {
             return Err(ExecutionError::new(
                 ExecutionErrorKind::ImplementationBinding,
             ));
         };
         path.push(component);
-        if fs::symlink_metadata(&path)
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?
-            .file_type()
-            .is_symlink()
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        let final_component = index + 1 == components.len();
+        if metadata.file_type().is_symlink()
+            || (final_component && !metadata.is_file())
+            || (!final_component && !metadata.is_dir())
         {
             return Err(ExecutionError::new(
                 ExecutionErrorKind::ImplementationBinding,
             ));
         }
+        checked.push((
+            path.clone(),
+            PackageIdentity {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+        ));
     }
     let metadata = fs::symlink_metadata(&path)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
-    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > 65_536 {
+    if metadata.len() == 0 || metadata.len() > 65_536 {
         return Err(ExecutionError::new(
             ExecutionErrorKind::ImplementationBinding,
         ));
     }
-    fs::read(path).map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))
+    let bytes = fs::read(&path)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    if checked.into_iter().all(|(path, identity)| {
+        fs::symlink_metadata(path).is_ok_and(|metadata| {
+            !metadata.file_type().is_symlink()
+                && metadata.dev() == identity.dev
+                && metadata.ino() == identity.ino
+        })
+    }) {
+        Ok(bytes)
+    } else {
+        Err(ExecutionError::new(
+            ExecutionErrorKind::ImplementationBinding,
+        ))
+    }
 }
 
 /// A validated runtime profile supplied to the reusable ADK executor.
@@ -3680,6 +3724,28 @@ struct SkillToolHandler {
 }
 
 impl ToolHandler for SkillToolHandler {
+    fn requires_approval(&self, arguments: &Value) -> Result<bool, ToolBridgeError> {
+        if !matches!(self.action, SkillToolAction::Run) {
+            return Ok(false);
+        }
+        let input = serde_json::from_value::<RunSkillScriptInput>(arguments.clone())
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+        let package = self
+            .packages
+            .get(&input.skill_id)
+            .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+        let script = package
+            .runtime
+            .script(&input.script_id)
+            .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+        Ok(script.capabilities().iter().any(|capability| {
+            matches!(
+                capability,
+                SandboxCapability::FilesystemWrite | SandboxCapability::Network
+            )
+        }))
+    }
+
     fn execute(
         &self,
         sandbox: &workflow_runtime::ChildSandbox<'_>,
@@ -3811,16 +3877,6 @@ fn build_tool_registry(
     }
     let packages = profile.skill_packages()?;
     if !packages.is_empty() {
-        let script_capabilities = packages
-            .values()
-            .flat_map(|package| package.capabilities())
-            .collect::<Vec<_>>();
-        let script_is_read_only = !script_capabilities.iter().any(|capability| {
-            matches!(
-                capability,
-                SandboxCapability::FilesystemWrite | SandboxCapability::Network
-            )
-        });
         for (name, action, capabilities, read_only) in [
             (
                 "activate_skill",
@@ -3834,12 +3890,7 @@ fn build_tool_registry(
                 vec![SandboxCapability::FilesystemRead],
                 true,
             ),
-            (
-                "run_skill_script",
-                SkillToolAction::Run,
-                script_capabilities,
-                script_is_read_only,
-            ),
+            ("run_skill_script", SkillToolAction::Run, Vec::new(), true),
         ] {
             let registration = match action {
                 SkillToolAction::Activate => {

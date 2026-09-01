@@ -100,6 +100,11 @@ impl ToolCallContext {
 
 /// A registered workflow-kit handler.
 pub trait ToolHandler: Send + Sync {
+    /// Returns whether these validated arguments require call-scoped approval.
+    fn requires_approval(&self, _arguments: &Value) -> Result<bool, ToolBridgeError> {
+        Ok(false)
+    }
+
     /// Executes one already-authorized call through its capability-narrowed child sandbox.
     fn execute(
         &self,
@@ -553,7 +558,9 @@ impl ToolBridge {
             .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::UnknownTool))?;
         let registration = registered.registration.clone();
         let handler = Arc::clone(&registered.handler);
-        if !registration.flags().read_only() {
+        let effectful =
+            !registration.flags().read_only() || handler.requires_approval(call.arguments())?;
+        if effectful {
             approvals
                 .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::ApprovalDenied))?
                 .authorize(
@@ -582,7 +589,7 @@ impl ToolBridge {
         };
         let timeout = Duration::from_millis(registration.timeout_ms().get());
         let capabilities = effective.capabilities;
-        if !registration.flags().read_only() {
+        if effectful {
             if let Some(result) = self.idempotent_results.get(&idempotency_key) {
                 return Ok(result.clone());
             }
