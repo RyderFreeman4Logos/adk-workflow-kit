@@ -69,6 +69,9 @@ m3-04-adk test_name:
 m3-05-spec test_name:
     {{_io}} cargo +1.98.0 test -p workflow-spec --test m3_05_skill_bindings {{test_name}} --locked -- --exact --nocapture
 
+m3-05-ir test_name:
+    {{_io}} cargo +1.98.0 test -p workflow-ir --test m3_05_skill_ir {{test_name}} --locked -- --exact --nocapture
+
 m3-04-unit test_name:
     {{_io}} cargo +1.98.0 test -p workflow-adk {{test_name}} --lib --locked -- --exact --nocapture
 
