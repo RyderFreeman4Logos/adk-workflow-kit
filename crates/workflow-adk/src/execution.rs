@@ -50,6 +50,7 @@ const MAX_STATE_BYTES: usize = 1024 * 1024;
 const ARTIFACT_LIMIT: u64 = 64 * 1024;
 const GRAPH_CONTINUATION_KEY: &str = "kit_graph_continuation_v1";
 const LOOP_LEDGER_FILE: &str = "loop-ledger.json";
+const LOOP_LEDGER_DIGEST_KEY: &str = "kit_loop_ledger_digest_v1";
 static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
 type BoundTool = (Vec<String>, Arc<AdkToolBridge<InMemoryArtifactStore>>);
 type CompletedToolResponse = (String, String, String, String, Value);
@@ -90,33 +91,56 @@ struct LoopLedgerV1 {
 
 struct LoopLedgerStore {
     path: PathBuf,
+    checkpoint_path: PathBuf,
     checkpoint_identity: String,
+    checkpoint_manifest: CheckpointManifestV1,
+    run_id: RunId,
     nodes: Mutex<BTreeMap<String, LoopState>>,
 }
 
 impl LoopLedgerStore {
-    fn create(path: PathBuf, checkpoint_identity: String) -> Result<Self, ExecutionError> {
+    fn create(
+        path: PathBuf,
+        checkpoint_path: PathBuf,
+        checkpoint_identity: String,
+        checkpoint_manifest: CheckpointManifestV1,
+        run_id: RunId,
+    ) -> Result<Self, ExecutionError> {
         let store = Self {
             path,
+            checkpoint_path,
             checkpoint_identity,
+            checkpoint_manifest,
+            run_id,
             nodes: Mutex::new(BTreeMap::new()),
         };
-        store.persist()?;
+        store.persist_ledger(&BTreeMap::new())?;
         Ok(store)
     }
 
-    fn open(path: PathBuf, checkpoint_identity: String) -> Result<Self, ExecutionError> {
+    fn open(
+        path: PathBuf,
+        checkpoint_path: PathBuf,
+        checkpoint_identity: String,
+        checkpoint_manifest: CheckpointManifestV1,
+        run_id: RunId,
+        checkpoint_digest: &str,
+    ) -> Result<Self, ExecutionError> {
         let ledger = serde_json::from_slice::<LoopLedgerV1>(&bounded_read(&path)?)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         if ledger.schema_version != 2
             || ledger.checkpoint_identity != checkpoint_identity
+            || checkpoint_digest != loop_ledger_digest(&ledger.nodes)?
             || ledger.nodes.values().any(|state| !valid_loop_state(state))
         {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
         Ok(Self {
             path,
+            checkpoint_path,
             checkpoint_identity,
+            checkpoint_manifest,
+            run_id,
             nodes: Mutex::new(ledger.nodes),
         })
     }
@@ -126,6 +150,60 @@ impl LoopLedgerStore {
             .lock()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
             .map(|nodes| nodes.get(node).cloned().unwrap_or_default())
+    }
+
+    fn tool_call_limit(
+        &self,
+        node: &str,
+        candidate: &LoopState,
+        limits: &RunLimits,
+    ) -> Result<Option<ExecutionErrorKind>, ExecutionError> {
+        let nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let states = nodes
+            .iter()
+            .map(|(name, state)| if name == node { candidate } else { state });
+        let total = states.clone().fold(0_u64, |total, state| {
+            total.saturating_add(state.total_tool_calls)
+        });
+        if total > limits.max_tool_calls().get() {
+            return Ok(Some(ExecutionErrorKind::TotalToolCallsLimit));
+        }
+        let mut per_tool = BTreeMap::<String, u64>::new();
+        for state in states {
+            for (tool, count) in &state.tool_calls {
+                *per_tool.entry(tool.clone()).or_default() = per_tool
+                    .get(tool)
+                    .copied()
+                    .unwrap_or_default()
+                    .saturating_add(*count);
+            }
+        }
+        Ok(per_tool
+            .values()
+            .any(|count| *count > limits.max_calls_per_tool().get())
+            .then_some(ExecutionErrorKind::ToolCallsPerToolLimit))
+    }
+
+    fn output_byte_limit(
+        &self,
+        node: &str,
+        candidate: &LoopState,
+        limit: u64,
+    ) -> Result<bool, ExecutionError> {
+        let nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        Ok(nodes
+            .iter()
+            .map(|(name, state)| if name == node { candidate } else { state })
+            .fold(0_u64, |total, state| {
+                total.saturating_add(state.tool_output_bytes)
+            })
+            > limit)
     }
 
     fn replace(&self, node: &str, state: LoopState) -> Result<(), ExecutionError> {
@@ -220,13 +298,19 @@ impl LoopLedgerStore {
             .nodes
             .lock()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let other_output_bytes = nodes
+            .iter()
+            .filter(|(name, _)| name.as_str() != node)
+            .fold(0_u64, |total, (_, state)| {
+                total.saturating_add(state.tool_output_bytes)
+            });
         let state = nodes
             .get_mut(node)
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let total = state
             .tool_output_bytes
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        if total > max_output_bytes {
+        if other_output_bytes.saturating_add(total) > max_output_bytes {
             return Err(ExecutionError::new(
                 ExecutionErrorKind::ToolOutputBytesLimit,
             ));
@@ -251,15 +335,12 @@ impl LoopLedgerStore {
         self.persist_locked(&nodes)
     }
 
-    fn persist(&self) -> Result<(), ExecutionError> {
-        let nodes = self
-            .nodes
-            .lock()
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-        self.persist_locked(&nodes)
+    fn persist_locked(&self, nodes: &BTreeMap<String, LoopState>) -> Result<(), ExecutionError> {
+        self.persist_ledger(nodes)?;
+        self.sync_checkpoint(nodes)
     }
 
-    fn persist_locked(&self, nodes: &BTreeMap<String, LoopState>) -> Result<(), ExecutionError> {
+    fn persist_ledger(&self, nodes: &BTreeMap<String, LoopState>) -> Result<(), ExecutionError> {
         write_json(
             &self.path,
             &LoopLedgerV1 {
@@ -269,6 +350,66 @@ impl LoopLedgerStore {
             },
         )
     }
+
+    fn sync_checkpoint(&self, nodes: &BTreeMap<String, LoopState>) -> Result<(), ExecutionError> {
+        let mut store =
+            SqliteCheckpointStore::open(&self.checkpoint_path, self.checkpoint_manifest.clone())
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let checkpoint = store
+            .load_latest(&self.run_id)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let mut state = serde_json::from_slice::<State>(checkpoint.state())
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        Self::bind_digest(&mut state, nodes)?;
+        store
+            .save_checkpoint(
+                DurableCheckpointV1::new(
+                    self.run_id.clone(),
+                    checkpoint.node_id(),
+                    checkpoint.event_sequence(),
+                    serde_json::to_vec(&state)
+                        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?,
+                    checkpoint.artifact_refs().iter().cloned(),
+                )
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?,
+            )
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+    }
+
+    fn bind_current_digest(&self, state: &mut State) -> Result<(), ExecutionError> {
+        let nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        Self::bind_digest(state, &nodes)
+    }
+
+    fn bind_digest(
+        state: &mut State,
+        nodes: &BTreeMap<String, LoopState>,
+    ) -> Result<(), ExecutionError> {
+        state.insert(
+            LOOP_LEDGER_DIGEST_KEY.to_owned(),
+            Value::String(loop_ledger_digest(nodes)?),
+        );
+        Ok(())
+    }
+}
+
+fn loop_ledger_digest(nodes: &BTreeMap<String, LoopState>) -> Result<String, ExecutionError> {
+    let canonical = serde_json::to_vec(&(2_u8, nodes))
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
+}
+
+fn checkpoint_ledger_digest(state: &[u8]) -> Result<String, ExecutionError> {
+    serde_json::from_slice::<State>(state)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+        .get(LOOP_LEDGER_DIGEST_KEY)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))
 }
 
 fn tool_response_content(call: &PendingCall, response: Value) -> adk_rust::Content {
@@ -576,21 +717,17 @@ impl LoopController {
                 });
             }
         }
-        if next.total_tool_calls > self.limits.max_tool_calls().get() {
-            return Err(self.fail(
-                ExecutionErrorKind::TotalToolCallsLimit,
-                "workflow.loop.limit.total_tool_calls",
-            ));
-        }
-        if next
-            .tool_calls
-            .values()
-            .any(|count| *count > self.limits.max_calls_per_tool().get())
+        if let Some(kind) = self
+            .ledger
+            .tool_call_limit(&self.node, &next, &self.limits)
+            .map_err(|_| self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable"))?
         {
-            return Err(self.fail(
-                ExecutionErrorKind::ToolCallsPerToolLimit,
-                "workflow.loop.limit.per_tool_calls",
-            ));
+            let marker = match kind {
+                ExecutionErrorKind::TotalToolCallsLimit => "workflow.loop.limit.total_tool_calls",
+                ExecutionErrorKind::ToolCallsPerToolLimit => "workflow.loop.limit.per_tool_calls",
+                _ => unreachable!(),
+            };
+            return Err(self.fail(kind, marker));
         }
         next.finish_admitted = finished_output.is_some();
         next.finished_output = finished_output;
@@ -635,7 +772,11 @@ impl LoopController {
         next.tool_output_bytes = next
             .tool_output_bytes
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        if next.tool_output_bytes > self.limits.max_tool_output_bytes().get() {
+        if self
+            .ledger
+            .output_byte_limit(&self.node, &next, self.limits.max_tool_output_bytes().get())
+            .map_err(|_| self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable"))?
+        {
             return Err(self.fail(
                 ExecutionErrorKind::ToolOutputBytesLimit,
                 "workflow.loop.limit.tool_output_bytes",
@@ -1867,14 +2008,19 @@ impl ExecutionBackend {
                 None
             }
         };
-        let loop_ledger =
-            match LoopLedgerStore::create(run_root.join(LOOP_LEDGER_FILE), ledger_identity) {
-                Ok(ledger) => Some(Arc::new(ledger)),
-                Err(_) => {
-                    persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
-                    None
-                }
-            };
+        let loop_ledger = match LoopLedgerStore::create(
+            run_root.join(LOOP_LEDGER_FILE),
+            run_root.join("checkpoint.sqlite"),
+            ledger_identity,
+            checkpoint_manifest.clone(),
+            run_id.clone(),
+        ) {
+            Ok(ledger) => Some(Arc::new(ledger)),
+            Err(_) => {
+                persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
+                None
+            }
+        };
         let mut checkpoint_store = match SqliteCheckpointStore::open(
             run_root.join("checkpoint.sqlite"),
             checkpoint_manifest.clone(),
@@ -1906,9 +2052,9 @@ impl ExecutionBackend {
                 0,
                 vec![compiled.ir().entry_node_id().as_str().to_owned()],
             );
-            let initial_state = checkpoint_state(State::new(), &initial, None);
-            let initial_state = initial_state
-                .and_then(|state| {
+            let initial_state = checkpoint_state(State::new(), &initial, None)
+                .and_then(|mut state| {
+                    LoopLedgerStore::bind_digest(&mut state, &BTreeMap::new())?;
                     serde_json::to_vec(&state)
                         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
                 })
@@ -2146,8 +2292,15 @@ impl ExecutionBackend {
         }
         crash_barrier("after-result");
         if persistence_error.is_none() {
-            if let (Ok(state), Some(store)) = (&execution, checkpoint_store.as_mut()) {
-                let state_bytes = match serde_json::to_vec(state) {
+            if let (Ok(state), Some(store), Some(loop_ledger)) =
+                (&execution, checkpoint_store.as_mut(), loop_ledger.as_ref())
+            {
+                let mut state = state.clone();
+                if loop_ledger.bind_current_digest(&mut state).is_err() {
+                    checkpoint_failed = true;
+                    persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
+                }
+                let state_bytes = match serde_json::to_vec(&state) {
                     Ok(bytes) => bytes,
                     Err(_) => {
                         checkpoint_failed = true;
@@ -2439,7 +2592,11 @@ impl ExecutionBackend {
         });
         let loop_ledger = Arc::new(LoopLedgerStore::open(
             root.join(LOOP_LEDGER_FILE),
+            root.join("checkpoint.sqlite"),
             ledger_identity,
+            checkpoint_manifest.clone(),
+            run_identity.clone(),
+            checkpoint_ledger_digest(checkpoint.state())?.as_str(),
         )?);
         let tool_registry = build_tool_registry(
             &profile,
@@ -2574,13 +2731,14 @@ impl ExecutionBackend {
                 ));
             }
         };
-        let state = checkpoint_state(
+        let mut state = checkpoint_state(
             state,
             &continuation
                 .latest()
                 .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?,
             Some(&retry),
         )?;
+        loop_ledger.bind_current_digest(&mut state)?;
         let state_bytes = serde_json::to_vec(&state)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let node_id = mapper

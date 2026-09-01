@@ -36,6 +36,33 @@ from = "work"
 to = "done"
 "#;
 
+const TWO_NODE_WORKFLOW: &str = r#"
+schema_version = 1
+[workflow]
+id = "two-node-tool-loop"
+version = "1"
+entry = "first"
+[[nodes]]
+id = "first"
+kind = "agent"
+model = { role = "worker", id = "worker", version = "1" }
+tools = [{ id = "search_code", version = "1" }]
+[[nodes]]
+id = "second"
+kind = "agent"
+model = { role = "worker", id = "worker", version = "1" }
+tools = [{ id = "search_code", version = "1" }]
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "first"
+to = "second"
+[[edges]]
+from = "second"
+to = "done"
+"#;
+
 fn root() -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "m3-04-{}-{}",
@@ -119,6 +146,16 @@ fn run(profile: ExecutionProfileV1) -> (PathBuf, Result<ExecutionReceipt, Execut
         json!({"request":"must not become args"}),
         &root,
     );
+    (root, result)
+}
+
+fn run_two_nodes(
+    profile: ExecutionProfileV1,
+) -> (PathBuf, Result<ExecutionReceipt, ExecutionError>) {
+    let root = root();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, TWO_NODE_WORKFLOW).unwrap();
+    let result = ExecutionBackend::run(&workflow, profile, json!({}), &root);
     (root, result)
 }
 
@@ -411,6 +448,37 @@ fn tool_output_byte_limit_is_exact_and_blocked() {
     assert_eq!(error.kind(), ExecutionErrorKind::ToolOutputBytesLimit);
     assert_eq!(error.receipt().unwrap().status(), "limit_exceeded");
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn run_limits_span_sequential_agent_nodes() {
+    for (policy, expected) in [
+        (
+            policy_with("max_total_tool_calls", 1),
+            ExecutionErrorKind::TotalToolCallsLimit,
+        ),
+        (
+            policy_with("max_tool_calls_per_tool", 1),
+            ExecutionErrorKind::ToolCallsPerToolLimit,
+        ),
+        (
+            policy_with("max_tool_output_bytes", 14),
+            ExecutionErrorKind::ToolOutputBytesLimit,
+        ),
+    ] {
+        let (root, result) = run_two_nodes(profile_with(
+            vec![
+                json!({"calls": [{"id":"call-search","name":"search_code","args":{"query":"needle"}}]}),
+                finish(json!({"answer":"done"})),
+            ],
+            Some(policy),
+        ));
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), expected);
+        assert_eq!(effect_count(error.receipt().unwrap().run_root()), 1);
+        assert!(!events(&error).contains("tool_completed\"}\n{\"sequence\":3"));
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
@@ -872,6 +940,60 @@ fn resume_rejects_tampered_pending_ledger_before_effect() {
     ledger["nodes"]["work"]["total_tool_calls"] = json!(2);
     ledger["nodes"]["work"]["tool_calls"]["search_code"] = json!(2);
     ledger["nodes"]["work"]["tool_output_bytes"] = json!(1);
+    fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+
+    let error = ExecutionBackend::resume(&root, &run_id(&run_root)).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(effect_count(&run_root), 0);
+    assert!(
+        !fs::read_to_string(run_root.join("events.jsonl"))
+            .unwrap()
+            .contains("tool_completed")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resume_rejects_coordinated_ledger_tamper_before_effect() {
+    if let Ok(root) = env::var("M3_04_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            workflow,
+            profile_with(
+                vec![
+                    json!({"calls": [{"id":"call-tampered","name":"search_code","args":{"query":"needle"}}]}),
+                    finish(json!({"answer":"must not run"})),
+                ],
+                Some(loop_policy()),
+            ),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let root = root();
+    let run_root = crash_run(
+        &root,
+        "resume_rejects_coordinated_ledger_tamper_before_effect",
+        "before-effect",
+    );
+    let ledger_path = run_root.join("loop-ledger.json");
+    let mut ledger: Value = serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    let call = &mut ledger["nodes"]["work"]["conversation"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap()["parts"]
+        .as_array_mut()
+        .unwrap()[0];
+    call["args"] = json!({"query":"forged"});
+    let fingerprint = workflow_runtime::argument_fingerprint(&call["args"]);
+    ledger["nodes"]["work"]["pending_calls"][0]["args"] = call["args"].clone();
+    ledger["nodes"]["work"]["pending_calls"][0]["fingerprint"] = json!(&fingerprint);
+    ledger["nodes"]["work"]["seen_calls"][0][1] = json!(fingerprint);
     fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
 
     let error = ExecutionBackend::resume(&root, &run_id(&run_root)).unwrap_err();
