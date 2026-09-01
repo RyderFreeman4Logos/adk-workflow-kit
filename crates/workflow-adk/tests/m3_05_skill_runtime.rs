@@ -1,7 +1,8 @@
 use std::{
-    fs,
-    os::unix::fs::PermissionsExt,
+    env, fs,
+    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
+    process::Command,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -287,6 +288,67 @@ fn unchanged_skill_package_resumes_from_snapshot() {
     let receipt = ExecutionBackend::run(&workflow, profile(&package), json!({}), &root).unwrap();
     let resumed = ExecutionBackend::resume(&root, receipt.run_id()).unwrap();
     assert_eq!(resumed.status(), "succeeded");
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
+fn crashed_unchanged_skill_package_resumes_from_snapshot() {
+    if let Ok(root) = env::var("M3_05_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            &workflow,
+            profile(&root.join("code-investigation")),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let root = root();
+    skill_package(&root);
+    let status = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "crashed_unchanged_skill_package_resumes_from_snapshot",
+            "--nocapture",
+        ])
+        .env("M3_05_CRASH_RUN_ROOT", &root)
+        .env("WORKFLOW_KIT_TEST_CRASH_BARRIER", "after-checkpoint")
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    let run_root = fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("run-manifest.json").is_file())
+        .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["status"], "running");
+    let resumed = ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap();
+    assert_eq!(resumed.status(), "succeeded");
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
+fn reviewer_skill_rejection_precedes_run_effects() {
+    let root = root();
+    let package = skill_package(&root);
+    let workflow = root.join("workflow.toml");
+    fs::write(
+        &workflow,
+        WORKFLOW.replace("role = \"worker\"", "role = \"reviewer\""),
+    )
+    .unwrap();
+    let entries_before = fs::read_dir(&root).unwrap().count();
+    let error = ExecutionBackend::run(&workflow, profile(&package), json!({}), &root).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::Compile);
+    assert_eq!(fs::read_dir(&root).unwrap().count(), entries_before);
     cleanup_test_root(&root);
     fs::remove_dir_all(root).expect("test cleanup");
 }
