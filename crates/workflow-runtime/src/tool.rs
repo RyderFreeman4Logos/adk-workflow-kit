@@ -9,6 +9,41 @@ use super::SandboxCapability;
 const DRAFT_2020_12_SCHEMA: &str = "https://json-schema.org/draft/2020-12/schema";
 const MAX_SCHEMA_BYTES: usize = 65_536;
 
+/// Typed input accepted by the Skill activation tool.
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActivateSkillInput {
+    /// The exact declared Skill identifier.
+    pub skill_id: String,
+}
+
+/// Typed input accepted by the Skill resource reader.
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadSkillResourceInput {
+    /// The exact declared Skill identifier.
+    pub skill_id: String,
+    /// The declared resource identifier.
+    pub resource_id: String,
+    /// The zero-based resource offset.
+    #[serde(default)]
+    pub offset: u64,
+    /// The nonzero maximum bytes to return.
+    pub limit: u64,
+}
+
+/// Typed input accepted by the Skill script runner.
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunSkillScriptInput {
+    /// The exact declared Skill identifier.
+    pub skill_id: String,
+    /// The declared script identifier.
+    pub script_id: String,
+    /// The script's schema-validated JSON input.
+    pub input: Value,
+}
+
 /// One typed terminal result from a tool invocation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]

@@ -232,9 +232,9 @@ impl TerminalOutcome {
     /// Projects a real ToolBridge policy denial to the closed terminal vocabulary.
     pub const fn from_tool_bridge_error(kind: ToolBridgeErrorKind) -> Self {
         match kind {
-            ToolBridgeErrorKind::CapabilityDenied | ToolBridgeErrorKind::ApprovalDenied => {
-                Self::AuthorizationDenied
-            }
+            ToolBridgeErrorKind::CapabilityDenied
+            | ToolBridgeErrorKind::ApprovalDenied
+            | ToolBridgeErrorKind::InvalidInput => Self::AuthorizationDenied,
             _ => Self::Failed,
         }
     }

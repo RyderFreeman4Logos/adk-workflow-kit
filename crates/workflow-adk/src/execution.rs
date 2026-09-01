@@ -29,14 +29,15 @@ use workflow_compiler::{
 };
 use workflow_ir::IrModelRole;
 use workflow_runtime::{
-    ArtifactId, ArtifactStore, BackendCapabilities, CapabilityIntersection, CheckpointManifestV1,
-    DurableCheckpointV1, EffectCommit, EffectJournal, EffectKey, FilesystemArtifactStore,
-    InMemoryArtifactStore, Materialization, PageRequest, PolicyCapabilities,
-    ProtectedArtifactReferenceV1, PureTransformRequest, RequestedCapabilities, RunContext, RunId,
-    RunLimits, RunSandbox, SandboxCapability, SqliteCheckpointStore, ToolBridge, ToolBridgeError,
-    ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler,
-    ToolProvenance, ToolRegistration, WorkdirManager, WorkflowRuntimeEventKindV1,
-    contains_sensitive_key, intersect_policy_capabilities, redact_json_value, selection_identity,
+    ActivateSkillInput, ArtifactId, ArtifactStore, BackendCapabilities, CapabilityIntersection,
+    CheckpointManifestV1, DurableCheckpointV1, EffectCommit, EffectJournal, EffectKey,
+    FilesystemArtifactStore, InMemoryArtifactStore, Materialization, PageRequest,
+    PolicyCapabilities, ProtectedArtifactReferenceV1, PureTransformRequest, ReadSkillResourceInput,
+    RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox, RunSkillScriptInput,
+    SandboxCapability, SqliteCheckpointStore, ToolBridge, ToolBridgeError, ToolBridgeErrorKind,
+    ToolCall, ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance,
+    ToolRegistration, WorkdirManager, WorkflowRuntimeEventKindV1, contains_sensitive_key,
+    intersect_policy_capabilities, redact_json_value, selection_identity,
     verify_sandbox_capabilities,
 };
 use workflow_spec::{SourcePath, read_bounded_regular_file};
@@ -3270,30 +3271,6 @@ enum SkillToolAction {
     Run,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ActivateSkillInput {
-    skill_id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReadSkillResourceInput {
-    skill_id: String,
-    resource_id: String,
-    #[serde(default)]
-    offset: u64,
-    limit: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RunSkillScriptInput {
-    skill_id: String,
-    script_id: String,
-    input: Value,
-}
-
 struct SkillToolHandler {
     action: SkillToolAction,
     activated_skills: Arc<Mutex<BTreeSet<(String, String)>>>,
@@ -3405,29 +3382,6 @@ impl ToolHandler for SkillToolHandler {
     }
 }
 
-fn skill_tool_registration(
-    name: &str,
-    capabilities: impl IntoIterator<Item = SandboxCapability>,
-    read_only: bool,
-) -> Result<ToolRegistration, ExecutionError> {
-    ToolRegistration::for_types::<Value, Value>(
-        name,
-        ToolProvenance::new("skill.runtime", "1"),
-        ToolFlags::new(read_only, true, true),
-    )
-    .map(|registration| {
-        registration
-            .with_required_capabilities(capabilities)
-            .with_timeout(NonZeroU64::new(60_000).expect("positive timeout"))
-            .with_idempotency(if read_only {
-                workflow_runtime::ToolIdempotency::NotRequired
-            } else {
-                workflow_runtime::ToolIdempotency::StableKey
-            })
-    })
-    .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))
-}
-
 fn build_tool_registry(
     profile: &ExecutionProfileV1,
     plan: &ResolvedRuntimePlan,
@@ -3489,7 +3443,38 @@ fn build_tool_registry(
                 script_is_read_only,
             ),
         ] {
-            let registration = skill_tool_registration(name, capabilities, read_only)?;
+            let registration = match action {
+                SkillToolAction::Activate => {
+                    ToolRegistration::for_types::<ActivateSkillInput, Value>(
+                        name,
+                        ToolProvenance::new("skill.runtime", "1"),
+                        ToolFlags::new(read_only, true, true),
+                    )
+                }
+                SkillToolAction::Read => {
+                    ToolRegistration::for_types::<ReadSkillResourceInput, Value>(
+                        name,
+                        ToolProvenance::new("skill.runtime", "1"),
+                        ToolFlags::new(read_only, true, true),
+                    )
+                }
+                SkillToolAction::Run => ToolRegistration::for_types::<RunSkillScriptInput, Value>(
+                    name,
+                    ToolProvenance::new("skill.runtime", "1"),
+                    ToolFlags::new(read_only, true, true),
+                ),
+            }
+            .map(|registration| {
+                registration
+                    .with_required_capabilities(capabilities)
+                    .with_timeout(NonZeroU64::new(60_000).expect("positive timeout"))
+                    .with_idempotency(if read_only {
+                        workflow_runtime::ToolIdempotency::NotRequired
+                    } else {
+                        workflow_runtime::ToolIdempotency::StableKey
+                    })
+            })
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
             let provenance = registration.provenance().clone();
             bridge
                 .register(
@@ -3596,9 +3581,9 @@ fn replay_pending_tools(
             .map_err(|_| effect_fence.execution_error())?;
         let response = response.map_err(|error| {
             let kind = match error.kind() {
-                ToolBridgeErrorKind::CapabilityDenied | ToolBridgeErrorKind::ApprovalDenied => {
-                    ExecutionErrorKind::AuthorizationDenied
-                }
+                ToolBridgeErrorKind::CapabilityDenied
+                | ToolBridgeErrorKind::ApprovalDenied
+                | ToolBridgeErrorKind::InvalidInput => ExecutionErrorKind::AuthorizationDenied,
                 _ => ExecutionErrorKind::Tool,
             };
             ExecutionError::new(kind)
@@ -4093,5 +4078,31 @@ mod execution_registry_tests {
         assert_eq!(error.kind(), ExecutionErrorKind::AmbiguousBinding);
         assert_eq!(error.binding_category(), Some(BindingCategory::Tool));
         assert_eq!(error.resolved_binding(), Some(&projection));
+    }
+
+    #[test]
+    fn skill_tool_registrations_have_closed_input_schemas() {
+        for registration in [
+            ToolRegistration::for_types::<ActivateSkillInput, Value>(
+                "activate_skill",
+                ToolProvenance::new("skill.runtime", "1"),
+                ToolFlags::new(true, true, true),
+            ),
+            ToolRegistration::for_types::<ReadSkillResourceInput, Value>(
+                "read_skill_resource",
+                ToolProvenance::new("skill.runtime", "1"),
+                ToolFlags::new(true, true, true),
+            ),
+            ToolRegistration::for_types::<RunSkillScriptInput, Value>(
+                "run_skill_script",
+                ToolProvenance::new("skill.runtime", "1"),
+                ToolFlags::new(false, true, true),
+            ),
+        ] {
+            assert_eq!(
+                registration.expect("skill registration").input_schema()["additionalProperties"],
+                Value::Bool(false)
+            );
+        }
     }
 }
