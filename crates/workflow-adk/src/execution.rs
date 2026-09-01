@@ -56,6 +56,9 @@ use crate::{
 const MAX_STATE_BYTES: usize = 1024 * 1024;
 const ARTIFACT_LIMIT: u64 = 64 * 1024;
 const SKILL_RESOURCE_READ_LIMIT: u64 = 64 * 1024;
+const SKILL_PACKAGE_LIMIT: usize = 64;
+// Byte arrays can expand fourfold in sealed JSON; reserve 64 KiB for structure.
+const SKILL_PACKAGE_BYTES_LIMIT: usize = MAX_STATE_BYTES / 4 - 16 * 1024;
 const GRAPH_CONTINUATION_KEY: &str = "kit_graph_continuation_v1";
 const LOOP_LEDGER_FILE: &str = "loop-ledger.json";
 const SKILL_SNAPSHOT_FILE: &str = "sealed-skill-snapshot.json";
@@ -1387,17 +1390,22 @@ struct SkillPackage {
 }
 
 impl SkillPackage {
-    fn load(wire: &SkillWire) -> Result<Self, ExecutionError> {
+    fn load(wire: &SkillWire, remaining_bytes: &mut usize) -> Result<Self, ExecutionError> {
         let root_identity = package_directory_identity(&wire.root)?;
         let id = SkillId::new(&wire.id)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
         if wire.version.is_empty() {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
         }
-        let skill_markdown = package_file(&wire.root, root_identity, "SKILL.md")?;
+        let skill_markdown = package_file(&wire.root, root_identity, "SKILL.md", remaining_bytes)?;
         let manifest = SkillManifest::parse(&wire.root, &skill_markdown)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
-        let runtime_toml = package_file(&wire.root, root_identity, "skill.runtime.toml")?;
+        let runtime_toml = package_file(
+            &wire.root,
+            root_identity,
+            "skill.runtime.toml",
+            remaining_bytes,
+        )?;
         let runtime = SkillRuntimeManifest::parse(&runtime_toml)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
         if runtime.skill_id() != &id || runtime.skill_version() != wire.version {
@@ -1409,14 +1417,19 @@ impl SkillPackage {
         for script in runtime.scripts() {
             scripts.insert(
                 script.id().as_str().to_owned(),
-                package_file(&wire.root, root_identity, script.path())?,
+                package_file(&wire.root, root_identity, script.path(), remaining_bytes)?,
             );
         }
         let mut resources = BTreeMap::new();
         for resource in runtime.resources() {
             resources.insert(
                 resource.id().clone(),
-                package_file(&wire.root, root_identity, resource.id().as_str())?,
+                package_file(
+                    &wire.root,
+                    root_identity,
+                    resource.id().as_str(),
+                    remaining_bytes,
+                )?,
             );
         }
         let lock = SkillRuntimeLock::try_from_declared_bytes(
@@ -1440,6 +1453,23 @@ impl SkillPackage {
             resources,
         };
         Ok(package)
+    }
+
+    fn into_sealed(self) -> Result<SealedSkillPackageV1, ExecutionError> {
+        let binding_identity = self.binding()?.metadata_identity().to_owned();
+        Ok(SealedSkillPackageV1 {
+            id: self.id.as_str().to_owned(),
+            version: self.version,
+            binding_identity,
+            skill_markdown: self.skill_markdown,
+            runtime_toml: self.runtime_toml,
+            scripts: self.scripts,
+            resources: self
+                .resources
+                .into_iter()
+                .map(|(id, bytes)| (id.as_str().to_owned(), bytes))
+                .collect(),
+        })
     }
 
     fn binding(&self) -> Result<ResolvedBinding, ExecutionError> {
@@ -1542,27 +1572,18 @@ struct SealedSkillPackageV1 {
 }
 
 impl SealedSkillSnapshotV1 {
-    fn from_profile(profile: &ExecutionProfileV1) -> Result<Option<Self>, ExecutionError> {
-        let packages = profile.skill_packages()?;
+    fn from_packages(
+        packages: BTreeMap<String, Arc<SkillPackage>>,
+    ) -> Result<Option<Self>, ExecutionError> {
         if packages.is_empty() {
             return Ok(None);
         }
         let packages = packages
-            .values()
+            .into_values()
             .map(|package| {
-                Ok(SealedSkillPackageV1 {
-                    id: package.id.as_str().to_owned(),
-                    version: package.version.clone(),
-                    binding_identity: package.binding()?.metadata_identity().to_owned(),
-                    skill_markdown: package.skill_markdown.clone(),
-                    runtime_toml: package.runtime_toml.clone(),
-                    scripts: package.scripts.clone(),
-                    resources: package
-                        .resources
-                        .iter()
-                        .map(|(id, bytes)| (id.as_str().to_owned(), bytes.clone()))
-                        .collect(),
-                })
+                Arc::try_unwrap(package)
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?
+                    .into_sealed()
             })
             .collect::<Result<Vec<_>, ExecutionError>>()?;
         Ok(Some(Self {
@@ -1584,6 +1605,10 @@ impl SealedSkillSnapshotV1 {
         if self.schema_version != 1 || self.identity()? != expected_identity {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
+        self.into_packages()
+    }
+
+    fn into_packages(self) -> Result<BTreeMap<String, Arc<SkillPackage>>, ExecutionError> {
         self.packages
             .into_iter()
             .map(|snapshot| {
@@ -1745,6 +1770,7 @@ fn package_file(
     root: &Path,
     root_identity: PackageIdentity,
     relative: &str,
+    remaining_bytes: &mut usize,
 ) -> Result<Vec<u8>, ExecutionError> {
     let mut checked = vec![(root.to_path_buf(), root_identity)];
     let mut path = root.to_path_buf();
@@ -1784,6 +1810,11 @@ fn package_file(
             ExecutionErrorKind::ImplementationBinding,
         ));
     }
+    let length = usize::try_from(metadata.len())
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
+    if length > *remaining_bytes {
+        return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+    }
     let bytes = read_bounded_regular_file(&SourcePath::from(path.as_path()), 65_536)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
     if bytes.is_empty() {
@@ -1792,7 +1823,8 @@ fn package_file(
         ));
     }
     package_file_test_read_len(root, relative, bytes.len());
-    if package_paths_match(&checked) {
+    if package_paths_match(&checked) && bytes.len() <= *remaining_bytes {
+        *remaining_bytes -= bytes.len();
         Ok(bytes)
     } else {
         Err(ExecutionError::new(
@@ -2039,9 +2071,39 @@ impl ExecutionProfileV1 {
         if let Some(packages) = &self.sealed_skills {
             return Ok(packages.clone());
         }
+        self.load_skill_packages(None)
+    }
+
+    fn planned_skill_packages(
+        &self,
+        ir: &workflow_ir::WorkflowIr,
+    ) -> Result<BTreeMap<String, Arc<SkillPackage>>, ExecutionError> {
+        let required = ir
+            .nodes()
+            .iter()
+            .flat_map(|node| node.skills())
+            .map(|skill| (skill.id().to_owned(), skill.version().to_owned()))
+            .collect::<BTreeSet<_>>();
+        self.load_skill_packages(Some(&required))
+    }
+
+    fn load_skill_packages(
+        &self,
+        required: Option<&BTreeSet<(String, String)>>,
+    ) -> Result<BTreeMap<String, Arc<SkillPackage>>, ExecutionError> {
+        if self.skills.len() > SKILL_PACKAGE_LIMIT
+            || required.is_some_and(|required| {
+                self.skills
+                    .iter()
+                    .any(|wire| !required.contains(&(wire.id.clone(), wire.version.clone())))
+            })
+        {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+        }
+        let mut remaining_bytes = SKILL_PACKAGE_BYTES_LIMIT;
         let mut packages = BTreeMap::new();
         for wire in &self.skills {
-            let package = Arc::new(SkillPackage::load(wire)?);
+            let package = Arc::new(SkillPackage::load(wire, &mut remaining_bytes)?);
             if packages.insert(wire.id.clone(), package).is_some() {
                 return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
             }
@@ -2906,14 +2968,26 @@ impl ExecutionBackend {
         if contains_sensitive_key(&input) {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
         }
-        let skill_snapshot = SealedSkillSnapshotV1::from_profile(&profile)?;
-        let skill_snapshot_identity = skill_snapshot
-            .as_ref()
-            .map(SealedSkillSnapshotV1::identity)
-            .transpose()?;
-        if let (Some(snapshot), Some(identity)) = (&skill_snapshot, &skill_snapshot_identity) {
-            profile.sealed_skills = Some(snapshot.clone().restore(identity)?);
-        }
+        let compiled = compile_file(workflow.as_ref().to_string_lossy().as_ref())
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Compile))?;
+        let skill_snapshot =
+            SealedSkillSnapshotV1::from_packages(profile.planned_skill_packages(compiled.ir())?)?;
+        let (skill_snapshot_bytes, skill_snapshot_identity) = match skill_snapshot {
+            Some(snapshot) => {
+                let bytes = serde_json::to_vec(&snapshot)
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
+                if bytes.len() > MAX_STATE_BYTES {
+                    return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+                }
+                let identity = format!("sha256:{:x}", Sha256::digest(&bytes));
+                profile.sealed_skills = Some(snapshot.into_packages()?);
+                (Some(bytes), Some(identity))
+            }
+            None => {
+                profile.sealed_skills = Some(BTreeMap::new());
+                (None, None)
+            }
+        };
         skill_snapshot_test_barrier();
         let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
         let requested = RequestedCapabilities::new(required_capabilities.iter().copied());
@@ -2923,8 +2997,6 @@ impl ExecutionBackend {
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::SandboxDenied))?;
 
-        let compiled = compile_file(workflow.as_ref().to_string_lossy().as_ref())
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Compile))?;
         let resolved_plan = resolve_runtime_plan(&profile, compiled.ir())?;
         let resolved_models = compiled
             .ir()
@@ -2991,8 +3063,8 @@ impl ExecutionBackend {
         if workflow_source
             .as_deref()
             .is_none_or(|source| write_atomic(&run_root.join("workflow.toml"), source).is_err())
-            || skill_snapshot.as_ref().is_some_and(|snapshot| {
-                write_json(&run_root.join(SKILL_SNAPSHOT_FILE), snapshot).is_err()
+            || skill_snapshot_bytes.as_ref().is_some_and(|snapshot| {
+                write_atomic(&run_root.join(SKILL_SNAPSHOT_FILE), snapshot).is_err()
             })
             || write_json(
                 &run_root.join("execution-profile.json"),
@@ -4388,7 +4460,7 @@ fn restore_completed_skill_calls(
             let resource_id = SkillResourceId::new(&input.resource_id)
                 .ok()
                 .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-            packages
+            let payload = packages
                 .get(&input.skill_id)
                 .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
                 .read_resource(
@@ -4402,7 +4474,12 @@ fn restore_completed_skill_calls(
                     NonZeroU64::new(SKILL_RESOURCE_READ_LIMIT)
                         .expect("positive resource read limit"),
                 )
-                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+            serde_json::to_value(ToolEnvelope::success(
+                payload,
+                ToolProvenance::new("skill.runtime", "1"),
+            ))
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
         } else {
             invoke_restored_tool(&node, &completed, toolset, effect_fence)?
         };

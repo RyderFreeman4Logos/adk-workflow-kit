@@ -568,7 +568,7 @@ fn changed_skill_content_rejects_resume() {
 }
 
 #[test]
-fn node_skill_subset_denies_sibling_skill_before_effect() {
+fn profile_rejects_unplanned_sibling_skill_before_loading() {
     let root = root();
     let allowed = skill_package(&root);
     let sibling = skill_package_named(&root, "sibling-skill");
@@ -586,12 +586,8 @@ fn node_skill_subset_denies_sibling_skill_before_effect() {
     let denied_profile = ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
 
     let error = ExecutionBackend::run(&workflow, denied_profile, json!({}), &root).unwrap_err();
-    assert_eq!(error.kind(), ExecutionErrorKind::AuthorizationDenied);
-    assert!(
-        !fs::read_to_string(error.receipt().unwrap().run_root().join("events.jsonl"))
-            .unwrap()
-            .contains("skill_activated")
-    );
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidProfile);
+    assert!(error.receipt().is_none());
     cleanup_test_root(&root);
     fs::remove_dir_all(root).expect("test cleanup");
 }
@@ -1413,6 +1409,87 @@ fn package_file_growth_is_bounded_before_execution() {
         !barrier.join("read-len").exists(),
         "package file read was not capped before rejection"
     );
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
+fn skill_snapshot_loading_is_plan_bound_and_aggregate_bounded() {
+    let root = root();
+    let package = skill_package(&root);
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+
+    let mut unplanned = serde_json::to_value(profile(&package)).unwrap();
+    unplanned["skills"].as_array_mut().unwrap().push(json!({
+        "id": "unplanned-skill",
+        "version": "1",
+        "root": root.join("must-not-be-loaded")
+    }));
+    let entries_before = fs::read_dir(&root).unwrap().count();
+    let error = ExecutionBackend::run(
+        &workflow,
+        ExecutionProfileV1::parse(&serde_json::to_vec(&unplanned).unwrap()).unwrap(),
+        json!({}),
+        &root,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidProfile);
+    assert!(error.receipt().is_none());
+    assert_eq!(fs::read_dir(&root).unwrap().count(), entries_before);
+
+    let runtime_path = package.join("skill.runtime.toml");
+    let mut runtime =
+        String::from("schema_version = 1\n[skill]\nid = \"code-investigation\"\nversion = \"1\"\n");
+    for index in 0..4 {
+        let name = format!("assets/chunk-{index}.bin");
+        let bytes = vec![b'x'; 65_536];
+        fs::write(package.join(&name), &bytes).unwrap();
+        runtime.push_str(&format!(
+            "[[resources]]\nid = \"{name}\"\nsha256 = \"{}\"\n",
+            digest(&bytes)
+        ));
+    }
+    fs::write(runtime_path, runtime).unwrap();
+    let entries_before = fs::read_dir(&root).unwrap().count();
+    let error = ExecutionBackend::run(&workflow, profile(&package), json!({}), &root).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidProfile);
+    assert!(error.receipt().is_none());
+    assert_eq!(fs::read_dir(&root).unwrap().count(), entries_before);
+
+    cleanup_test_root(&package);
+    fs::remove_dir_all(&package).expect("aggregate package cleanup");
+    let mut skill_wires = Vec::new();
+    let mut skill_bindings = Vec::new();
+    for index in 0..65 {
+        let id = if index == 0 {
+            "code-investigation".to_owned()
+        } else {
+            format!("skill-{index}")
+        };
+        let package = skill_package_named(&root, &id);
+        skill_wires.push(json!({"id": id, "version": "1", "root": package}));
+        skill_bindings.push(format!("{{ id = \"{id}\", version = \"1\" }}"));
+    }
+    let counted_workflow = WORKFLOW.replace(
+        "{ id = \"code-investigation\", version = \"1\" }",
+        &skill_bindings.join(", "),
+    );
+    fs::write(&workflow, counted_workflow).unwrap();
+    let mut counted = serde_json::to_value(profile(&root.join("code-investigation"))).unwrap();
+    counted["skills"] = json!(skill_wires);
+    let entries_before = fs::read_dir(&root).unwrap().count();
+    let error = ExecutionBackend::run(
+        &workflow,
+        ExecutionProfileV1::parse(&serde_json::to_vec(&counted).unwrap()).unwrap(),
+        json!({}),
+        &root,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidProfile);
+    assert!(error.receipt().is_none());
+    assert_eq!(fs::read_dir(&root).unwrap().count(), entries_before);
+
     cleanup_test_root(&root);
     fs::remove_dir_all(root).expect("test cleanup");
 }
