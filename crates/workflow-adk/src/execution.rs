@@ -4353,12 +4353,12 @@ fn build_tool_registry(
                     } else {
                         workflow_runtime::ToolIdempotency::StableKey
                     });
-                if matches!(action, SkillToolAction::Read) {
+                if matches!(action, SkillToolAction::Activate | SkillToolAction::Read) {
                     registration.with_inline_output_limit(
                         NonZeroU64::new(
                             u64::try_from(MAX_STATE_BYTES).expect("state limit fits u64"),
                         )
-                        .expect("positive Skill resource envelope limit"),
+                        .expect("positive Skill package envelope limit"),
                     )
                 } else {
                     registration

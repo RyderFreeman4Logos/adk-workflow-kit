@@ -366,6 +366,59 @@ fn activate_and_read_deliver_bounded_content_to_agent() {
 }
 
 #[test]
+fn maximum_skill_instructions_cross_public_tool_boundary() {
+    let root = root();
+    let package = skill_package(&root);
+    let mut instructions =
+        b"---\nname: code-investigation\ndescription: A near-limit test skill.\n---\n# Instructions\n"
+            .to_vec();
+    let expansion_heavy_markdown = b"> \"\\\\\"\n";
+    const CANARY: &[u8] = b"near-limit-instructions-canary";
+    while instructions.len() + expansion_heavy_markdown.len() + CANARY.len() <= 65_536 {
+        instructions.extend_from_slice(expansion_heavy_markdown);
+    }
+    instructions.resize(65_536 - CANARY.len(), b'\\');
+    instructions.extend_from_slice(CANARY);
+    assert_eq!(instructions.len(), 65_536);
+    fs::write(package.join("SKILL.md"), &instructions).unwrap();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let mut value = serde_json::to_value(profile(&package)).unwrap();
+    value["loop_policy"] = json!({
+        "schema_version": 1,
+        "max_model_iterations": 2,
+        "max_total_tool_calls": 1,
+        "max_tool_calls_per_tool": 1,
+        "wall_time_ms": 1_000,
+        "idle_time_ms": 1_000,
+        "tool_time_ms": 1_000,
+        "max_tool_output_bytes": 262_144
+    });
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
+    ]);
+
+    let receipt = ExecutionBackend::run(
+        &workflow,
+        ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap(),
+        json!({}),
+        &root,
+    )
+    .unwrap();
+    assert_eq!(receipt.status(), "succeeded");
+    assert!(
+        any_file_contains(
+            receipt.run_root(),
+            std::str::from_utf8(CANARY).expect("ASCII canary")
+        ),
+        "near-limit instruction tail did not cross the public tool boundary"
+    );
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
 fn concurrent_skill_resource_reads_reserve_budget_before_delivery() {
     let root = root();
     let package = skill_package(&root);
