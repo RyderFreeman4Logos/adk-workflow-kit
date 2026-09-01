@@ -1069,6 +1069,10 @@ fn package_replacements_between_validation_and_read_fail_closed() {
             ExecutionErrorKind::ImplementationBinding,
             "{replacement}"
         );
+        assert!(
+            !barrier.join("read-len").exists(),
+            "{replacement} package replacement was read before rejection"
+        );
         cleanup_test_root(&root);
         fs::remove_dir_all(root).expect("test cleanup");
     }

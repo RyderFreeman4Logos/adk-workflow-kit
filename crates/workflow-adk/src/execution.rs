@@ -1573,6 +1573,16 @@ fn package_file_test_read_len(relative: &str, length: usize) {
 #[cfg(not(debug_assertions))]
 fn package_file_test_read_len(_: &str, _: usize) {}
 
+fn package_paths_match(checked: &[(PathBuf, PackageIdentity)]) -> bool {
+    checked.iter().all(|(path, identity)| {
+        fs::symlink_metadata(path).is_ok_and(|metadata| {
+            !metadata.file_type().is_symlink()
+                && metadata.dev() == identity.dev
+                && metadata.ino() == identity.ino
+        })
+    })
+}
+
 fn package_file(
     root: &Path,
     root_identity: PackageIdentity,
@@ -1615,6 +1625,13 @@ fn package_file(
         ));
     }
     package_file_test_barrier(relative);
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    if metadata.len() == 0 || metadata.len() > 65_536 || !package_paths_match(&checked) {
+        return Err(ExecutionError::new(
+            ExecutionErrorKind::ImplementationBinding,
+        ));
+    }
     let bytes = read_bounded_regular_file(&SourcePath::from(path.as_path()), 65_536)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
     if bytes.is_empty() {
@@ -1623,13 +1640,7 @@ fn package_file(
         ));
     }
     package_file_test_read_len(relative, bytes.len());
-    if checked.into_iter().all(|(path, identity)| {
-        fs::symlink_metadata(path).is_ok_and(|metadata| {
-            !metadata.file_type().is_symlink()
-                && metadata.dev() == identity.dev
-                && metadata.ino() == identity.ino
-        })
-    }) {
+    if package_paths_match(&checked) {
         Ok(bytes)
     } else {
         Err(ExecutionError::new(
