@@ -780,6 +780,51 @@ fn crashed_unchanged_skill_package_resumes_from_snapshot() {
 }
 
 #[test]
+fn torn_loop_ledger_publication_resumes_matching_checkpoint_generation() {
+    if let Ok(root) = env::var("M3_05_TORN_LEDGER_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            &workflow,
+            one_turn_profile(&root.join("code-investigation")),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let root = root();
+    skill_package(&root);
+    let status = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "torn_loop_ledger_publication_resumes_matching_checkpoint_generation",
+            "--nocapture",
+        ])
+        .env("M3_05_TORN_LEDGER_ROOT", &root)
+        .env(
+            "WORKFLOW_KIT_TEST_CRASH_BARRIER",
+            "after-loop-ledger-before-checkpoint",
+        )
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    let run_root = fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("run-manifest.json").is_file())
+        .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+    let resumed = ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap();
+    assert_eq!(resumed.status(), "succeeded");
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
 fn finish_after_result_crash_with_declared_skill_resumes_without_model_request() {
     if let Ok(root) = env::var("M3_05_FINISH_CRASH_RUN_ROOT") {
         let root = PathBuf::from(root);

@@ -115,6 +115,8 @@ struct LoopLedgerV1 {
     schema_version: u8,
     checkpoint_identity: String,
     nodes: BTreeMap<String, LoopState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_nodes: Option<BTreeMap<String, LoopState>>,
 }
 
 struct LoopLedgerStore {
@@ -160,11 +162,19 @@ impl LoopLedgerStore {
     ) -> Result<Self, ExecutionError> {
         let ledger = serde_json::from_slice::<LoopLedgerV1>(&bounded_read(&path)?)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        if ledger.schema_version != 3
-            || ledger.checkpoint_identity != checkpoint_identity
-            || checkpoint_digest != loop_ledger_digest(&ledger.nodes)?
-            || ledger.nodes.values().any(|state| !valid_loop_state(state))
+        if ledger.schema_version != 4 || ledger.checkpoint_identity != checkpoint_identity {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        let nodes = if checkpoint_digest == loop_ledger_digest(&ledger.nodes)? {
+            ledger.nodes
+        } else if let Some(nodes) = ledger.checkpoint_nodes
+            && checkpoint_digest == loop_ledger_digest(&nodes)?
         {
+            nodes
+        } else {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        };
+        if nodes.values().any(|state| !valid_loop_state(state)) {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
         Ok(Self {
@@ -174,7 +184,7 @@ impl LoopLedgerStore {
             checkpoint_manifest,
             run_id,
             persist_raw_loop_state,
-            nodes: Mutex::new(ledger.nodes),
+            nodes: Mutex::new(nodes),
         })
     }
 
@@ -497,8 +507,42 @@ impl LoopLedgerStore {
                 }
             }
         }
-        self.persist_ledger(&durable_nodes)?;
+        self.persist_ledger_with_checkpoint_generation(&durable_nodes)?;
+        crash_barrier("after-loop-ledger-before-checkpoint");
         self.sync_checkpoint(&durable_nodes)
+    }
+
+    fn persist_ledger_with_checkpoint_generation(
+        &self,
+        nodes: &BTreeMap<String, LoopState>,
+    ) -> Result<(), ExecutionError> {
+        let store =
+            SqliteCheckpointStore::open(&self.checkpoint_path, self.checkpoint_manifest.clone())
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let checkpoint = store
+            .load_latest(&self.run_id)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let checkpoint_digest = checkpoint_ledger_digest(checkpoint.state())?;
+        let ledger = serde_json::from_slice::<LoopLedgerV1>(&bounded_read(&self.path)?)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let checkpoint_nodes = [Some(&ledger.nodes), ledger.checkpoint_nodes.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|generation| {
+                loop_ledger_digest(generation).as_deref() == Ok(checkpoint_digest.as_str())
+            })
+            .cloned()
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        write_json(
+            &self.path,
+            &LoopLedgerV1 {
+                schema_version: 4,
+                checkpoint_identity: self.checkpoint_identity.clone(),
+                nodes: nodes.clone(),
+                checkpoint_nodes: Some(checkpoint_nodes),
+            },
+        )
     }
 
     fn persist_ledger(&self, nodes: &BTreeMap<String, LoopState>) -> Result<(), ExecutionError> {
@@ -518,9 +562,10 @@ impl LoopLedgerStore {
         write_json(
             &self.path,
             &LoopLedgerV1 {
-                schema_version: 3,
+                schema_version: 4,
                 checkpoint_identity: self.checkpoint_identity.clone(),
                 nodes,
+                checkpoint_nodes: None,
             },
         )
     }
