@@ -1539,14 +1539,14 @@ fn package_directory_identity(path: &Path) -> Result<PackageIdentity, ExecutionE
 }
 
 #[cfg(debug_assertions)]
-fn package_file_test_barrier(relative: &str) {
+fn package_file_test_barrier(package_root: &Path, relative: &str) {
     if relative != "scripts/replacement.bin" {
         return;
     }
-    let Ok(root) = std::env::var("WORKFLOW_KIT_TEST_PACKAGE_FILE_BARRIER") else {
+    let Some(parent) = package_root.parent() else {
         return;
     };
-    let root = PathBuf::from(root);
+    let root = parent.join("package-file-barrier");
     if fs::write(root.join("ready"), b"ready").is_err() {
         return;
     }
@@ -1557,21 +1557,24 @@ fn package_file_test_barrier(relative: &str) {
 }
 
 #[cfg(not(debug_assertions))]
-fn package_file_test_barrier(_: &str) {}
+fn package_file_test_barrier(_: &Path, _: &str) {}
 
 #[cfg(debug_assertions)]
-fn package_file_test_read_len(relative: &str, length: usize) {
+fn package_file_test_read_len(package_root: &Path, relative: &str, length: usize) {
     if relative != "scripts/replacement.bin" {
         return;
     }
-    let Ok(root) = std::env::var("WORKFLOW_KIT_TEST_PACKAGE_FILE_BARRIER") else {
+    let Some(parent) = package_root.parent() else {
         return;
     };
-    let _ = fs::write(PathBuf::from(root).join("read-len"), length.to_string());
+    let _ = fs::write(
+        parent.join("package-file-barrier/read-len"),
+        length.to_string(),
+    );
 }
 
 #[cfg(not(debug_assertions))]
-fn package_file_test_read_len(_: &str, _: usize) {}
+fn package_file_test_read_len(_: &Path, _: &str, _: usize) {}
 
 fn package_paths_match(checked: &[(PathBuf, PackageIdentity)]) -> bool {
     checked.iter().all(|(path, identity)| {
@@ -1624,7 +1627,7 @@ fn package_file(
             ExecutionErrorKind::ImplementationBinding,
         ));
     }
-    package_file_test_barrier(relative);
+    package_file_test_barrier(root, relative);
     let metadata = fs::symlink_metadata(&path)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
     if metadata.len() == 0 || metadata.len() > 65_536 || !package_paths_match(&checked) {
@@ -1639,7 +1642,7 @@ fn package_file(
             ExecutionErrorKind::ImplementationBinding,
         ));
     }
-    package_file_test_read_len(relative, bytes.len());
+    package_file_test_read_len(root, relative, bytes.len());
     if package_paths_match(&checked) {
         Ok(bytes)
     } else {

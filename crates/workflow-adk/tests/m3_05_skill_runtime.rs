@@ -1010,18 +1010,24 @@ fn package_replacements_between_validation_and_read_fail_closed() {
         let workflow = root.join("workflow.toml");
         fs::write(&workflow, WORKFLOW).unwrap();
         let profile = profile(&package);
-        let barrier = root.join("replacement-barrier");
+        let barrier = root.join("package-file-barrier");
         fs::create_dir(&barrier).unwrap();
         let replacement_root = root.clone();
         let replacement_package = package.clone();
         let replacement_worker = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while !replacement_root.join("replacement-barrier/ready").is_file()
+            while !replacement_root
+                .join("package-file-barrier/ready")
+                .is_file()
                 && std::time::Instant::now() < deadline
             {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            assert!(replacement_root.join("replacement-barrier/ready").is_file());
+            assert!(
+                replacement_root
+                    .join("package-file-barrier/ready")
+                    .is_file()
+            );
             match replacement {
                 "leaf" => {
                     fs::rename(
@@ -1051,18 +1057,12 @@ fn package_replacements_between_validation_and_read_fail_closed() {
                 _ => unreachable!(),
             }
             fs::write(
-                replacement_root.join("replacement-barrier/continue"),
+                replacement_root.join("package-file-barrier/continue"),
                 b"continue",
             )
             .unwrap();
         });
-        unsafe {
-            env::set_var("WORKFLOW_KIT_TEST_PACKAGE_FILE_BARRIER", &barrier);
-        }
         let error = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap_err();
-        unsafe {
-            env::remove_var("WORKFLOW_KIT_TEST_PACKAGE_FILE_BARRIER");
-        }
         replacement_worker.join().unwrap();
         assert_eq!(
             error.kind(),
@@ -1165,7 +1165,7 @@ fn package_file_growth_is_bounded_before_execution() {
     .unwrap();
     let workflow = root.join("workflow.toml");
     fs::write(&workflow, WORKFLOW).unwrap();
-    let barrier = root.join("growth-barrier");
+    let barrier = root.join("package-file-barrier");
     fs::create_dir(&barrier).unwrap();
     let grown_file = package.join("scripts/replacement.bin");
     let growth_barrier = barrier.clone();
@@ -1182,13 +1182,7 @@ fn package_file_growth_is_bounded_before_execution() {
         file.write_all(&vec![b'x'; 65_537]).unwrap();
         fs::write(growth_barrier.join("continue"), b"continue").unwrap();
     });
-    unsafe {
-        env::set_var("WORKFLOW_KIT_TEST_PACKAGE_FILE_BARRIER", &barrier);
-    }
     let error = ExecutionBackend::run(&workflow, profile(&package), json!({}), &root).unwrap_err();
-    unsafe {
-        env::remove_var("WORKFLOW_KIT_TEST_PACKAGE_FILE_BARRIER");
-    }
     growth_worker.join().unwrap();
     assert_eq!(error.kind(), ExecutionErrorKind::ImplementationBinding);
     assert!(
