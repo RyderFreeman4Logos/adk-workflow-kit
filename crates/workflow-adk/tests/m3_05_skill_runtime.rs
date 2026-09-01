@@ -418,7 +418,7 @@ fn activate_and_read_exclude_content_from_public_durable_surfaces() {
 }
 
 #[test]
-fn maximum_skill_instructions_cross_public_tool_boundary() {
+fn maximum_skill_instructions_are_excluded_from_public_durable_surfaces() {
     let root = root();
     let package = skill_package(&root);
     let mut instructions =
@@ -459,12 +459,9 @@ fn maximum_skill_instructions_cross_public_tool_boundary() {
     )
     .unwrap();
     assert_eq!(receipt.status(), "succeeded");
-    assert!(
-        any_file_contains(
-            receipt.run_root(),
-            std::str::from_utf8(CANARY).expect("ASCII canary")
-        ),
-        "near-limit instruction tail did not cross the public tool boundary"
+    assert_public_durable_surfaces_exclude(
+        receipt.run_root(),
+        &[std::str::from_utf8(CANARY).expect("ASCII canary")],
     );
     cleanup_test_root(&root);
     fs::remove_dir_all(root).expect("test cleanup");
