@@ -362,6 +362,25 @@ impl ToolReference {
     }
 }
 
+/// An exact Skill identity authored on an agent node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillReference {
+    id: String,
+    version: String,
+}
+
+impl SkillReference {
+    /// Returns the opaque Skill identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the opaque Skill version.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+}
+
 /// A source-level node with its closed kind and optional approval timeout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Node {
@@ -373,6 +392,7 @@ pub struct Node {
     resources: Vec<ResourceReference>,
     model: Option<ModelReference>,
     tools: Vec<ToolReference>,
+    skills: Vec<SkillReference>,
 }
 
 impl Node {
@@ -414,6 +434,11 @@ impl Node {
     /// Returns the explicitly declared static tool subset in source order.
     pub fn tools(&self) -> &[ToolReference] {
         &self.tools
+    }
+
+    /// Returns the explicitly declared Skill subset in source order.
+    pub fn skills(&self) -> &[SkillReference] {
+        &self.skills
     }
 }
 
@@ -640,6 +665,7 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
             .as_ref()
             .is_some_and(|model| model.id.is_empty() || model.version.is_empty())
             || !valid_tools(&node.tools)
+            || !valid_skills(&node.skills)
     }) {
         return Err(SpecError::InvalidNodeBinding);
     }
@@ -687,6 +713,14 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
                     .map(|tool| ToolReference {
                         id: tool.id,
                         version: tool.version,
+                    })
+                    .collect(),
+                skills: node
+                    .skills
+                    .into_iter()
+                    .map(|skill| SkillReference {
+                        id: skill.id,
+                        version: skill.version,
                     })
                     .collect(),
             })
@@ -744,6 +778,15 @@ fn valid_tools(tools: &[RawToolReference]) -> bool {
         !tool.id.is_empty()
             && !tool.version.is_empty()
             && identities.insert((&tool.id, &tool.version))
+    })
+}
+
+fn valid_skills(skills: &[RawSkillReference]) -> bool {
+    let mut identities = BTreeSet::new();
+    skills.iter().all(|skill| {
+        !skill.id.is_empty()
+            && !skill.version.is_empty()
+            && identities.insert((&skill.id, &skill.version))
     })
 }
 
@@ -868,6 +911,8 @@ struct RawNode {
     model: Option<RawModelReference>,
     #[serde(default)]
     tools: Vec<RawToolReference>,
+    #[serde(default)]
+    skills: Vec<RawSkillReference>,
 }
 
 #[derive(Deserialize)]
@@ -881,6 +926,13 @@ struct RawModelReference {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawToolReference {
+    id: String,
+    version: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSkillReference {
     id: String,
     version: String,
 }
