@@ -1731,6 +1731,54 @@ fn same_inode_same_size_package_mutation_fails_closed() {
 }
 
 #[test]
+fn package_swap_open_restore_is_rejected_by_open_handle_identity() {
+    let root = root();
+    let package = skill_package(&root);
+    let runtime_path = package.join("skill.runtime.toml");
+    let runtime = fs::read_to_string(&runtime_path).unwrap();
+    fs::write(package.join("scripts/replacement.bin"), SCRIPT).unwrap();
+    fs::write(
+        &runtime_path,
+        format!(
+            "{runtime}[[scripts]]\nid = \"replacement\"\npath = \"scripts/replacement.bin\"\nruntime = \"python3\"\nsha256 = \"{}\"\ninput_schema = \"references/schema.json\"\noutput_schema = \"references/schema.json\"\ncapabilities = [\"filesystem.read\", \"process.spawn\", \"limit.output_bytes\"]\n",
+            digest(SCRIPT),
+        ),
+    )
+    .unwrap();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let barrier = root.join("package-file-barrier");
+    fs::create_dir(&barrier).unwrap();
+    let target = package.join("scripts/replacement.bin");
+    let worker_barrier = barrier.clone();
+    let replacement_worker = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !worker_barrier.join("ready").is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(worker_barrier.join("ready").is_file());
+        let original = target.with_extension("original");
+        fs::rename(&target, &original).unwrap();
+        fs::write(&target, vec![b'x'; SCRIPT.len()]).unwrap();
+        fs::write(worker_barrier.join("continue"), b"continue").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !worker_barrier.join("opened").is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(worker_barrier.join("opened").is_file());
+        fs::rename(&target, target.with_extension("substitute")).unwrap();
+        fs::rename(original, &target).unwrap();
+        fs::write(worker_barrier.join("restored"), b"restored").unwrap();
+    });
+
+    let error = ExecutionBackend::run(&workflow, profile(&package), json!({}), &root).unwrap_err();
+    replacement_worker.join().unwrap();
+    assert_eq!(error.kind(), ExecutionErrorKind::ImplementationBinding);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
 fn package_replacements_between_validation_and_read_fail_closed() {
     for replacement in ["leaf", "intermediate", "root"] {
         let root = root();

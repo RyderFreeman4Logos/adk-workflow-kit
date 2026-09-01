@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt, fs,
     future::Future,
+    io::Read,
     num::{NonZeroU64, NonZeroUsize},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -1972,6 +1973,27 @@ fn package_file_test_barrier(package_root: &Path, relative: &str) {
 fn package_file_test_barrier(_: &Path, _: &str) {}
 
 #[cfg(debug_assertions)]
+fn package_file_test_open_barrier(package_root: &Path, relative: &str) {
+    if relative != "scripts/replacement.bin" {
+        return;
+    }
+    let Some(parent) = package_root.parent() else {
+        return;
+    };
+    let root = parent.join("package-file-barrier");
+    if fs::write(root.join("opened"), b"opened").is_err() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !root.join("restored").is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn package_file_test_open_barrier(_: &Path, _: &str) {}
+
+#[cfg(debug_assertions)]
 fn package_file_test_read_len(package_root: &Path, relative: &str, length: usize) {
     if relative != "scripts/replacement.bin" {
         return;
@@ -2032,9 +2054,21 @@ fn package_file(
         ));
     }
     package_file_test_barrier(root, relative);
-    let metadata = fs::symlink_metadata(&path)
+    let file = fs::File::open(&path)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
-    if metadata.len() == 0 || metadata.len() > 65_536 || !package_paths_match(&checked) {
+    package_file_test_open_barrier(root, relative);
+    let metadata = file
+        .metadata()
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    let leaf_identity = checked
+        .last()
+        .map(|(_, identity)| *identity)
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    if !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > 65_536
+        || !leaf_identity.matches(&metadata)
+    {
         return Err(ExecutionError::new(
             ExecutionErrorKind::ImplementationBinding,
         ));
@@ -2044,9 +2078,11 @@ fn package_file(
     if length > *remaining_bytes {
         return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
     }
-    let bytes = read_bounded_regular_file(&SourcePath::from(path.as_path()), 65_536)
+    let mut bytes = Vec::with_capacity(length);
+    file.take(65_537)
+        .read_to_end(&mut bytes)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
-    if bytes.is_empty() {
+    if bytes.len() != length {
         return Err(ExecutionError::new(
             ExecutionErrorKind::ImplementationBinding,
         ));
