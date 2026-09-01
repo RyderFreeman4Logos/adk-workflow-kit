@@ -1386,14 +1386,14 @@ impl SkillRegistry for SkillPackage {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SealedSkillSnapshotV1 {
     schema_version: u8,
     packages: Vec<SealedSkillPackageV1>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SealedSkillPackageV1 {
     id: String,
@@ -1499,6 +1499,24 @@ impl SealedSkillSnapshotV1 {
             .collect()
     }
 }
+
+#[cfg(debug_assertions)]
+fn skill_snapshot_test_barrier() {
+    let Ok(root) = std::env::var("WORKFLOW_KIT_TEST_SKILL_SNAPSHOT_BARRIER") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    if fs::write(root.join("ready"), b"ready").is_err() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !root.join("continue").is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn skill_snapshot_test_barrier() {}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct PackageIdentity {
@@ -2692,7 +2710,7 @@ impl ExecutionBackend {
 
     pub fn run_cancellable(
         workflow: impl AsRef<Path>,
-        profile: ExecutionProfileV1,
+        mut profile: ExecutionProfileV1,
         input: Value,
         workdir_base: impl AsRef<Path>,
         cancellation: Arc<AtomicBool>,
@@ -2710,6 +2728,10 @@ impl ExecutionBackend {
             .as_ref()
             .map(SealedSkillSnapshotV1::identity)
             .transpose()?;
+        if let (Some(snapshot), Some(identity)) = (&skill_snapshot, &skill_snapshot_identity) {
+            profile.sealed_skills = Some(snapshot.clone().restore(identity)?);
+        }
+        skill_snapshot_test_barrier();
         let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
         let requested = RequestedCapabilities::new(required_capabilities.iter().copied());
         verify_sandbox_capabilities(

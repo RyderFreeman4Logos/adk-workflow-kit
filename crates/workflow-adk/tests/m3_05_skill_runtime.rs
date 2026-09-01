@@ -1073,6 +1073,76 @@ fn package_replacements_between_validation_and_read_fail_closed() {
     }
 }
 
+#[test]
+fn initial_run_uses_sealed_skill_snapshot_after_package_replacement() {
+    let root = root();
+    let package = skill_package(&root);
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let profile = profile(&package);
+    let replacement_root = root.join("replacement");
+    fs::create_dir(&replacement_root).unwrap();
+    let replacement = skill_package(&replacement_root);
+    let replacement_script =
+        b"import json\nprint(json.dumps({'value': 'replacement-generation'}))\n";
+    fs::write(replacement.join("scripts/content.bin"), replacement_script).unwrap();
+    let runtime_path = replacement.join("skill.runtime.toml");
+    let runtime = fs::read_to_string(&runtime_path).unwrap();
+    fs::write(
+        &runtime_path,
+        runtime.replace(&digest(SCRIPT), &digest(replacement_script)),
+    )
+    .unwrap();
+    let barrier = root.join("skill-snapshot-barrier");
+    fs::create_dir(&barrier).unwrap();
+    let replacement_root = root.clone();
+    let replacement_package = package.clone();
+    let replacement_worker = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !replacement_root
+            .join("skill-snapshot-barrier/ready")
+            .is_file()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            replacement_root
+                .join("skill-snapshot-barrier/ready")
+                .is_file()
+        );
+        fs::rename(
+            &replacement_package,
+            replacement_root.join("displaced-package"),
+        )
+        .unwrap();
+        fs::rename(
+            replacement_root.join("replacement/code-investigation"),
+            &replacement_package,
+        )
+        .unwrap();
+        fs::write(
+            replacement_root.join("skill-snapshot-barrier/continue"),
+            b"continue",
+        )
+        .unwrap();
+    });
+    unsafe {
+        env::set_var("WORKFLOW_KIT_TEST_SKILL_SNAPSHOT_BARRIER", &barrier);
+    }
+    let receipt = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap();
+    unsafe {
+        env::remove_var("WORKFLOW_KIT_TEST_SKILL_SNAPSHOT_BARRIER");
+    }
+    replacement_worker.join().unwrap();
+    let checkpoint_manifest =
+        fs::read_to_string(receipt.run_root().join("checkpoint-manifest.json")).unwrap();
+    assert!(checkpoint_manifest.contains(&digest(SCRIPT)));
+    assert!(!checkpoint_manifest.contains(&digest(replacement_script)));
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
 #[cfg(unix)]
 #[test]
 fn package_file_symlinks_fail_closed_before_effect() {
