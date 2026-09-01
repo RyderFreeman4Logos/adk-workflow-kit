@@ -58,6 +58,21 @@ fn cleanup_test_root(path: &Path) {
     }
 }
 
+fn any_file_contains(root: &Path, marker: &str) -> bool {
+    fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                any_file_contains(&path, marker)
+            } else {
+                fs::read(&path).is_ok_and(|bytes| String::from_utf8_lossy(&bytes).contains(marker))
+            }
+        })
+}
+
 fn digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
@@ -567,6 +582,30 @@ fn durable_surfaces_omit_paths_raw_args_and_stdout() {
             .iter()
             .any(|bytes| String::from_utf8_lossy(bytes).contains(&digest(SCRIPT))),
         "durable surfaces lost script identity",
+    );
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
+fn large_skill_stdout_is_absent_from_every_durable_file() {
+    let root = root();
+    let package = skill_package(&root);
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let canary = format!("skill-stdout-canary-{}", "x".repeat(4_096));
+    let mut value = serde_json::to_value(profile(&package)).unwrap();
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+        {"calls": [{"id":"run","name":"run_skill_script","args":{"skill_id":"code-investigation","script_id":"answer","input":{"value":canary}}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
+    ]);
+    let profile = ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let receipt = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap();
+    assert!(
+        !any_file_contains(receipt.run_root(), &canary),
+        "durable run files retained Skill stdout"
     );
     cleanup_test_root(&root);
     fs::remove_dir_all(root).expect("test cleanup");

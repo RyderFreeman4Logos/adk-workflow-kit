@@ -342,6 +342,8 @@ impl AdkEventMapper {
         };
         let structured_output = if structured_output.is_some() {
             structured_output
+                .map(redact_skill_script_results)
+                .transpose()?
         } else if calls.is_empty() {
             event
                 .content()
@@ -522,6 +524,40 @@ impl fmt::Display for AdkEventMappingError {
 }
 
 impl std::error::Error for AdkEventMappingError {}
+
+fn redact_skill_script_results(output: Value) -> Result<Value, AdkEventMappingError> {
+    let Value::Array(results) = output else {
+        return Ok(output);
+    };
+    results
+        .into_iter()
+        .map(|mut result| {
+            if result.get("tool_name").and_then(Value::as_str) == Some("run_skill_script") {
+                let response = result
+                    .as_object_mut()
+                    .and_then(|result| result.remove("response"))
+                    .ok_or_else(|| {
+                        AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
+                    })?;
+                let output_bytes = serde_json::to_vec(&response)
+                    .map_err(|_| {
+                        AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
+                    })?
+                    .len();
+                let result = result.as_object_mut().ok_or_else(|| {
+                    AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
+                })?;
+                result.insert(
+                    "response_digest".to_owned(),
+                    Value::String(redacted_json_digest(&response)?),
+                );
+                result.insert("response_bytes".to_owned(), Value::from(output_bytes));
+            }
+            Ok(result)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
+}
 
 fn protect_large_payload<S: ArtifactStore>(
     observation: AdkRuntimeObservationV1,
