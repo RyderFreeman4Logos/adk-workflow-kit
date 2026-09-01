@@ -194,6 +194,15 @@ fn resume_profile(package: &std::path::Path) -> ExecutionProfileV1 {
     ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
 }
 
+fn script_only_profile(package: &std::path::Path) -> ExecutionProfileV1 {
+    let mut value = serde_json::to_value(profile(package)).unwrap();
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"run","name":"run_skill_script","args":{"skill_id":"code-investigation","script_id":"answer","input":{"value":"admitted-script-input-must-not-persist"}}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
+    ]);
+    ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
+}
+
 #[test]
 fn fake_model_activates_reads_and_runs_declared_skill() {
     let root = root();
@@ -667,6 +676,54 @@ fn crashed_skill_admission_or_activation_resumes_without_widening() {
         cleanup_test_root(&root);
         fs::remove_dir_all(root).expect("test cleanup");
     }
+}
+
+#[test]
+fn admitted_script_call_is_bound_or_resume_fails_closed() {
+    if let Ok(root) = env::var("M3_05_SCRIPT_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            &workflow,
+            script_only_profile(&root.join("code-investigation")),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let root = root();
+    skill_package(&root);
+    let status = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "admitted_script_call_is_bound_or_resume_fails_closed",
+            "--nocapture",
+        ])
+        .env("M3_05_SCRIPT_CRASH_RUN_ROOT", &root)
+        .env(
+            "WORKFLOW_KIT_TEST_CRASH_BARRIER",
+            "after-skill-call-admission",
+        )
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    let run_root = fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("run-manifest.json").is_file())
+        .unwrap();
+    let ledger = fs::read_to_string(run_root.join("loop-ledger.json")).unwrap();
+    assert!(ledger.contains("run_skill_script"));
+    assert!(!ledger.contains("admitted-script-input-must-not-persist"));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+    let error = ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
 }
 
 #[cfg(unix)]

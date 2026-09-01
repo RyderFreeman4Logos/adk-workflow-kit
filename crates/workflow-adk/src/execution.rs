@@ -505,8 +505,33 @@ fn durable_pending_args(call: &PendingCall) -> Option<Value> {
                     })
                 })
         }
+        "run_skill_script" => {
+            if let Ok(input) = serde_json::from_value::<RunSkillScriptInput>(call.args.clone()) {
+                return Some(json!({
+                    "skill_id": input.skill_id,
+                    "script_id": input.script_id,
+                    "argument_fingerprint": call.fingerprint,
+                }));
+            }
+            let args = call.args.as_object()?;
+            (args.len() == 3
+                && args.get("skill_id").is_some_and(Value::is_string)
+                && args.get("script_id").is_some_and(Value::is_string)
+                && args.get("argument_fingerprint")
+                    == Some(&Value::String(call.fingerprint.clone())))
+            .then(|| call.args.clone())
+        }
         _ => None,
     }
+}
+
+fn is_redacted_script_pending(call: &PendingCall) -> bool {
+    call.name == "run_skill_script"
+        && call
+            .args
+            .get("argument_fingerprint")
+            .and_then(Value::as_str)
+            == Some(call.fingerprint.as_str())
 }
 
 fn loop_ledger_digest(nodes: &BTreeMap<String, LoopState>) -> Result<String, ExecutionError> {
@@ -3918,6 +3943,9 @@ fn replay_pending_tools(
     effect_fence: &EffectFence,
 ) -> Result<(), ExecutionError> {
     for (node, pending) in ledger.pending_calls()? {
+        if is_redacted_script_pending(&pending) {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
         let toolset = toolsets
             .get(&node)
             .and_then(Option::as_ref)
