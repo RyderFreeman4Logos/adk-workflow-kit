@@ -267,6 +267,17 @@ fn profile(package: &std::path::Path) -> ExecutionProfileV1 {
     ExecutionProfileV1::parse(&serde_json::to_vec(&profile).unwrap()).unwrap()
 }
 
+fn discovery_profile(package: &std::path::Path) -> ExecutionProfileV1 {
+    let mut value = serde_json::to_value(profile(package)).unwrap();
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+        {"calls": [{"id":"read","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":{"$from_tool_response":{"name":"activate_skill","pointer":"/payload/resources/0/id"}},"offset":0,"limit":64}}]},
+        {"calls": [{"id":"run","name":"run_skill_script","args":{"skill_id":"code-investigation","script_id":{"$from_tool_response":{"name":"activate_skill","pointer":"/payload/scripts/0/id"}},"input":{"value":"done"}}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
+    ]);
+    ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
+}
+
 fn one_turn_profile(package: &std::path::Path) -> ExecutionProfileV1 {
     let mut value = serde_json::to_value(profile(package)).unwrap();
     value["model"]["responses"] =
@@ -363,7 +374,8 @@ fn fake_model_activates_reads_and_runs_declared_skill() {
     let workflow = root.join("workflow.toml");
     fs::write(&workflow, WORKFLOW).unwrap();
 
-    let receipt = ExecutionBackend::run(&workflow, profile(&package), json!({}), &root).unwrap();
+    let receipt =
+        ExecutionBackend::run(&workflow, discovery_profile(&package), json!({}), &root).unwrap();
     let events = fs::read_to_string(receipt.run_root().join("events.jsonl")).unwrap();
     let ledger = fs::read_to_string(receipt.run_root().join("loop-ledger.json")).unwrap();
     assert_eq!(receipt.status(), "succeeded");
@@ -371,6 +383,20 @@ fn fake_model_activates_reads_and_runs_declared_skill() {
         assert!(events.contains(name), "missing {name} event");
         assert!(ledger.contains(name), "missing {name} ledger entry");
     }
+    for metadata in [
+        "assets/guide.txt".to_owned(),
+        digest(GUIDE),
+        "answer".to_owned(),
+        digest(SCRIPT),
+        "python3".to_owned(),
+        "filesystem.read".to_owned(),
+    ] {
+        assert!(
+            events.contains(&metadata),
+            "missing activation metadata {metadata}"
+        );
+    }
+    assert!(!events.contains("scripts/content.bin"));
     cleanup_test_root(&root);
     fs::remove_dir_all(root).expect("test cleanup");
 }

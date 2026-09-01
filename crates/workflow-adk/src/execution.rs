@@ -4306,6 +4306,16 @@ impl ToolHandler for SkillToolHandler {
                     "version": activation.version(),
                     "instructions_ref": format!("sha256:{:x}", Sha256::digest(activation.instructions())),
                     "instructions": activation.instructions(),
+                    "resources": skill_id.runtime.resources().iter().map(|resource| json!({
+                        "id": resource.id().as_str(),
+                        "sha256": resource.sha256(),
+                    })).collect::<Vec<_>>(),
+                    "scripts": skill_id.runtime.scripts().iter().map(|script| json!({
+                        "id": script.id().as_str(),
+                        "sha256": script.sha256(),
+                        "runtime": script.runtime(),
+                        "capabilities": script.capabilities().iter().map(SandboxCapability::as_str).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
                 });
                 self.ledger
                     .activate_skill(context.actor(), &skill_name)

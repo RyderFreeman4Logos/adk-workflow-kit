@@ -49,6 +49,11 @@ impl DeclaredSkillScript {
         &self.runtime
     }
 
+    /// Returns the declared SHA-256 identity of the script bytes.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
     /// Returns the capability classes required by this script.
     pub fn capabilities(&self) -> &[SandboxCapability] {
         &self.capabilities
@@ -66,6 +71,11 @@ impl DeclaredSkillResource {
     /// Returns the declared resource identifier.
     pub fn id(&self) -> &SkillResourceId {
         &self.id
+    }
+
+    /// Returns the declared SHA-256 identity of the resource bytes.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
     }
 }
 

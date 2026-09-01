@@ -555,10 +555,7 @@ fn redact_skill_tool_results(output: Value) -> Result<Value, AdkEventMappingErro
                     AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
                 })?;
                 let fields = match tool_name.as_deref() {
-                    Some("activate_skill") => {
-                        result.insert("activated".to_owned(), Value::Bool(true));
-                        &["skill_id", "version", "instructions_ref"][..]
-                    }
+                    Some("activate_skill") => &["skill_id", "version", "instructions_ref"][..],
                     Some("read_skill_resource") => &[
                         "resource_id",
                         "result_ref",
@@ -568,21 +565,69 @@ fn redact_skill_tool_results(output: Value) -> Result<Value, AdkEventMappingErro
                     ][..],
                     _ => &[],
                 };
+                let wrapped = response.get("payload").is_some();
                 let safe_response = response
+                    .get("payload")
+                    .unwrap_or(&response)
                     .as_object()
                     .map(|response| {
-                        fields
+                        let mut safe = fields
                             .iter()
                             .filter_map(|field| {
                                 response
                                     .get(*field)
                                     .map(|value| ((*field).to_owned(), value.clone()))
                             })
-                            .collect::<Map<_, _>>()
+                            .collect::<Map<_, _>>();
+                        if tool_name.as_deref() == Some("activate_skill") {
+                            safe.insert("activated".to_owned(), Value::Bool(true));
+                            for (name, fields) in [
+                                ("resources", &["id", "sha256"][..]),
+                                ("scripts", &["id", "sha256", "runtime", "capabilities"][..]),
+                            ] {
+                                if let Some(items) = response.get(name).and_then(Value::as_array) {
+                                    safe.insert(
+                                        name.to_owned(),
+                                        Value::Array(
+                                            items
+                                                .iter()
+                                                .filter_map(Value::as_object)
+                                                .map(|item| {
+                                                    Value::Object(
+                                                        fields
+                                                            .iter()
+                                                            .filter_map(|field| {
+                                                                item.get(*field).map(|value| {
+                                                                    (
+                                                                        (*field).to_owned(),
+                                                                        value.clone(),
+                                                                    )
+                                                                })
+                                                            })
+                                                            .collect(),
+                                                    )
+                                                })
+                                                .collect(),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        safe
                     })
                     .unwrap_or_default();
                 if !safe_response.is_empty() {
-                    result.insert("response".to_owned(), Value::Object(safe_response));
+                    result.insert(
+                        "response".to_owned(),
+                        if wrapped {
+                            Value::Object(Map::from_iter([(
+                                "payload".to_owned(),
+                                Value::Object(safe_response),
+                            )]))
+                        } else {
+                            Value::Object(safe_response)
+                        },
+                    );
                 }
                 result.insert(
                     "response_digest".to_owned(),
@@ -723,6 +768,18 @@ mod tests {
                     "version": "1",
                     "instructions_ref": "sha256:instructions",
                     "instructions": "instructions-canary",
+                    "resources": [{
+                        "id": "assets/guide.txt",
+                        "sha256": "sha256:resource",
+                        "content": "metadata-canary",
+                    }],
+                    "scripts": [{
+                        "id": "answer",
+                        "sha256": "sha256:script",
+                        "runtime": "python3",
+                        "capabilities": ["filesystem.read"],
+                        "content": "metadata-canary",
+                    }],
                 },
             },
             {
@@ -745,13 +802,21 @@ mod tests {
         let output = output.as_array().unwrap();
         let encoded = serde_json::to_string(output).unwrap();
 
-        for canary in ["instructions-canary", "resource-canary", "script-canary"] {
+        for canary in [
+            "instructions-canary",
+            "resource-canary",
+            "script-canary",
+            "metadata-canary",
+        ] {
             assert!(!encoded.contains(canary), "persisted {canary}");
         }
         assert!(encoded.contains("code-investigation"));
         assert!(encoded.contains("assets/guide.txt"));
         assert!(encoded.contains("sha256:instructions"));
         assert!(encoded.contains("sha256:resource"));
+        assert!(encoded.contains("sha256:script"));
+        assert!(encoded.contains("python3"));
+        assert!(encoded.contains("filesystem.read"));
         assert_eq!(
             output
                 .iter()
