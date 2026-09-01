@@ -156,3 +156,47 @@ fn undeclared_skill_resource_or_capability_fails_before_effect() {
     assert_eq!(error.kind(), ExecutionErrorKind::SandboxDenied);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn child_sandbox_denies_widening_and_bounds_output() {
+    let root = root();
+    let package = skill_package(&root);
+    let script = b"import json\nprint(json.dumps({'value': 'x' * 1024}))\n";
+    fs::write(package.join("scripts/content.bin"), script).unwrap();
+    let runtime_path = package.join("skill.runtime.toml");
+    let runtime = fs::read_to_string(&runtime_path).unwrap();
+    fs::write(
+        &runtime_path,
+        runtime.replace(&digest(SCRIPT), &digest(script)),
+    )
+    .unwrap();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+
+    let mut value = serde_json::to_value(profile(&package)).unwrap();
+    value["sandbox"]["capabilities"] = json!([
+        "filesystem.read",
+        "process.spawn",
+        "limit.output_bytes",
+        "network"
+    ]);
+    value["loop_policy"] = json!({
+        "schema_version": 1,
+        "max_model_iterations": 4,
+        "max_total_tool_calls": 4,
+        "max_tool_calls_per_tool": 4,
+        "wall_time_ms": 1_000,
+        "idle_time_ms": 1_000,
+        "tool_time_ms": 1_000,
+        "max_tool_output_bytes": 32
+    });
+    let profile = ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let error = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::ToolOutputBytesLimit);
+    assert!(
+        !fs::read_to_string(error.receipt().unwrap().run_root().join("events.jsonl"))
+            .unwrap()
+            .contains("tool_completed")
+    );
+    let _ = fs::remove_dir_all(root);
+}
