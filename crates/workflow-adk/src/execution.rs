@@ -9,6 +9,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -601,6 +602,16 @@ struct LoopController {
     last_progress: Arc<Mutex<Instant>>,
 }
 
+fn record_terminal(terminal: &Mutex<Option<ExecutionErrorKind>>, kind: ExecutionErrorKind) {
+    if let Ok(mut terminal) = terminal.lock()
+        && (terminal.is_none()
+            || (*terminal == Some(ExecutionErrorKind::Tool)
+                && kind == ExecutionErrorKind::ToolTimeLimit))
+    {
+        *terminal = Some(kind);
+    }
+}
+
 impl LoopController {
     fn new(
         node: impl Into<String>,
@@ -623,13 +634,7 @@ impl LoopController {
     }
 
     fn fail(&self, kind: ExecutionErrorKind, marker: &'static str) -> adk_rust::AdkError {
-        if let Ok(mut terminal) = self.terminal.lock()
-            && (terminal.is_none()
-                || (*terminal == Some(ExecutionErrorKind::Tool)
-                    && kind == ExecutionErrorKind::ToolTimeLimit))
-        {
-            *terminal = Some(kind);
-        }
+        record_terminal(&self.terminal, kind);
         adk_rust::AdkError::agent(marker)
     }
 
@@ -1786,28 +1791,69 @@ fn execution_deadline(limits: &RunLimits) -> Result<Instant, ExecutionError> {
         .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::WallTimeLimit))
 }
 
-fn remaining_wall_time(deadline: Instant) -> Result<Duration, ExecutionError> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::WallTimeLimit))
+async fn wait_for_run_deadline(
+    deadline: Instant,
+    terminal_kind: &Mutex<Option<ExecutionErrorKind>>,
+    cancellation: &AtomicBool,
+    last_progress: &Mutex<Instant>,
+    idle_timeout: Duration,
+) -> ExecutionErrorKind {
+    loop {
+        if cancellation.load(Ordering::Acquire) {
+            return ExecutionErrorKind::Cancelled;
+        }
+        if let Some(kind) = terminal_kind.lock().ok().and_then(|terminal| *terminal) {
+            return kind;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return ExecutionErrorKind::WallTimeLimit;
+        }
+        let idle_deadline = last_progress
+            .lock()
+            .ok()
+            .and_then(|progress| progress.checked_add(idle_timeout))
+            .unwrap_or(now);
+        if now >= idle_deadline {
+            return ExecutionErrorKind::IdleTimeLimit;
+        }
+        adk_rust::tokio::time::sleep(
+            deadline
+                .min(idle_deadline)
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(1)),
+        )
+        .await;
+    }
 }
 
 fn invoke_graph_with_deadline<F>(
     runtime: &adk_rust::tokio::runtime::Runtime,
     deadline: Instant,
     terminal_kind: &Arc<Mutex<Option<ExecutionErrorKind>>>,
+    cancellation: &AtomicBool,
+    last_progress: &Mutex<Instant>,
+    idle_timeout: Duration,
     future: F,
 ) -> Result<State, ExecutionError>
 where
     F: Future<Output = Result<State, AdkGraphError>>,
 {
-    let remaining = remaining_wall_time(deadline)?;
     runtime
         .block_on(async {
-            adk_rust::tokio::time::timeout(remaining, future)
-                .await
-                .unwrap_or(Err(AdkGraphError::WallTimeLimit))
+            adk_rust::tokio::select! {
+                result = future => result,
+                kind = wait_for_run_deadline(
+                    deadline,
+                    terminal_kind,
+                    cancellation,
+                    last_progress,
+                    idle_timeout,
+                ) => {
+                    record_terminal(terminal_kind, kind);
+                    Err(AdkGraphError::WallTimeLimit)
+                }
+            }
         })
         .map_err(|error| {
             let kind = terminal_kind
@@ -2175,6 +2221,9 @@ impl ExecutionBackend {
                     &runtime,
                     deadline,
                     &terminal_kind,
+                    &cancellation,
+                    &last_progress,
+                    Duration::from_millis(profile.run_limits().max_idle_time_ms().get()),
                     graph.invoke_observed(
                         State::new(),
                         ExecutionConfig::new(run_id.as_str()).with_recursion_limit(recursion_limit),
@@ -2621,13 +2670,9 @@ impl ExecutionBackend {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        if let Err(error) = replay_pending_tools(
-            &loop_ledger,
-            &toolsets,
-            profile.run_limits(),
-            deadline,
-            &terminal_kind,
-        ) {
+        if let Err(error) =
+            replay_pending_tools(&loop_ledger, &toolsets, profile.run_limits(), &effect_fence)
+        {
             return Err(resume_failure(
                 &root,
                 &events_path,
@@ -2710,6 +2755,9 @@ impl ExecutionBackend {
             &runtime,
             deadline,
             &terminal_kind,
+            &cancellation,
+            &last_progress,
+            Duration::from_millis(profile.run_limits().max_idle_time_ms().get()),
             graph.invoke_observed(
                 state,
                 ExecutionConfig::new(run_id)
@@ -2854,17 +2902,41 @@ struct EffectFence {
 }
 
 impl EffectFence {
-    fn wait(&self, delay: Duration) -> Result<Instant, ToolBridgeError> {
-        let tool_deadline = Instant::now()
+    fn tool_deadline(&self) -> Instant {
+        Instant::now()
             .checked_add(self.tool_timeout)
             .map_or(self.wall_deadline, |deadline| {
                 deadline.min(self.wall_deadline)
-            });
+            })
+    }
+
+    fn idle_deadline(&self) -> Instant {
+        self.last_progress
+            .lock()
+            .ok()
+            .and_then(|progress| progress.checked_add(self.idle_timeout))
+            .unwrap_or_else(Instant::now)
+    }
+
+    fn wait(&self, delay: Duration) -> Result<Instant, ToolBridgeError> {
+        let tool_deadline = self.tool_deadline();
+        let complete_at = Instant::now().checked_add(delay).unwrap_or(tool_deadline);
         test_effect_barrier(&self.cancellation);
-        self.admit(tool_deadline)?;
-        std::thread::sleep(delay.min(tool_deadline.saturating_duration_since(Instant::now())));
-        self.admit(tool_deadline)?;
-        Ok(tool_deadline)
+        loop {
+            self.admit(tool_deadline)?;
+            let now = Instant::now();
+            if now >= complete_at {
+                return Ok(tool_deadline);
+            }
+            std::thread::sleep(
+                complete_at
+                    .min(tool_deadline)
+                    .min(self.wall_deadline)
+                    .min(self.idle_deadline())
+                    .saturating_duration_since(now)
+                    .min(Duration::from_millis(1)),
+            );
+        }
     }
 
     fn admit(&self, tool_deadline: Instant) -> Result<(), ToolBridgeError> {
@@ -2884,14 +2956,20 @@ impl EffectFence {
             None
         };
         if let Some(kind) = kind {
-            if let Ok(mut terminal) = self.terminal.lock()
-                && terminal.is_none()
-            {
-                *terminal = Some(kind);
-            }
+            record_terminal(&self.terminal, kind);
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
         }
         Ok(())
+    }
+
+    fn execution_error(&self) -> ExecutionError {
+        ExecutionError::new(
+            self.terminal
+                .lock()
+                .ok()
+                .and_then(|terminal| *terminal)
+                .unwrap_or(ExecutionErrorKind::Tool),
+        )
     }
 
     fn mark_progress(&self) -> Result<(), ToolBridgeError> {
@@ -2988,8 +3066,7 @@ fn replay_pending_tools(
     ledger: &LoopLedgerStore,
     toolsets: &BTreeMap<String, Option<BoundTool>>,
     limits: RunLimits,
-    deadline: Instant,
-    terminal: &Mutex<Option<ExecutionErrorKind>>,
+    effect_fence: &EffectFence,
 ) -> Result<(), ExecutionError> {
     for (node, pending) in ledger.pending_calls()? {
         let toolset = toolsets
@@ -2998,7 +3075,8 @@ fn replay_pending_tools(
             .map(|(_, toolset)| toolset)
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let toolset = Arc::clone(toolset);
-        let worker = std::thread::Builder::new()
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
             .spawn(move || {
                 let response = toolset.invoke(ToolCall::new(
                     &pending.name,
@@ -3006,16 +3084,25 @@ fn replay_pending_tools(
                     &node,
                     pending.args.clone(),
                 ));
-                (node, pending, response)
+                let _ = sender.send((node, pending, response));
             })
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
-        let (node, pending, response) = worker
-            .join()
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
-        if let Some(kind) = terminal.lock().ok().and_then(|terminal| *terminal) {
-            return Err(ExecutionError::new(kind));
-        }
-        remaining_wall_time(deadline)?;
+        let tool_deadline = effect_fence.tool_deadline();
+        let (node, pending, response) = loop {
+            effect_fence
+                .admit(tool_deadline)
+                .map_err(|_| effect_fence.execution_error())?;
+            match receiver.recv_timeout(Duration::from_millis(1)) {
+                Ok(result) => break result,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ExecutionError::new(ExecutionErrorKind::Tool));
+                }
+            }
+        };
+        effect_fence
+            .admit(tool_deadline)
+            .map_err(|_| effect_fence.execution_error())?;
         let response = response.map_err(|error| {
             let kind = match error.kind() {
                 ToolBridgeErrorKind::CapabilityDenied | ToolBridgeErrorKind::ApprovalDenied => {
@@ -3025,7 +3112,6 @@ fn replay_pending_tools(
             };
             ExecutionError::new(kind)
         })?;
-        remaining_wall_time(deadline)?;
         let response = serde_json::to_value(response)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
         ledger.complete_pending(

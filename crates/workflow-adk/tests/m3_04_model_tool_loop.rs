@@ -498,17 +498,54 @@ fn wall_time_limit_is_exact_and_timed_out() {
 
 #[test]
 fn idle_time_limit_is_exact_and_timed_out() {
+    let started = Instant::now();
     let (root, error) = run(profile_with_delays(
         vec![finish(json!({"answer":"late"}))],
         Some(policy_with("idle_time_ms", 5)),
-        50,
+        1000,
         0,
         json!({"found":true}),
     ));
     let error = error.unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::IdleTimeLimit);
     assert_eq!(error.receipt().unwrap().status(), "timed_out");
+    assert_eq!(effect_count(error.receipt().unwrap().run_root()), 0);
+    assert!(!events(&error).contains("tool_completed"));
+    assert!(started.elapsed() < Duration::from_millis(400));
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn model_wait_selects_mid_run_cancellation() {
+    let root = root();
+    let cleanup = root.clone();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let worker_cancellation = Arc::clone(&cancellation);
+    let worker = std::thread::spawn(move || {
+        ExecutionBackend::run_cancellable(
+            &workflow,
+            profile_with_delays(
+                vec![finish(json!({"answer":"late"}))],
+                Some(loop_policy()),
+                1000,
+                0,
+                json!({"found":true}),
+            ),
+            json!({}),
+            &root,
+            worker_cancellation,
+        )
+    });
+    std::thread::sleep(Duration::from_millis(250));
+    let started = Instant::now();
+    cancellation.store(true, Ordering::Release);
+    let error = worker.join().unwrap().unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::Cancelled);
+    assert_eq!(error.receipt().unwrap().status(), "cancelled");
+    assert!(started.elapsed() < Duration::from_millis(100));
+    fs::remove_dir_all(cleanup).unwrap();
 }
 
 #[test]
@@ -531,6 +568,7 @@ fn tool_idle_limit_fences_effect_before_commit() {
     let mut policy = loop_policy();
     policy["idle_time_ms"] = json!(25);
     policy["tool_time_ms"] = json!(1000);
+    let started = Instant::now();
     let (root, error) = run(profile_with_delays(
         vec![
             json!({"calls": [{"id":"call-idle","name":"search_code","args":{"query":"one"}}]}),
@@ -538,7 +576,7 @@ fn tool_idle_limit_fences_effect_before_commit() {
         ],
         Some(policy),
         0,
-        100,
+        1000,
         json!({"found":true}),
     ));
     let error = error.unwrap_err();
@@ -546,6 +584,7 @@ fn tool_idle_limit_fences_effect_before_commit() {
     assert_eq!(error.receipt().unwrap().status(), "timed_out");
     assert_eq!(effect_count(error.receipt().unwrap().run_root()), 0);
     assert!(!events(&error).contains("tool_completed"));
+    assert!(started.elapsed() < Duration::from_millis(400));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -753,7 +792,7 @@ fn resume_idle_limit_fences_pending_replay_before_commit() {
                 ],
                 Some(policy),
                 0,
-                100,
+                1000,
                 json!({"found":true}),
             ),
             json!({}),
@@ -768,11 +807,13 @@ fn resume_idle_limit_fences_pending_replay_before_commit() {
         "resume_idle_limit_fences_pending_replay_before_commit",
         "before-effect",
     );
+    let started = Instant::now();
     let error = ExecutionBackend::resume(&root, &run_id(&run_root)).unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::IdleTimeLimit);
     assert_eq!(error.receipt().unwrap().status(), "timed_out");
     assert_eq!(effect_count(&run_root), 0);
     assert!(!events(&error).contains("tool_completed"));
+    assert!(started.elapsed() < Duration::from_millis(400));
     fs::remove_dir_all(root).unwrap();
 }
 
