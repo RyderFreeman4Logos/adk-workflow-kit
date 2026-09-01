@@ -1009,6 +1009,13 @@ struct SkillPackage {
 
 impl SkillPackage {
     fn load(wire: &SkillWire) -> Result<Self, ExecutionError> {
+        let metadata = fs::symlink_metadata(&wire.root)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(ExecutionError::new(
+                ExecutionErrorKind::ImplementationBinding,
+            ));
+        }
         let id = SkillId::new(&wire.id)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
         if wire.version.is_empty() {

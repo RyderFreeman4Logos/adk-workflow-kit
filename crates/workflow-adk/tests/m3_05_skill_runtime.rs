@@ -457,3 +457,21 @@ fn durable_surfaces_omit_paths_raw_args_and_stdout() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn symlink_or_replaced_package_fails_closed_before_effect() {
+    let root = root();
+    let package = skill_package(&root);
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let profile = profile(&package);
+    let replacement_root = root.join("replacement");
+    fs::create_dir(&replacement_root).unwrap();
+    let replacement = skill_package(&replacement_root);
+    fs::remove_dir_all(&package).unwrap();
+    std::os::unix::fs::symlink(&replacement, &package).unwrap();
+
+    let error = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::ImplementationBinding);
+    let _ = fs::remove_dir_all(root);
+}
