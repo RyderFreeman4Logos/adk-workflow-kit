@@ -457,6 +457,76 @@ fn activate_and_read_exclude_content_from_public_durable_surfaces() {
 }
 
 #[test]
+fn non_utf8_skill_resource_crosses_live_tool_boundary_losslessly() {
+    let root = root();
+    let package = skill_package(&root);
+    let resource = [0, 128, 255, b'a'];
+    fs::write(package.join("assets/guide.txt"), resource).unwrap();
+    let runtime_path = package.join("skill.runtime.toml");
+    let runtime = fs::read_to_string(&runtime_path).unwrap();
+    fs::write(
+        &runtime_path,
+        runtime.replace(&digest(GUIDE), &digest(&resource)),
+    )
+    .unwrap();
+    let workflow = root.join("workflow.toml");
+    fs::write(
+        &workflow,
+        MIXED_WORKFLOW.replace("search_code", "verify_resource"),
+    )
+    .unwrap();
+
+    let expected_args = json!({
+        "content": resource.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        "content_encoding": "hex",
+        "result_ref": digest(&resource).strip_prefix("sha256:").unwrap(),
+    });
+    let expected_fingerprint = workflow_runtime::argument_fingerprint(&expected_args);
+    let mut value = serde_json::to_value(profile(&package)).unwrap();
+    value["tools"] = json!([{
+        "name": "verify_resource",
+        "result": {"verified": true},
+        "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"},
+                "content_encoding": {"const": "hex"},
+                "result_ref": {"type": "string"}
+            },
+            "required": ["content", "content_encoding", "result_ref"],
+            "additionalProperties": false
+        }
+    }]);
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+        {"calls": [{"id":"read","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/guide.txt","offset":0,"limit":resource.len()}}]},
+        {"calls": [{"id":"verify","name":"verify_resource","args":{
+            "content":{"$from_tool_response":{"name":"read_skill_resource","pointer":"/payload/content"}},
+            "content_encoding":{"$from_tool_response":{"name":"read_skill_resource","pointer":"/payload/content_encoding"}},
+            "result_ref":{"$from_tool_response":{"name":"read_skill_resource","pointer":"/payload/result_ref"}}
+        }}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
+    ]);
+
+    let receipt = ExecutionBackend::run(
+        &workflow,
+        ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap(),
+        json!({}),
+        &root,
+    )
+    .unwrap();
+    let events = fs::read_to_string(receipt.run_root().join("events.jsonl")).unwrap();
+    assert!(
+        events.contains(&expected_fingerprint),
+        "live tool consumer did not receive the exact resource bytes and digest"
+    );
+    assert!(!events.contains("\"content_encoding\":\"hex\""));
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
 fn maximum_skill_instructions_are_excluded_from_public_durable_surfaces() {
     let root = root();
     let package = skill_package(&root);

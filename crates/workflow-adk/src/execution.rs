@@ -1824,7 +1824,8 @@ impl SkillPackage {
             "byte_len": read.metadata().byte_len(),
             "page_byte_len": page_byte_len,
             "next_offset": read.page().next_offset(),
-            "content": String::from_utf8_lossy(read.page().bytes()),
+            "content_encoding": "hex",
+            "content": read.page().bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         }))
     }
 }
