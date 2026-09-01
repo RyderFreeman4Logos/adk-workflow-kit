@@ -578,17 +578,23 @@ impl LoopLedgerStore {
             .load_latest(&self.run_id)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-        let checkpoint_digest = checkpoint_ledger_digest(checkpoint.state())?;
         let ledger = serde_json::from_slice::<LoopLedgerV1>(&bounded_read(&self.path)?)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-        let checkpoint_nodes = [Some(&ledger.nodes), ledger.checkpoint_nodes.as_ref()]
-            .into_iter()
-            .flatten()
-            .find(|generation| {
-                loop_ledger_digest(generation).as_deref() == Ok(checkpoint_digest.as_str())
-            })
-            .cloned()
-            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let checkpoint_nodes =
+            if let Ok(checkpoint_digest) = checkpoint_ledger_digest(checkpoint.state()) {
+                [Some(&ledger.nodes), ledger.checkpoint_nodes.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .find(|generation| {
+                        loop_ledger_digest(generation).as_deref() == Ok(checkpoint_digest.as_str())
+                    })
+                    .cloned()
+                    .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Persistence))?
+            } else if ledger.nodes.is_empty() {
+                BTreeMap::new()
+            } else {
+                return Err(ExecutionError::new(ExecutionErrorKind::Persistence));
+            };
         write_json(
             &self.path,
             &LoopLedgerV1 {
