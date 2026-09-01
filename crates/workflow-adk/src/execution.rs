@@ -70,13 +70,13 @@ struct LoopState {
     tool_calls: BTreeMap<String, u64>,
     seen_ids: BTreeSet<String>,
     seen_calls: BTreeSet<(String, String)>,
-    #[serde(skip_serializing, default)]
+    #[serde(default)]
     conversation: Vec<adk_rust::Content>,
     previous_response_id: Option<String>,
     pending_calls: VecDeque<PendingCall>,
     #[serde(default)]
     finish_admitted: bool,
-    #[serde(skip_serializing, default)]
+    #[serde(default)]
     finished_output: Option<Value>,
 }
 
@@ -85,7 +85,7 @@ struct LoopState {
 struct PendingCall {
     id: String,
     name: String,
-    #[serde(skip_serializing, default)]
+    #[serde(default)]
     args: Value,
     fingerprint: String,
 }
@@ -104,6 +104,7 @@ struct LoopLedgerStore {
     checkpoint_identity: String,
     checkpoint_manifest: CheckpointManifestV1,
     run_id: RunId,
+    persist_raw_loop_state: bool,
     nodes: Mutex<BTreeMap<String, LoopState>>,
 }
 
@@ -114,6 +115,7 @@ impl LoopLedgerStore {
         checkpoint_identity: String,
         checkpoint_manifest: CheckpointManifestV1,
         run_id: RunId,
+        persist_raw_loop_state: bool,
     ) -> Result<Self, ExecutionError> {
         let store = Self {
             path,
@@ -121,6 +123,7 @@ impl LoopLedgerStore {
             checkpoint_identity,
             checkpoint_manifest,
             run_id,
+            persist_raw_loop_state,
             nodes: Mutex::new(BTreeMap::new()),
         };
         store.persist_ledger(&BTreeMap::new())?;
@@ -134,6 +137,7 @@ impl LoopLedgerStore {
         checkpoint_manifest: CheckpointManifestV1,
         run_id: RunId,
         checkpoint_digest: &str,
+        persist_raw_loop_state: bool,
     ) -> Result<Self, ExecutionError> {
         let ledger = serde_json::from_slice::<LoopLedgerV1>(&bounded_read(&path)?)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
@@ -150,6 +154,7 @@ impl LoopLedgerStore {
             checkpoint_identity,
             checkpoint_manifest,
             run_id,
+            persist_raw_loop_state,
             nodes: Mutex::new(ledger.nodes),
         })
     }
@@ -360,12 +365,22 @@ impl LoopLedgerStore {
     }
 
     fn persist_ledger(&self, nodes: &BTreeMap<String, LoopState>) -> Result<(), ExecutionError> {
+        let mut nodes = nodes.clone();
+        if !self.persist_raw_loop_state {
+            for state in nodes.values_mut() {
+                state.conversation.clear();
+                state.finished_output = None;
+                for call in &mut state.pending_calls {
+                    call.args = Value::Null;
+                }
+            }
+        }
         write_json(
             &self.path,
             &LoopLedgerV1 {
                 schema_version: 2,
                 checkpoint_identity: self.checkpoint_identity.clone(),
-                nodes: nodes.clone(),
+                nodes,
             },
         )
     }
@@ -1382,9 +1397,10 @@ impl ExecutionProfileV1 {
             let projection = projection
                 .as_object_mut()
                 .expect("execution profile is an object");
+            let redact_fake_responses = !self.skills.is_empty();
             projection.insert("skills".to_owned(), Value::Array(Vec::new()));
             for model in ["model", "reviewer_model"] {
-                if projection[model]["provider"] == "fake" {
+                if redact_fake_responses && projection[model]["provider"] == "fake" {
                     projection[model]["responses"] =
                         Self::durable_fake_responses(&projection[model]["responses"]);
                 }
@@ -2354,6 +2370,7 @@ impl ExecutionBackend {
             ledger_identity,
             checkpoint_manifest.clone(),
             run_id.clone(),
+            profile.skill_packages()?.is_empty(),
         ) {
             Ok(ledger) => Some(Arc::new(ledger)),
             Err(_) => {
@@ -2954,6 +2971,7 @@ impl ExecutionBackend {
             checkpoint_manifest.clone(),
             run_identity.clone(),
             checkpoint_ledger_digest(checkpoint.state())?.as_str(),
+            profile.skill_packages()?.is_empty(),
         )?);
         let tool_registry = build_tool_registry(
             &profile,
@@ -3959,6 +3977,7 @@ mod execution_registry_tests {
             "fanout".to_owned(),
             manifest,
             run_id,
+            true,
         )
         .expect("fan-out ledger");
         ledger
