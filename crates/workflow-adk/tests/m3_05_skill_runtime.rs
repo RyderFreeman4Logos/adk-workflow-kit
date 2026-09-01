@@ -6,7 +6,7 @@ use std::{
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use workflow_adk::execution::{ExecutionBackend, ExecutionProfileV1};
+use workflow_adk::execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -125,5 +125,34 @@ fn fake_model_activates_reads_and_runs_declared_skill() {
         assert!(events.contains(name), "missing {name} event");
         assert!(ledger.contains(name), "missing {name} ledger entry");
     }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn undeclared_skill_resource_or_capability_fails_before_effect() {
+    let root = root();
+    let package = skill_package(&root);
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+
+    let mut value = serde_json::to_value(profile(&package)).unwrap();
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"read","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/undeclared.txt","offset":0,"limit":64}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"must_not":"run"}})).unwrap()
+    ]);
+    let denied_profile = ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let error = ExecutionBackend::run(&workflow, denied_profile, json!({}), &root).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::AuthorizationDenied);
+    assert!(
+        !fs::read_to_string(error.receipt().unwrap().run_root().join("events.jsonl"))
+            .unwrap()
+            .contains("run_skill_script")
+    );
+
+    let mut value = serde_json::to_value(profile(&package)).unwrap();
+    value["sandbox"]["capabilities"] = json!(["filesystem.read"]);
+    let profile = ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let error = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::SandboxDenied);
     let _ = fs::remove_dir_all(root);
 }

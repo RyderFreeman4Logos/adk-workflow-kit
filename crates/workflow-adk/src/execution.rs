@@ -1081,6 +1081,9 @@ impl SkillPackage {
         id: &SkillResourceId,
         request: PageRequest,
     ) -> Result<Value, ToolBridgeError> {
+        if !self.resources.contains_key(id) {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
+        }
         let activation = activate_skill(self, &self.id, &self.version)
             .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
         let capabilities = intersect_policy_capabilities(
