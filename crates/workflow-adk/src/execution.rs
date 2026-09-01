@@ -3420,7 +3420,7 @@ fn build_toolset(
         .iter()
         .map(|binding| binding.id().to_owned())
         .collect::<Vec<_>>();
-    if !names.iter().any(|name| name == "activate_skill") {
+    if !skills.is_empty() && !names.iter().any(|name| name == "activate_skill") {
         names.extend([
             "activate_skill".to_owned(),
             "read_skill_resource".to_owned(),
