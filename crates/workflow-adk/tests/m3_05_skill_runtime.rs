@@ -431,6 +431,48 @@ fn concurrent_skill_resource_reads_reserve_budget_before_delivery() {
 }
 
 #[test]
+fn maximum_skill_resource_page_crosses_public_tool_boundary() {
+    let root = root();
+    let package = skill_package(&root);
+    let guide = vec![b'x'; 65_536];
+    fs::write(package.join("assets/guide.txt"), &guide).unwrap();
+    fs::write(
+        package.join("skill.runtime.toml"),
+        format!(
+            "schema_version = 1\n\
+             [skill]\n\
+             id = \"code-investigation\"\n\
+             version = \"1\"\n\
+             [[resources]]\n\
+             id = \"assets/guide.txt\"\n\
+             sha256 = \"{}\"\n",
+            digest(&guide),
+        ),
+    )
+    .unwrap();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+
+    let receipt = ExecutionBackend::run(
+        &workflow,
+        large_read_profile(&package, 65_536, 1),
+        json!({}),
+        &root,
+    )
+    .unwrap();
+    assert_eq!(receipt.status(), "succeeded");
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(receipt.run_root().join("loop-ledger.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        ledger["nodes"]["work"]["skill_resource_read_bytes"]["code-investigation"],
+        65_536
+    );
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
 fn read_skill_resource_enforces_one_budget_per_activation() {
     let root = root();
     let package = skill_package(&root);

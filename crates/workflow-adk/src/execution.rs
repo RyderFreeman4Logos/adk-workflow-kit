@@ -3079,7 +3079,8 @@ impl ExecutionBackend {
             .filter(|bytes| !bytes.is_empty() && bytes.len() <= MAX_STATE_BYTES);
         let mut artifacts = FilesystemArtifactStore::try_new(
             run_root.join("artifacts"),
-            NonZeroU64::new(ARTIFACT_LIMIT).expect("positive artifact limit"),
+            NonZeroU64::new(u64::try_from(MAX_STATE_BYTES).expect("state limit fits u64"))
+                .expect("positive artifact limit"),
             NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page limit"),
         )
         .ok();
@@ -4344,14 +4345,24 @@ fn build_tool_registry(
                 ),
             }
             .map(|registration| {
-                registration
+                let registration = registration
                     .with_required_capabilities(capabilities)
                     .with_timeout(NonZeroU64::new(60_000).expect("positive timeout"))
                     .with_idempotency(if read_only {
                         workflow_runtime::ToolIdempotency::NotRequired
                     } else {
                         workflow_runtime::ToolIdempotency::StableKey
-                    })
+                    });
+                if matches!(action, SkillToolAction::Read) {
+                    registration.with_inline_output_limit(
+                        NonZeroU64::new(
+                            u64::try_from(MAX_STATE_BYTES).expect("state limit fits u64"),
+                        )
+                        .expect("positive Skill resource envelope limit"),
+                    )
+                } else {
+                    registration
+                }
             })
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
             let provenance = registration.provenance().clone();
