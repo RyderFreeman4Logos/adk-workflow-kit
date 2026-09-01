@@ -118,6 +118,31 @@ fn any_file_contains(root: &Path, marker: &str) -> bool {
         })
 }
 
+fn assert_public_durable_surfaces_exclude(run_root: &Path, markers: &[&str]) {
+    for marker in markers {
+        for name in [
+            "events.jsonl",
+            "loop-ledger.json",
+            "run-manifest.json",
+            "execution-profile.json",
+            "execution-input.json",
+            "checkpoint.sqlite",
+            "effects.sqlite",
+        ] {
+            let path = run_root.join(name);
+            assert!(
+                !fs::read(&path)
+                    .is_ok_and(|bytes| String::from_utf8_lossy(&bytes).contains(marker)),
+                "{name} persisted {marker}"
+            );
+        }
+        assert!(
+            !any_file_contains(&run_root.join("artifacts"), marker),
+            "artifact persisted {marker}"
+        );
+    }
+}
+
 fn digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
@@ -351,16 +376,17 @@ fn fake_model_activates_reads_and_runs_declared_skill() {
 }
 
 #[test]
-fn activate_and_read_deliver_bounded_content_to_agent() {
+fn activate_and_read_exclude_content_from_public_durable_surfaces() {
     let root = root();
     let package = skill_package(&root);
     let workflow = root.join("workflow.toml");
     fs::write(&workflow, WORKFLOW).unwrap();
 
     let receipt = ExecutionBackend::run(&workflow, profile(&package), json!({}), &root).unwrap();
-    let events = fs::read_to_string(receipt.run_root().join("events.jsonl")).unwrap();
-    assert!(events.contains("# Instructions"));
-    assert!(events.contains("Declared guide"));
+    assert_public_durable_surfaces_exclude(
+        receipt.run_root(),
+        &["# Instructions", "Declared guide"],
+    );
     cleanup_test_root(&root);
     fs::remove_dir_all(root).expect("test cleanup");
 }

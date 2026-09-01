@@ -342,7 +342,7 @@ impl AdkEventMapper {
         };
         let structured_output = if structured_output.is_some() {
             structured_output
-                .map(redact_skill_script_results)
+                .map(redact_skill_tool_results)
                 .transpose()?
         } else if calls.is_empty() {
             event
@@ -525,14 +525,21 @@ impl fmt::Display for AdkEventMappingError {
 
 impl std::error::Error for AdkEventMappingError {}
 
-fn redact_skill_script_results(output: Value) -> Result<Value, AdkEventMappingError> {
+fn redact_skill_tool_results(output: Value) -> Result<Value, AdkEventMappingError> {
     let Value::Array(results) = output else {
         return Ok(output);
     };
     results
         .into_iter()
         .map(|mut result| {
-            if result.get("tool_name").and_then(Value::as_str) == Some("run_skill_script") {
+            let tool_name = result
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if matches!(
+                tool_name.as_deref(),
+                Some("activate_skill" | "read_skill_resource" | "run_skill_script")
+            ) {
                 let response = result
                     .as_object_mut()
                     .and_then(|result| result.remove("response"))
@@ -547,6 +554,36 @@ fn redact_skill_script_results(output: Value) -> Result<Value, AdkEventMappingEr
                 let result = result.as_object_mut().ok_or_else(|| {
                     AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
                 })?;
+                let fields = match tool_name.as_deref() {
+                    Some("activate_skill") => {
+                        result.insert("activated".to_owned(), Value::Bool(true));
+                        &["skill_id", "version", "instructions_ref"][..]
+                    }
+                    Some("read_skill_resource") => &[
+                        "resource_id",
+                        "result_ref",
+                        "byte_len",
+                        "page_byte_len",
+                        "next_offset",
+                    ][..],
+                    _ => &[],
+                };
+                let safe_response = response
+                    .as_object()
+                    .map(|response| {
+                        fields
+                            .iter()
+                            .filter_map(|field| {
+                                response
+                                    .get(*field)
+                                    .map(|value| ((*field).to_owned(), value.clone()))
+                            })
+                            .collect::<Map<_, _>>()
+                    })
+                    .unwrap_or_default();
+                if !safe_response.is_empty() {
+                    result.insert("response".to_owned(), Value::Object(safe_response));
+                }
                 result.insert(
                     "response_digest".to_owned(),
                     Value::String(redacted_json_digest(&response)?),
@@ -674,6 +711,54 @@ mod tests {
         assert_eq!(model.payload()["finish_reason"], "stop");
         assert_eq!(requested.kind(), WorkflowRuntimeEventKindV1::ToolRequested);
         assert_eq!(completed.kind(), WorkflowRuntimeEventKindV1::ToolCompleted);
+    }
+
+    #[test]
+    fn skill_tool_results_keep_metadata_without_durable_content() {
+        let output = redact_skill_tool_results(json!([
+            {
+                "tool_name": "activate_skill",
+                "response": {
+                    "skill_id": "code-investigation",
+                    "version": "1",
+                    "instructions_ref": "sha256:instructions",
+                    "instructions": "instructions-canary",
+                },
+            },
+            {
+                "tool_name": "read_skill_resource",
+                "response": {
+                    "resource_id": "assets/guide.txt",
+                    "result_ref": "sha256:resource",
+                    "byte_len": 15,
+                    "page_byte_len": 15,
+                    "next_offset": null,
+                    "content": "resource-canary",
+                },
+            },
+            {
+                "tool_name": "run_skill_script",
+                "response": {"value": "script-canary"},
+            },
+        ]))
+        .unwrap();
+        let output = output.as_array().unwrap();
+        let encoded = serde_json::to_string(output).unwrap();
+
+        for canary in ["instructions-canary", "resource-canary", "script-canary"] {
+            assert!(!encoded.contains(canary), "persisted {canary}");
+        }
+        assert!(encoded.contains("code-investigation"));
+        assert!(encoded.contains("assets/guide.txt"));
+        assert!(encoded.contains("sha256:instructions"));
+        assert!(encoded.contains("sha256:resource"));
+        assert_eq!(
+            output
+                .iter()
+                .filter(|result| result.get("response_digest").is_some())
+                .count(),
+            3
+        );
     }
 
     #[test]
