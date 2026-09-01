@@ -1202,7 +1202,7 @@ fn effect_after_crash_before_node_checkpoint_resumes_from_loop_ledger() {
         panic!("crash barrier did not terminate the child");
     }
 
-    let (baseline_root, baseline) = run(profile_with(
+    let (_baseline_root, baseline) = run(profile_with(
         vec![
             json!({"calls": [{"id":"call-crash","name":"search_code","args":{"query":"needle"}}]}),
             finish(json!({"answer":"resumed"})),
@@ -1211,7 +1211,6 @@ fn effect_after_crash_before_node_checkpoint_resumes_from_loop_ledger() {
     ));
     let baseline = baseline.unwrap();
     let expected_response = function_response_bytes(baseline.run_root());
-    fs::remove_dir_all(baseline_root).unwrap();
 
     let root = root();
     let run_root = crash_run(
@@ -1279,13 +1278,12 @@ fn finish_after_crash_resumes_without_another_model_request() {
         "output": {"answer":"final"},
     }))
     .unwrap();
-    let (baseline_root, baseline) = run(profile_with(
+    let (_baseline_root, baseline) = run(profile_with(
         vec![finish(json!({"answer":"final"}))],
         Some(policy_with("max_model_iterations", 1)),
     ));
     let baseline = baseline.unwrap();
     assert_eq!(finish_status_bytes(baseline.run_root()), expected);
-    fs::remove_dir_all(baseline_root).unwrap();
 
     let root = root();
     let run_root = crash_run(
