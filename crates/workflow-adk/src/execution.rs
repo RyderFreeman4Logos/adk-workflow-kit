@@ -90,6 +90,8 @@ struct LoopState {
     #[serde(default)]
     finished_output: Option<Value>,
     #[serde(default)]
+    finish_successor: Option<Value>,
+    #[serde(default)]
     activated_skills: BTreeSet<String>,
     #[serde(default)]
     skill_resource_read_bytes: BTreeMap<String, u64>,
@@ -258,8 +260,8 @@ impl LoopLedgerStore {
         self.snapshot(node).map(|state| state.model_iterations)
     }
 
-    fn finished_output(&self, node: &str) -> Result<Option<Value>, ExecutionError> {
-        self.snapshot(node).map(|state| state.finished_output)
+    fn finish_successor(&self, node: &str) -> Result<Option<Value>, ExecutionError> {
+        self.snapshot(node).map(|state| state.finish_successor)
     }
 
     fn pending_calls(&self) -> Result<Vec<(String, PendingCall)>, ExecutionError> {
@@ -760,9 +762,15 @@ fn admitted_finish(content: &adk_rust::Content) -> Result<Option<Value>, ()> {
 }
 
 fn valid_terminal_state(state: &LoopState) -> bool {
-    match (&state.finished_output, state.finish_admitted) {
-        (None, false) => true,
-        (Some(output), true) if state.pending_calls.is_empty() => {
+    match (
+        &state.finished_output,
+        &state.finish_successor,
+        state.finish_admitted,
+    ) {
+        (None, None, false) => true,
+        (Some(output), Some(successor), true)
+            if output == successor && state.pending_calls.is_empty() =>
+        {
             state
                 .conversation
                 .last()
@@ -797,6 +805,9 @@ fn valid_loop_state(state: &LoopState) -> bool {
             .map(|call| (call.name.clone(), call.fingerprint.clone()))
             .collect::<BTreeSet<_>>();
         return state.finished_output.is_none()
+            && state.finish_admitted == state.finish_successor.is_some()
+            && (!state.finish_admitted
+                || (state.model_iterations > 0 && state.pending_calls.is_empty()))
             && state.pending_calls.iter().all(|call| {
                 durable_pending_args(call).as_ref() == Some(&call.args)
                     && workflow_runtime::argument_fingerprint(&call.args) == call.fingerprint
@@ -1106,6 +1117,7 @@ impl LoopController {
             }
         }
         next.finish_admitted = finished_output.is_some();
+        next.finish_successor = finished_output.clone();
         next.finished_output = finished_output;
         next.model_iterations += 1;
         next.conversation.push(content.clone());
@@ -1127,6 +1139,9 @@ impl LoopController {
                 _ => unreachable!(),
             };
             return Err(self.fail(kind, marker));
+        }
+        if next.finish_admitted {
+            crash_barrier("after-model-ledger-persist");
         }
         *state = next;
         if skill_call_admitted {
@@ -3769,7 +3784,7 @@ impl ExecutionBackend {
                 let name = node.id().as_str();
                 let completed_turns = loop_ledger.model_iterations(name)?;
                 let model = profile.bind_resolved_model(&resolved_plan, name, completed_turns)?;
-                let agent = if let Some(output) = loop_ledger.finished_output(name)? {
+                let agent = if let Some(output) = loop_ledger.finish_successor(name)? {
                     Arc::new(RestoredFinishAgent {
                         name: name.to_owned(),
                         output,
@@ -4813,6 +4828,17 @@ mod execution_registry_tests {
     use std::sync::{Arc, Barrier};
 
     use super::*;
+
+    #[test]
+    fn finish_admission_without_successor_is_invalid() {
+        let state = LoopState {
+            model_iterations: 1,
+            finish_admitted: true,
+            ..LoopState::default()
+        };
+
+        assert!(!valid_loop_state(&state));
+    }
 
     fn fanout_ledger() -> (PathBuf, Arc<LoopLedgerStore>) {
         let root = std::env::temp_dir().join(format!(

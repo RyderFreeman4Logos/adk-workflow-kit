@@ -731,39 +731,41 @@ fn finish_after_result_crash_with_declared_skill_resumes_without_model_request()
     .unwrap();
     let expected = terminal_value_bytes(baseline.run_root());
 
-    let root = root();
-    skill_package(&root);
-    let status = Command::new(env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "finish_after_result_crash_with_declared_skill_resumes_without_model_request",
-            "--nocapture",
-        ])
-        .env("M3_05_FINISH_CRASH_RUN_ROOT", &root)
-        .env("WORKFLOW_KIT_TEST_CRASH_BARRIER", "after-result")
-        .status()
-        .unwrap();
-    assert_eq!(status.signal(), Some(libc::SIGKILL));
-    let run_root = fs::read_dir(&root)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.join("run-manifest.json").is_file())
-        .unwrap();
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
-    let receipt = ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap();
-    assert_eq!(receipt.status(), "succeeded");
-    assert_eq!(terminal_value_bytes(&run_root), expected);
-    let ledger: serde_json::Value =
-        serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
-    assert_eq!(ledger["nodes"]["work"]["model_iterations"], 1);
-    assert_eq!(ledger["nodes"]["work"]["finished_output"], json!(null));
-
-    for root in [&baseline_root, &root] {
-        cleanup_test_root(root);
+    for barrier in ["after-model-ledger-persist", "after-result"] {
+        let root = root();
+        skill_package(&root);
+        let status = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "finish_after_result_crash_with_declared_skill_resumes_without_model_request",
+                "--nocapture",
+            ])
+            .env("M3_05_FINISH_CRASH_RUN_ROOT", &root)
+            .env("WORKFLOW_KIT_TEST_CRASH_BARRIER", barrier)
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{barrier}");
+        let run_root = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.join("run-manifest.json").is_file())
+            .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+        let receipt =
+            ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap();
+        assert_eq!(receipt.status(), "succeeded", "{barrier}");
+        assert_eq!(terminal_value_bytes(&run_root), expected, "{barrier}");
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
+        assert_eq!(ledger["nodes"]["work"]["model_iterations"], 1);
+        assert_eq!(ledger["nodes"]["work"]["finished_output"], json!(null));
+        cleanup_test_root(&root);
         fs::remove_dir_all(root).expect("test cleanup");
     }
+    cleanup_test_root(&baseline_root);
+    fs::remove_dir_all(baseline_root).expect("baseline cleanup");
 }
 
 #[test]
