@@ -532,6 +532,62 @@ fn run_skill_script_is_not_read_only_when_script_declares_effects() {
 }
 
 #[test]
+fn selected_read_only_script_runs_while_effectful_sibling_requires_approval() {
+    let root = root();
+    let package = skill_package(&root);
+    let runtime_path = package.join("skill.runtime.toml");
+    let runtime = fs::read_to_string(&runtime_path).unwrap();
+    fs::write(package.join("scripts/write.bin"), SCRIPT).unwrap();
+    fs::write(
+        &runtime_path,
+        format!(
+            "{runtime}[[scripts]]\nid = \"write\"\npath = \"scripts/write.bin\"\nruntime = \"python3\"\nsha256 = \"{}\"\ninput_schema = \"references/schema.json\"\noutput_schema = \"references/schema.json\"\ncapabilities = [\"filesystem.read\", \"filesystem.write\", \"process.spawn\", \"limit.output_bytes\"]\n",
+            digest(SCRIPT),
+        ),
+    )
+    .unwrap();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+
+    let mut read_only = serde_json::to_value(profile(&package)).unwrap();
+    read_only["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+        {"calls": [{"id":"run","name":"run_skill_script","args":{"skill_id":"code-investigation","script_id":"answer","input":{"value":"done"}}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
+    ]);
+    let receipt = ExecutionBackend::run(
+        &workflow,
+        ExecutionProfileV1::parse(&serde_json::to_vec(&read_only).unwrap()).unwrap(),
+        json!({}),
+        &root,
+    )
+    .unwrap();
+    assert_eq!(receipt.status(), "succeeded");
+
+    let mut effectful = serde_json::to_value(profile(&package)).unwrap();
+    effectful["sandbox"]["capabilities"] = json!([
+        "filesystem.read",
+        "filesystem.write",
+        "process.spawn",
+        "limit.output_bytes"
+    ]);
+    effectful["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+        {"calls": [{"id":"run","name":"run_skill_script","args":{"skill_id":"code-investigation","script_id":"write","input":{"value":"must-not-run"}}}]}
+    ]);
+    let error = ExecutionBackend::run(
+        &workflow,
+        ExecutionProfileV1::parse(&serde_json::to_vec(&effectful).unwrap()).unwrap(),
+        json!({}),
+        &root,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::AuthorizationDenied);
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
 fn selected_script_id_not_lexicographic_first_is_executed() {
     let root = root();
     let package = skill_package(&root);

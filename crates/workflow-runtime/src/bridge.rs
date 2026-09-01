@@ -100,6 +100,14 @@ impl ToolCallContext {
 
 /// A registered workflow-kit handler.
 pub trait ToolHandler: Send + Sync {
+    /// Returns the validated call-specific capabilities needed by this handler.
+    fn required_capabilities(
+        &self,
+        _arguments: &Value,
+    ) -> Result<Vec<SandboxCapability>, ToolBridgeError> {
+        Ok(Vec::new())
+    }
+
     /// Returns whether these validated arguments require call-scoped approval.
     fn requires_approval(&self, _arguments: &Value) -> Result<bool, ToolBridgeError> {
         Ok(false)
@@ -319,6 +327,19 @@ impl CapabilityIntersection {
             tool_name: name.to_owned(),
             capabilities: registration.required_capabilities().to_vec(),
         })
+    }
+
+    fn authorize_capabilities(
+        &self,
+        capabilities: &[SandboxCapability],
+    ) -> Result<(), ToolBridgeError> {
+        if capabilities.iter().any(|capability| {
+            !self.runtime_capabilities.contains(capability)
+                || !self.sandbox_capabilities.contains(capability)
+        }) {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
+        }
+        Ok(())
     }
 }
 
@@ -558,6 +579,11 @@ impl ToolBridge {
             .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::UnknownTool))?;
         let registration = registered.registration.clone();
         let handler = Arc::clone(&registered.handler);
+        let mut capabilities = effective.capabilities;
+        capabilities.extend(handler.required_capabilities(call.arguments())?);
+        capabilities.sort_unstable_by_key(SandboxCapability::as_str);
+        capabilities.dedup();
+        authority.authorize_capabilities(&capabilities)?;
         let effectful =
             !registration.flags().read_only() || handler.requires_approval(call.arguments())?;
         if effectful {
@@ -588,7 +614,6 @@ impl ToolBridge {
             deadline,
         };
         let timeout = Duration::from_millis(registration.timeout_ms().get());
-        let capabilities = effective.capabilities;
         if effectful {
             if let Some(result) = self.idempotent_results.get(&idempotency_key) {
                 return Ok(result.clone());

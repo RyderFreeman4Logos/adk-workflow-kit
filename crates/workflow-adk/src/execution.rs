@@ -1236,13 +1236,6 @@ impl SkillPackage {
             .with_metadata_identity(format!("sha256:{:x}", Sha256::digest(identity))))
     }
 
-    fn capabilities(&self) -> impl Iterator<Item = SandboxCapability> + '_ {
-        self.runtime
-            .scripts()
-            .iter()
-            .flat_map(|script| script.capabilities().iter().copied())
-    }
-
     fn read_resource(
         &self,
         id: &SkillResourceId,
@@ -1777,11 +1770,6 @@ impl ExecutionProfileV1 {
             .flat_map(|tool| tool.required_capabilities.iter())
             .map(|value| parse_capability(value))
             .collect::<Result<Vec<_>, _>>()?;
-        required.extend(
-            self.skill_packages()?
-                .values()
-                .flat_map(|package| package.capabilities()),
-        );
         required.sort_unstable_by_key(SandboxCapability::as_str);
         required.dedup();
         Ok((sandbox, required))
@@ -2130,16 +2118,6 @@ fn resolve_runtime_plan(
             )
         },
     )
-}
-
-fn effective_sandbox_capabilities(
-    plan: &ResolvedRuntimePlan,
-) -> Result<Vec<SandboxCapability>, ExecutionError> {
-    plan.effective_capabilities()
-        .as_slice()
-        .into_iter()
-        .map(parse_capability)
-        .collect()
 }
 
 fn parse_capability(value: &str) -> Result<SandboxCapability, ExecutionError> {
@@ -2639,7 +2617,7 @@ impl ExecutionBackend {
                     .map(|model| (node.id().as_str().to_owned(), model))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let effective_capabilities = effective_sandbox_capabilities(&resolved_plan)?;
+        let effective_capabilities = sandbox_capabilities;
         let transform_module = profile.transform_module()?;
         let recursion_limit = compiled
             .ir()
@@ -3255,7 +3233,7 @@ impl ExecutionBackend {
         if live_checkpoint_manifest != checkpoint_manifest {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
-        let effective_capabilities = effective_sandbox_capabilities(&resolved_plan)?;
+        let effective_capabilities = sandbox_capabilities;
         let events_path = root.join("events.jsonl");
         let mut events = read_events(&events_path)?;
         let event_sequence = events.last().map_or(0, |event| event.sequence());
@@ -3723,10 +3701,13 @@ struct SkillToolHandler {
     provenance: ToolProvenance,
 }
 
-impl ToolHandler for SkillToolHandler {
-    fn requires_approval(&self, arguments: &Value) -> Result<bool, ToolBridgeError> {
+impl SkillToolHandler {
+    fn selected_script_capabilities(
+        &self,
+        arguments: &Value,
+    ) -> Result<Vec<SandboxCapability>, ToolBridgeError> {
         if !matches!(self.action, SkillToolAction::Run) {
-            return Ok(false);
+            return Ok(Vec::new());
         }
         let input = serde_json::from_value::<RunSkillScriptInput>(arguments.clone())
             .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
@@ -3734,16 +3715,32 @@ impl ToolHandler for SkillToolHandler {
             .packages
             .get(&input.skill_id)
             .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
-        let script = package
+        package
             .runtime
             .script(&input.script_id)
-            .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
-        Ok(script.capabilities().iter().any(|capability| {
-            matches!(
-                capability,
-                SandboxCapability::FilesystemWrite | SandboxCapability::Network
-            )
-        }))
+            .map(|script| script.capabilities().to_vec())
+            .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))
+    }
+}
+
+impl ToolHandler for SkillToolHandler {
+    fn required_capabilities(
+        &self,
+        arguments: &Value,
+    ) -> Result<Vec<SandboxCapability>, ToolBridgeError> {
+        self.selected_script_capabilities(arguments)
+    }
+
+    fn requires_approval(&self, arguments: &Value) -> Result<bool, ToolBridgeError> {
+        Ok(self
+            .selected_script_capabilities(arguments)?
+            .iter()
+            .any(|capability| {
+                matches!(
+                    capability,
+                    SandboxCapability::FilesystemWrite | SandboxCapability::Network
+                )
+            }))
     }
 
     fn execute(
