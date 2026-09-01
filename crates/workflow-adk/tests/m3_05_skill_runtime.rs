@@ -122,6 +122,19 @@ fn digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
+fn terminal_value_bytes(run_root: &Path) -> Vec<u8> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+    let artifact = fs::read(
+        run_root
+            .join("artifacts")
+            .join(manifest["artifact_id"].as_str().unwrap()),
+    )
+    .unwrap();
+    let artifact: serde_json::Value = serde_json::from_slice(&artifact).unwrap();
+    serde_json::to_vec(&artifact["terminal"]).unwrap()
+}
+
 fn skill_package(root: &std::path::Path) -> PathBuf {
     let package = root.join("code-investigation");
     fs::create_dir(&package).unwrap();
@@ -227,6 +240,23 @@ fn profile(package: &std::path::Path) -> ExecutionProfileV1 {
         "sandbox": {"capabilities":["filesystem.read","process.spawn","limit.output_bytes"]}
     });
     ExecutionProfileV1::parse(&serde_json::to_vec(&profile).unwrap()).unwrap()
+}
+
+fn one_turn_profile(package: &std::path::Path) -> ExecutionProfileV1 {
+    let mut value = serde_json::to_value(profile(package)).unwrap();
+    value["model"]["responses"] =
+        json!([serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()]);
+    value["loop_policy"] = json!({
+        "schema_version": 1,
+        "max_model_iterations": 1,
+        "max_total_tool_calls": 1,
+        "max_tool_calls_per_tool": 1,
+        "wall_time_ms": 1_000,
+        "idle_time_ms": 1_000,
+        "tool_time_ms": 1_000,
+        "max_tool_output_bytes": 65_536
+    });
+    ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
 }
 
 fn resume_profile(package: &std::path::Path) -> ExecutionProfileV1 {
@@ -511,6 +541,69 @@ fn crashed_unchanged_skill_package_resumes_from_snapshot() {
     assert_eq!(resumed.status(), "succeeded");
     cleanup_test_root(&root);
     fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
+fn finish_after_result_crash_with_declared_skill_resumes_without_model_request() {
+    if let Ok(root) = env::var("M3_05_FINISH_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let _ = ExecutionBackend::run(
+            &workflow,
+            one_turn_profile(&root.join("code-investigation")),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    let baseline_root = root();
+    let baseline_package = skill_package(&baseline_root);
+    let baseline_workflow = baseline_root.join("workflow.toml");
+    fs::write(&baseline_workflow, WORKFLOW).unwrap();
+    let baseline = ExecutionBackend::run(
+        &baseline_workflow,
+        one_turn_profile(&baseline_package),
+        json!({}),
+        &baseline_root,
+    )
+    .unwrap();
+    let expected = terminal_value_bytes(baseline.run_root());
+
+    let root = root();
+    skill_package(&root);
+    let status = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "finish_after_result_crash_with_declared_skill_resumes_without_model_request",
+            "--nocapture",
+        ])
+        .env("M3_05_FINISH_CRASH_RUN_ROOT", &root)
+        .env("WORKFLOW_KIT_TEST_CRASH_BARRIER", "after-result")
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    let run_root = fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("run-manifest.json").is_file())
+        .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+    let receipt = ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap();
+    assert_eq!(receipt.status(), "succeeded");
+    assert_eq!(terminal_value_bytes(&run_root), expected);
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
+    assert_eq!(ledger["nodes"]["work"]["model_iterations"], 1);
+    assert_eq!(ledger["nodes"]["work"]["finished_output"], json!(null));
+
+    for root in [&baseline_root, &root] {
+        cleanup_test_root(root);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
 }
 
 #[test]

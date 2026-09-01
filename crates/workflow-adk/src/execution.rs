@@ -3372,7 +3372,6 @@ impl ExecutionBackend {
         if let Err(error) = write_events(&run_root.join("events.jsonl"), mapper.events()) {
             persistence_error.get_or_insert(error);
         }
-        crash_barrier("after-result");
         if persistence_error.is_none() {
             if let (Ok(state), Some(store), Some(loop_ledger)) =
                 (&execution, checkpoint_store.as_mut(), loop_ledger.as_ref())
@@ -3441,6 +3440,7 @@ impl ExecutionBackend {
                 persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
             }
         }
+        crash_barrier("after-result");
         if checkpoint_failed {
             status = "failed";
         }
@@ -3886,12 +3886,12 @@ impl ExecutionBackend {
             .to_owned();
         crash_barrier("before-result");
         write_events(&events_path, mapper.events())?;
-        crash_barrier("after-result");
         crash_barrier("before-checkpoint");
         checkpoint_store
             .save_checkpoint(checkpoint)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         crash_barrier("after-checkpoint");
+        crash_barrier("after-result");
         manifest.status = "succeeded".to_owned();
         manifest.artifact_id = artifact_id;
         manifest.resume_count = next;
