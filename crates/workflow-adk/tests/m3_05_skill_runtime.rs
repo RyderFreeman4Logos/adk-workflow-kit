@@ -79,6 +79,29 @@ fn cleanup_test_root(path: &Path) {
     }
 }
 
+fn assert_paired_skill_transcript(ledger: &serde_json::Value) {
+    let mut calls = std::collections::BTreeSet::new();
+    for content in ledger["nodes"]["work"]["conversation"]
+        .as_array()
+        .expect("durable Skill transcript")
+    {
+        for part in content["parts"]
+            .as_array()
+            .expect("durable transcript parts")
+        {
+            if let Some(call) = part.get("function_call") {
+                calls.insert(call["id"].as_str().expect("Skill call ID"));
+            }
+            if let Some(response) = part.get("function_response") {
+                assert!(
+                    calls.contains(response["id"].as_str().expect("Skill response ID")),
+                    "resumed model request contains an orphan Skill response"
+                );
+            }
+        }
+    }
+}
+
 fn any_file_contains(root: &Path, marker: &str) -> bool {
     fs::read_dir(root)
         .unwrap()
@@ -277,6 +300,52 @@ fn activate_and_read_deliver_bounded_content_to_agent() {
     let events = fs::read_to_string(receipt.run_root().join("events.jsonl")).unwrap();
     assert!(events.contains("# Instructions"));
     assert!(events.contains("Declared guide"));
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
+fn read_skill_resource_enforces_one_budget_per_activation() {
+    let root = root();
+    let package = skill_package(&root);
+    let guide = vec![b'x'; 65_536];
+    fs::write(package.join("assets/guide.txt"), &guide).unwrap();
+    let runtime_path = package.join("skill.runtime.toml");
+    let runtime = fs::read_to_string(&runtime_path).unwrap();
+    fs::write(
+        &runtime_path,
+        runtime.replace(&digest(GUIDE), &digest(&guide)),
+    )
+    .unwrap();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let mut value = serde_json::to_value(profile(&package)).unwrap();
+    value["loop_policy"] = json!({
+        "schema_version": 1,
+        "max_model_iterations": 5,
+        "max_total_tool_calls": 4,
+        "max_tool_calls_per_tool": 4,
+        "wall_time_ms": 1_000,
+        "idle_time_ms": 1_000,
+        "tool_time_ms": 1_000,
+        "max_tool_output_bytes": 262_144
+    });
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+        {"calls": [{"id":"read-first","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/guide.txt","offset":0,"limit":32768}}]},
+        {"calls": [{"id":"read-second","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/guide.txt","offset":32768,"limit":32768}}]},
+        {"calls": [{"id":"read-over-budget","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/guide.txt","offset":0,"limit":1}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
+    ]);
+
+    let error = ExecutionBackend::run(
+        &workflow,
+        ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap(),
+        json!({}),
+        &root,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ExecutionErrorKind::Tool);
     cleanup_test_root(&root);
     fs::remove_dir_all(root).expect("test cleanup");
 }
@@ -773,6 +842,9 @@ fn crashed_skill_admission_or_activation_resumes_without_widening() {
         let events = fs::read_to_string(run_root.join("events.jsonl")).unwrap();
         assert!(events.contains("read_skill_resource"), "{barrier}");
         assert!(!events.contains("authorization_denied"), "{barrier}");
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
+        assert_paired_skill_transcript(&ledger);
         cleanup_test_root(&root);
         fs::remove_dir_all(root).expect("test cleanup");
     }

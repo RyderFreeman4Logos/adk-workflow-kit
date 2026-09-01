@@ -42,3 +42,22 @@ fn parses_agent_skill_subset_and_rejects_invalid_bindings() {
         );
     }
 }
+
+#[test]
+fn rejects_conflicting_skill_versions_within_and_across_nodes() {
+    let same_node = WORKFLOW.replace(
+        "]\n[[nodes]]",
+        ", { id = \"code-investigation\", version = \"2\" }]\n[[nodes]]",
+    );
+    let cross_node = WORKFLOW.replace(
+        "[[nodes]]\nid = \"done\"",
+        "[[nodes]]\nid = \"other\"\nkind = \"agent\"\nskills = [{ id = \"code-investigation\", version = \"2\" }]\n[[nodes]]\nid = \"done\"",
+    );
+
+    for workflow in [same_node, cross_node] {
+        assert!(
+            parse_str("conflicting-skill-versions.toml", &workflow).is_err(),
+            "conflicting exact Skill versions must fail compilation"
+        );
+    }
+}

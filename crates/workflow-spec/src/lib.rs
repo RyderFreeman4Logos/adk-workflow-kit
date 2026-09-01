@@ -666,7 +666,8 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
             .is_some_and(|model| model.id.is_empty() || model.version.is_empty())
             || !valid_tools(&node.tools)
             || !valid_skills(&node.skills)
-    }) {
+    }) || !valid_skill_versions(&raw.nodes)
+    {
         return Err(SpecError::InvalidNodeBinding);
     }
 
@@ -787,6 +788,15 @@ fn valid_skills(skills: &[RawSkillReference]) -> bool {
         !skill.id.is_empty()
             && !skill.version.is_empty()
             && identities.insert((&skill.id, &skill.version))
+    })
+}
+
+fn valid_skill_versions(nodes: &[RawNode]) -> bool {
+    let mut versions = BTreeMap::new();
+    nodes.iter().flat_map(|node| &node.skills).all(|skill| {
+        versions
+            .insert(&skill.id, &skill.version)
+            .is_none_or(|version| version == &skill.version)
     })
 }
 

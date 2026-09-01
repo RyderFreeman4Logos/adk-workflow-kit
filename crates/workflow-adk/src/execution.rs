@@ -55,6 +55,7 @@ use crate::{
 
 const MAX_STATE_BYTES: usize = 1024 * 1024;
 const ARTIFACT_LIMIT: u64 = 64 * 1024;
+const SKILL_RESOURCE_READ_LIMIT: u64 = 64 * 1024;
 const GRAPH_CONTINUATION_KEY: &str = "kit_graph_continuation_v1";
 const LOOP_LEDGER_FILE: &str = "loop-ledger.json";
 const SKILL_SNAPSHOT_FILE: &str = "sealed-skill-snapshot.json";
@@ -82,6 +83,8 @@ struct LoopState {
     finished_output: Option<Value>,
     #[serde(default)]
     activated_skills: BTreeSet<String>,
+    #[serde(default)]
+    skill_resource_read_bytes: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -357,6 +360,28 @@ impl LoopLedgerStore {
             .remove(index)
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         state.tool_output_bytes = total;
+        if state.conversation.is_empty() {
+            state.conversation.push(tool_call_content(&call));
+        }
+        if call.name == "read_skill_resource" {
+            let input = serde_json::from_value::<ReadSkillResourceInput>(call.args.clone())
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+            let page_bytes = skill_page_byte_len(&response)
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+            let total = state
+                .skill_resource_read_bytes
+                .get(&input.skill_id)
+                .copied()
+                .unwrap_or_default()
+                .checked_add(page_bytes)
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Tool))?;
+            if total > SKILL_RESOURCE_READ_LIMIT {
+                return Err(ExecutionError::new(ExecutionErrorKind::Tool));
+            }
+            state
+                .skill_resource_read_bytes
+                .insert(input.skill_id, total);
+        }
         state
             .conversation
             .push(tool_response_content(&call, response));
@@ -487,6 +512,16 @@ impl LoopLedgerStore {
                     .is_some_and(|state| state.activated_skills.contains(skill))
             })
     }
+
+    fn skill_resource_read_bytes(&self, node: &str, skill: &str) -> Result<u64, ExecutionError> {
+        self.snapshot(node).map(|state| {
+            state
+                .skill_resource_read_bytes
+                .get(skill)
+                .copied()
+                .unwrap_or_default()
+        })
+    }
 }
 
 fn durable_pending_args(call: &PendingCall) -> Option<Value> {
@@ -566,6 +601,24 @@ fn tool_response_content(call: &PendingCall, response: Value) -> adk_rust::Conte
             annotations: None,
         }],
     }
+}
+
+fn tool_call_content(call: &PendingCall) -> adk_rust::Content {
+    adk_rust::Content {
+        role: "model".to_owned(),
+        parts: vec![adk_rust::Part::FunctionCall {
+            name: call.name.clone(),
+            args: call.args.clone(),
+            id: Some(call.id.clone()),
+            thought_signature: None,
+        }],
+    }
+}
+
+fn skill_page_byte_len(response: &Value) -> Option<u64> {
+    response
+        .pointer("/payload/page_byte_len")
+        .and_then(Value::as_u64)
 }
 
 #[derive(Deserialize)]
@@ -753,6 +806,10 @@ fn valid_loop_state(state: &LoopState) -> bool {
                     && actual.fingerprint == expected.fingerprint
             })
         && state.tool_output_bytes == tool_output_bytes
+        && state
+            .skill_resource_read_bytes
+            .iter()
+            .all(|(skill, bytes)| !skill.is_empty() && *bytes <= SKILL_RESOURCE_READ_LIMIT)
 }
 
 fn ledger_checkpoint_identity(
@@ -974,6 +1031,23 @@ impl LoopController {
             let input = serde_json::from_value::<ActivateSkillInput>(input.clone())
                 .map_err(|_| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
             next.activated_skills.insert(input.skill_id);
+        }
+        if name == "read_skill_resource" {
+            let input = serde_json::from_value::<ReadSkillResourceInput>(input.clone())
+                .map_err(|_| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+            let page_bytes = skill_page_byte_len(response)
+                .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+            let total = next
+                .skill_resource_read_bytes
+                .get(&input.skill_id)
+                .copied()
+                .unwrap_or_default()
+                .checked_add(page_bytes)
+                .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+            if total > SKILL_RESOURCE_READ_LIMIT {
+                return Err(self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"));
+            }
+            next.skill_resource_read_bytes.insert(input.skill_id, total);
         }
         next.conversation
             .push(tool_response_content(&call, response.clone()));
@@ -1245,6 +1319,7 @@ impl SkillPackage {
         &self,
         id: &SkillResourceId,
         request: PageRequest,
+        max_total_read_bytes: NonZeroU64,
     ) -> Result<Value, ToolBridgeError> {
         if !self.resources.contains_key(id) {
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
@@ -1263,8 +1338,8 @@ impl SkillPackage {
                     NonZeroUsize::new(self.resources.len().max(1))
                         .expect("positive resource limit"),
                     NonZeroU64::new(65_536).expect("positive resource limit"),
-                    NonZeroU64::new(65_536).expect("positive page limit"),
-                    NonZeroU64::new(65_536).expect("positive read limit"),
+                    NonZeroU64::new(SKILL_RESOURCE_READ_LIMIT).expect("positive resource limit"),
+                    max_total_read_bytes,
                 ),
                 self.resources
                     .iter()
@@ -1274,9 +1349,14 @@ impl SkillPackage {
         let read = resources
             .read_skill_resource(id, request)
             .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+        let page_byte_len = u64::try_from(read.page().bytes().len())
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
         Ok(json!({
             "resource_id": read.metadata().id().as_str(),
             "result_ref": read.metadata().artifact_id().as_str(),
+            "byte_len": read.metadata().byte_len(),
+            "page_byte_len": page_byte_len,
+            "next_offset": read.page().next_offset(),
             "content": String::from_utf8_lossy(read.page().bytes()),
         }))
     }
@@ -3243,14 +3323,6 @@ impl ExecutionBackend {
         {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
-        for node in compiled
-            .ir()
-            .nodes()
-            .iter()
-            .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
-        {
-            profile.bind_resolved_model(&resolved_plan, node.id().as_str(), 0)?;
-        }
         let transform_module = profile.transform_module()?;
         let live_checkpoint_manifest = build_checkpoint_manifest(
             &run_identity,
@@ -3852,7 +3924,19 @@ impl ToolHandler for SkillToolHandler {
                     .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
                 let limit = NonZeroU64::new(input.limit)
                     .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
-                skill_id.read_resource(&resource_id, PageRequest::new(input.offset, limit))?
+                let consumed = self
+                    .ledger
+                    .skill_resource_read_bytes(context.actor(), &skill_name)
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                let remaining = SKILL_RESOURCE_READ_LIMIT
+                    .checked_sub(consumed)
+                    .and_then(NonZeroU64::new)
+                    .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                skill_id.read_resource(
+                    &resource_id,
+                    PageRequest::new(input.offset, limit),
+                    remaining,
+                )?
             }
             SkillToolAction::Run => {
                 let input = serde_json::from_value::<RunSkillScriptInput>(arguments.clone())
