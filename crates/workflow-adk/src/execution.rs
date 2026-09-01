@@ -3458,15 +3458,14 @@ impl ExecutionBackend {
             .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
             .map(|node| -> Result<_, ExecutionError> {
                 let name = node.id().as_str();
+                let completed_turns = loop_ledger.model_iterations(name)?;
+                let model = profile.bind_resolved_model(&resolved_plan, name, completed_turns)?;
                 let agent = if let Some(output) = loop_ledger.finished_output(name)? {
                     Arc::new(RestoredFinishAgent {
                         name: name.to_owned(),
                         output,
                     }) as Arc<dyn Agent>
                 } else {
-                    let completed_turns = loop_ledger.model_iterations(name)?;
-                    let model =
-                        profile.bind_resolved_model(&resolved_plan, name, completed_turns)?;
                     build_profile_agent(
                         name,
                         model,
