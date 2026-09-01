@@ -278,6 +278,20 @@ fn child_sandbox_denies_widening_and_bounds_output() {
 }
 
 #[test]
+fn unchanged_skill_package_resumes_from_snapshot() {
+    let root = root();
+    let package = skill_package(&root);
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+
+    let receipt = ExecutionBackend::run(&workflow, profile(&package), json!({}), &root).unwrap();
+    let resumed = ExecutionBackend::resume(&root, receipt.run_id()).unwrap();
+    assert_eq!(resumed.status(), "succeeded");
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
 fn changed_skill_content_rejects_resume() {
     let root = root();
     let package = skill_package(&root);
@@ -306,15 +320,7 @@ fn changed_skill_content_rejects_resume() {
         digest(GUIDE)
     );
 
-    let changed = b"import json\nprint(json.dumps({'value': 'changed'}))\n";
-    fs::write(package.join("scripts/content.bin"), changed).unwrap();
-    let runtime_path = package.join("skill.runtime.toml");
-    let runtime = fs::read_to_string(&runtime_path).unwrap();
-    fs::write(
-        &runtime_path,
-        runtime.replace(&digest(SCRIPT), &digest(changed)),
-    )
-    .unwrap();
+    fs::write(receipt.run_root().join("sealed-skill-snapshot.json"), b"{}").unwrap();
     let error = ExecutionBackend::resume(&root, receipt.run_id()).unwrap_err();
     assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
     cleanup_test_root(&root);

@@ -56,6 +56,7 @@ const MAX_STATE_BYTES: usize = 1024 * 1024;
 const ARTIFACT_LIMIT: u64 = 64 * 1024;
 const GRAPH_CONTINUATION_KEY: &str = "kit_graph_continuation_v1";
 const LOOP_LEDGER_FILE: &str = "loop-ledger.json";
+const SKILL_SNAPSHOT_FILE: &str = "sealed-skill-snapshot.json";
 const LOOP_LEDGER_DIGEST_KEY: &str = "kit_loop_ledger_digest_v1";
 static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
 type BoundTool = (Vec<String>, Arc<AdkToolBridge<InMemoryArtifactStore>>);
@@ -360,8 +361,18 @@ impl LoopLedgerStore {
     }
 
     fn persist_locked(&self, nodes: &BTreeMap<String, LoopState>) -> Result<(), ExecutionError> {
-        self.persist_ledger(nodes)?;
-        self.sync_checkpoint(nodes)
+        let mut durable_nodes = nodes.clone();
+        if !self.persist_raw_loop_state {
+            for state in durable_nodes.values_mut() {
+                state.conversation.clear();
+                state.finished_output = None;
+                for call in &mut state.pending_calls {
+                    call.args = Value::Null;
+                }
+            }
+        }
+        self.persist_ledger(&durable_nodes)?;
+        self.sync_checkpoint(&durable_nodes)
     }
 
     fn persist_ledger(&self, nodes: &BTreeMap<String, LoopState>) -> Result<(), ExecutionError> {
@@ -412,10 +423,20 @@ impl LoopLedgerStore {
     }
 
     fn bind_current_digest(&self, state: &mut State) -> Result<(), ExecutionError> {
-        let nodes = self
+        let mut nodes = self
             .nodes
             .lock()
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?
+            .clone();
+        if !self.persist_raw_loop_state {
+            for state in nodes.values_mut() {
+                state.conversation.clear();
+                state.finished_output = None;
+                for call in &mut state.pending_calls {
+                    call.args = Value::Null;
+                }
+            }
+        }
         Self::bind_digest(state, &nodes)
     }
 
@@ -1043,6 +1064,7 @@ struct SkillPackage {
     version: String,
     manifest: SkillManifest,
     skill_markdown: Vec<u8>,
+    runtime_toml: Vec<u8>,
     runtime: SkillRuntimeManifest,
     lock: SkillRuntimeLock,
     scripts: BTreeMap<String, Vec<u8>>,
@@ -1066,8 +1088,8 @@ impl SkillPackage {
         let skill_markdown = package_file(&wire.root, "SKILL.md")?;
         let manifest = SkillManifest::parse(&wire.root, &skill_markdown)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
-        let runtime_bytes = package_file(&wire.root, "skill.runtime.toml")?;
-        let runtime = SkillRuntimeManifest::parse(&runtime_bytes)
+        let runtime_toml = package_file(&wire.root, "skill.runtime.toml")?;
+        let runtime = SkillRuntimeManifest::parse(&runtime_toml)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
         if runtime.skill_id() != &id || runtime.skill_version() != wire.version {
             return Err(ExecutionError::new(
@@ -1102,6 +1124,7 @@ impl SkillPackage {
             version: wire.version.clone(),
             manifest,
             skill_markdown,
+            runtime_toml,
             runtime,
             lock,
             scripts,
@@ -1191,6 +1214,120 @@ impl SkillRegistry for SkillPackage {
     }
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SealedSkillSnapshotV1 {
+    schema_version: u8,
+    packages: Vec<SealedSkillPackageV1>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SealedSkillPackageV1 {
+    id: String,
+    version: String,
+    binding_identity: String,
+    skill_markdown: Vec<u8>,
+    runtime_toml: Vec<u8>,
+    scripts: BTreeMap<String, Vec<u8>>,
+    resources: BTreeMap<String, Vec<u8>>,
+}
+
+impl SealedSkillSnapshotV1 {
+    fn from_profile(profile: &ExecutionProfileV1) -> Result<Option<Self>, ExecutionError> {
+        let packages = profile.skill_packages()?;
+        if packages.is_empty() {
+            return Ok(None);
+        }
+        let packages = packages
+            .values()
+            .map(|package| {
+                Ok(SealedSkillPackageV1 {
+                    id: package.id.as_str().to_owned(),
+                    version: package.version.clone(),
+                    binding_identity: package.binding()?.metadata_identity().to_owned(),
+                    skill_markdown: package.skill_markdown.clone(),
+                    runtime_toml: package.runtime_toml.clone(),
+                    scripts: package.scripts.clone(),
+                    resources: package
+                        .resources
+                        .iter()
+                        .map(|(id, bytes)| (id.as_str().to_owned(), bytes.clone()))
+                        .collect(),
+                })
+            })
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
+        Ok(Some(Self {
+            schema_version: 1,
+            packages,
+        }))
+    }
+
+    fn identity(&self) -> Result<String, ExecutionError> {
+        serde_json::to_vec(self)
+            .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)))
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+    }
+
+    fn restore(
+        self,
+        expected_identity: &str,
+    ) -> Result<BTreeMap<String, Arc<SkillPackage>>, ExecutionError> {
+        if self.schema_version != 1 || self.identity()? != expected_identity {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        self.packages
+            .into_iter()
+            .map(|snapshot| {
+                let id = SkillId::new(&snapshot.id)
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                let manifest =
+                    SkillManifest::parse(Path::new(id.as_str()), &snapshot.skill_markdown)
+                        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                let runtime = SkillRuntimeManifest::parse(&snapshot.runtime_toml)
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                if runtime.skill_id() != &id || runtime.skill_version() != snapshot.version {
+                    return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+                }
+                let resources = snapshot
+                    .resources
+                    .into_iter()
+                    .map(|(name, bytes)| {
+                        SkillResourceId::new(&name)
+                            .map(|id| (id, bytes))
+                            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()?;
+                let lock = SkillRuntimeLock::try_from_declared_bytes(
+                    &runtime,
+                    &snapshot.skill_markdown,
+                    snapshot
+                        .scripts
+                        .iter()
+                        .map(|(id, bytes)| (id.as_str(), bytes.as_slice())),
+                    resources.iter().map(|(id, bytes)| (id, bytes.as_slice())),
+                )
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                let package = SkillPackage {
+                    id,
+                    version: snapshot.version,
+                    manifest,
+                    skill_markdown: snapshot.skill_markdown,
+                    runtime_toml: snapshot.runtime_toml,
+                    runtime,
+                    lock,
+                    scripts: snapshot.scripts,
+                    resources,
+                };
+                if package.binding()?.metadata_identity() != snapshot.binding_identity {
+                    return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+                }
+                Ok((package.id.as_str().to_owned(), Arc::new(package)))
+            })
+            .collect()
+    }
+}
+
 fn package_file(root: &Path, relative: &str) -> Result<Vec<u8>, ExecutionError> {
     let path = root.join(relative);
     let metadata = fs::symlink_metadata(&path)
@@ -1204,7 +1341,7 @@ fn package_file(root: &Path, relative: &str) -> Result<Vec<u8>, ExecutionError> 
 }
 
 /// A validated runtime profile supplied to the reusable ADK executor.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionProfileV1 {
     schema_version: u16,
@@ -1215,6 +1352,10 @@ pub struct ExecutionProfileV1 {
     tools: Vec<ToolWire>,
     #[serde(default)]
     skills: Vec<SkillWire>,
+    #[serde(default)]
+    skill_snapshot: Option<String>,
+    #[serde(skip)]
+    sealed_skills: Option<BTreeMap<String, Arc<SkillPackage>>>,
     pure_transform: Option<PureTransformWire>,
     sandbox: SandboxWire,
     #[serde(default)]
@@ -1391,7 +1532,7 @@ impl ExecutionProfileV1 {
         ))])
     }
 
-    fn durable_projection(&self) -> Value {
+    fn durable_projection(&self, skill_snapshot: Option<&str>) -> Value {
         let mut projection = serde_json::to_value(self).expect("execution profile serializes");
         {
             let projection = projection
@@ -1399,6 +1540,10 @@ impl ExecutionProfileV1 {
                 .expect("execution profile is an object");
             let redact_fake_responses = !self.skills.is_empty();
             projection.insert("skills".to_owned(), Value::Array(Vec::new()));
+            projection.insert(
+                "skill_snapshot".to_owned(),
+                skill_snapshot.map_or(Value::Null, |identity| Value::String(identity.to_owned())),
+            );
             for model in ["model", "reviewer_model"] {
                 if redact_fake_responses && projection[model]["provider"] == "fake" {
                     projection[model]["responses"] =
@@ -1414,6 +1559,9 @@ impl ExecutionProfileV1 {
     }
 
     fn skill_packages(&self) -> Result<BTreeMap<String, Arc<SkillPackage>>, ExecutionError> {
+        if let Some(packages) = &self.sealed_skills {
+            return Ok(packages.clone());
+        }
         let mut packages = BTreeMap::new();
         for wire in &self.skills {
             let package = Arc::new(SkillPackage::load(wire)?);
@@ -1422,6 +1570,21 @@ impl ExecutionProfileV1 {
             }
         }
         Ok(packages)
+    }
+
+    fn restore_skill_snapshot(&mut self, root: &Path) -> Result<(), ExecutionError> {
+        let Some(identity) = self.skill_snapshot.as_deref() else {
+            return Ok(());
+        };
+        if !self.skills.is_empty() {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        let snapshot = serde_json::from_slice::<SealedSkillSnapshotV1>(&bounded_read(
+            &root.join(SKILL_SNAPSHOT_FILE),
+        )?)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        self.sealed_skills = Some(snapshot.restore(identity)?);
+        Ok(())
     }
 
     fn capabilities(
@@ -2273,6 +2436,11 @@ impl ExecutionBackend {
         if contains_sensitive_key(&input) {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
         }
+        let skill_snapshot = SealedSkillSnapshotV1::from_profile(&profile)?;
+        let skill_snapshot_identity = skill_snapshot
+            .as_ref()
+            .map(SealedSkillSnapshotV1::identity)
+            .transpose()?;
         let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
         let requested = RequestedCapabilities::new(required_capabilities.iter().copied());
         verify_sandbox_capabilities(
@@ -2318,6 +2486,7 @@ impl ExecutionBackend {
             &profile,
             &resolved_plan,
             transform_module.as_deref(),
+            skill_snapshot_identity.as_deref(),
         )?;
         let ledger_identity = ledger_checkpoint_identity(&checkpoint_manifest)?;
         let context = RunContext::new(run_id.clone(), profile.run_limits());
@@ -2348,9 +2517,12 @@ impl ExecutionBackend {
         if workflow_source
             .as_deref()
             .is_none_or(|source| write_atomic(&run_root.join("workflow.toml"), source).is_err())
+            || skill_snapshot.as_ref().is_some_and(|snapshot| {
+                write_json(&run_root.join(SKILL_SNAPSHOT_FILE), snapshot).is_err()
+            })
             || write_json(
                 &run_root.join("execution-profile.json"),
-                &profile.durable_projection(),
+                &profile.durable_projection(skill_snapshot_identity.as_deref()),
             )
             .is_err()
             || write_json(&run_root.join("execution-input.json"), &input).is_err()
@@ -2854,8 +3026,9 @@ impl ExecutionBackend {
                 return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
             }
         }
-        let profile =
+        let mut profile =
             ExecutionProfileV1::parse(&bounded_read(&root.join("execution-profile.json"))?)?;
+        profile.restore_skill_snapshot(&root)?;
         let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
         verify_sandbox_capabilities(
             &RequestedCapabilities::new(required_capabilities.iter().copied()),
@@ -2899,6 +3072,7 @@ impl ExecutionBackend {
             &profile,
             &resolved_plan,
             transform_module.as_deref(),
+            profile.skill_snapshot.as_deref(),
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         if live_checkpoint_manifest != checkpoint_manifest {
@@ -3188,13 +3362,16 @@ fn build_checkpoint_manifest(
     profile: &ExecutionProfileV1,
     plan: &ResolvedRuntimePlan,
     transform_module: Option<&[u8]>,
+    skill_snapshot: Option<&str>,
 ) -> Result<CheckpointManifestV1, ExecutionError> {
-    let durable_profile = profile.durable_projection();
+    let durable_profile = profile.durable_projection(skill_snapshot);
     let profile_identity = serde_json::to_vec(&(
         &durable_profile["model"],
         &durable_profile["reviewer_model"],
         &durable_profile["tool"],
         &durable_profile["tools"],
+        &durable_profile["skills"],
+        &durable_profile["skill_snapshot"],
         &durable_profile["loop_policy"],
     ))
     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
