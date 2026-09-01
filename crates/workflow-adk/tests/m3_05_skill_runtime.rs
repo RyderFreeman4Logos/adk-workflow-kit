@@ -384,3 +384,34 @@ fn run_skill_script_is_not_read_only_when_script_declares_effects() {
     assert_eq!(error.kind(), ExecutionErrorKind::AuthorizationDenied);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn selected_script_id_not_lexicographic_first_is_executed() {
+    let root = root();
+    let package = skill_package(&root);
+    let selected = b"import json, sys\nprint(json.dumps({'value': 'selected'}))\n";
+    fs::write(package.join("scripts/z-selected.bin"), selected).unwrap();
+    let runtime_path = package.join("skill.runtime.toml");
+    let runtime = fs::read_to_string(&runtime_path).unwrap();
+    fs::write(
+        &runtime_path,
+        format!(
+            "{runtime}[[scripts]]\nid = \"z-selected\"\npath = \"scripts/z-selected.bin\"\nruntime = \"python3\"\nsha256 = \"{}\"\ninput_schema = \"references/schema.json\"\noutput_schema = \"references/schema.json\"\ncapabilities = [\"filesystem.read\", \"process.spawn\", \"limit.output_bytes\"]\n",
+            digest(selected),
+        ),
+    )
+    .unwrap();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let mut value = serde_json::to_value(profile(&package)).unwrap();
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+        {"calls": [{"id":"run","name":"run_skill_script","args":{"skill_id":"code-investigation","script_id":"z-selected","input":{"value":"done"}}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
+    ]);
+    let profile = ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let receipt = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap();
+    assert_eq!(receipt.status(), "succeeded");
+    let _ = fs::remove_dir_all(root);
+}

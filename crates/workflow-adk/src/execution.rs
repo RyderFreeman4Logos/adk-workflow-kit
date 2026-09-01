@@ -2229,23 +2229,15 @@ impl ExecutionBackend {
         let context = RunContext::new(run_id.clone(), profile.run_limits());
         let mut mapper = AdkEventMapper::new(run_id.as_str(), compiled.ir().workflow_id().as_str())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-        let skill_bytes = profile
-            .skill_packages()?
-            .values()
-            .flat_map(|package| package.scripts.values())
-            .next()
-            .cloned();
-        let run_workdir = match skill_bytes {
-            Some(bytes) => manager.materialize(
+        let run_workdir = manager
+            .materialize(
                 &run_id,
                 &Materialization {
-                    skills: Some(bytes),
+                    skills: Some(Vec::new()),
                     ..Materialization::default()
                 },
-            ),
-            None => manager.allocate(&run_id),
-        }
-        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
+            )
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let run_root = run_workdir.root().to_path_buf();
         let workdir_id = run_workdir.id().as_str().to_owned();
         let workflow_source = fs::read(workflow.as_ref())
@@ -3356,11 +3348,16 @@ impl ToolHandler for SkillToolHandler {
                 let script_id = input.script_id;
                 let input = serde_json::to_vec(&input.input)
                     .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                let script_bytes = skill_id
+                    .scripts
+                    .get(&script_id)
+                    .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
                 let receipt = execute_registered_script_in_child(
                     &skill_id.runtime,
                     &skill_id.lock,
                     &script_id,
                     &input,
+                    script_bytes,
                     sandbox,
                 )
                 .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;

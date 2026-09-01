@@ -2,9 +2,12 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt, fs,
+    fmt,
     path::{Component, Path},
 };
+
+#[cfg(test)]
+use std::fs;
 
 use sha2::{Digest, Sha256};
 
@@ -219,14 +222,13 @@ impl ChildSandbox<'_> {
         &self,
         path: &str,
         expected_sha256: &str,
+        locked_bytes: &[u8],
         input_json: &[u8],
     ) -> Result<BubblewrapReceipt, SandboxExecutionError> {
         if !is_script_path(path) {
             return Err(SandboxExecutionError::InvalidScriptPath);
         }
-        let bytes = fs::read(self.parent.workdir.skills_dir().join(path))
-            .map_err(|_| SandboxExecutionError::ExecutionFailed)?;
-        let actual_sha256 = format!("sha256:{:x}", Sha256::digest(&bytes));
+        let actual_sha256 = format!("sha256:{:x}", Sha256::digest(locked_bytes));
         if actual_sha256 != expected_sha256 {
             return Err(SandboxExecutionError::ExecutionFailed);
         }
@@ -244,7 +246,7 @@ impl ChildSandbox<'_> {
             command,
             self.capabilities.iter().copied(),
             Some(input_json),
-            Some((&bytes, path)),
+            Some((locked_bytes, path)),
         )
     }
 }
@@ -386,8 +388,9 @@ mod tests {
         let expected = format!("sha256:{:x}", Sha256::digest(original));
 
         std::thread::scope(|scope| {
-            let execution = scope
-                .spawn(|| child.execute_registered_python_script("content.bin", &expected, b"{}"));
+            let execution = scope.spawn(|| {
+                child.execute_registered_python_script("content.bin", &expected, original, b"{}")
+            });
             barriers.0.wait();
             fs::write(&script_path, b"print('replacement')\n")
                 .expect("checked path must be replaceable for the race regression");

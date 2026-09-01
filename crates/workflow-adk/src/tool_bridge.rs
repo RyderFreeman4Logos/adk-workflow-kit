@@ -90,6 +90,7 @@ pub struct RegisteredSkillScript {
     manifest: SkillRuntimeManifest,
     lock: SkillRuntimeLock,
     script_id: String,
+    script_bytes: Vec<u8>,
 }
 
 impl RegisteredSkillScript {
@@ -98,11 +99,13 @@ impl RegisteredSkillScript {
         manifest: SkillRuntimeManifest,
         lock: SkillRuntimeLock,
         script_id: impl Into<String>,
+        script_bytes: impl Into<Vec<u8>>,
     ) -> Self {
         Self {
             manifest,
             lock,
             script_id: script_id.into(),
+            script_bytes: script_bytes.into(),
         }
     }
 
@@ -117,6 +120,7 @@ impl RegisteredSkillScript {
             &self.lock,
             &self.script_id,
             input_json,
+            &self.script_bytes,
             sandbox,
         )
     }
@@ -142,6 +146,7 @@ impl ToolHandler for RegisteredScriptHandler {
             &self.script.lock,
             &self.script.script_id,
             &input_json,
+            &self.script.script_bytes,
             sandbox,
         )
         .map_err(|_| ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed))?;

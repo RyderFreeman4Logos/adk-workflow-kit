@@ -111,16 +111,21 @@ impl ScriptPlan {
     }
 
     /// Executes this registered plan inside a capability-narrowed child sandbox.
-    pub fn execute(&self, sandbox: &RunSandbox) -> Result<BubblewrapReceipt, ScriptExecutionError> {
+    pub fn execute(
+        &self,
+        sandbox: &RunSandbox,
+        script_bytes: &[u8],
+    ) -> Result<BubblewrapReceipt, ScriptExecutionError> {
         let child = sandbox
             .child(self.capabilities.iter().copied())
             .map_err(ScriptExecutionError::sandbox)?;
-        self.execute_in(&child)
+        self.execute_in(&child, script_bytes)
     }
 
     fn execute_in(
         &self,
         sandbox: &ChildSandbox<'_>,
+        script_bytes: &[u8],
     ) -> Result<BubblewrapReceipt, ScriptExecutionError> {
         let child = sandbox
             .child(self.capabilities.iter().copied())
@@ -130,6 +135,7 @@ impl ScriptPlan {
             ScriptRuntime::Python3 => child.execute_registered_python_script(
                 "content.bin",
                 &self.script_sha256,
+                script_bytes,
                 &self.input_json,
             ),
         }
@@ -383,11 +389,12 @@ pub fn execute_registered_script(
     lock: &SkillRuntimeLock,
     script_id: &str,
     input_json: &[u8],
+    script_bytes: &[u8],
     sandbox: &RunSandbox,
 ) -> Result<BubblewrapReceipt, ScriptExecutionError> {
     plan_script_execution(manifest, lock, script_id, input_json)
         .map_err(ScriptExecutionError::denied)?
-        .execute(sandbox)
+        .execute(sandbox, script_bytes)
 }
 
 /// Plans and executes one declared Skill script within an already-narrowed child sandbox.
@@ -396,11 +403,12 @@ pub fn execute_registered_script_in_child(
     lock: &SkillRuntimeLock,
     script_id: &str,
     input_json: &[u8],
+    script_bytes: &[u8],
     sandbox: &ChildSandbox<'_>,
 ) -> Result<BubblewrapReceipt, ScriptExecutionError> {
     plan_script_execution(manifest, lock, script_id, input_json)
         .map_err(ScriptExecutionError::denied)?
-        .execute_in(sandbox)
+        .execute_in(sandbox, script_bytes)
 }
 
 /// A bounded, canonicalized v1 Skill runtime manifest.
@@ -1370,9 +1378,15 @@ mod tests {
         let (manifest, lock) = execution_fixture(vec![SandboxCapability::Network]);
         let sandbox = sandbox(Vec::new());
 
-        let error =
-            execute_registered_script(&manifest, &lock, "unknown", br#"{"value":"ok"}"#, &sandbox)
-                .expect_err("unknown script IDs must be denied before sandbox creation");
+        let error = execute_registered_script(
+            &manifest,
+            &lock,
+            "unknown",
+            br#"{"value":"ok"}"#,
+            SCRIPT_BYTES,
+            &sandbox,
+        )
+        .expect_err("unknown script IDs must be denied before sandbox creation");
 
         assert_eq!(
             error.kind(),
@@ -1388,9 +1402,15 @@ mod tests {
             SandboxCapability::OutputBytes,
         ]);
 
-        let error =
-            execute_registered_script(&manifest, &lock, "script", br#"{"value":"ok"}"#, &sandbox)
-                .expect_err("child sandbox must not expand its parent authority");
+        let error = execute_registered_script(
+            &manifest,
+            &lock,
+            "script",
+            br#"{"value":"ok"}"#,
+            SCRIPT_BYTES,
+            &sandbox,
+        )
+        .expect_err("child sandbox must not expand its parent authority");
 
         assert_eq!(
             error.kind(),
@@ -1411,9 +1431,15 @@ mod tests {
             SandboxCapability::OutputBytes,
         ]);
 
-        let receipt =
-            execute_registered_script(&manifest, &lock, "script", br#"{"value":"ok"}"#, &sandbox)
-                .expect("registered plan must execute in a child sandbox");
+        let receipt = execute_registered_script(
+            &manifest,
+            &lock,
+            "script",
+            br#"{"value":"ok"}"#,
+            SCRIPT_BYTES,
+            &sandbox,
+        )
+        .expect("registered plan must execute in a child sandbox");
 
         assert_eq!(receipt.stdout(), b"{\"value\": \"ok\"}\n");
     }
