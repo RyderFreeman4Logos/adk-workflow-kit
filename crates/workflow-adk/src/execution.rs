@@ -2275,7 +2275,12 @@ fn build_profile_agent(
             let controller = Arc::clone(&tool_error_controller);
             Box::pin(async move {
                 let error = error.to_ascii_lowercase();
-                let (kind, code) = if error.contains("authorization_denied") {
+                let (kind, code) = if error.contains("sandbox_denied") {
+                    (
+                        ExecutionErrorKind::SandboxDenied,
+                        "tool.bridge.sandbox_denied",
+                    )
+                } else if error.contains("authorization_denied") {
                     (
                         ExecutionErrorKind::AuthorizationDenied,
                         "tool.bridge.authorization_denied",
@@ -2397,6 +2402,7 @@ pub enum ExecutionErrorKind {
 fn execution_error_kind(error: AdkGraphError) -> ExecutionErrorKind {
     match error {
         AdkGraphError::AuthorizationDenied => ExecutionErrorKind::AuthorizationDenied,
+        AdkGraphError::SandboxDenied => ExecutionErrorKind::SandboxDenied,
         AdkGraphError::ModelIterationsLimit => ExecutionErrorKind::ModelIterationsLimit,
         AdkGraphError::TotalToolCallsLimit => ExecutionErrorKind::TotalToolCallsLimit,
         AdkGraphError::ToolCallsPerToolLimit => ExecutionErrorKind::ToolCallsPerToolLimit,

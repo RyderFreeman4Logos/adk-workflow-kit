@@ -337,7 +337,7 @@ impl CapabilityIntersection {
             !self.runtime_capabilities.contains(capability)
                 || !self.sandbox_capabilities.contains(capability)
         }) {
-            return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::SandboxDenied));
         }
         Ok(())
     }
@@ -352,6 +352,8 @@ pub enum ToolBridgeErrorKind {
     DuplicateTool,
     /// Capability intersection denied the call.
     CapabilityDenied,
+    /// The run sandbox does not grant a capability required by the selected tool.
+    SandboxDenied,
     /// Call-scoped approval was absent or invalid.
     ApprovalDenied,
     /// Input failed the registered JSON schema.
@@ -374,6 +376,7 @@ impl fmt::Display for ToolBridgeErrorKind {
             Self::UnknownTool => "tool is not registered",
             Self::DuplicateTool => "tool is already registered",
             Self::CapabilityDenied => "tool capability intersection denied the call",
+            Self::SandboxDenied => "run sandbox denied a required tool capability",
             Self::ApprovalDenied => "call approval denied the call",
             Self::InvalidInput => "tool input was invalid",
             Self::ProvenanceMismatch => "tool provenance did not match registration",
@@ -628,9 +631,7 @@ impl ToolBridge {
                     .spawn(move || {
                         let result = sandbox
                             .child(capabilities)
-                            .map_err(|_| {
-                                ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied)
-                            })
+                            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::SandboxDenied))
                             .and_then(|sandbox| handler.execute(&sandbox, &context, &arguments));
                         let _ = sender.send(result);
                     })
@@ -657,7 +658,7 @@ impl ToolBridge {
             .spawn(move || {
                 let result = sandbox
                     .child(capabilities)
-                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::SandboxDenied))
                     .and_then(|sandbox| handler.execute(&sandbox, &context, &arguments));
                 let _ = sender.send(result);
             })

@@ -54,8 +54,11 @@ impl ToolExecutionError {
 }
 
 pub(crate) fn project_tool_execution_error(error: ToolExecutionError) -> AdkError {
-    let (category, code) = match error.terminal_outcome() {
-        TerminalOutcome::AuthorizationDenied => {
+    let (category, code) = match error.kind() {
+        workflow_runtime::ToolBridgeErrorKind::SandboxDenied => {
+            (ErrorCategory::Forbidden, "tool.bridge.sandbox_denied")
+        }
+        _ if error.terminal_outcome() == TerminalOutcome::AuthorizationDenied => {
             (ErrorCategory::Forbidden, "tool.bridge.authorization_denied")
         }
         _ => (ErrorCategory::Internal, "tool.bridge.failed"),
