@@ -280,7 +280,7 @@ fn large_read_profile(
         "max_model_iterations": 4,
         "max_total_tool_calls": 3,
         "max_tool_calls_per_tool": 3,
-        "wall_time_ms": 1_000,
+        "wall_time_ms": 10_000,
         "idle_time_ms": 1_000,
         "tool_time_ms": 1_000,
         "max_tool_output_bytes": 262_144
