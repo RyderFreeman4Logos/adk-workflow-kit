@@ -215,7 +215,9 @@ impl std::error::Error for BindingValidationError {}
 
 fn validate_node_bindings(spec: &WorkflowSpec) -> Result<(), CompileError> {
     for node in spec.nodes() {
-        if node.kind() != NodeKind::Agent && (node.model().is_some() || !node.tools().is_empty()) {
+        if node.kind() != NodeKind::Agent
+            && (node.model().is_some() || !node.tools().is_empty() || !node.skills().is_empty())
+        {
             return Err(CompileError::Binding(
                 BindingValidationError::InvalidPlacement,
             ));
@@ -223,7 +225,7 @@ fn validate_node_bindings(spec: &WorkflowSpec) -> Result<(), CompileError> {
         if node
             .model()
             .is_some_and(|model| model.role() == workflow_spec::ModelRole::Reviewer)
-            && !node.tools().is_empty()
+            && (!node.tools().is_empty() || !node.skills().is_empty())
         {
             return Err(CompileError::Binding(BindingValidationError::ReviewerTool));
         }

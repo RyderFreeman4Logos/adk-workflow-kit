@@ -445,7 +445,9 @@ impl ResolvedRuntimePlan {
                 model_ref,
                 node_id,
             )?;
-            if *role == IrModelRole::Reviewer && !binding.tools.is_empty() {
+            if *role == IrModelRole::Reviewer
+                && (!binding.tools.is_empty() || !binding.skills.is_empty())
+            {
                 return Err(PlanResolutionError::node(
                     PlanResolutionErrorKind::InvalidBinding,
                     BindingCategory::Tool,

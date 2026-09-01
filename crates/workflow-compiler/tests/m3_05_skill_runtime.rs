@@ -1,6 +1,6 @@
 use workflow_compiler::{
-    BindingCategory, BindingRef, RegistryResolutionError, ResolvedBinding, ResolvedRuntimePlan,
-    RuntimePlanRegistry, RuntimePlanRequest, compile_str,
+    BindingCategory, BindingRef, BindingValidationError, CompileError, RegistryResolutionError,
+    ResolvedBinding, ResolvedRuntimePlan, RuntimePlanRegistry, RuntimePlanRequest, compile_str,
 };
 
 const WORKFLOW: &str = r#"
@@ -41,6 +41,23 @@ impl RuntimePlanRegistry for Registry {
             _ => Err(RegistryResolutionError::missing(category, binding)),
         }
     }
+}
+
+#[test]
+fn skill_bindings_require_worker_agents() {
+    let non_agent = WORKFLOW.replace("kind = \"agent\"", "kind = \"action\"");
+    assert!(matches!(
+        compile_str("non-agent-skill.toml", &non_agent),
+        Err(CompileError::Binding(
+            BindingValidationError::InvalidPlacement
+        ))
+    ));
+
+    let reviewer = WORKFLOW.replace("role = \"worker\"", "role = \"reviewer\"");
+    assert!(matches!(
+        compile_str("reviewer-skill.toml", &reviewer),
+        Err(CompileError::Binding(BindingValidationError::ReviewerTool))
+    ));
 }
 
 #[test]
