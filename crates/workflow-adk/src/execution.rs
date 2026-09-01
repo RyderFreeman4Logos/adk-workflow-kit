@@ -1403,7 +1403,24 @@ impl SealedSkillSnapshotV1 {
 }
 
 fn package_file(root: &Path, relative: &str) -> Result<Vec<u8>, ExecutionError> {
-    let path = root.join(relative);
+    let mut path = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(ExecutionError::new(
+                ExecutionErrorKind::ImplementationBinding,
+            ));
+        };
+        path.push(component);
+        if fs::symlink_metadata(&path)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(ExecutionError::new(
+                ExecutionErrorKind::ImplementationBinding,
+            ));
+        }
+    }
     let metadata = fs::symlink_metadata(&path)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
     if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > 65_536 {

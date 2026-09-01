@@ -669,6 +669,35 @@ fn crashed_skill_admission_or_activation_resumes_without_widening() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn package_file_symlinks_fail_closed_before_effect() {
+    for intermediate in [false, true] {
+        let root = root();
+        let package = skill_package(&root);
+        let profile = profile(&package);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let outside = root.join("outside");
+        if intermediate {
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("content.bin"), SCRIPT).unwrap();
+            fs::remove_file(package.join("scripts/content.bin")).unwrap();
+            fs::remove_dir(package.join("scripts")).unwrap();
+            std::os::unix::fs::symlink(&outside, package.join("scripts")).unwrap();
+        } else {
+            fs::write(&outside, SCRIPT).unwrap();
+            fs::remove_file(package.join("scripts/content.bin")).unwrap();
+            std::os::unix::fs::symlink(&outside, package.join("scripts/content.bin")).unwrap();
+        }
+
+        let error = ExecutionBackend::run(&workflow, profile, json!({}), &root).unwrap_err();
+        assert_eq!(error.kind(), ExecutionErrorKind::ImplementationBinding);
+        cleanup_test_root(&root);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+}
+
 #[test]
 fn symlink_or_replaced_package_fails_closed_before_effect() {
     let root = root();
