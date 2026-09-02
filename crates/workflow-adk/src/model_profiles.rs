@@ -1137,31 +1137,12 @@ async fn generate_once(
     if remaining.is_zero() {
         return Err(profile_timeout());
     }
-    let llm = Arc::clone(&binding.llm);
-    let (tx, rx) = adk_rust::tokio::sync::oneshot::channel();
-    let (timeout_tx, timeout_rx) = adk_rust::tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name("workflow-adk-model-deadline".into())
-        .spawn(move || {
-            let result = adk_rust::tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|_| profile_timeout())
-                .and_then(|runtime| runtime.block_on(collect_payloads(llm, request)));
-            let _ = tx.send(result);
-        })
-        .map_err(|_| profile_timeout())?;
-    std::thread::Builder::new()
-        .name("workflow-adk-model-timeout".into())
-        .spawn(move || {
-            std::thread::sleep(remaining);
-            let _ = timeout_tx.send(());
-        })
-        .map_err(|_| profile_timeout())?;
-    adk_rust::tokio::select! {
-        result = rx => result.unwrap_or_else(|_| Err(profile_timeout())),
-        _ = timeout_rx => Err(profile_timeout()),
-    }
+    adk_rust::tokio::time::timeout(
+        remaining,
+        collect_payloads(Arc::clone(&binding.llm), request),
+    )
+    .await
+    .unwrap_or_else(|_| Err(profile_timeout()))
 }
 
 fn response_has_model_payload(response: &LlmResponse) -> bool {
@@ -1212,6 +1193,135 @@ mod retry_admission_tests {
             !retryable_provider_error(&error),
             "substring rate must not admit retry, got {}",
             error
+        );
+    }
+
+    enum AttemptBehavior {
+        Success,
+        Stall,
+        RetryThenStall,
+    }
+
+    struct AttemptProbe {
+        behavior: AttemptBehavior,
+        dispatches: Arc<AtomicU64>,
+        active: Arc<AtomicU64>,
+    }
+
+    struct ActiveAttempt(Arc<AtomicU64>);
+
+    impl Drop for ActiveAttempt {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    #[async_trait]
+    impl Llm for AttemptProbe {
+        fn name(&self) -> &str {
+            "attempt-probe"
+        }
+
+        async fn generate_content(
+            &self,
+            _request: LlmRequest,
+            _stream: bool,
+        ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+            let dispatch = self.dispatches.fetch_add(1, Ordering::Relaxed);
+            if matches!(self.behavior, AttemptBehavior::RetryThenStall) && dispatch == 0 {
+                let mut error = AdkError::agent("retryable");
+                error.details.upstream_status_code = Some(429);
+                return Err(error);
+            }
+            if matches!(self.behavior, AttemptBehavior::Success) {
+                return Ok(Box::pin(stream::iter([Ok(LlmResponse::new(
+                    Content::new("assistant").with_text("done"),
+                ))])));
+            }
+
+            self.active.fetch_add(1, Ordering::Relaxed);
+            let attempt = ActiveAttempt(Arc::clone(&self.active));
+            Ok(Box::pin(stream::once(async move {
+                let _attempt = attempt;
+                std::future::pending::<adk_rust::Result<LlmResponse>>().await
+            })))
+        }
+    }
+
+    fn model_worker_threads() -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .expect("Linux task directory")
+            .filter_map(Result::ok)
+            .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+            .filter(|name| name.starts_with("workflow-adk-mo"))
+            .count()
+    }
+
+    #[test]
+    fn generate_attempts_are_owned_through_success_timeout_and_retry() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let request = || LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+
+        let success_dispatches = Arc::new(AtomicU64::new(0));
+        let success_active = Arc::new(AtomicU64::new(0));
+        let before = model_worker_threads();
+        let mut success = test_binding(
+            Arc::new(AttemptProbe {
+                behavior: AttemptBehavior::Success,
+                dispatches: Arc::clone(&success_dispatches),
+                active: Arc::clone(&success_active),
+            }),
+            "success",
+        );
+        success.runtime = ModelRuntimeConfig::default().with_timeout(Duration::from_secs(5));
+        runtime.block_on(async {
+            let _stream = Llm::generate_content(&success, request(), false)
+                .await
+                .expect("success");
+        });
+        let success_leftovers = model_worker_threads().saturating_sub(before);
+
+        let stall_dispatches = Arc::new(AtomicU64::new(0));
+        let stall_active = Arc::new(AtomicU64::new(0));
+        let mut stall = test_binding(
+            Arc::new(AttemptProbe {
+                behavior: AttemptBehavior::Stall,
+                dispatches: Arc::clone(&stall_dispatches),
+                active: Arc::clone(&stall_active),
+            }),
+            "stall",
+        );
+        stall.runtime = ModelRuntimeConfig::default().with_timeout(Duration::from_millis(50));
+        runtime.block_on(expect_profile_timeout(&stall, request()));
+
+        let retry_dispatches = Arc::new(AtomicU64::new(0));
+        let retry_active = Arc::new(AtomicU64::new(0));
+        let mut retry = test_binding(
+            Arc::new(AttemptProbe {
+                behavior: AttemptBehavior::RetryThenStall,
+                dispatches: Arc::clone(&retry_dispatches),
+                active: Arc::clone(&retry_active),
+            }),
+            "retry-stall",
+        );
+        retry.runtime = ModelRuntimeConfig::default().with_timeout(Duration::from_millis(50));
+        runtime.block_on(expect_profile_timeout(&retry, request()));
+        std::thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(
+            (
+                success_dispatches.load(Ordering::Relaxed),
+                success_leftovers,
+                stall_dispatches.load(Ordering::Relaxed),
+                stall_active.load(Ordering::Relaxed),
+                retry_dispatches.load(Ordering::Relaxed),
+                retry_active.load(Ordering::Relaxed),
+            ),
+            (1, 0, 1, 0, 2, 0),
+            "(success dispatches, success leftovers, stall dispatches, stall leftovers, retry dispatches, retry leftovers)"
         );
     }
 
