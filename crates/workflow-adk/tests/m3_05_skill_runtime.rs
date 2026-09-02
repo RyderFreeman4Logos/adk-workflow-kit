@@ -406,6 +406,60 @@ fn simultaneous_mixed_profile(package: &std::path::Path) -> ExecutionProfileV1 {
     ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
 }
 
+fn mixed_resource_profile(package: &Path, mode: &str) -> ExecutionProfileV1 {
+    let mut value = serde_json::to_value(profile(package)).unwrap();
+    value["tools"] = json!([{
+        "name": "search_code",
+        "result": {"found": true},
+        "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": false
+        }
+    }]);
+    let ordinary = |id: &str| json!({"id":id,"name":"search_code","args":{"query":format!("ordinary-raw-argument-{id}")}});
+    let read = |id: &str, offset: u64| json!({"id":id,"name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/guide.txt","offset":offset,"limit":8}});
+    let activate = json!({"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]});
+    let finish =
+        json!(serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap());
+    value["model"]["responses"] = match mode {
+        "sequential" => json!([
+            activate,
+            {"calls": [ordinary("ordinary-0")]},
+            {"calls": [read("read-0", 0)]},
+            finish
+        ]),
+        "simultaneous" => json!([
+            activate,
+            {"calls": [ordinary("ordinary-0"), read("read-0", 0)]},
+            finish
+        ]),
+        "multiple" => json!([
+            activate,
+            {"calls": [ordinary("ordinary-0")]},
+            {"calls": [read("read-0", 0)]},
+            {"calls": [ordinary("ordinary-1")]},
+            {"calls": [read("read-1", 8)]},
+            finish
+        ]),
+        "pending" => json!([
+            activate,
+            {"calls": [
+                ordinary("ordinary-0"),
+                read("read-0", 0),
+                ordinary("ordinary-1"),
+                read("read-1", 8),
+                ordinary("ordinary-pending")
+            ]},
+            finish
+        ]),
+        _ => unreachable!(),
+    };
+    ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
+}
+
 #[test]
 fn fake_model_activates_reads_and_runs_declared_skill() {
     let root = root();
@@ -1818,6 +1872,106 @@ fn sequential_and_simultaneous_mixed_calls_crash_resume() {
             1,
             "{barrier}"
         );
+        cleanup_test_root(&root);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+}
+
+#[test]
+fn mixed_completed_calls_resume_in_completion_order() {
+    if let Ok(root) = env::var("M3_05_MIXED_ORDER_CRASH_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, MIXED_WORKFLOW).unwrap();
+        let mode = env::var("M3_05_MIXED_ORDER_MODE").unwrap();
+        let _ = ExecutionBackend::run(
+            &workflow,
+            mixed_resource_profile(&root.join("code-investigation"), &mode),
+            json!({}),
+            root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
+    for (mode, barrier) in [
+        (
+            "sequential",
+            "after-skill-call-completion-read_skill_resource",
+        ),
+        (
+            "simultaneous",
+            "after-skill-call-completion-read_skill_resource",
+        ),
+        (
+            "multiple",
+            "after-skill-call-completion-read_skill_resource#2",
+        ),
+        (
+            "pending",
+            "after-skill-call-completion-read_skill_resource#2",
+        ),
+    ] {
+        let baseline_root = root();
+        let baseline_package = skill_package(&baseline_root);
+        let baseline_workflow = baseline_root.join("workflow.toml");
+        fs::write(&baseline_workflow, MIXED_WORKFLOW).unwrap();
+        unsafe {
+            env::set_var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST", "1");
+        }
+        let baseline = ExecutionBackend::run(
+            &baseline_workflow,
+            mixed_resource_profile(&baseline_package, mode),
+            json!({}),
+            &baseline_root,
+        )
+        .unwrap();
+        unsafe {
+            env::remove_var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST");
+        }
+        let baseline_digest =
+            fs::read_to_string(baseline.run_root().join("model-contents-digest")).unwrap();
+        cleanup_test_root(&baseline_root);
+        fs::remove_dir_all(baseline_root).expect("baseline cleanup");
+
+        let root = root();
+        skill_package(&root);
+        let status = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "mixed_completed_calls_resume_in_completion_order",
+                "--nocapture",
+            ])
+            .env("M3_05_MIXED_ORDER_CRASH_ROOT", &root)
+            .env("M3_05_MIXED_ORDER_MODE", mode)
+            .env("WORKFLOW_KIT_TEST_CRASH_BARRIER", barrier)
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{mode}");
+        let run_root = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.join("run-manifest.json").is_file())
+            .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+        unsafe {
+            env::set_var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST", "1");
+        }
+        let resumed =
+            ExecutionBackend::resume(&root, manifest["run_id"].as_str().unwrap()).unwrap();
+        unsafe {
+            env::remove_var("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST");
+        }
+        assert_eq!(resumed.status(), "succeeded", "{mode}");
+        assert_eq!(
+            fs::read_to_string(run_root.join("model-contents-digest")).unwrap(),
+            baseline_digest,
+            "{mode} resumed model request changed"
+        );
+        let ledger = fs::read_to_string(run_root.join("loop-ledger.json")).unwrap();
+        assert!(!ledger.contains("ordinary-raw-argument"), "{mode}");
+        assert!(!ledger.contains("Declared guide"), "{mode}");
         cleanup_test_root(&root);
         fs::remove_dir_all(root).expect("test cleanup");
     }

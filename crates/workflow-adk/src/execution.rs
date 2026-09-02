@@ -85,9 +85,7 @@ struct LoopState {
     conversation_reconstructed: bool,
     previous_response_id: Option<String>,
     pending_calls: VecDeque<PendingCall>,
-    completed_skill_calls: Vec<PendingCall>,
-    #[serde(default)]
-    completed_ordinary_calls: Vec<PendingCall>,
+    completed_calls: Vec<CompletedCall>,
     #[serde(default)]
     finish_admitted: bool,
     #[serde(default)]
@@ -102,7 +100,7 @@ struct LoopState {
     skill_resource_read_reservations: BTreeMap<String, u64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PendingCall {
     id: String,
@@ -110,6 +108,29 @@ struct PendingCall {
     #[serde(default)]
     args: Value,
     fingerprint: String,
+    model_iteration: u64,
+    admission_ordinal: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "call", rename_all = "snake_case")]
+enum CompletedCall {
+    Skill(PendingCall),
+    Ordinary(PendingCall),
+}
+
+impl CompletedCall {
+    fn call(&self) -> &PendingCall {
+        match self {
+            Self::Skill(call) | Self::Ordinary(call) => call,
+        }
+    }
+
+    fn call_mut(&mut self) -> &mut PendingCall {
+        match self {
+            Self::Skill(call) | Self::Ordinary(call) => call,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -165,7 +186,7 @@ impl LoopLedgerStore {
     ) -> Result<Self, ExecutionError> {
         let ledger = serde_json::from_slice::<LoopLedgerV1>(&bounded_read(&path)?)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        if ledger.schema_version != 4 || ledger.checkpoint_identity != checkpoint_identity {
+        if ledger.schema_version != 5 || ledger.checkpoint_identity != checkpoint_identity {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
         let nodes = if checkpoint_digest == loop_ledger_digest(&ledger.nodes)? {
@@ -296,7 +317,7 @@ impl LoopLedgerStore {
             .collect())
     }
 
-    fn completed_skill_calls(&self) -> Result<Vec<(String, PendingCall)>, ExecutionError> {
+    fn completed_calls(&self) -> Result<Vec<(String, CompletedCall)>, ExecutionError> {
         let nodes = self
             .nodes
             .lock()
@@ -305,7 +326,7 @@ impl LoopLedgerStore {
             .iter()
             .flat_map(|(node, state)| {
                 (!state.finish_admitted)
-                    .then_some(&state.completed_skill_calls)
+                    .then_some(&state.completed_calls)
                     .into_iter()
                     .flatten()
                     .cloned()
@@ -314,76 +335,47 @@ impl LoopLedgerStore {
             .collect())
     }
 
-    fn completed_ordinary_calls(&self) -> Result<Vec<(String, PendingCall)>, ExecutionError> {
-        let nodes = self
+    fn restore_completed_turn(
+        &self,
+        node: &str,
+        completed: &[(CompletedCall, Value)],
+    ) -> Result<(), ExecutionError> {
+        let mut nodes = self
             .nodes
             .lock()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        Ok(nodes
+        let state = nodes
+            .get_mut(node)
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if completed
             .iter()
-            .flat_map(|(node, state)| {
-                (!state.finish_admitted)
-                    .then_some(&state.completed_ordinary_calls)
-                    .into_iter()
-                    .flatten()
-                    .cloned()
-                    .map(|call| (node.clone(), call))
-            })
-            .collect())
-    }
-
-    fn restore_completed_skill_call(
-        &self,
-        node: &str,
-        call: &PendingCall,
-        response: Value,
-    ) -> Result<(), ExecutionError> {
-        let mut nodes = self
-            .nodes
-            .lock()
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let state = nodes
-            .get_mut(node)
-            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        if !state.completed_skill_calls.iter().any(|completed| {
-            completed.id == call.id
-                && completed.name == call.name
-                && completed.fingerprint == call.fingerprint
-        }) {
+            .any(|(call, _)| !state.completed_calls.contains(call))
+        {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
-        state.conversation.push(tool_call_content(call));
-        state
-            .conversation
-            .push(tool_response_content(call, response));
-        state.conversation_reconstructed = true;
-        Ok(())
-    }
-
-    fn restore_completed_ordinary_call(
-        &self,
-        node: &str,
-        call: &PendingCall,
-        response: Value,
-    ) -> Result<(), ExecutionError> {
-        let mut nodes = self
-            .nodes
-            .lock()
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let state = nodes
-            .get_mut(node)
+        let model_iteration = completed
+            .first()
+            .map(|(completed, _)| completed.call().model_iteration)
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        if !state.completed_ordinary_calls.iter().any(|completed| {
-            completed.id == call.id
-                && completed.name == call.name
-                && completed.fingerprint == call.fingerprint
-        }) {
-            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
-        }
-        state.conversation.push(tool_call_content(call));
+        let mut admitted = completed
+            .iter()
+            .map(|(completed, _)| completed.call())
+            .chain(
+                state
+                    .pending_calls
+                    .iter()
+                    .filter(|call| call.model_iteration == model_iteration),
+            )
+            .collect::<Vec<_>>();
+        admitted.sort_by_key(|call| call.admission_ordinal);
         state
             .conversation
-            .push(tool_response_content(call, response));
+            .extend(admitted.into_iter().map(tool_call_content));
+        state
+            .conversation
+            .extend(completed.iter().map(|(completed, response)| {
+                tool_response_content(completed.call(), response.clone())
+            }));
         state.conversation_reconstructed = true;
         Ok(())
     }
@@ -493,14 +485,15 @@ impl LoopLedgerStore {
             .remove(index)
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         state.tool_output_bytes = total;
-        if matches!(
+        let completed = if matches!(
             call.name.as_str(),
             "activate_skill" | "read_skill_resource" | "run_skill_script"
         ) {
-            state.completed_skill_calls.push(call.clone());
+            CompletedCall::Skill(call.clone())
         } else {
-            state.completed_ordinary_calls.push(call.clone());
-        }
+            CompletedCall::Ordinary(call.clone())
+        };
+        state.completed_calls.push(completed);
         if !state
             .conversation
             .iter()
@@ -553,12 +546,9 @@ impl LoopLedgerStore {
                 for call in &mut state.pending_calls {
                     call.args = durable_pending_args(call).expect("checked pending calls");
                 }
-                for call in &mut state.completed_skill_calls {
-                    call.args = durable_pending_args(call).expect("checked completed Skill calls");
-                }
-                for call in &mut state.completed_ordinary_calls {
-                    call.args =
-                        durable_pending_args(call).expect("checked completed ordinary calls");
+                for completed in &mut state.completed_calls {
+                    let call = completed.call_mut();
+                    call.args = durable_pending_args(call).expect("checked completed calls");
                 }
             }
         }
@@ -598,7 +588,7 @@ impl LoopLedgerStore {
         write_json(
             &self.path,
             &LoopLedgerV1 {
-                schema_version: 4,
+                schema_version: 5,
                 checkpoint_identity: self.checkpoint_identity.clone(),
                 nodes: nodes.clone(),
                 checkpoint_nodes: Some(checkpoint_nodes),
@@ -615,19 +605,16 @@ impl LoopLedgerStore {
                 for call in &mut state.pending_calls {
                     call.args = durable_pending_args(call).expect("checked pending calls");
                 }
-                for call in &mut state.completed_skill_calls {
-                    call.args = durable_pending_args(call).expect("checked completed Skill calls");
-                }
-                for call in &mut state.completed_ordinary_calls {
-                    call.args =
-                        durable_pending_args(call).expect("checked completed ordinary calls");
+                for completed in &mut state.completed_calls {
+                    let call = completed.call_mut();
+                    call.args = durable_pending_args(call).expect("checked completed calls");
                 }
             }
         }
         write_json(
             &self.path,
             &LoopLedgerV1 {
-                schema_version: 4,
+                schema_version: 5,
                 checkpoint_identity: self.checkpoint_identity.clone(),
                 nodes,
                 checkpoint_nodes: None,
@@ -674,12 +661,9 @@ impl LoopLedgerStore {
                 for call in &mut state.pending_calls {
                     call.args = durable_pending_args(call).expect("checked pending calls");
                 }
-                for call in &mut state.completed_skill_calls {
-                    call.args = durable_pending_args(call).expect("checked completed Skill calls");
-                }
-                for call in &mut state.completed_ordinary_calls {
-                    call.args =
-                        durable_pending_args(call).expect("checked completed ordinary calls");
+                for completed in &mut state.completed_calls {
+                    let call = completed.call_mut();
+                    call.args = durable_pending_args(call).expect("checked completed calls");
                 }
             }
         }
@@ -1005,8 +989,7 @@ fn valid_loop_state(state: &LoopState) -> bool {
         let disposed = state
             .pending_calls
             .iter()
-            .chain(&state.completed_skill_calls)
-            .chain(&state.completed_ordinary_calls)
+            .chain(state.completed_calls.iter().map(CompletedCall::call))
             .collect::<Vec<_>>();
         let disposed_ids = disposed
             .iter()
@@ -1015,6 +998,10 @@ fn valid_loop_state(state: &LoopState) -> bool {
         let disposed_calls = disposed
             .iter()
             .map(|call| (call.name.clone(), call.fingerprint.clone()))
+            .collect::<BTreeSet<_>>();
+        let admission_ordinals = disposed
+            .iter()
+            .map(|call| call.admission_ordinal)
             .collect::<BTreeSet<_>>();
         return state.finished_output.is_none()
             && state.finish_admitted == state.finish_successor.is_some()
@@ -1026,14 +1013,21 @@ fn valid_loop_state(state: &LoopState) -> bool {
                         || workflow_runtime::argument_fingerprint(&call.args) == call.fingerprint)
             })
             && state
-                .completed_skill_calls
+                .completed_calls
                 .iter()
-                .all(valid_completed_skill_call)
-            && state
-                .completed_ordinary_calls
-                .iter()
-                .all(valid_completed_ordinary_call)
+                .all(|completed| match completed {
+                    CompletedCall::Skill(call) => valid_completed_skill_call(call),
+                    CompletedCall::Ordinary(call) => valid_completed_ordinary_call(call),
+                })
             && state.total_tool_calls == tool_call_total
+            && admission_ordinals.len() == disposed.len()
+            && admission_ordinals
+                .iter()
+                .copied()
+                .eq((1_u64..).take(disposed.len()))
+            && disposed.iter().all(|call| {
+                call.model_iteration > 0 && call.model_iteration <= state.model_iterations
+            })
             && disposed.len() == disposed_ids.len()
             && disposed_ids == state.seen_ids
             && disposed_calls == state.seen_calls
@@ -1094,11 +1088,16 @@ fn valid_loop_state(state: &LoopState) -> bool {
                         return false;
                     };
                     tool_calls.insert(name.clone(), count);
+                    let Ok(admission_ordinal) = u64::try_from(seen_ids.len()) else {
+                        return false;
+                    };
                     calls.push_back(PendingCall {
                         id: id.clone(),
                         name: name.clone(),
                         args: args.clone(),
                         fingerprint,
+                        model_iteration: model_iterations,
+                        admission_ordinal,
                     });
                 }
                 adk_rust::Part::FunctionCall { .. } => return false,
@@ -1149,6 +1148,8 @@ fn valid_loop_state(state: &LoopState) -> bool {
                     && actual.name == expected.name
                     && actual.args == expected.args
                     && actual.fingerprint == expected.fingerprint
+                    && actual.model_iteration == expected.model_iteration
+                    && actual.admission_ordinal == expected.admission_ordinal
             })
         && state.tool_output_bytes == tool_output_bytes
         && state
@@ -1363,6 +1364,8 @@ impl LoopController {
                     name: name.clone(),
                     args: args.clone(),
                     fingerprint,
+                    model_iteration: next.model_iterations + 1,
+                    admission_ordinal: next.total_tool_calls,
                 });
             }
         }
@@ -1473,17 +1476,43 @@ impl LoopController {
             next.skill_resource_read_reservations
                 .remove(&call.fingerprint);
         }
+        if !self.ledger.persist_raw_loop_state {
+            let projected_args = durable_pending_args(&call)
+                .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+            let (admitted_name, admitted_args) = next
+                .conversation
+                .iter_mut()
+                .rev()
+                .flat_map(|content| content.parts.iter_mut().rev())
+                .find_map(|part| match part {
+                    adk_rust::Part::FunctionCall {
+                        name,
+                        args,
+                        id: Some(id),
+                        ..
+                    } if id == &call.id => Some((name, args)),
+                    _ => None,
+                })
+                .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+            if admitted_name != &call.name
+                || workflow_runtime::argument_fingerprint(admitted_args) != call.fingerprint
+            {
+                return Err(self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"));
+            }
+            *admitted_args = projected_args;
+        }
         let completion_barrier = match name {
             "activate_skill" => Some("after-skill-call-completion-activate_skill"),
             "read_skill_resource" => Some("after-skill-call-completion-read_skill_resource"),
             "run_skill_script" => Some("after-skill-call-completion-run_skill_script"),
             _ => None,
         };
-        if completion_barrier.is_some() {
-            next.completed_skill_calls.push(call.clone());
+        let completed = if completion_barrier.is_some() {
+            CompletedCall::Skill(call.clone())
         } else {
-            next.completed_ordinary_calls.push(call.clone());
-        }
+            CompletedCall::Ordinary(call.clone())
+        };
+        next.completed_calls.push(completed);
         next.conversation
             .push(tool_response_content(&call, response.clone()));
         if self
@@ -2418,6 +2447,8 @@ impl ExecutionProfileV1 {
                     name: name.clone(),
                     fingerprint: workflow_runtime::argument_fingerprint(&args),
                     args,
+                    model_iteration: 0,
+                    admission_ordinal: 0,
                 })?;
                 Some(json!({"id": id, "name": name, "args": args}))
             })
@@ -4102,13 +4133,13 @@ impl ExecutionBackend {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        if let Err(error) = restore_completed_skill_calls(
+        if let Err(error) = restore_completed_calls(
             &loop_ledger,
             &toolsets,
             &profile.skill_packages()?,
             &effect_fence,
+            &profile,
         )
-        .and_then(|()| restore_completed_ordinary_calls(&loop_ledger, &profile))
         .and_then(|()| {
             replay_pending_tools(
                 &loop_ledger,
@@ -4863,68 +4894,76 @@ fn invoke_restored_tool(
     serde_json::to_value(response).map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))
 }
 
-fn restore_completed_skill_calls(
+fn restore_completed_calls(
     ledger: &LoopLedgerStore,
     toolsets: &BTreeMap<String, Option<BoundTool>>,
     packages: &BTreeMap<String, Arc<SkillPackage>>,
     effect_fence: &EffectFence,
-) -> Result<(), ExecutionError> {
-    for (node, completed) in ledger.completed_skill_calls()? {
-        if is_redacted_script_pending(&completed) {
-            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
-        }
-        let toolset = toolsets
-            .get(&node)
-            .and_then(Option::as_ref)
-            .map(|(_, toolset)| Arc::clone(toolset))
-            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let response = if completed.name == "read_skill_resource" {
-            let input = serde_json::from_value::<ReadSkillResourceInput>(completed.args.clone())
-                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-            let resource_id = SkillResourceId::new(&input.resource_id)
-                .ok()
-                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-            let payload = packages
-                .get(&input.skill_id)
-                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
-                .read_resource(
-                    &resource_id,
-                    PageRequest::new(
-                        input.offset,
-                        NonZeroU64::new(input.limit).ok_or_else(|| {
-                            ExecutionError::new(ExecutionErrorKind::InvalidRunState)
-                        })?,
-                    ),
-                    NonZeroU64::new(SKILL_RESOURCE_READ_LIMIT)
-                        .expect("positive resource read limit"),
-                )
-                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-            serde_json::to_value(ToolEnvelope::success(
-                payload,
-                ToolProvenance::new("skill.runtime", "1"),
-            ))
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
-        } else {
-            invoke_restored_tool(&node, &completed, toolset, effect_fence)?
-        };
-        ledger.restore_completed_skill_call(&node, &completed, response)?;
-    }
-    Ok(())
-}
-
-fn restore_completed_ordinary_calls(
-    ledger: &LoopLedgerStore,
     profile: &ExecutionProfileV1,
 ) -> Result<(), ExecutionError> {
-    for (node, completed) in ledger.completed_ordinary_calls()? {
-        let tool = profile
-            .tool_wires()
-            .find(|tool| tool.name == completed.name)
-            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let provenance = profile.tool_registration(tool)?.provenance().clone();
-        let response = serde_json::to_value(ToolEnvelope::success(tool.result.clone(), provenance))
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        ledger.restore_completed_ordinary_call(&node, &completed, response)?;
+    let mut restored = Vec::new();
+    for (node, completed) in ledger.completed_calls()? {
+        let call = completed.call();
+        let response = match &completed {
+            CompletedCall::Skill(_) => {
+                if is_redacted_script_pending(call) {
+                    return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+                }
+                let toolset = toolsets
+                    .get(&node)
+                    .and_then(Option::as_ref)
+                    .map(|(_, toolset)| Arc::clone(toolset))
+                    .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                if call.name == "read_skill_resource" {
+                    let input = serde_json::from_value::<ReadSkillResourceInput>(call.args.clone())
+                        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                    let resource_id = SkillResourceId::new(&input.resource_id)
+                        .ok()
+                        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                    let payload = packages
+                        .get(&input.skill_id)
+                        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+                        .read_resource(
+                            &resource_id,
+                            PageRequest::new(
+                                input.offset,
+                                NonZeroU64::new(input.limit).ok_or_else(|| {
+                                    ExecutionError::new(ExecutionErrorKind::InvalidRunState)
+                                })?,
+                            ),
+                            NonZeroU64::new(SKILL_RESOURCE_READ_LIMIT)
+                                .expect("positive resource read limit"),
+                        )
+                        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                    serde_json::to_value(ToolEnvelope::success(
+                        payload,
+                        ToolProvenance::new("skill.runtime", "1"),
+                    ))
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+                } else {
+                    invoke_restored_tool(&node, call, toolset, effect_fence)?
+                }
+            }
+            CompletedCall::Ordinary(_) => {
+                let tool = profile
+                    .tool_wires()
+                    .find(|tool| tool.name == call.name)
+                    .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                let provenance = profile.tool_registration(tool)?.provenance().clone();
+                serde_json::to_value(ToolEnvelope::success(tool.result.clone(), provenance))
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+            }
+        };
+        restored.push((node, completed, response));
+    }
+    for turn in restored.chunk_by(|left, right| {
+        left.0 == right.0 && left.1.call().model_iteration == right.1.call().model_iteration
+    }) {
+        let completed = turn
+            .iter()
+            .map(|(_, completed, response)| (completed.clone(), response.clone()))
+            .collect::<Vec<_>>();
+        ledger.restore_completed_turn(&turn[0].0, &completed)?;
     }
     Ok(())
 }
