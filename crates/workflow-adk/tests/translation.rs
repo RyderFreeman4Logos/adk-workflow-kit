@@ -1771,6 +1771,72 @@ to = "done"
 }
 
 #[tokio::test]
+async fn authored_revise_max_visits_completes_every_authored_visit() {
+    const SOURCE: &str = r#"
+schema_version = 1
+[workflow]
+id = "direct-revise-budget"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "revise"
+kind = "action"
+max_visits = 4
+idempotent = true
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "done"
+"#;
+    let plan = compile_str("direct-revise-budget.workflow.toml", SOURCE).expect("fixture compiles");
+    let graph = AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("translation succeeds");
+    let mut mapper = AdkEventMapper::new("run-revise-budget", "direct-revise-budget").unwrap();
+    let mut artifacts = InMemoryArtifactStore::new(
+        std::num::NonZeroU64::new(64 * 1024).unwrap(),
+        std::num::NonZeroU64::new(64 * 1024).unwrap(),
+    );
+    let err = graph
+        .invoke_observed(
+            State::new(),
+            ExecutionConfig::new("direct-revise-budget"),
+            &mut mapper,
+            &mut artifacts,
+        )
+        .await
+        .expect_err("a self-loop into revise must honor authored max_visits");
+    let completed = mapper
+        .events()
+        .iter()
+        .filter(|event| {
+            event.kind() == WorkflowRuntimeEventKindV1::NodeCompleted
+                && event.node_id() == Some("revise")
+        })
+        .count();
+    assert_eq!(
+        completed, 4,
+        "authored max_visits=4 must complete 4 revise visits, got {completed}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "visit bound exceeded: max_visits=4",
+        "authored max_visits=4 must stay authoritative, got {err}"
+    );
+}
+
+#[tokio::test]
 async fn revise_divergent_predecessors_fan_in_then_admission() {
     const SOURCE: &str = r#"
 schema_version = 1

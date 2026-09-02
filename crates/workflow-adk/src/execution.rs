@@ -3704,14 +3704,7 @@ impl ExecutionBackend {
         let profile_identity = bound_profile_identity(&profile)?;
         let effective_capabilities = sandbox_capabilities;
         let transform_module = profile.transform_module()?;
-        let recursion_limit = compiled
-            .ir()
-            .nodes()
-            .iter()
-            .filter_map(workflow_ir::IrNode::max_visits)
-            .map(|visits| visits as usize)
-            .sum::<usize>()
-            .max(50);
+        let recursion_limit = crate::graph_recursion_limit(compiled.ir()).max(50);
         let manager = WorkdirManager::new(workdir_base)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let run_id = fresh_run_id()?;
@@ -4499,14 +4492,7 @@ impl ExecutionBackend {
                 Some(continuation.clone()),
             )
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let recursion_limit = compiled
-            .ir()
-            .nodes()
-            .iter()
-            .filter_map(workflow_ir::IrNode::max_visits)
-            .map(|visits| visits as usize)
-            .sum::<usize>()
-            .max(50);
+        let recursion_limit = crate::graph_recursion_limit(compiled.ir()).max(50);
         let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

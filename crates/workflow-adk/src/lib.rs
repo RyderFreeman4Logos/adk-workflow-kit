@@ -487,7 +487,10 @@ impl AdkGraph {
     ) -> Result<State, AdkGraphError> {
         let mut state = self.input.map(state);
         state.retain(|key, _| !key.starts_with("visits:"));
-        let limit = self.recursion_limit.min(config.recursion_limit);
+        let limit = match self.visit_bound {
+            Some(_) => self.recursion_limit,
+            None => self.recursion_limit.min(config.recursion_limit),
+        };
         let mut config = config.with_recursion_limit(limit);
         if let Some(binding) = &self.plan_binding {
             config = config
@@ -556,7 +559,10 @@ impl AdkGraph {
         if config.resume_from.is_none() {
             state.retain(|key, _| !key.starts_with("visits:"));
         }
-        let limit = self.recursion_limit.min(config.recursion_limit);
+        let limit = match self.visit_bound {
+            Some(_) => self.recursion_limit,
+            None => self.recursion_limit.min(config.recursion_limit),
+        };
         let mut config = config.with_recursion_limit(limit);
         if let Some(binding) = &self.plan_binding {
             config = config
@@ -1119,7 +1125,7 @@ impl AdkGraphTranslator {
             }
         }
         let visit_bound = ir_visit_bound(ir);
-        let recursion_limit = visit_bound.unwrap_or(50);
+        let recursion_limit = graph_recursion_limit(ir);
         let mut builder = GraphAgent::builder(ir.workflow_id().as_str())
             .channels(&["terminal"])
             .recursion_limit(recursion_limit);
@@ -1523,6 +1529,22 @@ fn ir_visit_bound(ir: &workflow_ir::WorkflowIr) -> Option<usize> {
         .map(|visits| visits as usize)
         .sum();
     (bound != 0).then_some(bound)
+}
+
+fn graph_recursion_limit(ir: &workflow_ir::WorkflowIr) -> usize {
+    let visit_bound = ir_visit_bound(ir).unwrap_or(50);
+    let Some(revise) = ir
+        .nodes()
+        .iter()
+        .find(|node| node.id().as_str() == "revise")
+    else {
+        return visit_bound;
+    };
+    let revise_visits = revise.max_visits().unwrap_or(0) as usize;
+    // ponytail: +16 covers start/fan-in/unknown-route synthetics; raise if a new node class appears
+    visit_bound
+        .saturating_add(revise_visits.saturating_add(1).saturating_mul(2))
+        .saturating_add(16)
 }
 
 fn valid_path(path: &str) -> bool {
