@@ -1080,12 +1080,11 @@ impl Llm for ModelBinding {
         stream: bool,
     ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
         let request = self.apply_runtime(request);
-        let stream = stream && self.identity.provider != "openai-compatible";
         let mut retried = false;
         loop {
             match generate_once(self, request.clone(), stream).await {
-                Ok(item) => {
-                    return Ok(Box::pin(stream::once(async move { Ok(item) }))
+                Ok(items) => {
+                    return Ok(Box::pin(stream::iter(items.into_iter().map(Ok)))
                         as adk_rust::LlmResponseStream);
                 }
                 Err(error) if !retried && retryable_provider_error(&error) => {
@@ -1102,7 +1101,7 @@ async fn generate_once(
     binding: &ModelBinding,
     request: LlmRequest,
     stream: bool,
-) -> adk_rust::Result<LlmResponse> {
+) -> adk_rust::Result<Vec<LlmResponse>> {
     let mut inner = adk_rust::tokio::time::timeout(
         binding.runtime.timeout(),
         binding.llm.generate_content(request, stream),
@@ -1115,13 +1114,18 @@ async fn generate_once(
             "model profile timed out",
         )
     })??;
-    match inner.next().await {
-        Some(Ok(response)) if response.content.is_none() => {
-            Err(AdkError::agent("model.profile.unreachable"))
+    let mut items = Vec::new();
+    while let Some(item) = inner.next().await {
+        let response = item?;
+        if items.is_empty() && response.content.is_none() {
+            return Err(AdkError::agent("model.profile.unreachable"));
         }
-        Some(item) => item,
-        None => Err(AdkError::agent("model.profile.unreachable")),
+        items.push(response);
     }
+    if items.is_empty() {
+        return Err(AdkError::agent("model.profile.unreachable"));
+    }
+    Ok(items)
 }
 
 fn retryable_provider_error(error: &AdkError) -> bool {
@@ -1153,5 +1157,79 @@ mod retry_admission_tests {
             "substring rate must not admit retry, got {}",
             error
         );
+    }
+
+    struct MultiChunkLlm;
+
+    #[async_trait]
+    impl Llm for MultiChunkLlm {
+        fn name(&self) -> &str {
+            "multi-chunk"
+        }
+
+        async fn generate_content(
+            &self,
+            _request: LlmRequest,
+            _stream: bool,
+        ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+            Ok(Box::pin(stream::iter([
+                Ok(LlmResponse::new(Content::new("assistant").with_text("one"))),
+                Ok(LlmResponse::new(Content::new("assistant").with_text("two"))),
+            ])))
+        }
+    }
+
+    #[test]
+    fn streaming_binding_preserves_every_response_chunk() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let binding = ModelBinding {
+                    role: ModelRole::Worker,
+                    identity: ModelBindingIdentity {
+                        profile: ModelProfileIdentity::new("worker", "1"),
+                        requested_model: "multi-chunk".to_owned(),
+                        resolved_model: "multi-chunk".to_owned(),
+                        provider: "custom".to_owned(),
+                    },
+                    runtime: ModelRuntimeConfig::default(),
+                    llm: Arc::new(MultiChunkLlm),
+                    fake_queue: None,
+                    retries: Arc::new(AtomicU64::new(0)),
+                };
+                let request =
+                    LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+                let mut items = Llm::generate_content(&binding, request, true)
+                    .await
+                    .expect("streamed binding must succeed");
+                let first = items
+                    .next()
+                    .await
+                    .expect("first chunk")
+                    .expect("first chunk ok")
+                    .content
+                    .expect("first content")
+                    .parts[0]
+                    .text()
+                    .map(str::to_owned);
+                let second = items
+                    .next()
+                    .await
+                    .expect("second chunk")
+                    .expect("second chunk ok")
+                    .content
+                    .expect("second content")
+                    .parts[0]
+                    .text()
+                    .map(str::to_owned);
+                assert_eq!(first.as_deref(), Some("one"));
+                assert_eq!(second.as_deref(), Some("two"));
+                assert!(
+                    items.next().await.is_none(),
+                    "stream must end after both chunks"
+                );
+            });
     }
 }
