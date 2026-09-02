@@ -421,13 +421,6 @@ fn terminal_graph_error(message: &str) -> Option<AdkGraphError> {
     ]
     .into_iter()
     .find_map(|(marker, error)| message.contains(marker).then_some(error))
-    .or_else(|| {
-        message
-            .contains(UNKNOWN_ROUTE_ERROR_PREFIX)
-            .then(|| AdkGraphError::InvalidOutput {
-                node: "route".to_owned(),
-            })
-    })
 }
 
 /// Explicit state input mapping owned by the adapter.
