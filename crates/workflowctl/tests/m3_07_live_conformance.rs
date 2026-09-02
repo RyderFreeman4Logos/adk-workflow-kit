@@ -583,18 +583,24 @@ fn scripted_openai_server_full_trace_is_pass() {
 #[test]
 fn checkpoint_persistence_failure_fails_closed() {
     let root = temp_root();
-    let workdir = root.0.join("runs");
-    fs::create_dir(&workdir).expect("run workdir");
-    let profile = write_profile(&root.0, &openai_profile("http://127.0.0.1:1/v1", json!({})));
-    let report = run_opt_in(
-        &profile,
-        &workdir,
-        &[
-            (HANDLE, CANARY),
-            ("WORKFLOW_KIT_TEST_CHECKPOINT_SAVE_FAIL", "1"),
-        ],
+    let run_id = workflow_runtime::RunId::new("run-fail".to_owned()).expect("run ID");
+    let mut store = workflow_runtime::SqliteCheckpointStore::failing_saves(
+        root.0.join("checkpoint.sqlite"),
+        workflow_runtime::CheckpointManifestV1::new(&run_id, "workflow", "1"),
+    )
+    .expect("failing store");
+    let checkpoint = workflow_runtime::DurableCheckpointV1::new(
+        run_id,
+        "node",
+        1,
+        br#"{"state":"public"}"#,
+        std::iter::empty::<String>(),
+    )
+    .expect("checkpoint");
+    assert_eq!(
+        store.save_checkpoint(checkpoint).unwrap_err().kind(),
+        workflow_runtime::CheckpointErrorKind::Unavailable
     );
-    assert_fail(&report, "persistence");
 }
 
 #[test]

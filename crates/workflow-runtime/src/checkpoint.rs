@@ -300,6 +300,7 @@ pub struct SqliteCheckpointStore {
     path: PathBuf,
     connection: Connection,
     manifest: CheckpointCompatibilityManifestV1,
+    fail_saves: bool,
 }
 
 /// Compatibility alias for callers that name the backend rather than its storage.
@@ -388,7 +389,18 @@ impl SqliteCheckpointStore {
             path,
             connection,
             manifest,
+            fail_saves: false,
         })
+    }
+
+    /// Test harness constructor: subsequent saves fail closed as Unavailable.
+    pub fn failing_saves(
+        path: impl Into<PathBuf>,
+        manifest: CheckpointCompatibilityManifestV1,
+    ) -> Result<Self, CheckpointError> {
+        let mut store = Self::open(path, manifest)?;
+        store.fail_saves = true;
+        Ok(store)
     }
 
     /// Returns the persisted database path.
@@ -406,7 +418,7 @@ impl SqliteCheckpointStore {
         &mut self,
         checkpoint: DurableCheckpointV1,
     ) -> Result<(), CheckpointError> {
-        if std::env::var_os("WORKFLOW_KIT_TEST_CHECKPOINT_SAVE_FAIL").is_some() {
+        if self.fail_saves {
             return Err(CheckpointError::new(CheckpointErrorKind::Unavailable));
         }
         if checkpoint.run_id

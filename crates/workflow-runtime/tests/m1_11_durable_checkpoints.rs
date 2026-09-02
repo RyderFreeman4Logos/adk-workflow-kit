@@ -194,3 +194,47 @@ fn checkpoint_rejects_secret_like_state_without_persisting_it() {
             .any(|window| window == b"fixture-secret-value")
     );
 }
+
+#[test]
+fn sqlite_checkpoint_save_ignores_process_env_fault_flag() {
+    let root = TestRoot::new();
+    let run_id = RunId::new("run-env-fault".to_owned()).unwrap();
+    let mut store = SqliteCheckpointStore::open(root.database(), manifest(&run_id)).unwrap();
+    let checkpoint = DurableCheckpointV1::new(
+        run_id.clone(),
+        "node",
+        1,
+        br#"{"state":"public"}"#,
+        std::iter::empty::<String>(),
+    )
+    .unwrap();
+    // Safety: this focused test is the only writer of the named variable.
+    unsafe {
+        std::env::set_var("WORKFLOW_KIT_TEST_CHECKPOINT_SAVE_FAIL", "1");
+    }
+    let saved = store.save_checkpoint(checkpoint.clone());
+    unsafe {
+        std::env::remove_var("WORKFLOW_KIT_TEST_CHECKPOINT_SAVE_FAIL");
+    }
+    saved.expect("production save must ignore process env fault flags");
+    assert_eq!(store.load_latest(&run_id).unwrap(), Some(checkpoint));
+}
+
+#[test]
+fn sqlite_checkpoint_failing_saves_constructor_returns_unavailable() {
+    let root = TestRoot::new();
+    let run_id = RunId::new("run-failing-saves".to_owned()).unwrap();
+    let mut store =
+        SqliteCheckpointStore::failing_saves(root.database(), manifest(&run_id)).unwrap();
+    let checkpoint = DurableCheckpointV1::new(
+        run_id.clone(),
+        "node",
+        1,
+        br#"{"state":"public"}"#,
+        std::iter::empty::<String>(),
+    )
+    .unwrap();
+    let error = store.save_checkpoint(checkpoint).unwrap_err();
+    assert_eq!(error.kind(), CheckpointErrorKind::Unavailable);
+    assert_eq!(store.load_latest(&run_id).unwrap(), None);
+}
