@@ -166,6 +166,12 @@ fn command() -> Command {
                         .required(true)
                         .value_name("DIR")
                         .help("Run workdir base directory"),
+                )
+                .arg(
+                    Arg::new("fail-checkpoint-saves")
+                        .long("fail-checkpoint-saves")
+                        .hide(true)
+                        .action(ArgAction::SetTrue),
                 ),
         )
         .subcommand(run_state_command("resume"))
@@ -868,6 +874,9 @@ pub(crate) fn run() {
                     Err(_) => exit_diagnostic(Diagnostic::run_unsupported_input(), json),
                 };
                 let cancellation = interrupt_cancellation();
+                if subcommand.get_flag("fail-checkpoint-saves") {
+                    ExecutionBackend::fail_checkpoint_saves_for_tests();
+                }
                 match ExecutionBackend::run_cancellable(path, profile, input, workdir, cancellation)
                 {
                     Ok(receipt) => write_execution_receipt(&receipt, json),

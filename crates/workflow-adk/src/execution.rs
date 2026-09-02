@@ -67,6 +67,7 @@ const LOOP_LEDGER_FILE: &str = "loop-ledger.json";
 const SKILL_SNAPSHOT_FILE: &str = "sealed-skill-snapshot.json";
 const LOOP_LEDGER_DIGEST_KEY: &str = "kit_loop_ledger_digest_v1";
 static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
+static FAIL_CHECKPOINT_SAVES: AtomicBool = AtomicBool::new(false);
 #[cfg(debug_assertions)]
 static CRASH_BARRIER_HITS: AtomicU64 = AtomicU64::new(0);
 static EFFECT_BARRIER_HITS: AtomicU64 = AtomicU64::new(0);
@@ -3466,6 +3467,11 @@ impl std::error::Error for ExecutionError {}
 pub struct ExecutionBackend;
 
 impl ExecutionBackend {
+    /// Test seam: subsequent `run` checkpoint saves use `failing_saves`.
+    pub fn fail_checkpoint_saves_for_tests() {
+        FAIL_CHECKPOINT_SAVES.store(true, Ordering::Relaxed);
+    }
+
     pub fn run(
         workflow: impl AsRef<Path>,
         profile: ExecutionProfileV1,
@@ -3628,10 +3634,12 @@ impl ExecutionBackend {
                 None
             }
         };
-        let mut checkpoint_store = match SqliteCheckpointStore::open(
-            run_root.join("checkpoint.sqlite"),
-            checkpoint_manifest.clone(),
-        ) {
+        let checkpoint_path = run_root.join("checkpoint.sqlite");
+        let mut checkpoint_store = match if FAIL_CHECKPOINT_SAVES.load(Ordering::Relaxed) {
+            SqliteCheckpointStore::failing_saves(&checkpoint_path, checkpoint_manifest.clone())
+        } else {
+            SqliteCheckpointStore::open(&checkpoint_path, checkpoint_manifest.clone())
+        } {
             Ok(store) => Some(store),
             Err(_) => {
                 checkpoint_failed = true;

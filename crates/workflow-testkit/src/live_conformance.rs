@@ -108,12 +108,24 @@ fn report(disposition: ConformanceDisposition, metrics: Option<SafeMetrics>) -> 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LiveConformance {
     enabled: bool,
+    fail_checkpoint_saves: bool,
 }
 
 impl LiveConformance {
     /// Enables a live attempt without consulting environment or config.
     pub const fn opt_in() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            fail_checkpoint_saves: false,
+        }
+    }
+
+    /// Injects `SqliteCheckpointStore::failing_saves` through the child CLI.
+    pub const fn with_failing_checkpoint_saves(self) -> Self {
+        Self {
+            enabled: self.enabled,
+            fail_checkpoint_saves: true,
+        }
     }
 
     /// Runs the opt-in gate. Default reports `SKIP` and performs no I/O.
@@ -177,6 +189,9 @@ impl LiveConformance {
             "--workdir",
             &workdir_s,
         ]);
+        if self.fail_checkpoint_saves {
+            command.arg("--fail-checkpoint-saves");
+        }
         for (key, value) in env {
             command.env(key, value);
         }

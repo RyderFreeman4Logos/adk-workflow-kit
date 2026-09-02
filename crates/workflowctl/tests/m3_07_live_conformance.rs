@@ -97,12 +97,21 @@ fn run_opt_in(
     workdir: &Path,
     env: &[(&str, &str)],
 ) -> workflow_testkit::live_conformance::ConformanceReport {
-    LiveConformance::opt_in().run_canonical_with_env(
+    let mut child_env = Vec::new();
+    let mut live = LiveConformance::opt_in();
+    for &(key, value) in env {
+        if key == "WORKFLOW_KIT_TEST_CHECKPOINT_SAVE_FAIL" {
+            live = live.with_failing_checkpoint_saves();
+            continue;
+        }
+        child_env.push((key, value));
+    }
+    live.run_canonical_with_env(
         env!("CARGO_BIN_EXE_workflowctl").as_ref(),
         &example_root(),
         profile,
         workdir,
-        env,
+        &child_env,
     )
 }
 
@@ -598,24 +607,20 @@ fn metrics_write_failure_is_fail_not_pass() {
 #[test]
 fn checkpoint_persistence_failure_fails_closed() {
     let root = temp_root();
-    let run_id = workflow_runtime::RunId::new("run-fail".to_owned()).expect("run ID");
-    let mut store = workflow_runtime::SqliteCheckpointStore::failing_saves(
-        root.0.join("checkpoint.sqlite"),
-        workflow_runtime::CheckpointManifestV1::new(&run_id, "workflow", "1"),
-    )
-    .expect("failing store");
-    let checkpoint = workflow_runtime::DurableCheckpointV1::new(
-        run_id,
-        "node",
-        1,
-        br#"{"state":"public"}"#,
-        std::iter::empty::<String>(),
-    )
-    .expect("checkpoint");
-    assert_eq!(
-        store.save_checkpoint(checkpoint).unwrap_err().kind(),
-        workflow_runtime::CheckpointErrorKind::Unavailable
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let profile = write_profile(&root.0, &openai_profile("http://127.0.0.1:1/v1", json!({})));
+    let report = run_opt_in(
+        &profile,
+        &workdir,
+        &[
+            (HANDLE, CANARY),
+            ("WORKFLOW_KIT_TEST_CHECKPOINT_SAVE_FAIL", "1"),
+        ],
     );
+    assert_fail(&report, "persistence");
+    assert_ne!(report.disposition(), ConformanceDisposition::Pass);
+    assert_ne!(report.disposition(), ConformanceDisposition::Abstain);
 }
 
 #[test]
