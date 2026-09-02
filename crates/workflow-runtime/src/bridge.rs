@@ -100,6 +100,19 @@ impl ToolCallContext {
 
 /// A registered workflow-kit handler.
 pub trait ToolHandler: Send + Sync {
+    /// Returns the validated call-specific capabilities needed by this handler.
+    fn required_capabilities(
+        &self,
+        _arguments: &Value,
+    ) -> Result<Vec<SandboxCapability>, ToolBridgeError> {
+        Ok(Vec::new())
+    }
+
+    /// Returns whether these validated arguments require call-scoped approval.
+    fn requires_approval(&self, _arguments: &Value) -> Result<bool, ToolBridgeError> {
+        Ok(false)
+    }
+
     /// Executes one already-authorized call through its capability-narrowed child sandbox.
     fn execute(
         &self,
@@ -315,6 +328,19 @@ impl CapabilityIntersection {
             capabilities: registration.required_capabilities().to_vec(),
         })
     }
+
+    fn authorize_capabilities(
+        &self,
+        capabilities: &[SandboxCapability],
+    ) -> Result<(), ToolBridgeError> {
+        if capabilities.iter().any(|capability| {
+            !self.runtime_capabilities.contains(capability)
+                || !self.sandbox_capabilities.contains(capability)
+        }) {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::SandboxDenied));
+        }
+        Ok(())
+    }
 }
 
 /// Closed errors returned by the bridge before or during dispatch.
@@ -326,6 +352,8 @@ pub enum ToolBridgeErrorKind {
     DuplicateTool,
     /// Capability intersection denied the call.
     CapabilityDenied,
+    /// The run sandbox does not grant a capability required by the selected tool.
+    SandboxDenied,
     /// Call-scoped approval was absent or invalid.
     ApprovalDenied,
     /// Input failed the registered JSON schema.
@@ -348,6 +376,7 @@ impl fmt::Display for ToolBridgeErrorKind {
             Self::UnknownTool => "tool is not registered",
             Self::DuplicateTool => "tool is already registered",
             Self::CapabilityDenied => "tool capability intersection denied the call",
+            Self::SandboxDenied => "run sandbox denied a required tool capability",
             Self::ApprovalDenied => "call approval denied the call",
             Self::InvalidInput => "tool input was invalid",
             Self::ProvenanceMismatch => "tool provenance did not match registration",
@@ -553,7 +582,14 @@ impl ToolBridge {
             .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::UnknownTool))?;
         let registration = registered.registration.clone();
         let handler = Arc::clone(&registered.handler);
-        if !registration.flags().read_only() {
+        let mut capabilities = effective.capabilities;
+        capabilities.extend(handler.required_capabilities(call.arguments())?);
+        capabilities.sort_unstable_by_key(SandboxCapability::as_str);
+        capabilities.dedup();
+        authority.authorize_capabilities(&capabilities)?;
+        let effectful =
+            !registration.flags().read_only() || handler.requires_approval(call.arguments())?;
+        if effectful {
             approvals
                 .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::ApprovalDenied))?
                 .authorize(
@@ -581,8 +617,7 @@ impl ToolBridge {
             deadline,
         };
         let timeout = Duration::from_millis(registration.timeout_ms().get());
-        let capabilities = effective.capabilities;
-        if !registration.flags().read_only() {
+        if effectful {
             if let Some(result) = self.idempotent_results.get(&idempotency_key) {
                 return Ok(result.clone());
             }
@@ -596,9 +631,7 @@ impl ToolBridge {
                     .spawn(move || {
                         let result = sandbox
                             .child(capabilities)
-                            .map_err(|_| {
-                                ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied)
-                            })
+                            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::SandboxDenied))
                             .and_then(|sandbox| handler.execute(&sandbox, &context, &arguments));
                         let _ = sender.send(result);
                     })
@@ -625,7 +658,7 @@ impl ToolBridge {
             .spawn(move || {
                 let result = sandbox
                     .child(capabilities)
-                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::SandboxDenied))
                     .and_then(|sandbox| handler.execute(&sandbox, &context, &arguments));
                 let _ = sender.send(result);
             })

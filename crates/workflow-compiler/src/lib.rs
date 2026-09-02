@@ -15,7 +15,10 @@ mod skill_runtime;
 use std::{collections::VecDeque, fmt};
 
 use workflow_ir::{IrNode, IrNodeKind, NodeId, WorkflowIr};
-use workflow_spec::{NodeKind, SourcePath, SpecError, WorkflowSpec, parse_file, parse_str};
+use workflow_spec::{
+    NodeKind, SourcePath, SpecError, WorkflowSpec, is_reserved_skill_tool_name, parse_file,
+    parse_str,
+};
 
 pub use diagnostics::{Diagnostic, DiagnosticProjectionError};
 pub use graph_builder::{GraphBuildError, GraphBuilder, RegistryBinding, RegistryIdentityDrift};
@@ -200,6 +203,8 @@ pub enum BindingValidationError {
     InvalidPlacement,
     /// A reviewer model attempted to own a static tool.
     ReviewerTool,
+    /// A static tool attempted to use a public Skill runtime tool name.
+    ReservedSkillTool,
 }
 
 impl fmt::Display for BindingValidationError {
@@ -207,6 +212,7 @@ impl fmt::Display for BindingValidationError {
         formatter.write_str(match self {
             Self::InvalidPlacement => "binding fields require an agent node",
             Self::ReviewerTool => "reviewer nodes cannot own tools",
+            Self::ReservedSkillTool => "static tool name is reserved by the Skill runtime",
         })
     }
 }
@@ -215,7 +221,9 @@ impl std::error::Error for BindingValidationError {}
 
 fn validate_node_bindings(spec: &WorkflowSpec) -> Result<(), CompileError> {
     for node in spec.nodes() {
-        if node.kind() != NodeKind::Agent && (node.model().is_some() || !node.tools().is_empty()) {
+        if node.kind() != NodeKind::Agent
+            && (node.model().is_some() || !node.tools().is_empty() || !node.skills().is_empty())
+        {
             return Err(CompileError::Binding(
                 BindingValidationError::InvalidPlacement,
             ));
@@ -223,9 +231,18 @@ fn validate_node_bindings(spec: &WorkflowSpec) -> Result<(), CompileError> {
         if node
             .model()
             .is_some_and(|model| model.role() == workflow_spec::ModelRole::Reviewer)
-            && !node.tools().is_empty()
+            && (!node.tools().is_empty() || !node.skills().is_empty())
         {
             return Err(CompileError::Binding(BindingValidationError::ReviewerTool));
+        }
+        if node
+            .tools()
+            .iter()
+            .any(|tool| is_reserved_skill_tool_name(tool.id()))
+        {
+            return Err(CompileError::Binding(
+                BindingValidationError::ReservedSkillTool,
+            ));
         }
     }
     Ok(())

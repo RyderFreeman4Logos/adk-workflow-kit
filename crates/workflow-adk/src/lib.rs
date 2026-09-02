@@ -232,9 +232,9 @@ impl TerminalOutcome {
     /// Projects a real ToolBridge policy denial to the closed terminal vocabulary.
     pub const fn from_tool_bridge_error(kind: ToolBridgeErrorKind) -> Self {
         match kind {
-            ToolBridgeErrorKind::CapabilityDenied | ToolBridgeErrorKind::ApprovalDenied => {
-                Self::AuthorizationDenied
-            }
+            ToolBridgeErrorKind::CapabilityDenied
+            | ToolBridgeErrorKind::ApprovalDenied
+            | ToolBridgeErrorKind::InvalidInput => Self::AuthorizationDenied,
             _ => Self::Failed,
         }
     }
@@ -321,6 +321,7 @@ pub enum AdkGraphError {
     VisitBound { max_visits: usize },
     Observation(events::AdkEventMappingErrorKind),
     AuthorizationDenied,
+    SandboxDenied,
     ModelIterationsLimit,
     TotalToolCallsLimit,
     ToolCallsPerToolLimit,
@@ -351,6 +352,7 @@ impl fmt::Display for AdkGraphError {
             }
             Self::Observation(_) => write!(f, "ADK event observation failed"),
             Self::AuthorizationDenied => write!(f, "authorization denied"),
+            Self::SandboxDenied => write!(f, "sandbox denied a required capability"),
             Self::ModelIterationsLimit => write!(f, "model iteration limit exceeded"),
             Self::TotalToolCallsLimit => write!(f, "total tool-call limit exceeded"),
             Self::ToolCallsPerToolLimit => write!(f, "per-tool call limit exceeded"),
@@ -377,6 +379,7 @@ fn terminal_graph_error(message: &str) -> Option<AdkGraphError> {
             "tool.bridge.authorization_denied",
             AdkGraphError::AuthorizationDenied,
         ),
+        ("tool.bridge.sandbox_denied", AdkGraphError::SandboxDenied),
         (
             "workflow.loop.limit.model_iterations",
             AdkGraphError::ModelIterationsLimit,
@@ -477,6 +480,9 @@ impl AdkGraph {
                 if let GraphError::NodeExecutionFailed { node, message } = &error {
                     if message.contains("tool.bridge.authorization_denied") {
                         return Err(AdkGraphError::AuthorizationDenied);
+                    }
+                    if message.contains("tool.bridge.sandbox_denied") {
+                        return Err(AdkGraphError::SandboxDenied);
                     }
                     if let Some(target) = self.fan_in_guard_nodes.get(node)
                         && let Some(key) = message.strip_prefix("workflow fan-in conflict: ")

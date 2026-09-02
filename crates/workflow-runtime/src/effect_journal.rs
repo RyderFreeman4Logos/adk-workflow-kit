@@ -22,13 +22,27 @@ impl EffectKey {
         logical_operation_id: impl AsRef<str>,
         arguments: &Value,
     ) -> Self {
-        let arguments = canonical_json(arguments);
+        Self::from_argument_fingerprint(
+            run_id,
+            node_id,
+            logical_operation_id,
+            crate::argument_fingerprint(arguments),
+        )
+    }
+
+    /// Builds the same key from a privacy-safe canonical argument fingerprint.
+    pub fn from_argument_fingerprint(
+        run_id: impl AsRef<str>,
+        node_id: impl AsRef<str>,
+        logical_operation_id: impl AsRef<str>,
+        argument_fingerprint: impl AsRef<str>,
+    ) -> Self {
         let mut digest = Sha256::new();
         for value in [
             run_id.as_ref().as_bytes(),
             node_id.as_ref().as_bytes(),
             logical_operation_id.as_ref().as_bytes(),
-            arguments.as_bytes(),
+            argument_fingerprint.as_ref().as_bytes(),
         ] {
             digest.update(value);
             digest.update([0]);
@@ -244,44 +258,4 @@ fn secure_path(path: &Path) -> Result<(), EffectJournalError> {
         return Err(EffectJournalError::new(EffectJournalErrorKind::Unavailable));
     }
     Ok(())
-}
-
-fn canonical_json(value: &Value) -> String {
-    match value {
-        Value::Object(object) => {
-            let mut keys = object.keys().collect::<Vec<_>>();
-            keys.sort_unstable();
-            let fields = keys
-                .into_iter()
-                .map(|key| {
-                    format!(
-                        "{}:{}",
-                        serde_json::to_string(key).unwrap_or_default(),
-                        canonical_json(&object[key])
-                    )
-                })
-                .collect::<Vec<_>>();
-            format!("{{{}}}", fields.join(","))
-        }
-        Value::Array(values) => format!(
-            "[{}]",
-            values
-                .iter()
-                .map(canonical_json)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        _ => serde_json::to_string(value).unwrap_or_default(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::canonical_json;
-    use serde_json::json;
-
-    #[test]
-    fn canonical_json_sorts_object_keys() {
-        assert_eq!(canonical_json(&json!({"b": 2, "a": 1})), r#"{"a":1,"b":2}"#);
-    }
 }

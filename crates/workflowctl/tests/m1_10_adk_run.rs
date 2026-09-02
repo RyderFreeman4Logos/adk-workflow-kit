@@ -18,6 +18,9 @@ use workflow_runtime::{
     SqliteCheckpointStore, WorkflowRuntimeEventV1,
 };
 
+#[path = "support/owned_tree.rs"]
+mod owned_tree;
+
 static TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 const WORKFLOW: &str = r#"
@@ -121,7 +124,7 @@ impl TempRoot {
         {
             return Err("test root cleanup identity mismatch");
         }
-        fs::remove_dir_all(&self.path).map_err(|_| "test root cleanup failed")
+        owned_tree::remove_dir_all(&self.path).map_err(|_| "test root cleanup failed")
     }
 }
 
@@ -1689,7 +1692,7 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
             .expect("UTF-8 abort root"),
     );
     let sentinel_survived = fixture_root.join("sentinel").is_file();
-    let _ = fs::remove_dir_all(&fixture_root);
+    let _ = owned_tree::remove_dir_all(&fixture_root);
 
     assert!(!output.status.success(), "unproven reap must abort");
     assert!(
@@ -1742,8 +1745,8 @@ fn temp_root_cleanup_refuses_replacement_directory() {
     let cleanup_result = root.cleanup();
     drop(root);
     let substitute_survived = original.join("sentinel").is_file();
-    let _ = fs::remove_dir_all(&original);
-    let _ = fs::remove_dir_all(&owned);
+    let _ = owned_tree::remove_dir_all(&original);
+    let _ = owned_tree::remove_dir_all(&owned);
     assert!(matches!(
         cleanup_result,
         Err("test root cleanup identity mismatch")

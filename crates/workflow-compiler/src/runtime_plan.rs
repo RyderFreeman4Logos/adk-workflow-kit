@@ -225,6 +225,7 @@ pub struct RuntimePlanRequest {
 struct NodeBindingRequest {
     model: Option<(IrModelRole, BindingRef)>,
     tools: Vec<BindingRef>,
+    skills: Vec<BindingRef>,
 }
 
 impl RuntimePlanRequest {
@@ -246,6 +247,11 @@ impl RuntimePlanRequest {
                                 .tools()
                                 .iter()
                                 .map(|tool| BindingRef::new(tool.id(), tool.version()))
+                                .collect(),
+                            skills: node
+                                .skills()
+                                .iter()
+                                .map(|skill| BindingRef::new(skill.id(), skill.version()))
                                 .collect(),
                         },
                     )
@@ -334,11 +340,12 @@ struct ResolvedNodeBinding {
     role: IrModelRole,
     model: ResolvedBinding,
     tools: Vec<ResolvedBinding>,
+    skills: Vec<ResolvedBinding>,
 }
 
 impl Serialize for ResolvedNodeBinding {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut value = serializer.serialize_struct("ResolvedNodeBinding", 3)?;
+        let mut value = serializer.serialize_struct("ResolvedNodeBinding", 4)?;
         value.serialize_field(
             "role",
             match self.role {
@@ -348,6 +355,7 @@ impl Serialize for ResolvedNodeBinding {
         )?;
         value.serialize_field("model", &self.model)?;
         value.serialize_field("tools", &self.tools)?;
+        value.serialize_field("skills", &self.skills)?;
         value.end()
     }
 }
@@ -437,7 +445,9 @@ impl ResolvedRuntimePlan {
                 model_ref,
                 node_id,
             )?;
-            if *role == IrModelRole::Reviewer && !binding.tools.is_empty() {
+            if *role == IrModelRole::Reviewer
+                && (!binding.tools.is_empty() || !binding.skills.is_empty())
+            {
                 return Err(PlanResolutionError::node(
                     PlanResolutionErrorKind::InvalidBinding,
                     BindingCategory::Tool,
@@ -457,12 +467,26 @@ impl ResolvedRuntimePlan {
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let skills = binding
+                .skills
+                .iter()
+                .map(|skill_ref| {
+                    resolve_node_value(
+                        registry,
+                        &request.ambiguous,
+                        BindingCategory::Skill,
+                        skill_ref,
+                        node_id,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             node_bindings.insert(
                 node_id.clone(),
                 ResolvedNodeBinding {
                     role: *role,
                     model,
                     tools,
+                    skills,
                 },
             );
         }
@@ -517,6 +541,7 @@ impl ResolvedRuntimePlan {
                             },
                             model: binding_fingerprint(&binding.model),
                             tools: binding.tools.iter().map(binding_fingerprint).collect(),
+                            skills: binding.skills.iter().map(binding_fingerprint).collect(),
                         },
                     )
                 })
@@ -571,6 +596,11 @@ impl ResolvedRuntimePlan {
         self.node_bindings
             .get(node_id)
             .map_or(&[], |binding| binding.tools.as_slice())
+    }
+    pub fn node_skills(&self, node_id: &str) -> &[ResolvedBinding] {
+        self.node_bindings
+            .get(node_id)
+            .map_or(&[], |binding| binding.skills.as_slice())
     }
     pub fn validators(&self) -> &[ValidatorBindingProjection] {
         &self.validators
@@ -648,6 +678,7 @@ struct NodeBindingFingerprint {
     role: String,
     model: BindingFingerprint,
     tools: Vec<BindingFingerprint>,
+    skills: Vec<BindingFingerprint>,
 }
 
 #[derive(Serialize)]

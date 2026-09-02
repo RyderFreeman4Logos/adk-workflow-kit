@@ -236,7 +236,7 @@ fn adapter(
     let (manifest, lock) = manifest(locked_script, &capabilities);
     let sandbox = sandbox(base, id, materialized_script, capabilities.clone());
     let root = sandbox.workdir().root().to_path_buf();
-    let script = RegisteredSkillScript::new(manifest, lock, "script");
+    let script = RegisteredSkillScript::new(manifest, lock, "script", locked_script);
     let adapter = AdkToolBridge::for_registered_script(
         sandbox,
         registration(&capabilities),
@@ -313,7 +313,7 @@ fn registered_script_rejects_capabilities_beyond_registration_before_spawn() {
             NonZeroU64::new(4_096).expect("positive"),
             NonZeroU64::new(1_024).expect("positive"),
         ),
-        RegisteredSkillScript::new(manifest, lock, "script"),
+        RegisteredSkillScript::new(manifest, lock, "script", SCRIPT),
     );
 
     assert!(matches!(
@@ -365,7 +365,7 @@ fn adapter_registered_script_api_denies_unknown_script_id() {
     let base = TestBase::new();
     let (manifest, lock) = manifest(SCRIPT, &[]);
     let sandbox = sandbox(&base, "unknown-script", SCRIPT, Vec::new());
-    let script = RegisteredSkillScript::new(manifest, lock, "unknown");
+    let script = RegisteredSkillScript::new(manifest, lock, "unknown", SCRIPT);
 
     let error = script
         .execute(&sandbox, br#"{"value":"ok"}"#)
@@ -390,7 +390,7 @@ fn adapter_registered_script_api_cannot_expand_child_capabilities() {
             SandboxCapability::OutputBytes,
         ],
     );
-    let script = RegisteredSkillScript::new(manifest, lock, "script");
+    let script = RegisteredSkillScript::new(manifest, lock, "script", SCRIPT);
 
     let error = script
         .execute(&sandbox, br#"{"value":"ok"}"#)
@@ -453,7 +453,7 @@ fn adk_adapter_denies_undeclared_filesystem_read() {
 }
 
 #[test]
-fn registered_script_rejects_materialized_bytes_that_do_not_match_its_lock() {
+fn registered_script_executes_locked_bytes_over_materialization() {
     let base = TestBase::new();
     let capabilities = vec![
         SandboxCapability::FilesystemRead,
@@ -465,21 +465,18 @@ fn registered_script_rejects_materialized_bytes_that_do_not_match_its_lock() {
     let sandbox = sandbox(&base, "adapter-mismatch", MISMATCH_SCRIPT, capabilities);
     let root = sandbox.workdir().root().to_path_buf();
     let marker = root.join("work/mismatch-marker");
-    let script = RegisteredSkillScript::new(manifest, lock, "script");
+    let script = RegisteredSkillScript::new(manifest, lock, "script", SCRIPT);
 
-    let error = script
+    let receipt = script
         .execute(&sandbox, br#"{"value":"ok"}"#)
-        .expect_err("mismatched materialized bytes must fail before spawn");
+        .expect("locked script bytes must execute over the materialized placeholder");
 
-    assert_eq!(
-        error.kind(),
-        ScriptExecutionErrorKind::Sandbox(SandboxExecutionError::ExecutionFailed)
-    );
+    assert_eq!(receipt.stdout(), b"{\"value\": \"ok\"}\n");
     assert!(
-        !root.join("pid").exists(),
-        "mismatched script bytes must not create a backend PID witness"
+        root.join("work/adapter-marker").exists(),
+        "locked script bytes must run"
     );
-    assert!(!marker.exists(), "mismatched script bytes must never spawn");
+    assert!(!marker.exists(), "materialized bytes must not run");
 }
 
 #[test]

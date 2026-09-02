@@ -7,6 +7,7 @@ use workflow_runtime::{
     WorkflowRuntimeEventLogV1, WorkflowRuntimeEventV1, argument_fingerprint, redact_json_value,
     redacted_json_digest,
 };
+use workflow_spec::{RESERVED_SKILL_TOOL_NAMES, is_reserved_skill_tool_name};
 
 const MAX_INLINE_STRUCTURED_OUTPUT_BYTES: usize = 4 * 1024;
 
@@ -244,8 +245,17 @@ impl AdkEventMapper {
             let encoded = serde_json::to_vec(&output).map_err(|_| {
                 AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
             })?;
-            if encoded.len() > MAX_INLINE_STRUCTURED_OUTPUT_BYTES {
-                if observation.artifact_reference.is_none() {
+            if (observation.kind == AdkRuntimeObservationKindV1::ToolCompleted
+                && output.as_array().is_some_and(|results| {
+                    results.iter().any(|result| {
+                        trusted_skill_tool_name(result) == Some(RESERVED_SKILL_TOOL_NAMES[2])
+                    })
+                }))
+                || encoded.len() > MAX_INLINE_STRUCTURED_OUTPUT_BYTES
+            {
+                if encoded.len() > MAX_INLINE_STRUCTURED_OUTPUT_BYTES
+                    && observation.artifact_reference.is_none()
+                {
                     return Err(AdkEventMappingError::new(
                         AdkEventMappingErrorKind::LargePayloadMissingArtifact,
                     ));
@@ -333,6 +343,8 @@ impl AdkEventMapper {
         };
         let structured_output = if structured_output.is_some() {
             structured_output
+                .map(redact_skill_tool_results)
+                .transpose()?
         } else if calls.is_empty() {
             event
                 .content()
@@ -514,6 +526,127 @@ impl fmt::Display for AdkEventMappingError {
 
 impl std::error::Error for AdkEventMappingError {}
 
+fn redact_skill_tool_results(output: Value) -> Result<Value, AdkEventMappingError> {
+    let Value::Array(results) = output else {
+        return Ok(output);
+    };
+    results
+        .into_iter()
+        .map(|mut result| {
+            let tool_name = trusted_skill_tool_name(&result).map(ToOwned::to_owned);
+            if tool_name.is_some() {
+                let response = result
+                    .as_object_mut()
+                    .and_then(|result| result.remove("response"))
+                    .ok_or_else(|| {
+                        AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
+                    })?;
+                let output_bytes = serde_json::to_vec(&response)
+                    .map_err(|_| {
+                        AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
+                    })?
+                    .len();
+                let result = result.as_object_mut().ok_or_else(|| {
+                    AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
+                })?;
+                let fields = match tool_name.as_deref() {
+                    Some(name) if name == RESERVED_SKILL_TOOL_NAMES[0] => {
+                        &["skill_id", "version", "instructions_ref"][..]
+                    }
+                    Some(name) if name == RESERVED_SKILL_TOOL_NAMES[1] => &[
+                        "resource_id",
+                        "result_ref",
+                        "byte_len",
+                        "page_byte_len",
+                        "next_offset",
+                    ][..],
+                    _ => &[],
+                };
+                let wrapped = response.get("payload").is_some();
+                let safe_response = response
+                    .get("payload")
+                    .unwrap_or(&response)
+                    .as_object()
+                    .map(|response| {
+                        let mut safe = fields
+                            .iter()
+                            .filter_map(|field| {
+                                response
+                                    .get(*field)
+                                    .map(|value| ((*field).to_owned(), value.clone()))
+                            })
+                            .collect::<Map<_, _>>();
+                        if tool_name.as_deref() == Some(RESERVED_SKILL_TOOL_NAMES[0]) {
+                            safe.insert("activated".to_owned(), Value::Bool(true));
+                            for (name, fields) in [
+                                ("resources", &["id", "sha256"][..]),
+                                ("scripts", &["id", "sha256", "runtime", "capabilities"][..]),
+                            ] {
+                                if let Some(items) = response.get(name).and_then(Value::as_array) {
+                                    safe.insert(
+                                        name.to_owned(),
+                                        Value::Array(
+                                            items
+                                                .iter()
+                                                .filter_map(Value::as_object)
+                                                .map(|item| {
+                                                    Value::Object(
+                                                        fields
+                                                            .iter()
+                                                            .filter_map(|field| {
+                                                                item.get(*field).map(|value| {
+                                                                    (
+                                                                        (*field).to_owned(),
+                                                                        value.clone(),
+                                                                    )
+                                                                })
+                                                            })
+                                                            .collect(),
+                                                    )
+                                                })
+                                                .collect(),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        safe
+                    })
+                    .unwrap_or_default();
+                if !safe_response.is_empty() {
+                    result.insert(
+                        "response".to_owned(),
+                        if wrapped {
+                            Value::Object(Map::from_iter([(
+                                "payload".to_owned(),
+                                Value::Object(safe_response),
+                            )]))
+                        } else {
+                            Value::Object(safe_response)
+                        },
+                    );
+                }
+                result.insert(
+                    "response_digest".to_owned(),
+                    Value::String(redacted_json_digest(&response)?),
+                );
+                result.insert("response_bytes".to_owned(), Value::from(output_bytes));
+            }
+            Ok(result)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
+}
+
+fn trusted_skill_tool_name(result: &Value) -> Option<&str> {
+    let tool_name = result.get("tool_name")?.as_str()?;
+    let provenance = result.get("response")?.get("provenance")?;
+    (is_reserved_skill_tool_name(tool_name)
+        && provenance.get("tool_id")?.as_str()? == "skill.runtime"
+        && provenance.get("tool_version")?.as_str()? == "1")
+        .then_some(tool_name)
+}
+
 fn protect_large_payload<S: ArtifactStore>(
     observation: AdkRuntimeObservationV1,
     output: &Value,
@@ -629,6 +762,123 @@ mod tests {
         assert_eq!(model.payload()["finish_reason"], "stop");
         assert_eq!(requested.kind(), WorkflowRuntimeEventKindV1::ToolRequested);
         assert_eq!(completed.kind(), WorkflowRuntimeEventKindV1::ToolCompleted);
+    }
+
+    #[test]
+    fn skill_tool_results_keep_metadata_without_durable_content() {
+        let result = |tool_name, payload| {
+            json!({
+                "tool_name": tool_name,
+                "response": {
+                    "status": "success",
+                    "payload": payload,
+                    "provenance": {"tool_id": "skill.runtime", "tool_version": "1"},
+                },
+            })
+        };
+        let output = redact_skill_tool_results(Value::Array(vec![
+            result(
+                "activate_skill",
+                json!({
+                    "skill_id": "code-investigation",
+                    "version": "1",
+                    "instructions_ref": "sha256:instructions",
+                    "instructions": "instructions-canary",
+                    "resources": [{
+                        "id": "assets/guide.txt",
+                        "sha256": "sha256:resource",
+                        "content": "metadata-canary",
+                    }],
+                    "scripts": [{
+                        "id": "answer",
+                        "sha256": "sha256:script",
+                        "runtime": "python3",
+                        "capabilities": ["filesystem.read"],
+                        "content": "metadata-canary",
+                    }],
+                }),
+            ),
+            result(
+                "read_skill_resource",
+                json!({
+                    "resource_id": "assets/guide.txt",
+                    "result_ref": "sha256:resource",
+                    "byte_len": 15,
+                    "page_byte_len": 15,
+                    "next_offset": null,
+                    "content": "resource-canary",
+                }),
+            ),
+            result("run_skill_script", json!({"value": "script-canary"})),
+        ]))
+        .unwrap();
+        let output = output.as_array().unwrap();
+        let encoded = serde_json::to_string(output).unwrap();
+
+        for canary in [
+            "instructions-canary",
+            "resource-canary",
+            "script-canary",
+            "metadata-canary",
+        ] {
+            assert!(!encoded.contains(canary), "persisted {canary}");
+        }
+        assert!(encoded.contains("code-investigation"));
+        assert!(encoded.contains("assets/guide.txt"));
+        assert!(encoded.contains("sha256:instructions"));
+        assert!(encoded.contains("sha256:resource"));
+        assert!(encoded.contains("sha256:script"));
+        assert!(encoded.contains("python3"));
+        assert!(encoded.contains("filesystem.read"));
+        assert_eq!(
+            output
+                .iter()
+                .filter(|result| result.get("response_digest").is_some())
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn ordinary_reserved_name_tool_results_keep_structured_projection() {
+        let mut mapper = AdkEventMapper::new("run-static", "workflow-static").unwrap();
+        let mut artifacts = InMemoryArtifactStore::new(
+            NonZeroU64::new(16 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024).unwrap(),
+        );
+        let mut event = Event::new("invocation");
+        event.set_content(Content {
+            role: "function".to_owned(),
+            parts: vec![Part::FunctionResponse {
+                function_response: FunctionResponseData::new(
+                    "activate_skill",
+                    json!({
+                        "status": "success",
+                        "payload": {"value": 42},
+                        "provenance": {
+                            "tool_id": "activate_skill",
+                            "tool_version": "1"
+                        }
+                    }),
+                ),
+                id: Some("call-static".to_owned()),
+                annotations: None,
+            }],
+        });
+
+        let mapped = mapper
+            .map_adk_event("agent".to_owned(), event, &mut artifacts)
+            .unwrap();
+
+        assert_eq!(
+            mapped.payload()["structured_output"][0]["response"]["payload"]["value"],
+            42
+        );
+        assert!(
+            mapped.payload()["structured_output"][0]
+                .get("response_digest")
+                .is_none()
+        );
     }
 
     #[test]

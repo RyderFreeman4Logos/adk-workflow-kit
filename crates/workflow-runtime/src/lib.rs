@@ -83,8 +83,9 @@ pub use session::{
     RunSessionIds, SessionId, SessionIdentityError, SessionIdentityErrorKind, SessionRole,
 };
 pub use tool::{
-    StructuredOutputError, ToolEnvelope, ToolFailure, ToolFlags, ToolIdempotency, ToolProvenance,
-    ToolRegistration, ToolRegistrationError, decode_structured_tool_output,
+    ActivateSkillInput, ReadSkillResourceInput, RunSkillScriptInput, StructuredOutputError,
+    ToolEnvelope, ToolFailure, ToolFlags, ToolIdempotency, ToolProvenance, ToolRegistration,
+    ToolRegistrationError, decode_structured_tool_output,
 };
 pub use workdir::{
     CleanupOutcome, Materialization, RunWorkdir, WorkdirError, WorkdirErrorKind, WorkdirId,

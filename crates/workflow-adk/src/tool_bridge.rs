@@ -27,6 +27,7 @@ use workflow_runtime::{
 
 struct BridgeState<S> {
     bridge: Mutex<ToolBridge>,
+    actor: Option<String>,
     authority: CapabilityIntersection,
     approvals: Option<ApprovalLedger>,
     artifacts: Mutex<S>,
@@ -53,8 +54,11 @@ impl ToolExecutionError {
 }
 
 pub(crate) fn project_tool_execution_error(error: ToolExecutionError) -> AdkError {
-    let (category, code) = match error.terminal_outcome() {
-        TerminalOutcome::AuthorizationDenied => {
+    let (category, code) = match error.kind() {
+        workflow_runtime::ToolBridgeErrorKind::SandboxDenied => {
+            (ErrorCategory::Forbidden, "tool.bridge.sandbox_denied")
+        }
+        _ if error.terminal_outcome() == TerminalOutcome::AuthorizationDenied => {
             (ErrorCategory::Forbidden, "tool.bridge.authorization_denied")
         }
         _ => (ErrorCategory::Internal, "tool.bridge.failed"),
@@ -89,6 +93,7 @@ pub struct RegisteredSkillScript {
     manifest: SkillRuntimeManifest,
     lock: SkillRuntimeLock,
     script_id: String,
+    script_bytes: Vec<u8>,
 }
 
 impl RegisteredSkillScript {
@@ -97,11 +102,13 @@ impl RegisteredSkillScript {
         manifest: SkillRuntimeManifest,
         lock: SkillRuntimeLock,
         script_id: impl Into<String>,
+        script_bytes: impl Into<Vec<u8>>,
     ) -> Self {
         Self {
             manifest,
             lock,
             script_id: script_id.into(),
+            script_bytes: script_bytes.into(),
         }
     }
 
@@ -116,6 +123,7 @@ impl RegisteredSkillScript {
             &self.lock,
             &self.script_id,
             input_json,
+            &self.script_bytes,
             sandbox,
         )
     }
@@ -141,6 +149,7 @@ impl ToolHandler for RegisteredScriptHandler {
             &self.script.lock,
             &self.script.script_id,
             &input_json,
+            &self.script.script_bytes,
             sandbox,
         )
         .map_err(|_| ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed))?;
@@ -178,6 +187,7 @@ where
         Self {
             state: Arc::new(BridgeState {
                 bridge: Mutex::new(bridge),
+                actor: None,
                 authority,
                 approvals,
                 artifacts: Mutex::new(artifacts),
@@ -190,16 +200,16 @@ where
     pub fn for_selected<'a>(
         bridge: &ToolBridge,
         names: impl IntoIterator<Item = &'a str>,
+        actor: impl Into<String>,
         authority: CapabilityIntersection,
         approvals: Option<ApprovalLedger>,
         artifacts: S,
     ) -> std::result::Result<Self, ToolBridgeError> {
-        Ok(Self::new(
-            bridge.select(names)?,
-            authority,
-            approvals,
-            artifacts,
-        ))
+        let mut adapter = Self::new(bridge.select(names)?, authority, approvals, artifacts);
+        Arc::get_mut(&mut adapter.state)
+            .expect("new tool bridge state is unshared")
+            .actor = Some(actor.into());
+        Ok(adapter)
     }
 
     /// Builds the production ADK script tool over exactly one run sandbox.
@@ -381,10 +391,15 @@ where
         context: Arc<dyn ToolContext>,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        let actor = self
+            .state
+            .actor
+            .as_deref()
+            .unwrap_or_else(|| context.user_id());
         let call = ToolCall::new(
             self.registration.name(),
             context.function_call_id(),
-            context.user_id(),
+            actor,
             arguments,
         );
         let result = AdkToolBridge {

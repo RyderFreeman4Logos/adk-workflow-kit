@@ -4,7 +4,9 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt, fs,
     future::Future,
-    num::NonZeroU64,
+    io::Read,
+    num::{NonZeroU64, NonZeroUsize},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -21,21 +23,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use workflow_compiler::{
-    BindingCategory, BindingRef, CapabilitySet, RegistryResolutionError, ResolvedBinding,
-    ResolvedRuntimePlan, RuntimePlanRegistry, RuntimePlanRequest, compile_file,
+    BindingCategory, BindingRef, CapabilitySet, RegistryEntry, RegistryNotFound,
+    RegistryResolutionError, ResolvedBinding, ResolvedRuntimePlan, RuntimePlanRegistry,
+    RuntimePlanRequest, SkillId, SkillManifest, SkillRegistry, SkillResourceId, SkillResourceInput,
+    SkillResourceLimits, SkillRuntimeLock, SkillRuntimeManifest, activate_skill, compile_file,
+    execute_registered_script_in_child,
 };
 use workflow_ir::IrModelRole;
 use workflow_runtime::{
-    ArtifactId, ArtifactStore, BackendCapabilities, CapabilityIntersection, CheckpointManifestV1,
-    DurableCheckpointV1, EffectCommit, EffectJournal, EffectKey, FilesystemArtifactStore,
-    InMemoryArtifactStore, PageRequest, ProtectedArtifactReferenceV1, PureTransformRequest,
-    RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox, SandboxCapability,
-    SqliteCheckpointStore, ToolBridge, ToolBridgeError, ToolBridgeErrorKind, ToolCall,
-    ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance, ToolRegistration,
-    WorkdirManager, WorkflowRuntimeEventKindV1, contains_sensitive_key, redact_json_value,
-    selection_identity, verify_sandbox_capabilities,
+    ActivateSkillInput, ArtifactId, ArtifactStore, BackendCapabilities, CapabilityIntersection,
+    CheckpointManifestV1, DurableCheckpointV1, EffectCommit, EffectJournal, EffectKey,
+    FilesystemArtifactStore, InMemoryArtifactStore, Materialization, PageRequest,
+    PolicyCapabilities, ProtectedArtifactReferenceV1, PureTransformRequest, ReadSkillResourceInput,
+    RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox, RunSkillScriptInput,
+    SandboxCapability, SqliteCheckpointStore, ToolBridge, ToolBridgeError, ToolBridgeErrorKind,
+    ToolCall, ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance,
+    ToolRegistration, WorkdirManager, WorkflowRuntimeEventKindV1, contains_sensitive_key,
+    intersect_policy_capabilities, redact_json_value, selection_identity,
+    verify_sandbox_capabilities,
 };
-use workflow_spec::{SourcePath, read_bounded_regular_file};
+use workflow_spec::{
+    RESERVED_SKILL_TOOL_NAMES, SourcePath, is_reserved_skill_tool_name, read_bounded_regular_file,
+};
 
 use crate::{
     AdkGraphError, AdkGraphTranslator,
@@ -49,10 +58,18 @@ use crate::{
 
 const MAX_STATE_BYTES: usize = 1024 * 1024;
 const ARTIFACT_LIMIT: u64 = 64 * 1024;
+const SKILL_RESOURCE_READ_LIMIT: u64 = 64 * 1024;
+const SKILL_PACKAGE_LIMIT: usize = 64;
+// Byte arrays can expand fourfold in sealed JSON; reserve 64 KiB for structure.
+const SKILL_PACKAGE_BYTES_LIMIT: usize = MAX_STATE_BYTES / 4 - 16 * 1024;
 const GRAPH_CONTINUATION_KEY: &str = "kit_graph_continuation_v1";
 const LOOP_LEDGER_FILE: &str = "loop-ledger.json";
+const SKILL_SNAPSHOT_FILE: &str = "sealed-skill-snapshot.json";
 const LOOP_LEDGER_DIGEST_KEY: &str = "kit_loop_ledger_digest_v1";
 static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
+#[cfg(debug_assertions)]
+static CRASH_BARRIER_HITS: AtomicU64 = AtomicU64::new(0);
+static EFFECT_BARRIER_HITS: AtomicU64 = AtomicU64::new(0);
 type BoundTool = (Vec<String>, Arc<AdkToolBridge<InMemoryArtifactStore>>);
 type CompletedToolResponse = (String, String, String, String, Value);
 
@@ -65,21 +82,58 @@ struct LoopState {
     tool_calls: BTreeMap<String, u64>,
     seen_ids: BTreeSet<String>,
     seen_calls: BTreeSet<(String, String)>,
+    #[serde(default)]
     conversation: Vec<adk_rust::Content>,
+    #[serde(skip)]
+    conversation_reconstructed: bool,
     previous_response_id: Option<String>,
     pending_calls: VecDeque<PendingCall>,
+    completed_calls: Vec<CompletedCall>,
     #[serde(default)]
     finish_admitted: bool,
+    #[serde(default)]
     finished_output: Option<Value>,
+    #[serde(default)]
+    finish_successor: Option<Value>,
+    #[serde(default)]
+    activated_skills: BTreeSet<String>,
+    #[serde(default)]
+    skill_resource_read_bytes: BTreeMap<String, u64>,
+    #[serde(default)]
+    skill_resource_read_reservations: BTreeMap<String, u64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PendingCall {
     id: String,
     name: String,
+    #[serde(default)]
     args: Value,
     fingerprint: String,
+    model_iteration: u64,
+    admission_ordinal: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "call", rename_all = "snake_case")]
+enum CompletedCall {
+    Skill(PendingCall),
+    Ordinary(PendingCall),
+}
+
+impl CompletedCall {
+    fn call(&self) -> &PendingCall {
+        match self {
+            Self::Skill(call) | Self::Ordinary(call) => call,
+        }
+    }
+
+    fn call_mut(&mut self) -> &mut PendingCall {
+        match self {
+            Self::Skill(call) | Self::Ordinary(call) => call,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -88,6 +142,8 @@ struct LoopLedgerV1 {
     schema_version: u8,
     checkpoint_identity: String,
     nodes: BTreeMap<String, LoopState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_nodes: Option<BTreeMap<String, LoopState>>,
 }
 
 struct LoopLedgerStore {
@@ -96,6 +152,7 @@ struct LoopLedgerStore {
     checkpoint_identity: String,
     checkpoint_manifest: CheckpointManifestV1,
     run_id: RunId,
+    persist_raw_loop_state: bool,
     nodes: Mutex<BTreeMap<String, LoopState>>,
 }
 
@@ -106,6 +163,7 @@ impl LoopLedgerStore {
         checkpoint_identity: String,
         checkpoint_manifest: CheckpointManifestV1,
         run_id: RunId,
+        persist_raw_loop_state: bool,
     ) -> Result<Self, ExecutionError> {
         let store = Self {
             path,
@@ -113,6 +171,7 @@ impl LoopLedgerStore {
             checkpoint_identity,
             checkpoint_manifest,
             run_id,
+            persist_raw_loop_state,
             nodes: Mutex::new(BTreeMap::new()),
         };
         store.persist_ledger(&BTreeMap::new())?;
@@ -126,14 +185,23 @@ impl LoopLedgerStore {
         checkpoint_manifest: CheckpointManifestV1,
         run_id: RunId,
         checkpoint_digest: &str,
+        persist_raw_loop_state: bool,
     ) -> Result<Self, ExecutionError> {
         let ledger = serde_json::from_slice::<LoopLedgerV1>(&bounded_read(&path)?)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        if ledger.schema_version != 2
-            || ledger.checkpoint_identity != checkpoint_identity
-            || checkpoint_digest != loop_ledger_digest(&ledger.nodes)?
-            || ledger.nodes.values().any(|state| !valid_loop_state(state))
+        if ledger.schema_version != 5 || ledger.checkpoint_identity != checkpoint_identity {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        let nodes = if checkpoint_digest == loop_ledger_digest(&ledger.nodes)? {
+            ledger.nodes
+        } else if let Some(nodes) = ledger.checkpoint_nodes
+            && checkpoint_digest == loop_ledger_digest(&nodes)?
         {
+            nodes
+        } else {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        };
+        if nodes.values().any(|state| !valid_loop_state(state)) {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
         Ok(Self {
@@ -142,7 +210,8 @@ impl LoopLedgerStore {
             checkpoint_identity,
             checkpoint_manifest,
             run_id,
-            nodes: Mutex::new(ledger.nodes),
+            persist_raw_loop_state,
+            nodes: Mutex::new(nodes),
         })
     }
 
@@ -230,8 +299,8 @@ impl LoopLedgerStore {
         self.snapshot(node).map(|state| state.model_iterations)
     }
 
-    fn finished_output(&self, node: &str) -> Result<Option<Value>, ExecutionError> {
-        self.snapshot(node).map(|state| state.finished_output)
+    fn finish_successor(&self, node: &str) -> Result<Option<Value>, ExecutionError> {
+        self.snapshot(node).map(|state| state.finish_successor)
     }
 
     fn pending_calls(&self) -> Result<Vec<(String, PendingCall)>, ExecutionError> {
@@ -249,6 +318,69 @@ impl LoopLedgerStore {
                     .map(|call| (node.clone(), call))
             })
             .collect())
+    }
+
+    fn completed_calls(&self) -> Result<Vec<(String, CompletedCall)>, ExecutionError> {
+        let nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        Ok(nodes
+            .iter()
+            .flat_map(|(node, state)| {
+                (!state.finish_admitted)
+                    .then_some(&state.completed_calls)
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+                    .map(|call| (node.clone(), call))
+            })
+            .collect())
+    }
+
+    fn restore_completed_turn(
+        &self,
+        node: &str,
+        completed: &[(CompletedCall, Value)],
+    ) -> Result<(), ExecutionError> {
+        let mut nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let state = nodes
+            .get_mut(node)
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if completed
+            .iter()
+            .any(|(call, _)| !state.completed_calls.contains(call))
+        {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        let model_iteration = completed
+            .first()
+            .map(|(completed, _)| completed.call().model_iteration)
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let mut admitted = completed
+            .iter()
+            .map(|(completed, _)| completed.call())
+            .chain(
+                state
+                    .pending_calls
+                    .iter()
+                    .filter(|call| call.model_iteration == model_iteration),
+            )
+            .collect::<Vec<_>>();
+        admitted.sort_by_key(|call| call.admission_ordinal);
+        state
+            .conversation
+            .extend(admitted.into_iter().map(tool_call_content));
+        state
+            .conversation
+            .extend(completed.iter().map(|(completed, response)| {
+                tool_response_content(completed.call(), response.clone())
+            }));
+        state.conversation_reconstructed = true;
+        Ok(())
     }
 
     fn completed_tool_responses(&self) -> Result<Vec<CompletedToolResponse>, ExecutionError> {
@@ -335,11 +467,63 @@ impl LoopLedgerStore {
                     && pending.fingerprint == call.fingerprint
             })
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let pending = state
+            .pending_calls
+            .get(index)
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if pending.name == "read_skill_resource" {
+            let page_bytes = skill_page_byte_len(&response)
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+            if state
+                .skill_resource_read_reservations
+                .get(&pending.fingerprint)
+                .copied()
+                != Some(page_bytes)
+            {
+                return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+            }
+        }
         let call = state
             .pending_calls
             .remove(index)
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         state.tool_output_bytes = total;
+        let completed = if matches!(
+            call.name.as_str(),
+            "activate_skill" | "read_skill_resource" | "run_skill_script"
+        ) {
+            CompletedCall::Skill(call.clone())
+        } else {
+            CompletedCall::Ordinary(call.clone())
+        };
+        state.completed_calls.push(completed);
+        if !state
+            .conversation
+            .iter()
+            .flat_map(|content| &content.parts)
+            .any(|part| {
+                matches!(part, adk_rust::Part::FunctionCall { id: Some(id), .. } if id == &call.id)
+            })
+        {
+            state.conversation.push(tool_call_content(&call));
+        }
+        if call.name == "read_skill_resource" {
+            let input = serde_json::from_value::<ReadSkillResourceInput>(call.args.clone())
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+            let page_bytes = skill_page_byte_len(&response)
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+            let reserved = state
+                .skill_resource_read_bytes
+                .get(&input.skill_id)
+                .copied()
+                .unwrap_or_default();
+            if reserved < page_bytes {
+                return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+            }
+            state
+                .skill_resource_read_reservations
+                .remove(&call.fingerprint);
+        }
         state
             .conversation
             .push(tool_response_content(&call, response));
@@ -347,17 +531,96 @@ impl LoopLedgerStore {
     }
 
     fn persist_locked(&self, nodes: &BTreeMap<String, LoopState>) -> Result<(), ExecutionError> {
-        self.persist_ledger(nodes)?;
-        self.sync_checkpoint(nodes)
+        if !self.persist_raw_loop_state
+            && nodes.values().any(|state| {
+                state
+                    .pending_calls
+                    .iter()
+                    .any(|call| durable_pending_args(call).is_none())
+            })
+        {
+            return Err(ExecutionError::new(ExecutionErrorKind::Persistence));
+        }
+        let mut durable_nodes = nodes.clone();
+        if !self.persist_raw_loop_state {
+            for state in durable_nodes.values_mut() {
+                state.conversation.clear();
+                state.finished_output = None;
+                for call in &mut state.pending_calls {
+                    call.args = durable_pending_args(call).expect("checked pending calls");
+                }
+                for completed in &mut state.completed_calls {
+                    let call = completed.call_mut();
+                    call.args = durable_pending_args(call).expect("checked completed calls");
+                }
+            }
+        }
+        self.persist_ledger_with_checkpoint_generation(&durable_nodes)?;
+        crash_barrier("after-loop-ledger-before-checkpoint");
+        self.sync_checkpoint(&durable_nodes)
     }
 
-    fn persist_ledger(&self, nodes: &BTreeMap<String, LoopState>) -> Result<(), ExecutionError> {
+    fn persist_ledger_with_checkpoint_generation(
+        &self,
+        nodes: &BTreeMap<String, LoopState>,
+    ) -> Result<(), ExecutionError> {
+        let store =
+            SqliteCheckpointStore::open(&self.checkpoint_path, self.checkpoint_manifest.clone())
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let checkpoint = store
+            .load_latest(&self.run_id)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let ledger = serde_json::from_slice::<LoopLedgerV1>(&bounded_read(&self.path)?)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let checkpoint_nodes =
+            if let Ok(checkpoint_digest) = checkpoint_ledger_digest(checkpoint.state()) {
+                [Some(&ledger.nodes), ledger.checkpoint_nodes.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .find(|generation| {
+                        loop_ledger_digest(generation).as_deref() == Ok(checkpoint_digest.as_str())
+                    })
+                    .cloned()
+                    .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Persistence))?
+            } else if ledger.nodes.is_empty() {
+                BTreeMap::new()
+            } else {
+                return Err(ExecutionError::new(ExecutionErrorKind::Persistence));
+            };
         write_json(
             &self.path,
             &LoopLedgerV1 {
-                schema_version: 2,
+                schema_version: 5,
                 checkpoint_identity: self.checkpoint_identity.clone(),
                 nodes: nodes.clone(),
+                checkpoint_nodes: Some(checkpoint_nodes),
+            },
+        )
+    }
+
+    fn persist_ledger(&self, nodes: &BTreeMap<String, LoopState>) -> Result<(), ExecutionError> {
+        let mut nodes = nodes.clone();
+        if !self.persist_raw_loop_state {
+            for state in nodes.values_mut() {
+                state.conversation.clear();
+                state.finished_output = None;
+                for call in &mut state.pending_calls {
+                    call.args = durable_pending_args(call).expect("checked pending calls");
+                }
+                for completed in &mut state.completed_calls {
+                    let call = completed.call_mut();
+                    call.args = durable_pending_args(call).expect("checked completed calls");
+                }
+            }
+        }
+        write_json(
+            &self.path,
+            &LoopLedgerV1 {
+                schema_version: 5,
+                checkpoint_identity: self.checkpoint_identity.clone(),
+                nodes,
+                checkpoint_nodes: None,
             },
         )
     }
@@ -389,10 +652,24 @@ impl LoopLedgerStore {
     }
 
     fn bind_current_digest(&self, state: &mut State) -> Result<(), ExecutionError> {
-        let nodes = self
+        let mut nodes = self
             .nodes
             .lock()
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?
+            .clone();
+        if !self.persist_raw_loop_state {
+            for state in nodes.values_mut() {
+                state.conversation.clear();
+                state.finished_output = None;
+                for call in &mut state.pending_calls {
+                    call.args = durable_pending_args(call).expect("checked pending calls");
+                }
+                for completed in &mut state.completed_calls {
+                    let call = completed.call_mut();
+                    call.args = durable_pending_args(call).expect("checked completed calls");
+                }
+            }
+        }
         Self::bind_digest(state, &nodes)
     }
 
@@ -406,10 +683,194 @@ impl LoopLedgerStore {
         );
         Ok(())
     }
+
+    fn activate_skill(&self, node: &str, skill: &str) -> Result<(), ExecutionError> {
+        let mut nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        nodes
+            .entry(node.to_owned())
+            .or_default()
+            .activated_skills
+            .insert(skill.to_owned());
+        self.persist_locked(&nodes)
+    }
+
+    fn is_skill_activated(&self, node: &str, skill: &str) -> Result<bool, ExecutionError> {
+        self.nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+            .map(|nodes| {
+                nodes
+                    .get(node)
+                    .is_some_and(|state| state.activated_skills.contains(skill))
+            })
+    }
+
+    fn reserve_skill_resource_read(
+        &self,
+        node: &str,
+        skill: &str,
+        fingerprint: &str,
+        page_bytes: u64,
+    ) -> Result<u64, ExecutionError> {
+        let mut nodes = self
+            .nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let state = nodes
+            .get_mut(node)
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if let Some(reserved) = state.skill_resource_read_reservations.get(fingerprint) {
+            if *reserved != page_bytes {
+                return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+            }
+            return Ok(state
+                .skill_resource_read_bytes
+                .get(skill)
+                .copied()
+                .unwrap_or_default());
+        }
+        let total = {
+            let total = state
+                .skill_resource_read_bytes
+                .get(skill)
+                .copied()
+                .unwrap_or_default()
+                .checked_add(page_bytes)
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Tool))?;
+            if total > SKILL_RESOURCE_READ_LIMIT {
+                return Err(ExecutionError::new(ExecutionErrorKind::Tool));
+            }
+            state
+                .skill_resource_read_bytes
+                .insert(skill.to_owned(), total);
+            state
+                .skill_resource_read_reservations
+                .insert(fingerprint.to_owned(), page_bytes);
+            total
+        };
+        self.persist_locked(&nodes)?;
+        Ok(total)
+    }
+}
+
+fn durable_pending_args(call: &PendingCall) -> Option<Value> {
+    match call.name.as_str() {
+        "activate_skill" => serde_json::from_value::<ActivateSkillInput>(call.args.clone())
+            .ok()
+            .map(|input| json!({"skill_id": input.skill_id}))
+            .or_else(|| Some(json!({"invalid": true}))),
+        "read_skill_resource" => {
+            serde_json::from_value::<ReadSkillResourceInput>(call.args.clone())
+                .ok()
+                .map(|input| {
+                    json!({
+                        "skill_id": input.skill_id,
+                        "resource_id": input.resource_id,
+                        "offset": input.offset,
+                        "limit": input.limit,
+                    })
+                })
+                .or_else(|| Some(json!({"invalid": true})))
+        }
+        "run_skill_script" => {
+            if let Ok(input) = serde_json::from_value::<RunSkillScriptInput>(call.args.clone()) {
+                return Some(json!({
+                    "skill_id": input.skill_id,
+                    "script_id": input.script_id,
+                    "argument_fingerprint": call.fingerprint,
+                }));
+            }
+            let Some(args) = call.args.as_object() else {
+                return Some(json!({"invalid": true}));
+            };
+            (args.len() == 3
+                && args.get("skill_id").is_some_and(Value::is_string)
+                && args.get("script_id").is_some_and(Value::is_string)
+                && args.get("argument_fingerprint")
+                    == Some(&Value::String(call.fingerprint.clone())))
+            .then(|| call.args.clone())
+            .or_else(|| Some(json!({"invalid": true})))
+        }
+        _ if !call.name.is_empty() => Some(json!({
+            "argument_fingerprint": call.fingerprint,
+        })),
+        _ => None,
+    }
+}
+
+fn is_redacted_ordinary_pending(call: &PendingCall) -> bool {
+    !matches!(
+        call.name.as_str(),
+        "activate_skill" | "read_skill_resource" | "run_skill_script"
+    ) && call.args.as_object().is_some_and(|args| {
+        args.len() == 1
+            && args.get("argument_fingerprint") == Some(&Value::String(call.fingerprint.clone()))
+    })
+}
+
+fn is_redacted_script_pending(call: &PendingCall) -> bool {
+    call.name == "run_skill_script"
+        && call
+            .args
+            .get("argument_fingerprint")
+            .and_then(Value::as_str)
+            == Some(call.fingerprint.as_str())
+}
+
+fn valid_completed_skill_call(call: &PendingCall) -> bool {
+    durable_pending_args(call).as_ref() == Some(&call.args)
+        && (is_redacted_script_pending(call)
+            || workflow_runtime::argument_fingerprint(&call.args) == call.fingerprint)
+}
+
+fn valid_completed_ordinary_call(call: &PendingCall) -> bool {
+    durable_pending_args(call).as_ref() == Some(&call.args) && is_redacted_ordinary_pending(call)
+}
+
+fn valid_skill_resource_read_accounting(state: &LoopState) -> bool {
+    if state
+        .skill_resource_read_bytes
+        .iter()
+        .any(|(skill, bytes)| skill.is_empty() || *bytes > SKILL_RESOURCE_READ_LIMIT)
+    {
+        return false;
+    }
+    let mut pending_bytes = BTreeMap::<String, u64>::new();
+    for (fingerprint, page_bytes) in &state.skill_resource_read_reservations {
+        let Some(call) = state
+            .pending_calls
+            .iter()
+            .find(|call| call.name == "read_skill_resource" && call.fingerprint == *fingerprint)
+        else {
+            return false;
+        };
+        let Ok(input) = serde_json::from_value::<ReadSkillResourceInput>(call.args.clone()) else {
+            return false;
+        };
+        let Some(total) = pending_bytes
+            .get(&input.skill_id)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(*page_bytes)
+        else {
+            return false;
+        };
+        pending_bytes.insert(input.skill_id, total);
+    }
+    pending_bytes.iter().all(|(skill, bytes)| {
+        *bytes > 0
+            && state
+                .skill_resource_read_bytes
+                .get(skill)
+                .is_some_and(|total| total >= bytes)
+    })
 }
 
 fn loop_ledger_digest(nodes: &BTreeMap<String, LoopState>) -> Result<String, ExecutionError> {
-    let canonical = serde_json::to_vec(&(2_u8, nodes))
+    let canonical = serde_json::to_vec(&(3_u8, nodes))
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
     Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
 }
@@ -434,6 +895,24 @@ fn tool_response_content(call: &PendingCall, response: Value) -> adk_rust::Conte
             annotations: None,
         }],
     }
+}
+
+fn tool_call_content(call: &PendingCall) -> adk_rust::Content {
+    adk_rust::Content {
+        role: "model".to_owned(),
+        parts: vec![adk_rust::Part::FunctionCall {
+            name: call.name.clone(),
+            args: call.args.clone(),
+            id: Some(call.id.clone()),
+            thought_signature: None,
+        }],
+    }
+}
+
+fn skill_page_byte_len(response: &Value) -> Option<u64> {
+    response
+        .pointer("/payload/page_byte_len")
+        .and_then(Value::as_u64)
 }
 
 #[derive(Deserialize)]
@@ -478,9 +957,15 @@ fn admitted_finish(content: &adk_rust::Content) -> Result<Option<Value>, ()> {
 }
 
 fn valid_terminal_state(state: &LoopState) -> bool {
-    match (&state.finished_output, state.finish_admitted) {
-        (None, false) => true,
-        (Some(output), true) if state.pending_calls.is_empty() => {
+    match (
+        &state.finished_output,
+        &state.finish_successor,
+        state.finish_admitted,
+    ) {
+        (None, None, false) => true,
+        (Some(output), Some(successor), true)
+            if output == successor && state.pending_calls.is_empty() =>
+        {
             state
                 .conversation
                 .last()
@@ -493,6 +978,77 @@ fn valid_terminal_state(state: &LoopState) -> bool {
 }
 
 fn valid_loop_state(state: &LoopState) -> bool {
+    if !valid_skill_resource_read_accounting(state) {
+        return false;
+    }
+    if state.conversation.is_empty() {
+        let Some(tool_call_total) = state
+            .tool_calls
+            .values()
+            .try_fold(0_u64, |total, count| total.checked_add(*count))
+        else {
+            return false;
+        };
+        let disposed = state
+            .pending_calls
+            .iter()
+            .chain(state.completed_calls.iter().map(CompletedCall::call))
+            .collect::<Vec<_>>();
+        let disposed_ids = disposed
+            .iter()
+            .map(|call| call.id.clone())
+            .collect::<BTreeSet<_>>();
+        let disposed_calls = disposed
+            .iter()
+            .map(|call| (call.name.clone(), call.fingerprint.clone()))
+            .collect::<BTreeSet<_>>();
+        let admission_ordinals = disposed
+            .iter()
+            .map(|call| call.admission_ordinal)
+            .collect::<BTreeSet<_>>();
+        return state.finished_output.is_none()
+            && state.finish_admitted == state.finish_successor.is_some()
+            && (!state.finish_admitted
+                || (state.model_iterations > 0 && state.pending_calls.is_empty()))
+            && state.pending_calls.iter().all(|call| {
+                durable_pending_args(call).as_ref() == Some(&call.args)
+                    && (is_redacted_ordinary_pending(call)
+                        || workflow_runtime::argument_fingerprint(&call.args) == call.fingerprint)
+            })
+            && state
+                .completed_calls
+                .iter()
+                .all(|completed| match completed {
+                    CompletedCall::Skill(call) => valid_completed_skill_call(call),
+                    CompletedCall::Ordinary(call) => valid_completed_ordinary_call(call),
+                })
+            && state.total_tool_calls == tool_call_total
+            && admission_ordinals.len() == disposed.len()
+            && admission_ordinals
+                .iter()
+                .copied()
+                .eq((1_u64..).take(disposed.len()))
+            && disposed.iter().all(|call| {
+                call.model_iteration > 0 && call.model_iteration <= state.model_iterations
+            })
+            && disposed.len() == disposed_ids.len()
+            && disposed_ids == state.seen_ids
+            && disposed_calls == state.seen_calls
+            && usize::try_from(state.total_tool_calls)
+                .ok()
+                .is_some_and(|count| {
+                    count == state.seen_ids.len() && count == state.seen_calls.len()
+                })
+            && state
+                .tool_calls
+                .iter()
+                .all(|(name, count)| !name.is_empty() && *count > 0)
+            && state.seen_ids.iter().all(|id| !id.is_empty())
+            && state
+                .seen_calls
+                .iter()
+                .all(|(name, fingerprint)| !name.is_empty() && !fingerprint.is_empty());
+    }
     if !valid_terminal_state(state) {
         return false;
     }
@@ -535,11 +1091,16 @@ fn valid_loop_state(state: &LoopState) -> bool {
                         return false;
                     };
                     tool_calls.insert(name.clone(), count);
+                    let Ok(admission_ordinal) = u64::try_from(seen_ids.len()) else {
+                        return false;
+                    };
                     calls.push_back(PendingCall {
                         id: id.clone(),
                         name: name.clone(),
                         args: args.clone(),
                         fingerprint,
+                        model_iteration: model_iterations,
+                        admission_ordinal,
                     });
                 }
                 adk_rust::Part::FunctionCall { .. } => return false,
@@ -590,8 +1151,14 @@ fn valid_loop_state(state: &LoopState) -> bool {
                     && actual.name == expected.name
                     && actual.args == expected.args
                     && actual.fingerprint == expected.fingerprint
+                    && actual.model_iteration == expected.model_iteration
+                    && actual.admission_ordinal == expected.admission_ordinal
             })
         && state.tool_output_bytes == tool_output_bytes
+        && state
+            .skill_resource_read_bytes
+            .iter()
+            .all(|(skill, bytes)| !skill.is_empty() && *bytes <= SKILL_RESOURCE_READ_LIMIT)
 }
 
 fn ledger_checkpoint_identity(
@@ -601,6 +1168,69 @@ fn ledger_checkpoint_identity(
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
     Ok(format!("sha256:{:x}", Sha256::digest(manifest)))
 }
+
+#[cfg(debug_assertions)]
+fn model_contents_test_digest(request: &adk_rust::LlmRequest, ledger_path: &Path) {
+    if std::env::var_os("WORKFLOW_KIT_TEST_MODEL_CONTENTS_DIGEST").is_none() {
+        return;
+    }
+    let Some(root) = ledger_path.parent() else {
+        return;
+    };
+    let transcript = request
+        .contents
+        .iter()
+        .flat_map(|content| &content.parts)
+        .filter(|part| {
+            matches!(
+                part,
+                adk_rust::Part::FunctionCall { .. } | adk_rust::Part::FunctionResponse { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    let Ok(contents) = serde_json::to_vec(&transcript) else {
+        return;
+    };
+    let _ = fs::write(
+        root.join("model-contents-digest"),
+        format!("sha256:{:x}", Sha256::digest(contents)),
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn model_contents_test_digest(_: &adk_rust::LlmRequest, _: &Path) {}
+
+#[cfg(debug_assertions)]
+fn model_contents_test_pairs(request: &adk_rust::LlmRequest, ledger_path: &Path) {
+    if std::env::var_os("WORKFLOW_KIT_TEST_MODEL_CONTENTS_PAIRS").is_none() {
+        return;
+    }
+    let mut calls = BTreeSet::new();
+    let mut responses = Vec::new();
+    let mut paired = true;
+    for part in request.contents.iter().flat_map(|content| &content.parts) {
+        match part {
+            adk_rust::Part::FunctionCall { id: Some(id), .. } => {
+                calls.insert(id);
+            }
+            adk_rust::Part::FunctionResponse { id: Some(id), .. } => {
+                paired &= calls.contains(id);
+                responses.push(id);
+            }
+            _ => {}
+        }
+    }
+    if let Some(root) = ledger_path.parent() {
+        let _ = fs::write(
+            root.join("model-contents-pairs"),
+            serde_json::to_vec(&json!({"paired": paired, "responses": responses}))
+                .expect("test model pairs serialize"),
+        );
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn model_contents_test_pairs(_: &adk_rust::LlmRequest, _: &Path) {}
 
 struct LoopController {
     limits: RunLimits,
@@ -673,9 +1303,17 @@ impl LoopController {
                     self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable")
                 })?;
         } else {
+            if state.conversation_reconstructed {
+                let mut conversation = request.contents.clone();
+                conversation.append(&mut state.conversation);
+                state.conversation = conversation;
+                state.conversation_reconstructed = false;
+            }
             request.contents = state.conversation.clone();
             request.previous_response_id = state.previous_response_id.clone();
         }
+        model_contents_test_digest(&request, &self.ledger.path);
+        model_contents_test_pairs(&request, &self.ledger.path);
         Ok(request)
     }
 
@@ -729,14 +1367,23 @@ impl LoopController {
                     name: name.clone(),
                     args: args.clone(),
                     fingerprint,
+                    model_iteration: next.model_iterations + 1,
+                    admission_ordinal: next.total_tool_calls,
                 });
             }
         }
         next.finish_admitted = finished_output.is_some();
+        next.finish_successor = finished_output.clone();
         next.finished_output = finished_output;
         next.model_iterations += 1;
         next.conversation.push(content.clone());
         next.previous_response_id = response.interaction_id.clone();
+        let skill_call_admitted = next.pending_calls.iter().any(|call| {
+            matches!(
+                call.name.as_str(),
+                "activate_skill" | "read_skill_resource" | "run_skill_script"
+            )
+        });
         if let Some(kind) = self
             .ledger
             .tool_call_limit(&self.node, &next, &self.limits)
@@ -749,7 +1396,13 @@ impl LoopController {
             };
             return Err(self.fail(kind, marker));
         }
+        if next.finish_admitted {
+            crash_barrier("after-model-ledger-persist");
+        }
         *state = next;
+        if skill_call_admitted {
+            crash_barrier("after-skill-call-admission");
+        }
         *last_progress = Instant::now();
         Ok(())
     }
@@ -800,6 +1453,69 @@ impl LoopController {
             .pending_calls
             .remove(index)
             .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+        if name == "activate_skill" {
+            let input = serde_json::from_value::<ActivateSkillInput>(input.clone())
+                .map_err(|_| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+            next.activated_skills.insert(input.skill_id);
+        }
+        if name == "read_skill_resource" {
+            serde_json::from_value::<ReadSkillResourceInput>(input.clone())
+                .map_err(|_| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+            let page_bytes = skill_page_byte_len(response)
+                .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+            let persisted = self.ledger.snapshot(&self.node).map_err(|_| {
+                self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable")
+            })?;
+            if persisted
+                .skill_resource_read_reservations
+                .get(&call.fingerprint)
+                .copied()
+                != Some(page_bytes)
+            {
+                return Err(self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"));
+            }
+            next.skill_resource_read_bytes = persisted.skill_resource_read_bytes;
+            next.skill_resource_read_reservations = persisted.skill_resource_read_reservations;
+            next.skill_resource_read_reservations
+                .remove(&call.fingerprint);
+        }
+        if !self.ledger.persist_raw_loop_state {
+            let projected_args = durable_pending_args(&call)
+                .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+            let (admitted_name, admitted_args) = next
+                .conversation
+                .iter_mut()
+                .rev()
+                .flat_map(|content| content.parts.iter_mut().rev())
+                .find_map(|part| match part {
+                    adk_rust::Part::FunctionCall {
+                        name,
+                        args,
+                        id: Some(id),
+                        ..
+                    } if id == &call.id => Some((name, args)),
+                    _ => None,
+                })
+                .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
+            if admitted_name != &call.name
+                || workflow_runtime::argument_fingerprint(admitted_args) != call.fingerprint
+            {
+                return Err(self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"));
+            }
+            *admitted_args = projected_args;
+        }
+        let completion_barrier = match name {
+            "activate_skill" => Some("after-skill-call-completion-activate_skill"),
+            "read_skill_resource" => Some("after-skill-call-completion-read_skill_resource"),
+            "run_skill_script" => Some("after-skill-call-completion-run_skill_script"),
+            _ => None,
+        };
+        let completed = if completion_barrier.is_some() {
+            CompletedCall::Skill(call.clone())
+        } else {
+            CompletedCall::Ordinary(call.clone())
+        };
+        next.completed_calls.push(completed);
         next.conversation
             .push(tool_response_content(&call, response.clone()));
         if self
@@ -811,6 +1527,11 @@ impl LoopController {
                 ExecutionErrorKind::ToolOutputBytesLimit,
                 "workflow.loop.limit.tool_output_bytes",
             ));
+        }
+        if let Some(marker) = completion_barrier {
+            crash_barrier(marker);
+        } else {
+            crash_barrier("after-ordinary-call-completion");
         }
         *state = next;
         Ok(())
@@ -981,8 +1702,532 @@ fn restore_checkpoint_state(
         .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))
 }
 
-/// A validated runtime profile supplied to the reusable ADK executor.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SkillWire {
+    id: String,
+    version: String,
+    root: PathBuf,
+}
+
+struct SkillPackage {
+    id: SkillId,
+    version: String,
+    manifest: SkillManifest,
+    skill_markdown: Vec<u8>,
+    runtime_toml: Vec<u8>,
+    runtime: SkillRuntimeManifest,
+    lock: SkillRuntimeLock,
+    scripts: BTreeMap<String, Vec<u8>>,
+    resources: BTreeMap<SkillResourceId, Vec<u8>>,
+}
+
+impl SkillPackage {
+    fn load(wire: &SkillWire, remaining_bytes: &mut usize) -> Result<Self, ExecutionError> {
+        let root_identity = package_directory_identity(&wire.root)?;
+        let id = SkillId::new(&wire.id)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
+        if wire.version.is_empty() {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+        }
+        let skill_markdown = package_file(&wire.root, root_identity, "SKILL.md", remaining_bytes)?;
+        let manifest = SkillManifest::parse(&wire.root, &skill_markdown)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        let runtime_toml = package_file(
+            &wire.root,
+            root_identity,
+            "skill.runtime.toml",
+            remaining_bytes,
+        )?;
+        let runtime = SkillRuntimeManifest::parse(&runtime_toml)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        if runtime.skill_id() != &id || runtime.skill_version() != wire.version {
+            return Err(ExecutionError::new(
+                ExecutionErrorKind::ImplementationBinding,
+            ));
+        }
+        let mut scripts = BTreeMap::new();
+        for script in runtime.scripts() {
+            scripts.insert(
+                script.id().as_str().to_owned(),
+                package_file(&wire.root, root_identity, script.path(), remaining_bytes)?,
+            );
+        }
+        let mut resources = BTreeMap::new();
+        for resource in runtime.resources() {
+            resources.insert(
+                resource.id().clone(),
+                package_file(
+                    &wire.root,
+                    root_identity,
+                    resource.id().as_str(),
+                    remaining_bytes,
+                )?,
+            );
+        }
+        let lock = SkillRuntimeLock::try_from_declared_bytes(
+            &runtime,
+            &skill_markdown,
+            scripts
+                .iter()
+                .map(|(id, bytes)| (id.as_str(), bytes.as_slice())),
+            resources.iter().map(|(id, bytes)| (id, bytes.as_slice())),
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        let package = Self {
+            id,
+            version: wire.version.clone(),
+            manifest,
+            skill_markdown,
+            runtime_toml,
+            runtime,
+            lock,
+            scripts,
+            resources,
+        };
+        Ok(package)
+    }
+
+    fn into_sealed(self) -> Result<SealedSkillPackageV1, ExecutionError> {
+        let binding_identity = self.binding()?.metadata_identity().to_owned();
+        Ok(SealedSkillPackageV1 {
+            id: self.id.as_str().to_owned(),
+            version: self.version,
+            binding_identity,
+            skill_markdown: self.skill_markdown,
+            runtime_toml: self.runtime_toml,
+            scripts: self.scripts,
+            resources: self
+                .resources
+                .into_iter()
+                .map(|(id, bytes)| (id.as_str().to_owned(), bytes))
+                .collect(),
+        })
+    }
+
+    fn binding(&self) -> Result<ResolvedBinding, ExecutionError> {
+        let identity = self
+            .lock
+            .to_toml()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        Ok(ResolvedBinding::new(self.id.as_str(), &self.version)
+            .with_metadata_identity(format!("sha256:{:x}", Sha256::digest(identity))))
+    }
+
+    fn read_resource(
+        &self,
+        id: &SkillResourceId,
+        request: PageRequest,
+        max_total_read_bytes: NonZeroU64,
+    ) -> Result<Value, ToolBridgeError> {
+        if !self.resources.contains_key(id) {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
+        }
+        let activation = activate_skill(self, &self.id, &self.version)
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+        let capabilities = intersect_policy_capabilities(
+            &RequestedCapabilities::new([SandboxCapability::FilesystemRead]),
+            &[PolicyCapabilities::new([SandboxCapability::FilesystemRead])],
+        )
+        .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+        let mut resources = activation
+            .attach_resources(
+                &capabilities,
+                SkillResourceLimits::new(
+                    NonZeroUsize::new(self.resources.len().max(1))
+                        .expect("positive resource limit"),
+                    NonZeroU64::new(65_536).expect("positive resource limit"),
+                    NonZeroU64::new(SKILL_RESOURCE_READ_LIMIT).expect("positive resource limit"),
+                    max_total_read_bytes,
+                ),
+                self.resources
+                    .iter()
+                    .map(|(id, bytes)| SkillResourceInput::file(id.clone(), bytes.clone())),
+            )
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+        let read = resources
+            .read_skill_resource(id, request)
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+        let page_byte_len = u64::try_from(read.page().bytes().len())
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+        Ok(json!({
+            "resource_id": read.metadata().id().as_str(),
+            "result_ref": read.metadata().artifact_id().as_str(),
+            "byte_len": read.metadata().byte_len(),
+            "page_byte_len": page_byte_len,
+            "next_offset": read.page().next_offset(),
+            "content_encoding": "hex",
+            "content": read.page().bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        }))
+    }
+}
+
+impl SkillRegistry for SkillPackage {
+    type Implementation = SkillManifest;
+
+    fn resolve(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<RegistryEntry<'_, Self::Implementation>, RegistryNotFound> {
+        if id == self.id.as_str() && version == self.version {
+            Ok(RegistryEntry::new(
+                &self.manifest,
+                self.id.as_str(),
+                &self.version,
+            ))
+        } else {
+            Err(RegistryNotFound::new(
+                workflow_compiler::RegistryCategory::Skill,
+                id,
+                version,
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SealedSkillSnapshotV1 {
+    schema_version: u8,
+    packages: Vec<SealedSkillPackageV1>,
+    model_responses: Option<Vec<u8>>,
+    reviewer_model_responses: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SealedSkillPackageV1 {
+    id: String,
+    version: String,
+    binding_identity: String,
+    skill_markdown: Vec<u8>,
+    runtime_toml: Vec<u8>,
+    scripts: BTreeMap<String, Vec<u8>>,
+    resources: BTreeMap<String, Vec<u8>>,
+}
+
+impl SealedSkillSnapshotV1 {
+    fn from_packages(
+        packages: BTreeMap<String, Arc<SkillPackage>>,
+        model: &ModelWire,
+        reviewer_model: Option<&ModelWire>,
+    ) -> Result<Option<Self>, ExecutionError> {
+        if packages.is_empty() {
+            return Ok(None);
+        }
+        let packages = packages
+            .into_values()
+            .map(|package| {
+                Arc::try_unwrap(package)
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?
+                    .into_sealed()
+            })
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
+        let reviewer_model_responses = reviewer_model
+            .map(ModelWire::sealed_fake_responses)
+            .transpose()?
+            .flatten();
+        Ok(Some(Self {
+            schema_version: 1,
+            packages,
+            model_responses: model.sealed_fake_responses()?,
+            reviewer_model_responses,
+        }))
+    }
+
+    fn identity(&self) -> Result<String, ExecutionError> {
+        serde_json::to_vec(self)
+            .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)))
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+    }
+
+    fn restore(
+        mut self,
+        expected_identity: &str,
+        profile: &mut ExecutionProfileV1,
+    ) -> Result<BTreeMap<String, Arc<SkillPackage>>, ExecutionError> {
+        if self.schema_version != 1 || self.identity()? != expected_identity {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        profile
+            .model
+            .restore_fake_responses(self.model_responses.take())?;
+        match (
+            &mut profile.reviewer_model,
+            self.reviewer_model_responses.take(),
+        ) {
+            (Some(model), responses) => model.restore_fake_responses(responses)?,
+            (None, None) => {}
+            (None, Some(_)) => {
+                return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+            }
+        }
+        self.into_packages()
+    }
+
+    fn into_packages(self) -> Result<BTreeMap<String, Arc<SkillPackage>>, ExecutionError> {
+        self.packages
+            .into_iter()
+            .map(|snapshot| {
+                let id = SkillId::new(&snapshot.id)
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                let manifest =
+                    SkillManifest::parse(Path::new(id.as_str()), &snapshot.skill_markdown)
+                        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                let runtime = SkillRuntimeManifest::parse(&snapshot.runtime_toml)
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                if runtime.skill_id() != &id || runtime.skill_version() != snapshot.version {
+                    return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+                }
+                let resources = snapshot
+                    .resources
+                    .into_iter()
+                    .map(|(name, bytes)| {
+                        SkillResourceId::new(&name)
+                            .map(|id| (id, bytes))
+                            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()?;
+                let lock = SkillRuntimeLock::try_from_declared_bytes(
+                    &runtime,
+                    &snapshot.skill_markdown,
+                    snapshot
+                        .scripts
+                        .iter()
+                        .map(|(id, bytes)| (id.as_str(), bytes.as_slice())),
+                    resources.iter().map(|(id, bytes)| (id, bytes.as_slice())),
+                )
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                let package = SkillPackage {
+                    id,
+                    version: snapshot.version,
+                    manifest,
+                    skill_markdown: snapshot.skill_markdown,
+                    runtime_toml: snapshot.runtime_toml,
+                    runtime,
+                    lock,
+                    scripts: snapshot.scripts,
+                    resources,
+                };
+                if package.binding()?.metadata_identity() != snapshot.binding_identity {
+                    return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+                }
+                Ok((package.id.as_str().to_owned(), Arc::new(package)))
+            })
+            .collect()
+    }
+}
+
+#[cfg(debug_assertions)]
+fn skill_snapshot_test_barrier() {
+    let Ok(root) = std::env::var("WORKFLOW_KIT_TEST_SKILL_SNAPSHOT_BARRIER") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    if fs::write(root.join("ready"), b"ready").is_err() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !root.join("continue").is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn skill_snapshot_test_barrier() {}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct PackageIdentity {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl PackageIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+
+    fn matches(self, metadata: &fs::Metadata) -> bool {
+        self == Self::from_metadata(metadata)
+    }
+}
+
+fn package_directory_identity(path: &Path) -> Result<PackageIdentity, ExecutionError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(ExecutionError::new(
+            ExecutionErrorKind::ImplementationBinding,
+        ));
+    }
+    Ok(PackageIdentity::from_metadata(&metadata))
+}
+
+#[cfg(debug_assertions)]
+fn package_file_test_barrier(package_root: &Path, relative: &str) {
+    let Some(parent) = package_root.parent() else {
+        return;
+    };
+    let root = parent.join("package-file-barrier");
+    let target = fs::read_to_string(root.join("target"))
+        .unwrap_or_else(|_| "scripts/replacement.bin".to_owned());
+    if relative != target {
+        return;
+    }
+    if fs::write(root.join("ready"), b"ready").is_err() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !root.join("continue").is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn package_file_test_barrier(_: &Path, _: &str) {}
+
+#[cfg(debug_assertions)]
+fn package_file_test_open_barrier(package_root: &Path, relative: &str) {
+    if relative != "scripts/replacement.bin" {
+        return;
+    }
+    let Some(parent) = package_root.parent() else {
+        return;
+    };
+    let root = parent.join("package-file-barrier");
+    if fs::write(root.join("opened"), b"opened").is_err() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !root.join("restored").is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn package_file_test_open_barrier(_: &Path, _: &str) {}
+
+#[cfg(debug_assertions)]
+fn package_file_test_read_len(package_root: &Path, relative: &str, length: usize) {
+    if relative != "scripts/replacement.bin" {
+        return;
+    }
+    let Some(parent) = package_root.parent() else {
+        return;
+    };
+    let _ = fs::write(
+        parent.join("package-file-barrier/read-len"),
+        length.to_string(),
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn package_file_test_read_len(_: &Path, _: &str, _: usize) {}
+
+fn package_paths_match(checked: &[(PathBuf, PackageIdentity)]) -> bool {
+    checked.iter().all(|(path, identity)| {
+        fs::symlink_metadata(path)
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink() && identity.matches(&metadata))
+    })
+}
+
+fn package_file(
+    root: &Path,
+    root_identity: PackageIdentity,
+    relative: &str,
+    remaining_bytes: &mut usize,
+) -> Result<Vec<u8>, ExecutionError> {
+    let mut checked = vec![(root.to_path_buf(), root_identity)];
+    let mut path = root.to_path_buf();
+    let components = Path::new(relative).components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(ExecutionError::new(
+                ExecutionErrorKind::ImplementationBinding,
+            ));
+        };
+        path.push(component);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        let final_component = index + 1 == components.len();
+        if metadata.file_type().is_symlink()
+            || (final_component && !metadata.is_file())
+            || (!final_component && !metadata.is_dir())
+        {
+            return Err(ExecutionError::new(
+                ExecutionErrorKind::ImplementationBinding,
+            ));
+        }
+        checked.push((path.clone(), PackageIdentity::from_metadata(&metadata)));
+    }
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    if metadata.len() == 0 || metadata.len() > 65_536 {
+        return Err(ExecutionError::new(
+            ExecutionErrorKind::ImplementationBinding,
+        ));
+    }
+    package_file_test_barrier(root, relative);
+    let file = fs::File::open(&path)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    package_file_test_open_barrier(root, relative);
+    let metadata = file
+        .metadata()
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    let leaf_identity = checked
+        .last()
+        .map(|(_, identity)| *identity)
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    if !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > 65_536
+        || !leaf_identity.matches(&metadata)
+    {
+        return Err(ExecutionError::new(
+            ExecutionErrorKind::ImplementationBinding,
+        ));
+    }
+    let length = usize::try_from(metadata.len())
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
+    if length > *remaining_bytes {
+        return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+    }
+    let mut bytes = Vec::with_capacity(length);
+    file.take(65_537)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    if bytes.len() != length {
+        return Err(ExecutionError::new(
+            ExecutionErrorKind::ImplementationBinding,
+        ));
+    }
+    package_file_test_read_len(root, relative, bytes.len());
+    if package_paths_match(&checked) && bytes.len() <= *remaining_bytes {
+        *remaining_bytes -= bytes.len();
+        Ok(bytes)
+    } else {
+        Err(ExecutionError::new(
+            ExecutionErrorKind::ImplementationBinding,
+        ))
+    }
+}
+
+/// A validated runtime profile supplied to the reusable ADK executor.
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionProfileV1 {
     schema_version: u16,
@@ -991,6 +2236,12 @@ pub struct ExecutionProfileV1 {
     tool: Option<ToolWire>,
     #[serde(default)]
     tools: Vec<ToolWire>,
+    #[serde(default)]
+    skills: Vec<SkillWire>,
+    #[serde(default)]
+    skill_snapshot: Option<String>,
+    #[serde(skip)]
+    sealed_skills: Option<BTreeMap<String, Arc<SkillPackage>>>,
     pure_transform: Option<PureTransformWire>,
     sandbox: SandboxWire,
     #[serde(default)]
@@ -1015,6 +2266,29 @@ enum ModelWire {
         base_url: String,
         credential_env: String,
     },
+}
+
+impl ModelWire {
+    fn sealed_fake_responses(&self) -> Result<Option<Vec<u8>>, ExecutionError> {
+        match self {
+            Self::Fake { responses, .. } => serde_json::to_vec(responses)
+                .map(Some)
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile)),
+            Self::OpenaiCompatible { .. } => Ok(None),
+        }
+    }
+
+    fn restore_fake_responses(&mut self, sealed: Option<Vec<u8>>) -> Result<(), ExecutionError> {
+        match (self, sealed) {
+            (Self::Fake { responses, .. }, Some(sealed)) => {
+                *responses = serde_json::from_slice(&sealed)
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                Ok(())
+            }
+            (Self::OpenaiCompatible { .. }, None) => Ok(()),
+            _ => Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1113,13 +2387,14 @@ impl ExecutionProfileV1 {
             }
         }
         let mut tool_names = BTreeSet::new();
-        if profile
-            .tool_wires()
-            .any(|tool| tool.name.is_empty() || !tool_names.insert(tool.name.as_str()))
-            || profile
-                .pure_transform
-                .as_ref()
-                .is_some_and(|transform| transform.module.is_empty())
+        if profile.tool_wires().any(|tool| {
+            tool.name.is_empty()
+                || is_reserved_skill_tool_name(&tool.name)
+                || !tool_names.insert(tool.name.as_str())
+        }) || profile
+            .pure_transform
+            .as_ref()
+            .is_some_and(|transform| transform.module.is_empty())
         {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
         }
@@ -1139,24 +2414,155 @@ impl ExecutionProfileV1 {
         Ok(profile)
     }
 
+    fn durable_fake_responses(responses: &Value) -> Value {
+        if let Some(responses) = responses.as_array()
+            && let Some(responses) = responses
+                .iter()
+                .map(Self::durable_fake_response)
+                .collect::<Option<Vec<_>>>()
+        {
+            return Value::Array(responses);
+        }
+        let identity = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(responses).expect("model responses serialize")),
+        );
+        Value::Array(vec![Value::String(format!(
+            "{{\"status\":\"finished\",\"output\":{{\"kit_durable_model_response_sha256\":\"{identity}\"}}}}"
+        ))])
+    }
+
+    fn durable_fake_response(response: &Value) -> Option<Value> {
+        if let Value::String(response) = response {
+            let identity = format!("sha256:{:x}", Sha256::digest(response));
+            return Some(Value::String(format!(
+                "{{\"status\":\"finished\",\"output\":{{\"kit_durable_model_response_sha256\":\"{identity}\"}}}}"
+            )));
+        }
+        let calls = response.get("calls")?.as_array()?;
+        let calls = calls
+            .iter()
+            .map(|call| {
+                let id = call.get("id")?.as_str()?.to_owned();
+                let name = call.get("name")?.as_str()?.to_owned();
+                let args = call.get("args")?.clone();
+                let args = durable_pending_args(&PendingCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    fingerprint: workflow_runtime::argument_fingerprint(&args),
+                    args,
+                    model_iteration: 0,
+                    admission_ordinal: 0,
+                })?;
+                Some(json!({"id": id, "name": name, "args": args}))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(json!({"calls": calls}))
+    }
+
+    fn durable_projection(&self, skill_snapshot: Option<&str>) -> Value {
+        let mut projection = serde_json::to_value(self).expect("execution profile serializes");
+        {
+            let projection = projection
+                .as_object_mut()
+                .expect("execution profile is an object");
+            let redact_fake_responses = !self.skills.is_empty() || self.skill_snapshot.is_some();
+            projection.insert("skills".to_owned(), Value::Array(Vec::new()));
+            projection.insert(
+                "skill_snapshot".to_owned(),
+                skill_snapshot.map_or(Value::Null, |identity| Value::String(identity.to_owned())),
+            );
+            for model in ["model", "reviewer_model"] {
+                if redact_fake_responses && projection[model]["provider"] == "fake" {
+                    projection[model]["responses"] =
+                        Self::durable_fake_responses(&projection[model]["responses"]);
+                }
+            }
+        }
+        projection
+    }
+
     fn tool_wires(&self) -> impl Iterator<Item = &ToolWire> {
         self.tool.iter().chain(&self.tools)
+    }
+
+    fn skill_packages(&self) -> Result<BTreeMap<String, Arc<SkillPackage>>, ExecutionError> {
+        if let Some(packages) = &self.sealed_skills {
+            return Ok(packages.clone());
+        }
+        self.load_skill_packages(None)
+    }
+
+    fn planned_skill_packages(
+        &self,
+        ir: &workflow_ir::WorkflowIr,
+    ) -> Result<BTreeMap<String, Arc<SkillPackage>>, ExecutionError> {
+        let required = ir
+            .nodes()
+            .iter()
+            .flat_map(|node| node.skills())
+            .map(|skill| (skill.id().to_owned(), skill.version().to_owned()))
+            .collect::<BTreeSet<_>>();
+        self.load_skill_packages(Some(&required))
+    }
+
+    fn load_skill_packages(
+        &self,
+        required: Option<&BTreeSet<(String, String)>>,
+    ) -> Result<BTreeMap<String, Arc<SkillPackage>>, ExecutionError> {
+        if self.skills.len() > SKILL_PACKAGE_LIMIT
+            || required.is_some_and(|required| {
+                self.skills
+                    .iter()
+                    .any(|wire| !required.contains(&(wire.id.clone(), wire.version.clone())))
+            })
+        {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+        }
+        let mut remaining_bytes = SKILL_PACKAGE_BYTES_LIMIT;
+        let mut packages = BTreeMap::new();
+        for wire in &self.skills {
+            let package = Arc::new(SkillPackage::load(wire, &mut remaining_bytes)?);
+            if packages.insert(wire.id.clone(), package).is_some() {
+                return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+            }
+        }
+        Ok(packages)
+    }
+
+    fn restore_skill_snapshot(&mut self, root: &Path) -> Result<(), ExecutionError> {
+        let Some(identity) = self.skill_snapshot.clone() else {
+            return Ok(());
+        };
+        if !self.skills.is_empty() {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        let snapshot = serde_json::from_slice::<SealedSkillSnapshotV1>(&bounded_read(
+            &root.join(SKILL_SNAPSHOT_FILE),
+        )?)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        self.sealed_skills = Some(snapshot.restore(&identity, self)?);
+        Ok(())
     }
 
     fn capabilities(
         &self,
     ) -> Result<(Vec<SandboxCapability>, Vec<SandboxCapability>), ExecutionError> {
-        let sandbox = self
+        let mut sandbox = self
             .sandbox
             .capabilities
             .iter()
             .map(|value| parse_capability(value))
             .collect::<Result<Vec<_>, _>>()?;
-        let required = self
+        sandbox.sort_unstable_by_key(SandboxCapability::as_str);
+        sandbox.dedup();
+        let mut required = self
             .tool_wires()
             .flat_map(|tool| tool.required_capabilities.iter())
             .map(|value| parse_capability(value))
             .collect::<Result<Vec<_>, _>>()?;
+        required.sort_unstable_by_key(SandboxCapability::as_str);
+        required.dedup();
         Ok((sandbox, required))
     }
 
@@ -1413,6 +2819,14 @@ impl ExecutionRuntimeRegistry {
         if !tools.is_empty() {
             candidates.insert(BindingCategory::Tool, tools);
         }
+        let skills = profile
+            .skill_packages()?
+            .values()
+            .map(|package| package.binding())
+            .collect::<Result<Vec<_>, _>>()?;
+        if !skills.is_empty() {
+            candidates.insert(BindingCategory::Skill, skills);
+        }
         Ok(ExecutionRuntimeRegistry { candidates })
     }
 }
@@ -1495,16 +2909,6 @@ fn resolve_runtime_plan(
             )
         },
     )
-}
-
-fn effective_sandbox_capabilities(
-    plan: &ResolvedRuntimePlan,
-) -> Result<Vec<SandboxCapability>, ExecutionError> {
-    plan.effective_capabilities()
-        .as_slice()
-        .into_iter()
-        .map(parse_capability)
-        .collect()
 }
 
 fn parse_capability(value: &str) -> Result<SandboxCapability, ExecutionError> {
@@ -1640,7 +3044,12 @@ fn build_profile_agent(
             let controller = Arc::clone(&tool_error_controller);
             Box::pin(async move {
                 let error = error.to_ascii_lowercase();
-                let (kind, code) = if error.contains("authorization_denied") {
+                let (kind, code) = if error.contains("sandbox_denied") {
+                    (
+                        ExecutionErrorKind::SandboxDenied,
+                        "tool.bridge.sandbox_denied",
+                    )
+                } else if error.contains("authorization_denied") {
                     (
                         ExecutionErrorKind::AuthorizationDenied,
                         "tool.bridge.authorization_denied",
@@ -1762,6 +3171,7 @@ pub enum ExecutionErrorKind {
 fn execution_error_kind(error: AdkGraphError) -> ExecutionErrorKind {
     match error {
         AdkGraphError::AuthorizationDenied => ExecutionErrorKind::AuthorizationDenied,
+        AdkGraphError::SandboxDenied => ExecutionErrorKind::SandboxDenied,
         AdkGraphError::ModelIterationsLimit => ExecutionErrorKind::ModelIterationsLimit,
         AdkGraphError::TotalToolCallsLimit => ExecutionErrorKind::TotalToolCallsLimit,
         AdkGraphError::ToolCallsPerToolLimit => ExecutionErrorKind::ToolCallsPerToolLimit,
@@ -1964,7 +3374,7 @@ impl ExecutionBackend {
 
     pub fn run_cancellable(
         workflow: impl AsRef<Path>,
-        profile: ExecutionProfileV1,
+        mut profile: ExecutionProfileV1,
         input: Value,
         workdir_base: impl AsRef<Path>,
         cancellation: Arc<AtomicBool>,
@@ -1977,6 +3387,30 @@ impl ExecutionBackend {
         if contains_sensitive_key(&input) {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
         }
+        let compiled = compile_file(workflow.as_ref().to_string_lossy().as_ref())
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Compile))?;
+        let skill_snapshot = SealedSkillSnapshotV1::from_packages(
+            profile.planned_skill_packages(compiled.ir())?,
+            &profile.model,
+            profile.reviewer_model.as_ref(),
+        )?;
+        let (skill_snapshot_bytes, skill_snapshot_identity) = match skill_snapshot {
+            Some(snapshot) => {
+                let bytes = serde_json::to_vec(&snapshot)
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
+                if bytes.len() > MAX_STATE_BYTES {
+                    return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+                }
+                let identity = format!("sha256:{:x}", Sha256::digest(&bytes));
+                profile.sealed_skills = Some(snapshot.into_packages()?);
+                (Some(bytes), Some(identity))
+            }
+            None => {
+                profile.sealed_skills = Some(BTreeMap::new());
+                (None, None)
+            }
+        };
+        skill_snapshot_test_barrier();
         let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
         let requested = RequestedCapabilities::new(required_capabilities.iter().copied());
         verify_sandbox_capabilities(
@@ -1985,8 +3419,6 @@ impl ExecutionBackend {
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::SandboxDenied))?;
 
-        let compiled = compile_file(workflow.as_ref().to_string_lossy().as_ref())
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Compile))?;
         let resolved_plan = resolve_runtime_plan(&profile, compiled.ir())?;
         let resolved_models = compiled
             .ir()
@@ -1999,7 +3431,7 @@ impl ExecutionBackend {
                     .map(|model| (node.id().as_str().to_owned(), model))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let effective_capabilities = effective_sandbox_capabilities(&resolved_plan)?;
+        let effective_capabilities = sandbox_capabilities;
         let transform_module = profile.transform_module()?;
         let recursion_limit = compiled
             .ir()
@@ -2022,13 +3454,20 @@ impl ExecutionBackend {
             &profile,
             &resolved_plan,
             transform_module.as_deref(),
+            skill_snapshot_identity.as_deref(),
         )?;
         let ledger_identity = ledger_checkpoint_identity(&checkpoint_manifest)?;
         let context = RunContext::new(run_id.clone(), profile.run_limits());
         let mut mapper = AdkEventMapper::new(run_id.as_str(), compiled.ir().workflow_id().as_str())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
         let run_workdir = manager
-            .allocate(&run_id)
+            .materialize(
+                &run_id,
+                &Materialization {
+                    skills: Some(Vec::new()),
+                    ..Materialization::default()
+                },
+            )
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let run_root = run_workdir.root().to_path_buf();
         let workdir_id = run_workdir.id().as_str().to_owned();
@@ -2037,7 +3476,8 @@ impl ExecutionBackend {
             .filter(|bytes| !bytes.is_empty() && bytes.len() <= MAX_STATE_BYTES);
         let mut artifacts = FilesystemArtifactStore::try_new(
             run_root.join("artifacts"),
-            NonZeroU64::new(ARTIFACT_LIMIT).expect("positive artifact limit"),
+            NonZeroU64::new(u64::try_from(MAX_STATE_BYTES).expect("state limit fits u64"))
+                .expect("positive artifact limit"),
             NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page limit"),
         )
         .ok();
@@ -2046,7 +3486,14 @@ impl ExecutionBackend {
         if workflow_source
             .as_deref()
             .is_none_or(|source| write_atomic(&run_root.join("workflow.toml"), source).is_err())
-            || write_json(&run_root.join("execution-profile.json"), &profile).is_err()
+            || skill_snapshot_bytes.as_ref().is_some_and(|snapshot| {
+                write_atomic(&run_root.join(SKILL_SNAPSHOT_FILE), snapshot).is_err()
+            })
+            || write_json(
+                &run_root.join("execution-profile.json"),
+                &profile.durable_projection(skill_snapshot_identity.as_deref()),
+            )
+            .is_err()
             || write_json(&run_root.join("execution-input.json"), &input).is_err()
         {
             persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
@@ -2064,6 +3511,7 @@ impl ExecutionBackend {
             ledger_identity,
             checkpoint_manifest.clone(),
             run_id.clone(),
+            profile.skill_packages()?.is_empty(),
         ) {
             Ok(ledger) => Some(Arc::new(ledger)),
             Err(_) => {
@@ -2174,8 +3622,10 @@ impl ExecutionBackend {
                 });
                 let tool_registry = build_tool_registry(
                     &profile,
+                    &resolved_plan,
                     sandbox,
                     &run_id,
+                    Arc::clone(&loop_ledger),
                     effect_journal.clone(),
                     Arc::clone(&effect_fence),
                 )?;
@@ -2196,7 +3646,9 @@ impl ExecutionBackend {
                             model,
                             build_toolset(
                                 &tool_registry,
+                                node.id().as_str(),
                                 resolved_plan.node_tools(node.id().as_str()),
+                                resolved_plan.node_skills(node.id().as_str()),
                                 &effective_capabilities,
                             )?,
                             profile.run_limits(),
@@ -2343,7 +3795,6 @@ impl ExecutionBackend {
         if let Err(error) = write_events(&run_root.join("events.jsonl"), mapper.events()) {
             persistence_error.get_or_insert(error);
         }
-        crash_barrier("after-result");
         if persistence_error.is_none() {
             if let (Ok(state), Some(store), Some(loop_ledger)) =
                 (&execution, checkpoint_store.as_mut(), loop_ledger.as_ref())
@@ -2412,6 +3863,7 @@ impl ExecutionBackend {
                 persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
             }
         }
+        crash_barrier("after-result");
         if checkpoint_failed {
             status = "failed";
         }
@@ -2544,8 +3996,9 @@ impl ExecutionBackend {
                 return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
             }
         }
-        let profile =
+        let mut profile =
             ExecutionProfileV1::parse(&bounded_read(&root.join("execution-profile.json"))?)?;
+        profile.restore_skill_snapshot(&root)?;
         let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
         verify_sandbox_capabilities(
             &RequestedCapabilities::new(required_capabilities.iter().copied()),
@@ -2570,14 +4023,6 @@ impl ExecutionBackend {
         {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
-        for node in compiled
-            .ir()
-            .nodes()
-            .iter()
-            .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
-        {
-            profile.bind_resolved_model(&resolved_plan, node.id().as_str(), 0)?;
-        }
         let transform_module = profile.transform_module()?;
         let live_checkpoint_manifest = build_checkpoint_manifest(
             &run_identity,
@@ -2589,12 +4034,13 @@ impl ExecutionBackend {
             &profile,
             &resolved_plan,
             transform_module.as_deref(),
+            profile.skill_snapshot.as_deref(),
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         if live_checkpoint_manifest != checkpoint_manifest {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
-        let effective_capabilities = effective_sandbox_capabilities(&resolved_plan)?;
+        let effective_capabilities = sandbox_capabilities;
         let events_path = root.join("events.jsonl");
         let mut events = read_events(&events_path)?;
         let event_sequence = events.last().map_or(0, |event| event.sequence());
@@ -2621,6 +4067,7 @@ impl ExecutionBackend {
             });
         let mut mapper = AdkEventMapper::resume(run_id, &manifest.workflow_id, events)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+
         let next = manifest.resume_count + 1;
         mapper
             .map(AdkRuntimeObservationV1::new(
@@ -2629,16 +4076,19 @@ impl ExecutionBackend {
                 AdkRuntimeObservationKindV1::WorkflowResumed,
             ))
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+
         let sandbox = RunSandbox::new(
             RunContext::new(run_identity.clone(), profile.run_limits()),
             run_workdir,
             effective_capabilities.clone(),
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+
         let effect_journal = Arc::new(
             EffectJournal::open(root.join("effects.sqlite"))
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?,
         );
+
         let deadline = execution_deadline(&profile.run_limits())?;
         let terminal_kind = Arc::new(Mutex::new(None));
         let last_progress = Arc::new(Mutex::new(Instant::now()));
@@ -2657,14 +4107,18 @@ impl ExecutionBackend {
             checkpoint_manifest.clone(),
             run_identity.clone(),
             checkpoint_ledger_digest(checkpoint.state())?.as_str(),
+            profile.skill_packages()?.is_empty(),
         )?);
         let tool_registry = build_tool_registry(
             &profile,
+            &resolved_plan,
             sandbox,
             &run_identity,
+            Arc::clone(&loop_ledger),
             Some(Arc::clone(&effect_journal)),
             Arc::clone(&effect_fence),
         )?;
+
         let toolsets = compiled
             .ir()
             .nodes()
@@ -2675,15 +4129,32 @@ impl ExecutionBackend {
                     node.id().as_str().to_owned(),
                     build_toolset(
                         &tool_registry,
+                        node.id().as_str(),
                         resolved_plan.node_tools(node.id().as_str()),
+                        resolved_plan.node_skills(node.id().as_str()),
                         &effective_capabilities,
                     )?,
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        if let Err(error) =
-            replay_pending_tools(&loop_ledger, &toolsets, profile.run_limits(), &effect_fence)
-        {
+        if let Err(error) = restore_completed_calls(
+            &loop_ledger,
+            &toolsets,
+            &profile.skill_packages()?,
+            &effect_fence,
+            &profile,
+        )
+        .and_then(|()| {
+            replay_pending_tools(
+                &loop_ledger,
+                &toolsets,
+                &profile,
+                &effect_journal,
+                &run_identity,
+                profile.run_limits(),
+                &effect_fence,
+            )
+        }) {
             return Err(resume_failure(
                 &root,
                 &events_path,
@@ -2694,6 +4165,7 @@ impl ExecutionBackend {
             ));
         }
         restore_tool_events(&loop_ledger, &tool_event_counts, &mut mapper)?;
+
         let agents = compiled
             .ir()
             .nodes()
@@ -2701,15 +4173,14 @@ impl ExecutionBackend {
             .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
             .map(|node| -> Result<_, ExecutionError> {
                 let name = node.id().as_str();
-                let agent = if let Some(output) = loop_ledger.finished_output(name)? {
+                let completed_turns = loop_ledger.model_iterations(name)?;
+                let model = profile.bind_resolved_model(&resolved_plan, name, completed_turns)?;
+                let agent = if let Some(output) = loop_ledger.finish_successor(name)? {
                     Arc::new(RestoredFinishAgent {
                         name: name.to_owned(),
                         output,
                     }) as Arc<dyn Agent>
                 } else {
-                    let completed_turns = loop_ledger.model_iterations(name)?;
-                    let model =
-                        profile.bind_resolved_model(&resolved_plan, name, completed_turns)?;
                     build_profile_agent(
                         name,
                         model,
@@ -2847,12 +4318,12 @@ impl ExecutionBackend {
             .to_owned();
         crash_barrier("before-result");
         write_events(&events_path, mapper.events())?;
-        crash_barrier("after-result");
         crash_barrier("before-checkpoint");
         checkpoint_store
             .save_checkpoint(checkpoint)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         crash_barrier("after-checkpoint");
+        crash_barrier("after-result");
         manifest.status = "succeeded".to_owned();
         manifest.artifact_id = artifact_id;
         manifest.resume_count = next;
@@ -2868,29 +4339,39 @@ fn build_checkpoint_manifest(
     profile: &ExecutionProfileV1,
     plan: &ResolvedRuntimePlan,
     transform_module: Option<&[u8]>,
+    skill_snapshot: Option<&str>,
 ) -> Result<CheckpointManifestV1, ExecutionError> {
+    let durable_profile = profile.durable_projection(skill_snapshot);
     let profile_identity = serde_json::to_vec(&(
-        &profile.model,
-        &profile.reviewer_model,
-        &profile.tool,
-        &profile.tools,
-        &profile.loop_policy,
+        &durable_profile["model"],
+        &durable_profile["reviewer_model"],
+        &durable_profile["tool"],
+        &durable_profile["tools"],
+        &durable_profile["skills"],
+        &durable_profile["skill_snapshot"],
+        &durable_profile["loop_policy"],
     ))
     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-    let effective_capabilities = plan.effective_capabilities().as_slice().join("\n");
+    let sandbox_capabilities = profile
+        .capabilities()?
+        .0
+        .iter()
+        .map(SandboxCapability::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut manifest = CheckpointManifestV1::new(run_id, workflow.0, workflow.1)
         .with_workflow_hash(workflow_hash.clone())
         .with_resource_hash("workflow.ir", workflow_hash)
         .with_implementation("model", profile.profile_identity())
         .with_implementation("adk-rust", "2.1.0")
-        .with_implementation("loop-ledger", "v2")
+        .with_implementation("loop-ledger", "v3")
         .with_implementation(
             "execution-profile",
             format!("sha256:{:x}", Sha256::digest(profile_identity)),
         )
         .with_sandbox_policy_hash(format!(
             "sha256:{:x}",
-            Sha256::digest(effective_capabilities.as_bytes())
+            Sha256::digest(sandbox_capabilities.as_bytes())
         ))
         .with_implementation("toolset", plan.resume_identity())
         .with_event_log_identity("workflow-runtime-events-v1");
@@ -2899,6 +4380,30 @@ fn build_checkpoint_manifest(
             "pure-transform",
             format!("sha256:{:x}", Sha256::digest(transform)),
         );
+    }
+    for package in profile.skill_packages()?.values() {
+        let prefix = format!("skill.{}", package.id.as_str());
+        manifest = manifest
+            .with_implementation(
+                format!("{prefix}.activation"),
+                format!("{}:{}", package.id.as_str(), package.version),
+            )
+            .with_resource_hash(
+                format!("{prefix}.skill_markdown"),
+                format!("sha256:{:x}", Sha256::digest(&package.skill_markdown)),
+            );
+        for (id, bytes) in &package.scripts {
+            manifest = manifest.with_resource_hash(
+                format!("{prefix}.script.{id}"),
+                format!("sha256:{:x}", Sha256::digest(bytes)),
+            );
+        }
+        for (id, bytes) in &package.resources {
+            manifest = manifest.with_resource_hash(
+                format!("{prefix}.resource.{}", id.as_str()),
+                format!("sha256:{:x}", Sha256::digest(bytes)),
+            );
+        }
     }
     Ok(manifest)
 }
@@ -2951,6 +4456,13 @@ impl EffectFence {
     }
 
     fn admit(&self, tool_deadline: Instant) -> Result<(), ToolBridgeError> {
+        if self
+            .terminal
+            .lock()
+            .map_or(true, |terminal| terminal.is_some())
+        {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
+        }
         let kind = if self.cancellation.load(Ordering::Acquire) {
             Some(ExecutionErrorKind::Cancelled)
         } else if Instant::now() >= self.wall_deadline {
@@ -2994,13 +4506,23 @@ impl EffectFence {
 }
 
 fn test_effect_barrier(cancellation: &AtomicBool) {
-    let Ok(root) = std::env::var("WORKFLOW_KIT_TEST_EFFECT_BARRIER") else {
+    let Ok(configured) = std::env::var("WORKFLOW_KIT_TEST_EFFECT_BARRIER") else {
         return;
     };
+    let (root, hit) = configured
+        .rsplit_once('#')
+        .and_then(|(root, hit)| hit.parse::<u64>().ok().map(|hit| (root, hit)))
+        .unwrap_or((configured.as_str(), 1));
+    if EFFECT_BARRIER_HITS.fetch_add(1, Ordering::Relaxed) + 1 != hit {
+        return;
+    }
     let root = PathBuf::from(root);
     let _ = fs::write(root.join("ready"), b"ready");
     let deadline = Instant::now() + Duration::from_secs(2);
-    while !root.join("cancel").is_file() && Instant::now() < deadline {
+    while !root.join("cancel").is_file()
+        && !root.join("continue").is_file()
+        && Instant::now() < deadline
+    {
         std::thread::sleep(Duration::from_millis(5));
     }
     if root.join("cancel").is_file() {
@@ -3008,10 +4530,206 @@ fn test_effect_barrier(cancellation: &AtomicBool) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SkillToolAction {
+    Activate,
+    Read,
+    Run,
+}
+
+struct SkillToolHandler {
+    action: SkillToolAction,
+    ledger: Arc<LoopLedgerStore>,
+    effect_fence: Arc<EffectFence>,
+    packages: BTreeMap<String, Arc<SkillPackage>>,
+    plan: ResolvedRuntimePlan,
+    provenance: ToolProvenance,
+}
+
+impl SkillToolHandler {
+    fn selected_script_capabilities(
+        &self,
+        arguments: &Value,
+    ) -> Result<Vec<SandboxCapability>, ToolBridgeError> {
+        if !matches!(self.action, SkillToolAction::Run) {
+            return Ok(Vec::new());
+        }
+        let input = serde_json::from_value::<RunSkillScriptInput>(arguments.clone())
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+        let package = self
+            .packages
+            .get(&input.skill_id)
+            .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+        package
+            .runtime
+            .script(&input.script_id)
+            .map(|script| script.capabilities().to_vec())
+            .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))
+    }
+}
+
+impl ToolHandler for SkillToolHandler {
+    fn required_capabilities(
+        &self,
+        arguments: &Value,
+    ) -> Result<Vec<SandboxCapability>, ToolBridgeError> {
+        self.selected_script_capabilities(arguments)
+    }
+
+    fn requires_approval(&self, arguments: &Value) -> Result<bool, ToolBridgeError> {
+        Ok(self
+            .selected_script_capabilities(arguments)?
+            .iter()
+            .any(|capability| {
+                matches!(
+                    capability,
+                    SandboxCapability::FilesystemWrite | SandboxCapability::Network
+                )
+            }))
+    }
+
+    fn execute(
+        &self,
+        sandbox: &workflow_runtime::ChildSandbox<'_>,
+        context: &ToolCallContext,
+        arguments: &Value,
+    ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        let skill_name = match self.action {
+            SkillToolAction::Activate => {
+                serde_json::from_value::<ActivateSkillInput>(arguments.clone())
+                    .map(|input| input.skill_id)
+            }
+            SkillToolAction::Read => {
+                serde_json::from_value::<ReadSkillResourceInput>(arguments.clone())
+                    .map(|input| input.skill_id)
+            }
+            SkillToolAction::Run => {
+                serde_json::from_value::<RunSkillScriptInput>(arguments.clone())
+                    .map(|input| input.skill_id)
+            }
+        }
+        .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+        let skill_id = self
+            .packages
+            .get(&skill_name)
+            .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+        let binding = skill_id
+            .binding()
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+        if !self
+            .plan
+            .node_skills(context.actor())
+            .iter()
+            .any(|allowed| allowed == &binding)
+        {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
+        }
+        if !matches!(self.action, SkillToolAction::Activate)
+            && !self
+                .ledger
+                .is_skill_activated(context.actor(), &skill_name)
+                .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?
+        {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
+        }
+        let tool_deadline = self.effect_fence.wait(Duration::ZERO)?;
+        let payload = match self.action {
+            SkillToolAction::Activate => {
+                let activation = activate_skill(skill_id.as_ref(), &skill_id.id, &skill_id.version)
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                let payload = json!({
+                    "skill_id": activation.id().as_str(),
+                    "version": activation.version(),
+                    "instructions_ref": format!("sha256:{:x}", Sha256::digest(activation.instructions())),
+                    "instructions": activation.instructions(),
+                    "resources": skill_id.runtime.resources().iter().map(|resource| json!({
+                        "id": resource.id().as_str(),
+                        "sha256": resource.sha256(),
+                    })).collect::<Vec<_>>(),
+                    "scripts": skill_id.runtime.scripts().iter().map(|script| json!({
+                        "id": script.id().as_str(),
+                        "sha256": script.sha256(),
+                        "runtime": script.runtime(),
+                        "capabilities": script.capabilities().iter().map(SandboxCapability::as_str).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                });
+                self.effect_fence.admit(tool_deadline)?;
+                self.ledger
+                    .activate_skill(context.actor(), &skill_name)
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                crash_barrier("after-skill-activation");
+                payload
+            }
+            SkillToolAction::Read => {
+                let input = serde_json::from_value::<ReadSkillResourceInput>(arguments.clone())
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+                let resource_id = SkillResourceId::new(&input.resource_id)
+                    .ok()
+                    .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                let limit = NonZeroU64::new(input.limit)
+                    .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                let payload = skill_id.read_resource(
+                    &resource_id,
+                    PageRequest::new(input.offset, limit),
+                    NonZeroU64::new(SKILL_RESOURCE_READ_LIMIT)
+                        .expect("positive resource read limit"),
+                )?;
+                let page_bytes = payload
+                    .get("page_byte_len")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                self.effect_fence.admit(tool_deadline)?;
+                self.ledger
+                    .reserve_skill_resource_read(
+                        context.actor(),
+                        &skill_name,
+                        context.argument_fingerprint(),
+                        page_bytes,
+                    )
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                crash_barrier("after-skill-resource-read-reservation");
+                payload
+            }
+            SkillToolAction::Run => {
+                let input = serde_json::from_value::<RunSkillScriptInput>(arguments.clone())
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied))?;
+                let script_id = input.script_id;
+                let input = serde_json::to_vec(&input.input)
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                let script_bytes = skill_id
+                    .scripts
+                    .get(&script_id)
+                    .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                self.effect_fence.admit(tool_deadline)?;
+                let receipt = execute_registered_script_in_child(
+                    &skill_id.runtime,
+                    &skill_id.lock,
+                    &script_id,
+                    &input,
+                    script_bytes,
+                    sandbox,
+                )
+                .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                self.effect_fence.admit(tool_deadline)?;
+                if !receipt.exit_success() {
+                    return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
+                }
+                serde_json::from_slice(receipt.stdout())
+                    .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?
+            }
+        };
+        self.effect_fence.admit(tool_deadline)?;
+        self.effect_fence.mark_progress()?;
+        Ok(ToolEnvelope::success(payload, self.provenance.clone()))
+    }
+}
+
 fn build_tool_registry(
     profile: &ExecutionProfileV1,
+    plan: &ResolvedRuntimePlan,
     sandbox: RunSandbox,
     run_id: &RunId,
+    ledger: Arc<LoopLedgerStore>,
     effect_journal: Option<Arc<EffectJournal>>,
     effect_fence: Arc<EffectFence>,
 ) -> Result<ToolBridge, ExecutionError> {
@@ -3035,21 +4753,106 @@ fn build_tool_registry(
             )
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
     }
+    let packages = profile.skill_packages()?;
+    if !packages.is_empty() {
+        for (name, action, capabilities, read_only) in [
+            (
+                RESERVED_SKILL_TOOL_NAMES[0],
+                SkillToolAction::Activate,
+                Vec::new(),
+                true,
+            ),
+            (
+                RESERVED_SKILL_TOOL_NAMES[1],
+                SkillToolAction::Read,
+                vec![SandboxCapability::FilesystemRead],
+                true,
+            ),
+            (
+                RESERVED_SKILL_TOOL_NAMES[2],
+                SkillToolAction::Run,
+                Vec::new(),
+                true,
+            ),
+        ] {
+            let registration = match action {
+                SkillToolAction::Activate => {
+                    ToolRegistration::for_types::<ActivateSkillInput, Value>(
+                        name,
+                        ToolProvenance::new("skill.runtime", "1"),
+                        ToolFlags::new(read_only, true, true),
+                    )
+                }
+                SkillToolAction::Read => {
+                    ToolRegistration::for_types::<ReadSkillResourceInput, Value>(
+                        name,
+                        ToolProvenance::new("skill.runtime", "1"),
+                        ToolFlags::new(read_only, true, true),
+                    )
+                }
+                SkillToolAction::Run => ToolRegistration::for_types::<RunSkillScriptInput, Value>(
+                    name,
+                    ToolProvenance::new("skill.runtime", "1"),
+                    ToolFlags::new(read_only, true, true),
+                ),
+            }
+            .map(|registration| {
+                let registration = registration
+                    .with_required_capabilities(capabilities)
+                    .with_timeout(NonZeroU64::new(60_000).expect("positive timeout"))
+                    .with_idempotency(if read_only {
+                        workflow_runtime::ToolIdempotency::NotRequired
+                    } else {
+                        workflow_runtime::ToolIdempotency::StableKey
+                    });
+                if matches!(action, SkillToolAction::Activate | SkillToolAction::Read) {
+                    registration.with_inline_output_limit(
+                        NonZeroU64::new(
+                            u64::try_from(MAX_STATE_BYTES).expect("state limit fits u64"),
+                        )
+                        .expect("positive Skill package envelope limit"),
+                    )
+                } else {
+                    registration
+                }
+            })
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+            let provenance = registration.provenance().clone();
+            bridge
+                .register(
+                    registration,
+                    SkillToolHandler {
+                        action,
+                        ledger: Arc::clone(&ledger),
+                        effect_fence: Arc::clone(&effect_fence),
+                        packages: packages.clone(),
+                        plan: plan.clone(),
+                        provenance,
+                    },
+                )
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        }
+    }
     Ok(bridge)
 }
 
 fn build_toolset(
     bridge: &ToolBridge,
+    node_id: &str,
     bindings: &[ResolvedBinding],
+    skills: &[ResolvedBinding],
     effective_capabilities: &[SandboxCapability],
 ) -> Result<Option<BoundTool>, ExecutionError> {
-    if bindings.is_empty() {
+    if bindings.is_empty() && skills.is_empty() {
         return Ok(None);
     }
-    let names = bindings
+    let mut names = bindings
         .iter()
         .map(|binding| binding.id().to_owned())
         .collect::<Vec<_>>();
+    if !skills.is_empty() {
+        names.extend(RESERVED_SKILL_TOOL_NAMES.map(str::to_owned));
+    }
     let authority = CapabilityIntersection::new(
         effective_capabilities.iter().copied(),
         names.iter(),
@@ -3062,6 +4865,7 @@ fn build_toolset(
     let adapter = AdkToolBridge::for_selected(
         bridge,
         names.iter().map(String::as_str),
+        node_id,
         authority,
         None,
         InMemoryArtifactStore::new(
@@ -3073,58 +4877,194 @@ fn build_toolset(
     Ok(Some((names, Arc::new(adapter))))
 }
 
+fn invoke_restored_tool(
+    node: &str,
+    call: &PendingCall,
+    toolset: Arc<AdkToolBridge<InMemoryArtifactStore>>,
+    effect_fence: &EffectFence,
+) -> Result<Value, ExecutionError> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let node = node.to_owned();
+    let call = call.clone();
+    std::thread::Builder::new()
+        .spawn(move || {
+            let response = toolset.invoke(ToolCall::new(
+                &call.name,
+                &call.id,
+                &node,
+                call.args.clone(),
+            ));
+            let _ = sender.send(response);
+        })
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
+    let tool_deadline = effect_fence.tool_deadline();
+    let response = loop {
+        effect_fence
+            .admit(tool_deadline)
+            .map_err(|_| effect_fence.execution_error())?;
+        match receiver.recv_timeout(Duration::from_millis(1)) {
+            Ok(response) => break response,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ExecutionError::new(ExecutionErrorKind::Tool));
+            }
+        }
+    };
+    effect_fence
+        .admit(tool_deadline)
+        .map_err(|_| effect_fence.execution_error())?;
+    let response = response.map_err(|error| {
+        let kind = match error.kind() {
+            ToolBridgeErrorKind::CapabilityDenied
+            | ToolBridgeErrorKind::ApprovalDenied
+            | ToolBridgeErrorKind::InvalidInput => ExecutionErrorKind::AuthorizationDenied,
+            _ => ExecutionErrorKind::Tool,
+        };
+        ExecutionError::new(kind)
+    })?;
+    serde_json::to_value(response).map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))
+}
+
+fn restore_completed_calls(
+    ledger: &LoopLedgerStore,
+    toolsets: &BTreeMap<String, Option<BoundTool>>,
+    packages: &BTreeMap<String, Arc<SkillPackage>>,
+    effect_fence: &EffectFence,
+    profile: &ExecutionProfileV1,
+) -> Result<(), ExecutionError> {
+    let mut restored = Vec::new();
+    for (node, completed) in ledger.completed_calls()? {
+        let call = completed.call();
+        let response = match &completed {
+            CompletedCall::Skill(_) => {
+                if is_redacted_script_pending(call) {
+                    return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+                }
+                let toolset = toolsets
+                    .get(&node)
+                    .and_then(Option::as_ref)
+                    .map(|(_, toolset)| Arc::clone(toolset))
+                    .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                if call.name == "read_skill_resource" {
+                    let input = serde_json::from_value::<ReadSkillResourceInput>(call.args.clone())
+                        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                    let resource_id = SkillResourceId::new(&input.resource_id)
+                        .ok()
+                        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                    let payload = packages
+                        .get(&input.skill_id)
+                        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+                        .read_resource(
+                            &resource_id,
+                            PageRequest::new(
+                                input.offset,
+                                NonZeroU64::new(input.limit).ok_or_else(|| {
+                                    ExecutionError::new(ExecutionErrorKind::InvalidRunState)
+                                })?,
+                            ),
+                            NonZeroU64::new(SKILL_RESOURCE_READ_LIMIT)
+                                .expect("positive resource read limit"),
+                        )
+                        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                    serde_json::to_value(ToolEnvelope::success(
+                        payload,
+                        ToolProvenance::new("skill.runtime", "1"),
+                    ))
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+                } else {
+                    invoke_restored_tool(&node, call, toolset, effect_fence)?
+                }
+            }
+            CompletedCall::Ordinary(_) => {
+                let tool = profile
+                    .tool_wires()
+                    .find(|tool| tool.name == call.name)
+                    .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                let provenance = profile.tool_registration(tool)?.provenance().clone();
+                serde_json::to_value(ToolEnvelope::success(tool.result.clone(), provenance))
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+            }
+        };
+        restored.push((node, completed, response));
+    }
+    for turn in restored.chunk_by(|left, right| {
+        left.0 == right.0 && left.1.call().model_iteration == right.1.call().model_iteration
+    }) {
+        let completed = turn
+            .iter()
+            .map(|(_, completed, response)| (completed.clone(), response.clone()))
+            .collect::<Vec<_>>();
+        ledger.restore_completed_turn(&turn[0].0, &completed)?;
+    }
+    Ok(())
+}
+
+fn invoke_restored_ordinary_tool(
+    profile: &ExecutionProfileV1,
+    call: &PendingCall,
+    effect_journal: &EffectJournal,
+    run_id: &RunId,
+    effect_fence: &EffectFence,
+) -> Result<Value, ExecutionError> {
+    let tool = profile
+        .tool_wires()
+        .find(|tool| tool.name == call.name)
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+    if tool.handler_error {
+        return Err(ExecutionError::new(ExecutionErrorKind::Tool));
+    }
+    let tool_deadline = effect_fence
+        .wait(Duration::from_millis(tool.delay_ms))
+        .map_err(|_| effect_fence.execution_error())?;
+    effect_fence
+        .admit(tool_deadline)
+        .map_err(|_| effect_fence.execution_error())?;
+    let key = EffectKey::from_argument_fingerprint(
+        run_id.as_str(),
+        &tool.name,
+        &tool.name,
+        &call.fingerprint,
+    );
+    let result = match effect_journal
+        .commit(&key, &tool.result)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?
+    {
+        EffectCommit::Committed => tool.result.clone(),
+        EffectCommit::AlreadyCommitted(result) => result,
+    };
+    effect_fence
+        .mark_progress()
+        .map_err(|_| effect_fence.execution_error())?;
+    let provenance = profile.tool_registration(tool)?.provenance().clone();
+    serde_json::to_value(ToolEnvelope::success(result, provenance))
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))
+}
+
 fn replay_pending_tools(
     ledger: &LoopLedgerStore,
     toolsets: &BTreeMap<String, Option<BoundTool>>,
+    profile: &ExecutionProfileV1,
+    effect_journal: &EffectJournal,
+    run_id: &RunId,
     limits: RunLimits,
     effect_fence: &EffectFence,
 ) -> Result<(), ExecutionError> {
     for (node, pending) in ledger.pending_calls()? {
-        let toolset = toolsets
+        if is_redacted_script_pending(&pending) {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        let (names, toolset) = toolsets
             .get(&node)
             .and_then(Option::as_ref)
-            .map(|(_, toolset)| toolset)
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let toolset = Arc::clone(toolset);
-        let (sender, receiver) = mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .spawn(move || {
-                let response = toolset.invoke(ToolCall::new(
-                    &pending.name,
-                    &pending.id,
-                    &node,
-                    pending.args.clone(),
-                ));
-                let _ = sender.send((node, pending, response));
-            })
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
-        let tool_deadline = effect_fence.tool_deadline();
-        let (node, pending, response) = loop {
-            effect_fence
-                .admit(tool_deadline)
-                .map_err(|_| effect_fence.execution_error())?;
-            match receiver.recv_timeout(Duration::from_millis(1)) {
-                Ok(result) => break result,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(ExecutionError::new(ExecutionErrorKind::Tool));
-                }
-            }
+        if !names.contains(&pending.name) {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        let response = if is_redacted_ordinary_pending(&pending) {
+            invoke_restored_ordinary_tool(profile, &pending, effect_journal, run_id, effect_fence)?
+        } else {
+            invoke_restored_tool(&node, &pending, Arc::clone(toolset), effect_fence)?
         };
-        effect_fence
-            .admit(tool_deadline)
-            .map_err(|_| effect_fence.execution_error())?;
-        let response = response.map_err(|error| {
-            let kind = match error.kind() {
-                ToolBridgeErrorKind::CapabilityDenied | ToolBridgeErrorKind::ApprovalDenied => {
-                    ExecutionErrorKind::AuthorizationDenied
-                }
-                _ => ExecutionErrorKind::Tool,
-            };
-            ExecutionError::new(kind)
-        })?;
-        let response = serde_json::to_value(response)
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?;
         ledger.complete_pending(
             &node,
             &pending,
@@ -3215,7 +5155,12 @@ impl ToolHandler for StaticToolHandler {
 
 fn crash_barrier(name: &str) {
     let configured = std::env::var("WORKFLOW_KIT_TEST_CRASH_BARRIER").ok();
-    if configured.as_deref() != Some(name) {
+    let (configured, hit) = configured
+        .as_deref()
+        .and_then(|value| value.rsplit_once('#'))
+        .and_then(|(value, hit)| hit.parse::<u64>().ok().map(|hit| (value, hit)))
+        .unwrap_or((configured.as_deref().unwrap_or_default(), 1));
+    if configured != name || CRASH_BARRIER_HITS.fetch_add(1, Ordering::Relaxed) + 1 != hit {
         return;
     }
     #[cfg(unix)]
@@ -3393,6 +5338,17 @@ mod execution_registry_tests {
 
     use super::*;
 
+    #[test]
+    fn finish_admission_without_successor_is_invalid() {
+        let state = LoopState {
+            model_iterations: 1,
+            finish_admitted: true,
+            ..LoopState::default()
+        };
+
+        assert!(!valid_loop_state(&state));
+    }
+
     fn fanout_ledger() -> (PathBuf, Arc<LoopLedgerStore>) {
         let root = std::env::temp_dir().join(format!(
             "workflow-adk-fanout-{}",
@@ -3423,6 +5379,7 @@ mod execution_registry_tests {
             "fanout".to_owned(),
             manifest,
             run_id,
+            true,
         )
         .expect("fan-out ledger");
         ledger
@@ -3557,6 +5514,39 @@ mod execution_registry_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn same_call_resource_read_reservations_are_idempotent() {
+        let (root, ledger) = fanout_ledger();
+        let barrier = Arc::new(Barrier::new(2));
+        let outcomes = std::thread::scope(|scope| {
+            let reserve = || {
+                let barrier = Arc::clone(&barrier);
+                let ledger = Arc::clone(&ledger);
+                scope.spawn(move || {
+                    barrier.wait();
+                    ledger.reserve_skill_resource_read(
+                        "left",
+                        "skill",
+                        "call-fingerprint",
+                        40 * 1_024,
+                    )
+                })
+            };
+            let first = reserve();
+            let second = reserve();
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 2);
+        let state = ledger.snapshot("left").unwrap();
+        assert_eq!(state.skill_resource_read_bytes["skill"], 40 * 1_024);
+        assert_eq!(
+            state.skill_resource_read_reservations["call-fingerprint"],
+            40 * 1_024,
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn registry_with(candidates: &[(BindingCategory, &str, &str)]) -> ExecutionRuntimeRegistry {
         let mut grouped = BTreeMap::new();
         for &(category, id, version) in candidates {
@@ -3613,5 +5603,31 @@ mod execution_registry_tests {
         assert_eq!(error.kind(), ExecutionErrorKind::AmbiguousBinding);
         assert_eq!(error.binding_category(), Some(BindingCategory::Tool));
         assert_eq!(error.resolved_binding(), Some(&projection));
+    }
+
+    #[test]
+    fn skill_tool_registrations_have_closed_input_schemas() {
+        for registration in [
+            ToolRegistration::for_types::<ActivateSkillInput, Value>(
+                "activate_skill",
+                ToolProvenance::new("skill.runtime", "1"),
+                ToolFlags::new(true, true, true),
+            ),
+            ToolRegistration::for_types::<ReadSkillResourceInput, Value>(
+                "read_skill_resource",
+                ToolProvenance::new("skill.runtime", "1"),
+                ToolFlags::new(true, true, true),
+            ),
+            ToolRegistration::for_types::<RunSkillScriptInput, Value>(
+                "run_skill_script",
+                ToolProvenance::new("skill.runtime", "1"),
+                ToolFlags::new(false, true, true),
+            ),
+        ] {
+            assert_eq!(
+                registration.expect("skill registration").input_schema()["additionalProperties"],
+                Value::Bool(false)
+            );
+        }
     }
 }

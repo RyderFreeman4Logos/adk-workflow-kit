@@ -12,8 +12,9 @@ use std::time::Duration;
 use adk_rust::async_trait;
 use adk_rust::futures::{Stream, StreamExt};
 use adk_rust::model::{OpenAICompatible, OpenAICompatibleConfig};
-use adk_rust::{AdkError, Content, ErrorCategory, Llm, LlmRequest, LlmResponse};
+use adk_rust::{AdkError, Content, ErrorCategory, Llm, LlmRequest, LlmResponse, Part};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use workflow_compiler::{ModelRegistry, RegistryCategory, RegistryEntry, RegistryNotFound};
 
 /// A stream whose provider failures have been converted to project errors.
@@ -315,6 +316,54 @@ impl QueuedFakeLlm {
     }
 }
 
+fn resolve_fake_response_reference(
+    value: &mut Value,
+    request: &LlmRequest,
+) -> adk_rust::Result<()> {
+    let reference = value
+        .as_object()
+        .filter(|object| object.len() == 1)
+        .and_then(|object| object.get("$from_tool_response"))
+        .and_then(Value::as_object)
+        .map(|reference| {
+            (
+                reference.get("name").and_then(Value::as_str),
+                reference.get("pointer").and_then(Value::as_str),
+            )
+        });
+    if let Some((Some(name), Some(pointer))) = reference {
+        let resolved = request
+            .contents
+            .iter()
+            .rev()
+            .flat_map(|content| content.parts.iter().rev())
+            .find_map(|part| match part {
+                Part::FunctionResponse {
+                    function_response, ..
+                } if function_response.name == name => function_response.response.pointer(pointer),
+                _ => None,
+            })
+            .cloned()
+            .ok_or_else(|| AdkError::agent("fake model response reference is unresolved"))?;
+        *value = resolved;
+        return Ok(());
+    }
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                resolve_fake_response_reference(value, request)?;
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                resolve_fake_response_reference(value, request)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Llm for QueuedFakeLlm {
     fn name(&self) -> &str {
@@ -323,16 +372,23 @@ impl Llm for QueuedFakeLlm {
 
     async fn generate_content(
         &self,
-        _request: LlmRequest,
+        request: LlmRequest,
         _stream: bool,
     ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
         adk_rust::tokio::time::sleep(self.response_delay).await;
-        let response = self
+        let mut response = self
             .responses
             .lock()
             .map_err(|_| AdkError::agent("fake model response queue poisoned"))?
             .pop_front()
             .ok_or_else(|| AdkError::agent("fake model response script exhausted"))?;
+        if let Some(content) = response.content.as_mut() {
+            for part in &mut content.parts {
+                if let Part::FunctionCall { args, .. } = part {
+                    resolve_fake_response_reference(args, &request)?;
+                }
+            }
+        }
         Ok(Box::pin(adk_rust::futures::stream::iter([Ok(response)])))
     }
 }

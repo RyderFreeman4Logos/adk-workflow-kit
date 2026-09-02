@@ -65,11 +65,27 @@ m3-03-adk test_name:
 m3-04-adk test_name:
     {{_io}} cargo +1.98.0 test -p workflow-adk --test m3_04_model_tool_loop {{test_name}} --locked -- --exact --nocapture
 
+# Focused M3-05 per-agent Skill runtime tests.
+m3-05-spec test_name:
+    {{_io}} cargo +1.98.0 test -p workflow-spec --test m3_05_skill_bindings {{test_name}} --locked -- --exact --nocapture
+
+m3-05-ir test_name:
+    {{_io}} cargo +1.98.0 test -p workflow-ir --test m3_05_skill_ir {{test_name}} --locked -- --exact --nocapture
+
+m3-05-compiler test_name:
+    {{_io}} cargo +1.98.0 test -p workflow-compiler --test m3_05_skill_runtime {{test_name}} --locked -- --exact --nocapture
+
+m3-05-adk test_name:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test m3_05_skill_runtime {{test_name}} --locked -- --exact --nocapture
+
 m3-04-unit test_name:
     {{_io}} cargo +1.98.0 test -p workflow-adk {{test_name}} --lib --locked -- --exact --nocapture
 
 m3-04-cli test_name:
     {{_io}} cargo +1.98.0 test -p workflowctl --test m1_12_destructive_resume {{test_name}} --locked -- --exact --nocapture
+
+m1-10-adk test_name:
+    {{_io}} cargo +1.98.0 test -p workflowctl --test m1_10_adk_run {{test_name}} --locked -- --exact --nocapture
 
 # Focused M1-15 conformance contract tests.
 m1-15-test:
