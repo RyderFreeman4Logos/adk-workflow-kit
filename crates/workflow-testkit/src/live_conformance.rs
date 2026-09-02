@@ -281,7 +281,10 @@ fn collect_metrics(
     };
     let review_revisions = parsed
         .iter()
-        .filter(|value| value.get("node_id").and_then(Value::as_str) == Some("revise"))
+        .filter(|value| {
+            value.get("kind").and_then(Value::as_str) == Some("node_completed")
+                && value.get("node_id").and_then(Value::as_str) == Some("revise")
+        })
         .count() as u64;
     let terminal = parsed
         .iter()
@@ -340,4 +343,64 @@ fn event_node_ids(run_root: &Path) -> Vec<String> {
             value.get("node_id")?.as_str().map(str::to_owned)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    fn review_revisions_for(events: &str) -> u64 {
+        let root = std::env::temp_dir().join(format!(
+            "m3-07-rev-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("temp run root");
+        fs::write(root.join("events.jsonl"), events).expect("events");
+        let metrics = collect_metrics(
+            ConformanceDisposition::Pass,
+            &root,
+            Some(&root),
+            Instant::now(),
+            None,
+        );
+        let _ = fs::remove_dir_all(&root);
+        metrics.review_revisions()
+    }
+
+    #[test]
+    fn review_revisions_counts_one_event_per_revise_visit() {
+        let none = concat!(
+            r#"{"kind":"node_started","node_id":"review"}"#,
+            "\n",
+            r#"{"kind":"node_completed","node_id":"review"}"#,
+            "\n",
+        );
+        let one = concat!(
+            r#"{"kind":"node_started","node_id":"revise"}"#,
+            "\n",
+            r#"{"kind":"model_request_completed","node_id":"revise"}"#,
+            "\n",
+            r#"{"kind":"node_completed","node_id":"revise"}"#,
+            "\n",
+        );
+        let repeated = concat!(
+            r#"{"kind":"node_started","node_id":"revise"}"#,
+            "\n",
+            r#"{"kind":"node_completed","node_id":"revise"}"#,
+            "\n",
+            r#"{"kind":"node_started","node_id":"revise"}"#,
+            "\n",
+            r#"{"kind":"model_request_completed","node_id":"revise"}"#,
+            "\n",
+            r#"{"kind":"node_completed","node_id":"revise"}"#,
+            "\n",
+        );
+        assert_eq!(review_revisions_for(none), 0);
+        assert_eq!(review_revisions_for(one), 1);
+        assert_eq!(review_revisions_for(repeated), 2);
+    }
 }
