@@ -61,9 +61,6 @@ pub(crate) fn project_tool_execution_error(error: ToolExecutionError) -> AdkErro
         workflow_runtime::ToolBridgeErrorKind::UnknownTool => {
             (ErrorCategory::NotFound, "model.call.unknown_tool")
         }
-        workflow_runtime::ToolBridgeErrorKind::InvalidInput => {
-            (ErrorCategory::InvalidInput, "model.call.malformed_tool")
-        }
         _ if error.terminal_outcome() == TerminalOutcome::AuthorizationDenied => {
             (ErrorCategory::Forbidden, "tool.bridge.authorization_denied")
         }
