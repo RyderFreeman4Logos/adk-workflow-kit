@@ -2827,6 +2827,14 @@ impl ExecutionRuntimeRegistry {
         if !skills.is_empty() {
             candidates.insert(BindingCategory::Skill, skills);
         }
+        candidates.insert(
+            BindingCategory::Predicate,
+            vec![
+                ResolvedBinding::new("coverage.decision@v1", "1.0.0"),
+                ResolvedBinding::new("review.verdict@v1", "1.0.0"),
+                ResolvedBinding::new("grounding.verdict@v1", "1.0.0"),
+            ],
+        );
         Ok(ExecutionRuntimeRegistry { candidates })
     }
 }
@@ -3420,17 +3428,24 @@ impl ExecutionBackend {
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::SandboxDenied))?;
 
         let resolved_plan = resolve_runtime_plan(&profile, compiled.ir())?;
-        let resolved_models = compiled
+        let mut resolved_models = BTreeMap::new();
+        let mut shared_worker = None;
+        let mut shared_reviewer = None;
+        for node in compiled
             .ir()
             .nodes()
             .iter()
             .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
-            .map(|node| {
-                profile
-                    .bind_resolved_model(&resolved_plan, node.id().as_str(), 0)
-                    .map(|model| (node.id().as_str().to_owned(), model))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        {
+            let node_id = node.id().as_str();
+            let model = profile.bind_resolved_model(&resolved_plan, node_id, 0)?;
+            let slot = match resolved_plan.node_model_role(node_id) {
+                Some(IrModelRole::Reviewer) => &mut shared_reviewer,
+                _ => &mut shared_worker,
+            };
+            let model = slot.get_or_insert(model).clone();
+            resolved_models.insert(node_id.to_owned(), model);
+        }
         let effective_capabilities = sandbox_capabilities;
         let transform_module = profile.transform_module()?;
         let recursion_limit = compiled

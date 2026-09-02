@@ -8,41 +8,57 @@ entry = "prepare_workspace"
 [[nodes]]
 id = "prepare_workspace"
 kind = "agent"
+model = { role = "worker", id = "code-investigation-fake", version = "1" }
 [[nodes]]
 id = "planner"
 kind = "agent"
+model = { role = "worker", id = "code-investigation-fake", version = "1" }
 [[nodes]]
 id = "search_code"
 kind = "agent"
+model = { role = "worker", id = "code-investigation-fake", version = "1" }
+tools = [{ id = "search_code", version = "1" }]
 [[nodes]]
 id = "inspect_evidence"
 kind = "agent"
+model = { role = "worker", id = "code-investigation-fake", version = "1" }
+tools = [{ id = "read_source_range", version = "1" }]
 [[nodes]]
 id = "coverage_decision"
 kind = "agent"
+model = { role = "worker", id = "code-investigation-fake", version = "1" }
 [[nodes]]
 id = "retry_search_code"
 kind = "agent"
+model = { role = "worker", id = "code-investigation-fake", version = "1" }
+tools = [{ id = "search_code", version = "1" }]
 [[nodes]]
 id = "retry_inspect_evidence"
 kind = "agent"
+model = { role = "worker", id = "code-investigation-fake", version = "1" }
+tools = [{ id = "read_source_range", version = "1" }]
 [[nodes]]
 id = "retry_coverage_decision"
 kind = "agent"
+model = { role = "worker", id = "code-investigation-fake", version = "1" }
 [[nodes]]
 id = "draft"
 kind = "agent"
+model = { role = "worker", id = "code-investigation-fake", version = "1" }
 [[nodes]]
 id = "grounding_validation"
 kind = "agent"
+model = { role = "worker", id = "code-investigation-fake", version = "1" }
 max_visits = 32
 [[nodes]]
 id = "review"
 kind = "agent"
+model = { role = "reviewer", id = "code-investigation-reviewer", version = "1" }
 max_visits = 32
 [[nodes]]
 id = "revise"
 kind = "agent"
+model = { role = "worker", id = "code-investigation-fake", version = "1" }
 max_visits = 32
 [[nodes]]
 id = "publish"
