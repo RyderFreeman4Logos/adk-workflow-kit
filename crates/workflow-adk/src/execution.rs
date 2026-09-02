@@ -1422,18 +1422,20 @@ impl LoopController {
         context: &dyn adk_rust::CallbackContext,
         response: &Value,
     ) -> adk_rust::Result<()> {
+        if let Some(outcome) = context.tool_outcome()
+            && outcome.duration >= Duration::from_millis(self.limits.max_tool_time_ms().get())
+        {
+            return Err(self.fail(
+                ExecutionErrorKind::ToolTimeLimit,
+                "workflow.loop.timeout.tool",
+            ));
+        }
         if self.cancellation.load(Ordering::Acquire) {
             return Err(self.fail(ExecutionErrorKind::Cancelled, "workflow.loop.cancelled"));
         }
         let outcome = context
             .tool_outcome()
             .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
-        if outcome.duration.as_millis() as u64 >= self.limits.max_tool_time_ms().get() {
-            return Err(self.fail(
-                ExecutionErrorKind::ToolTimeLimit,
-                "workflow.loop.timeout.tool",
-            ));
-        }
         if !outcome.success {
             return Err(self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"));
         }
