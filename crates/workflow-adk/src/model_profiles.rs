@@ -1125,9 +1125,7 @@ async fn generate_once(
 }
 
 fn retryable_provider_error(error: &AdkError) -> bool {
-    error.category == ErrorCategory::RateLimited
-        || error.to_string().contains("429")
-        || error.to_string().contains("rate")
+    error.is_rate_limited() || error.details.upstream_status_code == Some(429)
 }
 
 fn provider_adk_error(error: AdkError) -> AdkError {
@@ -1135,5 +1133,25 @@ fn provider_adk_error(error: AdkError) -> AdkError {
         error
     } else {
         AdkError::agent("model.profile.unreachable")
+    }
+}
+
+#[cfg(test)]
+mod retry_admission_tests {
+    use super::*;
+
+    #[test]
+    fn non_retryable_error_message_containing_rate_is_not_retried() {
+        let error = AdkError::agent("failed to generate");
+        assert!(
+            error.to_string().contains("rate"),
+            "fixture must contain rate in the rendered message, got {}",
+            error
+        );
+        assert!(
+            !retryable_provider_error(&error),
+            "substring rate must not admit retry, got {}",
+            error
+        );
     }
 }
