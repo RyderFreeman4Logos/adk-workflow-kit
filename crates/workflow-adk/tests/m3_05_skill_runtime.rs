@@ -4,7 +4,10 @@ use std::{
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use rusqlite::Connection;
@@ -13,6 +16,7 @@ use sha2::{Digest, Sha256};
 use workflow_adk::execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+static MODEL_DIGEST_LOCK: Mutex<()> = Mutex::new(());
 
 const WORKFLOW: &str = r#"
 schema_version = 1
@@ -1353,6 +1357,7 @@ fn crashed_skill_admission_or_activation_resumes_without_widening() {
         panic!("crash barrier did not terminate the child");
     }
 
+    let _digest_guard = MODEL_DIGEST_LOCK.lock().unwrap();
     let baseline_root = root();
     let baseline_package = skill_package(&baseline_root);
     let baseline_workflow = baseline_root.join("workflow.toml");
@@ -1893,6 +1898,7 @@ fn mixed_completed_calls_resume_in_completion_order() {
         panic!("crash barrier did not terminate the child");
     }
 
+    let _digest_guard = MODEL_DIGEST_LOCK.lock().unwrap();
     for (mode, barrier) in [
         (
             "sequential",
