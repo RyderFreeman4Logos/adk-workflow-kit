@@ -1260,22 +1260,24 @@ impl AdkGraphTranslator {
                 });
             }
         }
-        builder = builder.node_fn("__workflow_revise_admit", |context| {
-            let visits = context
-                .state
-                .get("visits:revise")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default();
-            async move {
-                if visits >= 1 {
-                    return Err(GraphError::Other(
-                        "workflow.loop.review_exhausted".to_owned(),
-                    ));
+        if ids.contains("revise") {
+            builder = builder.node_fn("__workflow_revise_admit", |context| {
+                let visits = context
+                    .state
+                    .get("visits:revise")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                async move {
+                    if visits >= 1 {
+                        return Err(GraphError::Other(
+                            "workflow.loop.review_exhausted".to_owned(),
+                        ));
+                    }
+                    Ok(NodeOutput::new().with_update("visits:revise", json!(visits + 1)))
                 }
-                Ok(NodeOutput::new().with_update("visits:revise", json!(visits + 1)))
-            }
-        });
-        builder = builder.edge("__workflow_revise_admit", "revise");
+            });
+            builder = builder.edge("__workflow_revise_admit", "revise");
+        }
         builder = builder.edge(START, ir.entry_node_id().as_str());
         for edge in ir.edges() {
             let target = fan_in_guards_by_target
