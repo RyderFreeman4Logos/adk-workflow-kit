@@ -1100,11 +1100,11 @@ impl Llm for ModelBinding {
 async fn generate_once(
     binding: &ModelBinding,
     request: LlmRequest,
-    stream: bool,
+    _stream: bool,
 ) -> adk_rust::Result<Vec<LlmResponse>> {
     let mut inner = adk_rust::tokio::time::timeout(
         binding.runtime.timeout(),
-        binding.llm.generate_content(request, stream),
+        binding.llm.generate_content(request, false),
     )
     .await
     .map_err(|_| {
@@ -1117,8 +1117,8 @@ async fn generate_once(
     let mut items = Vec::new();
     while let Some(item) = inner.next().await {
         let response = item?;
-        if items.is_empty() && response.content.is_none() {
-            return Err(AdkError::agent("model.profile.unreachable"));
+        if !response_has_model_payload(&response) {
+            continue;
         }
         items.push(response);
     }
@@ -1126,6 +1126,16 @@ async fn generate_once(
         return Err(AdkError::agent("model.profile.unreachable"));
     }
     Ok(items)
+}
+
+fn response_has_model_payload(response: &LlmResponse) -> bool {
+    response.content.as_ref().is_some_and(|content| {
+        content.parts.iter().any(|part| match part {
+            Part::Text { text } => !text.trim().is_empty(),
+            Part::FunctionCall { .. } => true,
+            _ => false,
+        })
+    })
 }
 
 fn retryable_provider_error(error: &AdkError) -> bool {
@@ -1177,6 +1187,85 @@ mod retry_admission_tests {
                 Ok(LlmResponse::new(Content::new("assistant").with_text("two"))),
             ])))
         }
+    }
+
+    struct TrailingEmptyLlm;
+
+    #[async_trait]
+    impl Llm for TrailingEmptyLlm {
+        fn name(&self) -> &str {
+            "trailing-empty"
+        }
+
+        async fn generate_content(
+            &self,
+            _request: LlmRequest,
+            _stream: bool,
+        ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+            let mut empty = LlmResponse::new(Content::new("assistant"));
+            empty.content = None;
+            Ok(Box::pin(stream::iter([
+                Ok(empty),
+                Ok(LlmResponse::new(Content::new("assistant").with_text(
+                    "{\"status\":\"finished\",\"output\":\"oracle-ok\"}",
+                ))),
+                Ok({
+                    let mut trailing = LlmResponse::new(Content::new("assistant"));
+                    trailing.content = None;
+                    trailing
+                }),
+            ])))
+        }
+    }
+
+    fn test_binding(llm: Arc<dyn Llm>, model: &str) -> ModelBinding {
+        ModelBinding {
+            role: ModelRole::Worker,
+            identity: ModelBindingIdentity {
+                profile: ModelProfileIdentity::new("worker", "1"),
+                requested_model: model.to_owned(),
+                resolved_model: model.to_owned(),
+                provider: "custom".to_owned(),
+            },
+            runtime: ModelRuntimeConfig::default(),
+            llm,
+            fake_queue: None,
+            retries: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn streaming_binding_drops_empty_content_chunks() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let binding = test_binding(Arc::new(TrailingEmptyLlm), "trailing-empty");
+                let request =
+                    LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+                let mut items = Llm::generate_content(&binding, request, true)
+                    .await
+                    .expect("contentful chunks must remain after empty wrappers");
+                let first = items
+                    .next()
+                    .await
+                    .expect("content chunk")
+                    .expect("content chunk ok")
+                    .content
+                    .expect("content")
+                    .parts[0]
+                    .text()
+                    .map(str::to_owned);
+                assert_eq!(
+                    first.as_deref(),
+                    Some("{\"status\":\"finished\",\"output\":\"oracle-ok\"}")
+                );
+                assert!(
+                    items.next().await.is_none(),
+                    "empty leading/trailing chunks must not surface to the agent"
+                );
+            });
     }
 
     #[test]
@@ -1231,5 +1320,105 @@ mod retry_admission_tests {
                     "stream must end after both chunks"
                 );
             });
+    }
+
+    struct FixtureSecrets;
+    impl SecretProvider for FixtureSecrets {
+        fn resolve(&self, _handle: &str) -> Result<SecretValue, CredentialError> {
+            Ok(SecretValue::new("fixture-token"))
+        }
+    }
+
+    #[test]
+    fn streamed_openai_compatible_binding_reads_non_sse_json_completion() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let address = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let bytes = socket.read(&mut buffer).expect("read");
+                request.extend_from_slice(&buffer[..bytes]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("headers")
+                + 4;
+            let content_length = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .map(str::trim)
+                        .map(str::to_owned)
+                })
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let bytes = socket.read(&mut buffer).expect("body");
+                request.extend_from_slice(&buffer[..bytes]);
+            }
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"status\":\"finished\",\"output\":\"oracle-ok\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write");
+        });
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let profile = OpenAiCompatibleProfile::new(
+                    "worker",
+                    "1",
+                    "oracle",
+                    format!("http://{address}/v1"),
+                    CredentialHandle::SecretProvider("fixture-key".to_owned()),
+                )
+                .with_runtime(ModelRuntimeConfig::default().with_timeout(Duration::from_secs(2)));
+                let registry = ModelProfileRegistry::new().with_worker(profile).unwrap();
+                let binding = registry
+                    .bind_worker(
+                        &CredentialBroker::new().with_secret_provider(Arc::new(FixtureSecrets)),
+                    )
+                    .unwrap();
+                let request =
+                    LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+                let mut items = Llm::generate_content(&binding, request, true)
+                    .await
+                    .expect("non-SSE JSON completion must be readable when the agent streams");
+                let text = items
+                    .next()
+                    .await
+                    .expect("completion chunk")
+                    .expect("completion ok")
+                    .content
+                    .expect("content")
+                    .parts[0]
+                    .text()
+                    .map(str::to_owned);
+                assert_eq!(
+                    text.as_deref(),
+                    Some("{\"status\":\"finished\",\"output\":\"oracle-ok\"}")
+                );
+                assert!(items.next().await.is_none(), "single completion");
+            });
+        server.join().expect("server");
     }
 }
