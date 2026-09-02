@@ -1328,12 +1328,21 @@ impl AdkGraphTranslator {
             });
             builder = builder.edge(admit, "revise");
         }
-        builder = builder.edge(START, ir.entry_node_id().as_str());
+        let rewrite_target = |target: &str| {
+            if target == "revise"
+                && let Some(admit) = &revise_admit
+            {
+                return admit.clone();
+            }
+            fan_in_guards_by_target
+                .get(target)
+                .cloned()
+                .unwrap_or_else(|| target.to_owned())
+        };
+        builder = builder.edge(START, &rewrite_target(ir.entry_node_id().as_str()));
         for edge in ir.edges() {
-            let target = fan_in_guards_by_target
-                .get(edge.to().as_str())
-                .map_or_else(|| edge.to().as_str(), String::as_str);
-            builder = builder.edge(edge.from().as_str(), target);
+            let target = rewrite_target(edge.to().as_str());
+            builder = builder.edge(edge.from().as_str(), &target);
         }
         for (guard, target) in &fan_in_guard_nodes {
             builder = builder.edge(guard, target);
@@ -1387,24 +1396,13 @@ impl AdkGraphTranslator {
                 unknown_route_nodes.insert(unknown_route_node.clone(), from.clone());
                 Some(unknown_route_node)
             };
-            let guarded_target = |target: &str| {
-                if target == "revise"
-                    && let Some(admit) = &revise_admit
-                {
-                    return admit.clone();
-                }
-                fan_in_guards_by_target
-                    .get(target)
-                    .cloned()
-                    .unwrap_or_else(|| target.to_owned())
-            };
             let mut cases: Vec<(&'static str, &'static str)> = route
                 .cases()
                 .iter()
                 .map(|case| {
                     (
                         Box::leak(case.key().to_owned().into_boxed_str()) as &'static str,
-                        Box::leak(guarded_target(case.target().as_str()).into_boxed_str())
+                        Box::leak(rewrite_target(case.target().as_str()).into_boxed_str())
                             as &'static str,
                     )
                 })
@@ -1412,7 +1410,7 @@ impl AdkGraphTranslator {
             if let Some(default) = route.default() {
                 cases.push((
                     IR_DEFAULT_KEY,
-                    Box::leak(guarded_target(default.as_str()).into_boxed_str()) as &'static str,
+                    Box::leak(rewrite_target(default.as_str()).into_boxed_str()) as &'static str,
                 ));
             }
             if let Some(unknown_route_node) = &unknown_route_node {

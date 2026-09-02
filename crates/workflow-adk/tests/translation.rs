@@ -1725,3 +1725,47 @@ to = "done"
         Some(&json!(true))
     );
 }
+
+#[tokio::test]
+async fn direct_edge_to_revise_uses_admission() {
+    const SOURCE: &str = r#"
+schema_version = 1
+[workflow]
+id = "direct-revise"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "revise"
+kind = "action"
+max_visits = 4
+idempotent = true
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "done"
+"#;
+    let plan = compile_str("direct-revise.workflow.toml", SOURCE).expect("fixture compiles");
+    let graph = AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("translation succeeds");
+    let err = graph
+        .invoke(State::new(), ExecutionConfig::new("direct-revise"))
+        .await
+        .expect_err("a second direct edge into revise must hit admission");
+    assert_eq!(
+        err.to_string(),
+        "visit bound exceeded: max_visits=1",
+        "direct to=revise must not bypass one-revision admission, got {err}"
+    );
+}
