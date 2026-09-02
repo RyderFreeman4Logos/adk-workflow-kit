@@ -221,16 +221,27 @@ impl Drop for ScriptedServer {
 }
 
 fn serve_script(responses: Vec<String>, stall: bool) -> ScriptedServer {
-    serve_provider(responses, stall, 0, false)
+    serve_provider(responses, stall, 0, false, false, Duration::ZERO)
 }
 
 fn serve_retrying(responses: Vec<String>) -> ScriptedServer {
-    serve_provider(responses, false, 1, false)
+    serve_provider(responses, false, 1, false, false, Duration::ZERO)
 }
 
 fn serve_interrupted_script(mut responses: Vec<String>) -> ScriptedServer {
     responses.insert(0, finished("interrupted"));
-    serve_provider(responses, false, 0, true)
+    serve_provider(responses, false, 0, true, false, Duration::ZERO)
+}
+
+fn serve_partial_body_stall(rate_limits: usize, rate_limit_delay: Duration) -> ScriptedServer {
+    serve_provider(
+        vec![String::new()],
+        false,
+        rate_limits,
+        false,
+        true,
+        rate_limit_delay,
+    )
 }
 
 fn serve_provider(
@@ -238,6 +249,8 @@ fn serve_provider(
     stall: bool,
     rate_limits: usize,
     hold_first_response: bool,
+    stall_body: bool,
+    rate_limit_delay: Duration,
 ) -> ScriptedServer {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
     listener.set_nonblocking(true).expect("nonblocking");
@@ -345,10 +358,28 @@ fn serve_provider(
             }
             match body {
                 None => {
+                    if !rate_limit_delay.is_zero() {
+                        thread::sleep(rate_limit_delay);
+                    }
                     let _ = write!(
                         socket,
                         "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n"
                     );
+                }
+                Some(_) if stall_body => {
+                    let partial = r#"{"choices":[{"message":{"role":"assistant","content":""#;
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2048\r\nconnection: close\r\n\r\n{partial}"
+                    );
+                    let _ = socket.flush();
+                    let hold = Instant::now();
+                    while !finished.load(Ordering::Acquire)
+                        && hold.elapsed() < Duration::from_secs(8)
+                    {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    break;
                 }
                 Some(body) => {
                     let _ = write!(
@@ -481,6 +512,62 @@ fn provider_timeout_fails_closed() {
     );
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_scripted_fail(&report, "timeout", server, 1);
+}
+
+fn timeout_profile(base_url: &str, timeout_ms: u64, loop_ms: u64) -> Value {
+    let mut profile = openai_profile(
+        base_url,
+        json!({
+            "loop_policy": {
+                "schema_version": 1,
+                "max_model_iterations": 4,
+                "max_total_tool_calls": 8,
+                "max_tool_calls_per_tool": 4,
+                "wall_time_ms": loop_ms,
+                "idle_time_ms": loop_ms,
+                "tool_time_ms": loop_ms,
+                "max_tool_output_bytes": 65536
+            }
+        }),
+    );
+    let runtime = json!({ "timeout_ms": timeout_ms });
+    profile["model"]["runtime"] = runtime.clone();
+    profile["reviewer_model"]["runtime"] = runtime;
+    profile
+}
+
+#[test]
+fn provider_body_stall_fails_closed_at_timeout() {
+    let server = serve_partial_body_stall(0, Duration::ZERO);
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let profile = write_profile(&root.0, &timeout_profile(&server.base_url, 400, 4_000));
+    let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
+    let elapsed_ms = report.metrics().expect("metrics").elapsed_ms();
+    assert!(
+        elapsed_ms < 2_000,
+        "elapsed_ms={elapsed_ms} body stall must fail at runtime.timeout_ms, not loop wall/idle"
+    );
+    assert_scripted_fail(&report, "timeout", server, 1);
+}
+
+#[test]
+fn provider_retry_does_not_reset_timeout_on_body_stall() {
+    let server = serve_partial_body_stall(1, Duration::from_millis(600));
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let profile = write_profile(&root.0, &timeout_profile(&server.base_url, 1_000, 5_000));
+    let started = Instant::now();
+    let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
+    let elapsed_ms = report.metrics().expect("metrics").elapsed_ms();
+    assert!(
+        elapsed_ms < 2_000,
+        "elapsed_ms={elapsed_ms} must keep one absolute deadline across retry"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_scripted_fail(&report, "timeout", server, 2);
 }
 
 #[test]

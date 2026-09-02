@@ -18,7 +18,7 @@ use std::{
 
 use adk_rust::graph::prelude::{ExecutionConfig, State};
 use adk_rust::graph::{Checkpoint, Checkpointer, GraphError};
-use adk_rust::{Agent, agent::LlmAgentBuilder, async_trait};
+use adk_rust::{Agent, ErrorCategory, Llm, LlmRequest, agent::LlmAgentBuilder, async_trait};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -3200,6 +3200,34 @@ impl Agent for RestoredFinishAgent {
     }
 }
 
+struct FencedModel {
+    binding: Arc<ModelBinding>,
+    fence: Arc<EffectFence>,
+}
+
+#[async_trait]
+impl Llm for FencedModel {
+    fn name(&self) -> &str {
+        self.binding.resolved_model_identity()
+    }
+
+    async fn generate_content(
+        &self,
+        request: LlmRequest,
+        stream: bool,
+    ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+        let result = Llm::generate_content(&*self.binding, request, stream).await;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.category == ErrorCategory::Timeout)
+        {
+            record_terminal(&self.fence.terminal, ExecutionErrorKind::Timeout);
+            self.fence.cancellation.store(true, Ordering::Release);
+        }
+        result
+    }
+}
+
 fn build_profile_agent(
     name: &str,
     model: Arc<ModelBinding>,
@@ -3225,6 +3253,10 @@ fn build_profile_agent(
     let tool_controller = Arc::clone(&controller);
     let tool_error_controller = Arc::clone(&controller);
     let tool_timeout = std::time::Duration::from_millis(controller.limits.max_tool_time_ms().get());
+    let model = Arc::new(FencedModel {
+        binding: model,
+        fence: Arc::clone(&effect_fence),
+    });
     let mut builder = LlmAgentBuilder::new(name)
         .description("workflow-kit profile-driven agent")
         .model(model)

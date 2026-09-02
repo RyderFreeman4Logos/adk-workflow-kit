@@ -874,17 +874,16 @@ impl ModelBinding {
         stream: bool,
     ) -> Result<ModelResponseStream, ModelProfileError> {
         let request = self.apply_runtime(request);
-        let result = adk_rust::tokio::time::timeout(
-            self.runtime.timeout(),
-            self.llm.generate_content(request, stream),
-        )
-        .await;
+        let deadline = adk_rust::tokio::time::Instant::now() + self.runtime.timeout();
+        let result =
+            adk_rust::tokio::time::timeout_at(deadline, self.llm.generate_content(request, stream))
+                .await;
         let stream = result
             .map_err(|_| ModelProfileError::timeout())?
             .map_err(|error| self.map_adk_error(error))?;
         Ok(timed_response_stream(
             stream,
-            self.runtime.timeout(),
+            deadline,
             self.identity.profile.clone(),
         ))
     }
@@ -936,7 +935,7 @@ impl ModelBinding {
 
 fn timed_response_stream(
     stream: adk_rust::LlmResponseStream,
-    timeout: Duration,
+    deadline: adk_rust::tokio::time::Instant,
     identity: ModelProfileIdentity,
 ) -> ModelResponseStream {
     Box::pin(adk_rust::futures::stream::unfold(
@@ -945,7 +944,7 @@ fn timed_response_stream(
             let identity = identity.clone();
             async move {
                 let mut inner = stream.take()?;
-                match adk_rust::tokio::time::timeout(timeout, inner.next()).await {
+                match adk_rust::tokio::time::timeout_at(deadline, inner.next()).await {
                     Ok(Some(result)) => Some((
                         result.map_err(|error| map_adk_error(&identity, error)),
                         Some(inner),
@@ -1080,9 +1079,13 @@ impl Llm for ModelBinding {
         stream: bool,
     ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
         let request = self.apply_runtime(request);
+        let deadline = std::time::Instant::now() + self.runtime.timeout();
         let mut retried = false;
         loop {
-            match generate_once(self, request.clone(), stream).await {
+            if std::time::Instant::now() >= deadline {
+                return Err(provider_adk_error(profile_timeout()));
+            }
+            match generate_once(self, request.clone(), stream, deadline).await {
                 Ok(items) => {
                     return Ok(Box::pin(stream::iter(items.into_iter().map(Ok)))
                         as adk_rust::LlmResponseStream);
@@ -1097,23 +1100,19 @@ impl Llm for ModelBinding {
     }
 }
 
-async fn generate_once(
-    binding: &ModelBinding,
-    request: LlmRequest,
-    _stream: bool,
-) -> adk_rust::Result<Vec<LlmResponse>> {
-    let mut inner = adk_rust::tokio::time::timeout(
-        binding.runtime.timeout(),
-        binding.llm.generate_content(request, false),
+fn profile_timeout() -> AdkError {
+    AdkError::timeout(
+        adk_rust::ErrorComponent::Model,
+        "model.profile.timeout",
+        "model.profile.timeout",
     )
-    .await
-    .map_err(|_| {
-        AdkError::timeout(
-            adk_rust::ErrorComponent::Model,
-            "model.profile.timeout",
-            "model profile timed out",
-        )
-    })??;
+}
+
+async fn collect_payloads(
+    llm: Arc<dyn Llm>,
+    request: LlmRequest,
+) -> adk_rust::Result<Vec<LlmResponse>> {
+    let mut inner = llm.generate_content(request, false).await?;
     let mut items = Vec::new();
     while let Some(item) = inner.next().await {
         let response = item?;
@@ -1126,6 +1125,43 @@ async fn generate_once(
         return Err(AdkError::agent("model.profile.unreachable"));
     }
     Ok(items)
+}
+
+async fn generate_once(
+    binding: &ModelBinding,
+    request: LlmRequest,
+    _stream: bool,
+    deadline: std::time::Instant,
+) -> adk_rust::Result<Vec<LlmResponse>> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(profile_timeout());
+    }
+    let llm = Arc::clone(&binding.llm);
+    let (tx, rx) = adk_rust::tokio::sync::oneshot::channel();
+    let (timeout_tx, timeout_rx) = adk_rust::tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("workflow-adk-model-deadline".into())
+        .spawn(move || {
+            let result = adk_rust::tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| profile_timeout())
+                .and_then(|runtime| runtime.block_on(collect_payloads(llm, request)));
+            let _ = tx.send(result);
+        })
+        .map_err(|_| profile_timeout())?;
+    std::thread::Builder::new()
+        .name("workflow-adk-model-timeout".into())
+        .spawn(move || {
+            std::thread::sleep(remaining);
+            let _ = timeout_tx.send(());
+        })
+        .map_err(|_| profile_timeout())?;
+    adk_rust::tokio::select! {
+        result = rx => result.unwrap_or_else(|_| Err(profile_timeout())),
+        _ = timeout_rx => Err(profile_timeout()),
+    }
 }
 
 fn response_has_model_payload(response: &LlmResponse) -> bool {
@@ -1153,6 +1189,16 @@ fn provider_adk_error(error: AdkError) -> AdkError {
 #[cfg(test)]
 mod retry_admission_tests {
     use super::*;
+
+    async fn expect_profile_timeout(binding: &ModelBinding, request: LlmRequest) -> AdkError {
+        match Llm::generate_content(binding, request, true).await {
+            Err(error) => error,
+            Ok(mut items) => match items.next().await {
+                Some(Err(error)) => error,
+                _ => panic!("body stall must time out"),
+            },
+        }
+    }
 
     #[test]
     fn non_retryable_error_message_containing_rate_is_not_retried() {
@@ -1420,5 +1466,155 @@ mod retry_admission_tests {
                 assert!(items.next().await.is_none(), "single completion");
             });
         server.join().expect("server");
+    }
+
+    #[test]
+    fn openai_compatible_partial_body_stall_times_out() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let address = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            while let Ok(bytes) = socket.read(&mut buffer) {
+                if bytes == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..bytes]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let partial = r#"{"choices":[{"message":{"role":"assistant","content":""#;
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2048\r\nconnection: close\r\n\r\n{partial}"
+            );
+            let _ = socket.flush();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let profile = OpenAiCompatibleProfile::new(
+                    "worker",
+                    "1",
+                    "oracle",
+                    format!("http://{address}/v1"),
+                    CredentialHandle::SecretProvider("fixture-key".to_owned()),
+                )
+                .with_runtime(
+                    ModelRuntimeConfig::default().with_timeout(Duration::from_millis(400)),
+                );
+                let registry = ModelProfileRegistry::new().with_worker(profile).unwrap();
+                let binding = registry
+                    .bind_worker(
+                        &CredentialBroker::new().with_secret_provider(Arc::new(FixtureSecrets)),
+                    )
+                    .unwrap();
+                let request =
+                    LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+                let started = Instant::now();
+                let error = expect_profile_timeout(&binding, request).await;
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "elapsed {:?}",
+                    started.elapsed()
+                );
+                assert_eq!(error.category, ErrorCategory::Timeout);
+            });
+        let _ = server.join();
+    }
+
+    #[test]
+    fn openai_compatible_retry_keeps_absolute_deadline() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let address = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    return;
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("read timeout");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                while let Ok(bytes) = socket.read(&mut buffer) {
+                    if bytes == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..bytes]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if attempt == 0 {
+                    std::thread::sleep(Duration::from_millis(600));
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n"
+                    );
+                    continue;
+                }
+                let partial = r#"{"choices":[{"message":{"role":"assistant","content":""#;
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2048\r\nconnection: close\r\n\r\n{partial}"
+                );
+                let _ = socket.flush();
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        });
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let profile = OpenAiCompatibleProfile::new(
+                    "worker",
+                    "1",
+                    "oracle",
+                    format!("http://{address}/v1"),
+                    CredentialHandle::SecretProvider("fixture-key".to_owned()),
+                )
+                .with_runtime(
+                    ModelRuntimeConfig::default().with_timeout(Duration::from_millis(1_000)),
+                );
+                let registry = ModelProfileRegistry::new().with_worker(profile).unwrap();
+                let binding = registry
+                    .bind_worker(
+                        &CredentialBroker::new().with_secret_provider(Arc::new(FixtureSecrets)),
+                    )
+                    .unwrap();
+                let request =
+                    LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+                let started = Instant::now();
+                let error = expect_profile_timeout(&binding, request).await;
+                assert!(
+                    started.elapsed() < Duration::from_millis(1_400),
+                    "elapsed {:?}",
+                    started.elapsed()
+                );
+                assert_eq!(error.category, ErrorCategory::Timeout);
+            });
+        let _ = server.join();
     }
 }
