@@ -50,8 +50,8 @@ use crate::{
     AdkGraphError, AdkGraphTranslator,
     events::{AdkEventMapper, AdkRuntimeObservationKindV1, AdkRuntimeObservationV1},
     model_profiles::{
-        CredentialBroker, CredentialHandle, FakeModelProfile, ModelBinding, ModelProfileRegistry,
-        OpenAiCompatibleProfile, QueuedFakeLlm,
+        CredentialBroker, CredentialHandle, FakeModelProfile, ModelBinding, ModelProfileErrorKind,
+        ModelProfileRegistry, OpenAiCompatibleProfile, QueuedFakeLlm,
     },
     tool_bridge::AdkToolBridge,
 };
@@ -1275,6 +1275,7 @@ impl LoopController {
 
     fn fail(&self, kind: ExecutionErrorKind, marker: &'static str) -> adk_rust::AdkError {
         record_terminal(&self.terminal, kind);
+        self.cancellation.store(true, Ordering::Release);
         adk_rust::AdkError::agent(marker)
     }
 
@@ -1349,16 +1350,25 @@ impl LoopController {
                     .as_deref()
                     .filter(|id| !id.is_empty())
                     .ok_or_else(|| adk_rust::AdkError::agent("model call missing ID"))?;
-                if !allowed.contains(name) || !args.is_object() {
-                    return Err(adk_rust::AdkError::agent(
-                        "model call is unselected or schema-invalid",
+                if !allowed.contains(name) {
+                    return Err(
+                        self.fail(ExecutionErrorKind::UnknownTool, "model.call.unknown_tool")
+                    );
+                }
+                if !args.is_object() {
+                    return Err(self.fail(
+                        ExecutionErrorKind::MalformedTool,
+                        "model.call.malformed_tool",
                     ));
                 }
                 let fingerprint = workflow_runtime::argument_fingerprint(args);
                 if !next.seen_ids.insert(id.to_owned())
                     || !next.seen_calls.insert((name.clone(), fingerprint.clone()))
                 {
-                    return Err(adk_rust::AdkError::agent("repeated model tool call"));
+                    return Err(self.fail(
+                        ExecutionErrorKind::NonProgress,
+                        "workflow.loop.non_progress",
+                    ));
                 }
                 next.total_tool_calls = next.total_tool_calls.saturating_add(1);
                 *next.tool_calls.entry(name.clone()).or_default() += 1;
@@ -2662,7 +2672,14 @@ impl ExecutionProfileV1 {
             IrModelRole::Reviewer => registry.bind_reviewer(&CredentialBroker::new()),
         }
         .map(Arc::new)
-        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Model))
+        .map_err(|error| {
+            ExecutionError::new(match error.kind() {
+                ModelProfileErrorKind::Credential => ExecutionErrorKind::Credential,
+                ModelProfileErrorKind::Timeout => ExecutionErrorKind::Timeout,
+                ModelProfileErrorKind::Provider => ExecutionErrorKind::Unreachable,
+                _ => ExecutionErrorKind::Model,
+            })
+        })
     }
 
     fn transform_module(&self) -> Result<Option<Vec<u8>>, ExecutionError> {
@@ -2771,13 +2788,19 @@ impl ExecutionProfileV1 {
                 &BindingRef::new(binding.id(), binding.version()),
             )
             .map_err(|error| map_registry_error(error, Some(binding)))?;
-        let bound = self.bind_model(role, 0).map_err(|_| {
-            ExecutionError::binding(
-                ExecutionErrorKind::ImplementationBinding,
-                BindingCategory::Model,
-                Some(binding),
-            )
-        })?;
+        let bound = match self.bind_model(role, 0) {
+            Ok(bound) => bound,
+            Err(error) if matches!(error.kind(), ExecutionErrorKind::Credential) => {
+                return Err(error);
+            }
+            Err(_) => {
+                return Err(ExecutionError::binding(
+                    ExecutionErrorKind::ImplementationBinding,
+                    BindingCategory::Model,
+                    Some(binding),
+                ));
+            }
+        };
         Ok(match bound.fake_queue() {
             Some(queue) => {
                 let slot = match role {
@@ -2798,13 +2821,19 @@ impl ExecutionProfileV1 {
                 Arc::new(bound.for_node(node_id, shared))
             }
             None if completed_turns == 0 => bound,
-            None => self.bind_model(role, completed_turns).map_err(|_| {
-                ExecutionError::binding(
-                    ExecutionErrorKind::ImplementationBinding,
-                    BindingCategory::Model,
-                    Some(binding),
-                )
-            })?,
+            None => match self.bind_model(role, completed_turns) {
+                Ok(bound) => bound,
+                Err(error) if matches!(error.kind(), ExecutionErrorKind::Credential) => {
+                    return Err(error);
+                }
+                Err(_) => {
+                    return Err(ExecutionError::binding(
+                        ExecutionErrorKind::ImplementationBinding,
+                        BindingCategory::Model,
+                        Some(binding),
+                    ));
+                }
+            },
         })
     }
 
@@ -3191,7 +3220,15 @@ pub enum ExecutionErrorKind {
     Compile,
     Workdir,
     Model,
+    Credential,
+    Unreachable,
+    Timeout,
     Tool,
+    MalformedTool,
+    UnknownTool,
+    NonProgress,
+    InvalidOutput,
+    VisitBound,
     Adk,
     AuthorizationDenied,
     ModelIterationsLimit,
@@ -3208,6 +3245,27 @@ pub enum ExecutionErrorKind {
     InvalidRunState,
 }
 
+impl ExecutionErrorKind {
+    /// Bounded causal category persisted by live conformance and CLI diagnostics.
+    pub const fn conformance_category(self) -> &'static str {
+        match self {
+            Self::Credential => "missing_credential",
+            Self::Unreachable => "unreachable",
+            Self::Timeout | Self::WallTimeLimit | Self::IdleTimeLimit | Self::ToolTimeLimit => {
+                "timeout"
+            }
+            Self::SandboxDenied | Self::AuthorizationDenied => "capability_denied",
+            Self::MalformedTool => "malformed_tool",
+            Self::UnknownTool => "unknown_tool",
+            Self::NonProgress => "non_progress",
+            Self::InvalidOutput => "malformed_artifact",
+            Self::VisitBound => "review_exhausted",
+            Self::Persistence => "persistence",
+            _ => "fail_closed",
+        }
+    }
+}
+
 fn execution_error_kind(error: AdkGraphError) -> ExecutionErrorKind {
     match error {
         AdkGraphError::AuthorizationDenied => ExecutionErrorKind::AuthorizationDenied,
@@ -3221,6 +3279,14 @@ fn execution_error_kind(error: AdkGraphError) -> ExecutionErrorKind {
         AdkGraphError::ToolTimeLimit => ExecutionErrorKind::ToolTimeLimit,
         AdkGraphError::Cancelled => ExecutionErrorKind::Cancelled,
         AdkGraphError::ToolFailed => ExecutionErrorKind::Tool,
+        AdkGraphError::Unreachable => ExecutionErrorKind::Unreachable,
+        AdkGraphError::MalformedTool => ExecutionErrorKind::MalformedTool,
+        AdkGraphError::UnknownTool => ExecutionErrorKind::UnknownTool,
+        AdkGraphError::NonProgress => ExecutionErrorKind::NonProgress,
+        AdkGraphError::InvalidOutput { .. } | AdkGraphError::UnknownRoute { .. } => {
+            ExecutionErrorKind::InvalidOutput
+        }
+        AdkGraphError::VisitBound { .. } => ExecutionErrorKind::VisitBound,
         _ => ExecutionErrorKind::Adk,
     }
 }
@@ -3231,7 +3297,8 @@ fn execution_status(kind: ExecutionErrorKind) -> &'static str {
         | ExecutionErrorKind::TotalToolCallsLimit
         | ExecutionErrorKind::ToolCallsPerToolLimit
         | ExecutionErrorKind::ToolOutputBytesLimit => "limit_exceeded",
-        ExecutionErrorKind::WallTimeLimit
+        ExecutionErrorKind::Timeout
+        | ExecutionErrorKind::WallTimeLimit
         | ExecutionErrorKind::IdleTimeLimit
         | ExecutionErrorKind::ToolTimeLimit => "timed_out",
         ExecutionErrorKind::Cancelled => "cancelled",

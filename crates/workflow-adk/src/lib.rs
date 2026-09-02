@@ -332,6 +332,10 @@ pub enum AdkGraphError {
     Cancelled,
     ToolFailed,
     InvalidOutput { node: String },
+    Unreachable,
+    MalformedTool,
+    UnknownTool,
+    NonProgress,
     Failed,
 }
 
@@ -363,6 +367,10 @@ impl fmt::Display for AdkGraphError {
             Self::Cancelled => write!(f, "execution cancelled"),
             Self::ToolFailed => write!(f, "tool execution failed"),
             Self::InvalidOutput { node } => write!(f, "invalid output from node {node:?}"),
+            Self::Unreachable => write!(f, "model provider is unreachable"),
+            Self::MalformedTool => write!(f, "model tool call is malformed"),
+            Self::UnknownTool => write!(f, "model requested an unknown tool"),
+            Self::NonProgress => write!(f, "model repeated a tool call without progress"),
             Self::Failed => write!(f, "graph execution failed"),
         }
     }
@@ -401,9 +409,25 @@ fn terminal_graph_error(message: &str) -> Option<AdkGraphError> {
         ("workflow.loop.timeout.tool", AdkGraphError::ToolTimeLimit),
         ("workflow.loop.cancelled", AdkGraphError::Cancelled),
         ("tool.bridge.failed", AdkGraphError::ToolFailed),
+        ("model.profile.timeout", AdkGraphError::IdleTimeLimit),
+        ("model.profile.unreachable", AdkGraphError::Unreachable),
+        ("model.call.malformed_tool", AdkGraphError::MalformedTool),
+        ("model.call.unknown_tool", AdkGraphError::UnknownTool),
+        ("workflow.loop.non_progress", AdkGraphError::NonProgress),
+        (
+            "workflow.loop.review_exhausted",
+            AdkGraphError::VisitBound { max_visits: 1 },
+        ),
     ]
     .into_iter()
     .find_map(|(marker, error)| message.contains(marker).then_some(error))
+    .or_else(|| {
+        message
+            .contains(UNKNOWN_ROUTE_ERROR_PREFIX)
+            .then(|| AdkGraphError::InvalidOutput {
+                node: "route".to_owned(),
+            })
+    })
 }
 
 /// Explicit state input mapping owned by the adapter.
@@ -478,11 +502,8 @@ impl AdkGraph {
             }
             Err(error) => {
                 if let GraphError::NodeExecutionFailed { node, message } = &error {
-                    if message.contains("tool.bridge.authorization_denied") {
-                        return Err(AdkGraphError::AuthorizationDenied);
-                    }
-                    if message.contains("tool.bridge.sandbox_denied") {
-                        return Err(AdkGraphError::SandboxDenied);
+                    if let Some(error) = terminal_graph_error(message) {
+                        return Err(error);
                     }
                     if let Some(target) = self.fan_in_guard_nodes.get(node)
                         && let Some(key) = message.strip_prefix("workflow fan-in conflict: ")
@@ -544,6 +565,9 @@ impl AdkGraph {
         while let Some(item) = stream.next().await {
             match item.map_err(|error| match &error {
                 GraphError::NodeExecutionFailed { message, .. } => {
+                    terminal_graph_error(message).unwrap_or(AdkGraphError::Failed)
+                }
+                GraphError::Other(message) => {
                     terminal_graph_error(message).unwrap_or(AdkGraphError::Failed)
                 }
                 _ => AdkGraphError::Failed,
@@ -648,19 +672,10 @@ impl AdkGraph {
                         )
                         .map_err(|error| AdkGraphError::Observation(error.kind()))?;
                 }
-                StreamEvent::Error { message, node } => {
-                    if let Some(error) = terminal_graph_error(&message) {
-                        return Err(error);
-                    }
-                    mapper
-                        .map_stream_observation(
-                            node,
-                            events::AdkRuntimeObservationKindV1::WorkflowFailed,
-                            Some(json!({ "message": message })),
-                            None,
-                            artifacts,
-                        )
-                        .map_err(|error| AdkGraphError::Observation(error.kind()))?;
+                StreamEvent::Error { message, .. } => {
+                    return Err(
+                        terminal_graph_error(&message).unwrap_or(AdkGraphError::Unreachable)
+                    );
                 }
                 StreamEvent::State { .. }
                 | StreamEvent::Updates { .. }
@@ -1245,6 +1260,22 @@ impl AdkGraphTranslator {
                 });
             }
         }
+        builder = builder.node_fn("__workflow_revise_admit", |context| {
+            let visits = context
+                .state
+                .get("visits:revise")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            async move {
+                if visits >= 1 {
+                    return Err(GraphError::Other(
+                        "workflow.loop.review_exhausted".to_owned(),
+                    ));
+                }
+                Ok(NodeOutput::new().with_update("visits:revise", json!(visits + 1)))
+            }
+        });
+        builder = builder.edge("__workflow_revise_admit", "revise");
         builder = builder.edge(START, ir.entry_node_id().as_str());
         for edge in ir.edges() {
             let target = fan_in_guards_by_target
@@ -1277,6 +1308,7 @@ impl AdkGraphTranslator {
                     }
                 };
                 let state_key = format!("route:{from}");
+                let node_key = format!("node:{from}");
                 let node_name = unknown_route_node.clone();
                 builder = builder.node_fn(&node_name, move |context| {
                     let selector = context
@@ -1285,7 +1317,16 @@ impl AdkGraphTranslator {
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_owned();
+                    let invalid_output = context
+                        .state
+                        .get(&node_key)
+                        .and_then(|value| value.get("__workflow_invalid_output"))
+                        .and_then(Value::as_bool)
+                        == Some(true);
                     async move {
+                        if invalid_output {
+                            return Err(GraphError::Other("model.profile.unreachable".to_owned()));
+                        }
                         Err(GraphError::Other(format!(
                             "{UNKNOWN_ROUTE_ERROR_PREFIX}{selector}"
                         )))
@@ -1295,6 +1336,9 @@ impl AdkGraphTranslator {
                 Some(unknown_route_node)
             };
             let guarded_target = |target: &str| {
+                if target == "revise" {
+                    return "__workflow_revise_admit".to_owned();
+                }
                 fan_in_guards_by_target
                     .get(target)
                     .cloned()

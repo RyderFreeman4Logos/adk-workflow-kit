@@ -642,7 +642,7 @@ fn exit_execution_error(kind: ExecutionErrorKind, json: bool) -> ! {
     let diagnostic = if kind == ExecutionErrorKind::InvalidProfile {
         Diagnostic::run_unsupported_input()
     } else {
-        Diagnostic::run_failed()
+        Diagnostic::run_failed_with_category(kind.conformance_category())
     };
     exit_diagnostic(diagnostic, json)
 }

@@ -153,17 +153,17 @@ impl LiveConformance {
             .to_str()
             .map(str::to_owned)
         else {
-            return fail_closed(workdir, Instant::now(), None);
+            return fail_closed(workdir, Instant::now(), None, None);
         };
         let Some(profile) = profile.to_str().map(str::to_owned) else {
-            return fail_closed(workdir, Instant::now(), None);
+            return fail_closed(workdir, Instant::now(), None, None);
         };
         let Some(workdir_s) = workdir.to_str().map(str::to_owned) else {
-            return fail_closed(workdir, Instant::now(), None);
+            return fail_closed(workdir, Instant::now(), None, None);
         };
         let input = match fs::read_to_string(example_root.join("input.example.json")) {
             Ok(input) => input,
-            Err(_) => return fail_closed(workdir, Instant::now(), None),
+            Err(_) => return fail_closed(workdir, Instant::now(), None, None),
         };
         let mut command = Command::new(workflowctl);
         command.args([
@@ -185,13 +185,18 @@ impl LiveConformance {
     }
 }
 
-fn fail_closed(workdir: &Path, started: Instant, run_root: Option<&Path>) -> ConformanceReport {
+fn fail_closed(
+    workdir: &Path,
+    started: Instant,
+    run_root: Option<&Path>,
+    error_category: Option<&str>,
+) -> ConformanceReport {
     let metrics = collect_metrics(
         ConformanceDisposition::Fail,
         workdir,
         run_root,
         started,
-        Some("fail_closed"),
+        Some(error_category.unwrap_or("fail_closed")),
     );
     persist_metrics(workdir, &metrics);
     report(ConformanceDisposition::Fail, Some(metrics))
@@ -204,7 +209,7 @@ fn classify(
 ) -> ConformanceReport {
     let output = match output {
         Ok(output) => output,
-        Err(_) => return fail_closed(workdir, started, None),
+        Err(_) => return fail_closed(workdir, started, None, None),
     };
     let receipt: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
     let run_root = receipt
@@ -212,10 +217,15 @@ fn classify(
         .and_then(Value::as_str)
         .map(PathBuf::from);
     if !output.status.success() || receipt["status"] != "succeeded" {
-        return fail_closed(workdir, started, run_root.as_deref());
+        return fail_closed(
+            workdir,
+            started,
+            run_root.as_deref(),
+            category_from_stderr(&output.stderr).as_deref(),
+        );
     }
     let Some(run_root) = run_root else {
-        return fail_closed(workdir, started, None);
+        return fail_closed(workdir, started, None, None);
     };
     let nodes = event_node_ids(&run_root);
     let published = nodes.iter().any(|node| node == "publish");
@@ -228,11 +238,25 @@ fn classify(
         ConformanceDisposition::Fail
     };
     if disposition == ConformanceDisposition::Fail {
-        return fail_closed(workdir, started, Some(&run_root));
+        return fail_closed(
+            workdir,
+            started,
+            Some(&run_root),
+            category_from_stderr(&output.stderr).as_deref(),
+        );
     }
     let metrics = collect_metrics(disposition, workdir, Some(&run_root), started, None);
     persist_metrics(workdir, &metrics);
     report(disposition, Some(metrics))
+}
+
+fn category_from_stderr(stderr: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(stderr)
+        .ok()?
+        .get("details")?
+        .get("category")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 fn collect_metrics(

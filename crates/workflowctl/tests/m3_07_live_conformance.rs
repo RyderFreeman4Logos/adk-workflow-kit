@@ -4,7 +4,10 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -104,10 +107,27 @@ fn run_opt_in(
     )
 }
 
-fn assert_fail(report: &workflow_testkit::live_conformance::ConformanceReport) {
+fn assert_fail(report: &workflow_testkit::live_conformance::ConformanceReport, category: &str) {
     assert_eq!(report.disposition(), ConformanceDisposition::Fail);
     assert_ne!(report.disposition(), ConformanceDisposition::Pass);
     assert_ne!(report.disposition(), ConformanceDisposition::Skip);
+    assert_eq!(
+        report
+            .metrics()
+            .and_then(|metrics| metrics.error_category()),
+        Some(category)
+    );
+}
+
+fn assert_scripted_fail(
+    report: &workflow_testkit::live_conformance::ConformanceReport,
+    category: &str,
+    server: ScriptedServer,
+    requests: u64,
+) {
+    assert_fail(report, category);
+    assert_eq!(server.request_count(), requests, "provider request count");
+    server.finish();
 }
 
 fn finished(output: &str) -> String {
@@ -145,18 +165,63 @@ fn publish_script() -> Vec<String> {
     ]
 }
 
-fn serve_script(responses: Vec<String>, stall: bool) -> (String, thread::JoinHandle<()>) {
+struct ScriptedServer {
+    base_url: String,
+    requests: Arc<AtomicU64>,
+    extra: Arc<AtomicU64>,
+    done: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ScriptedServer {
+    fn request_count(&self) -> u64 {
+        self.requests.load(Ordering::Acquire)
+    }
+
+    fn finish(mut self) {
+        self.stop();
+        assert_eq!(
+            self.extra.load(Ordering::Acquire),
+            0,
+            "unexpected extra provider request"
+        );
+    }
+
+    fn stop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ScriptedServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn serve_script(responses: Vec<String>, stall: bool) -> ScriptedServer {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("addr");
+    let requests = Arc::new(AtomicU64::new(0));
+    let extra = Arc::new(AtomicU64::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+    let request_count = Arc::clone(&requests);
+    let extra_count = Arc::clone(&extra);
+    let finished = Arc::clone(&done);
     let handle = thread::spawn(move || {
-        let accept = || {
+        let accept = |timeout: Duration| {
             let started = Instant::now();
             loop {
+                if finished.load(Ordering::Acquire) {
+                    return None;
+                }
                 match listener.accept() {
                     Ok((socket, _)) => return Some(socket),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if started.elapsed() > Duration::from_secs(2) {
+                        if started.elapsed() > timeout {
                             return None;
                         }
                         thread::sleep(Duration::from_millis(20));
@@ -165,18 +230,32 @@ fn serve_script(responses: Vec<String>, stall: bool) -> (String, thread::JoinHan
                 }
             }
         };
+        let drain_extra = || {
+            while !finished.load(Ordering::Acquire) {
+                if let Some(socket) = accept(Duration::from_millis(50)) {
+                    extra_count.fetch_add(1, Ordering::Relaxed);
+                    request_count.fetch_add(1, Ordering::Relaxed);
+                    drop(socket);
+                }
+            }
+        };
         if stall {
-            let Some(socket) = accept() else {
+            let Some(mut socket) = accept(Duration::from_secs(2)) else {
                 return;
             };
+            request_count.fetch_add(1, Ordering::Relaxed);
             thread::sleep(Duration::from_secs(2));
-            drop(socket);
+            let _ = write!(
+                socket,
+                "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
             return;
         }
         for body in responses {
-            let Some(mut socket) = accept() else {
+            let Some(mut socket) = accept(Duration::from_secs(2)) else {
                 return;
             };
+            request_count.fetch_add(1, Ordering::Relaxed);
             socket.set_nonblocking(false).ok();
             socket.set_read_timeout(Some(Duration::from_secs(2))).ok();
             let mut request = Vec::new();
@@ -197,8 +276,15 @@ fn serve_script(responses: Vec<String>, stall: bool) -> (String, thread::JoinHan
                 body
             );
         }
+        drain_extra();
     });
-    (format!("http://{address}/v1"), handle)
+    ScriptedServer {
+        base_url: format!("http://{address}/v1"),
+        requests,
+        extra,
+        done,
+        handle: Some(handle),
+    }
 }
 
 fn assert_no_canary(root: &Path) {
@@ -261,7 +347,7 @@ fn missing_credential_fails_closed() {
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
     let profile = write_profile(&root.0, &openai_profile("http://127.0.0.1:1/v1", json!({})));
-    assert_fail(&run_opt_in(&profile, &workdir, &[]));
+    assert_fail(&run_opt_in(&profile, &workdir, &[]), "missing_credential");
 }
 
 #[test]
@@ -270,19 +356,22 @@ fn unreachable_endpoint_fails_closed() {
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
     let profile = write_profile(&root.0, &openai_profile("http://127.0.0.1:1/v1", json!({})));
-    assert_fail(&run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]));
+    assert_fail(
+        &run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]),
+        "unreachable",
+    );
 }
 
 #[test]
 fn provider_timeout_fails_closed() {
-    let (base_url, server) = serve_script(Vec::new(), true);
+    let server = serve_script(Vec::new(), true);
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
     let profile = write_profile(
         &root.0,
         &openai_profile(
-            &base_url,
+            &server.base_url,
             json!({
                 "loop_policy": {
                     "schema_version": 1,
@@ -299,54 +388,56 @@ fn provider_timeout_fails_closed() {
     );
     let started = Instant::now();
     let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
-    assert_fail(&report);
     let elapsed_ms = report.metrics().expect("metrics").elapsed_ms();
     assert!(
         elapsed_ms >= 200,
         "elapsed_ms={elapsed_ms} must include the delayed provider"
     );
     assert!(started.elapsed() < Duration::from_secs(5));
-    let _ = server.join();
+    assert_scripted_fail(&report, "timeout", server, 1);
 }
 
 #[test]
 fn elapsed_ms_includes_delayed_local_server() {
-    let (base_url, server) = serve_script(Vec::new(), true);
+    let server = serve_script(Vec::new(), true);
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
-    let profile = write_profile(&root.0, &openai_profile(&base_url, json!({})));
+    let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
     let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
-    assert_fail(&report);
     let elapsed_ms = report.metrics().expect("metrics").elapsed_ms();
     assert!(
         elapsed_ms >= 1_500,
         "elapsed_ms={elapsed_ms} must include the delayed local server"
     );
-    let _ = server.join();
+    assert_scripted_fail(&report, "unreachable", server, 1);
 }
 
 #[test]
 fn malformed_tool_call_fails_closed() {
-    let (base_url, server) = serve_script(
+    let server = serve_script(
         vec![
             finished("prepared"),
             finished("planned"),
-            tool_call("bad", "search_code", r#""not-json""#),
+            tool_call("bad", "search_code", r#""[]""#),
         ],
         false,
     );
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
-    let profile = write_profile(&root.0, &openai_profile(&base_url, json!({})));
-    assert_fail(&run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]));
-    let _ = server.join();
+    let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
+    assert_scripted_fail(
+        &run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]),
+        "malformed_tool",
+        server,
+        3,
+    );
 }
 
 #[test]
 fn unknown_tool_fails_closed() {
-    let (base_url, server) = serve_script(
+    let server = serve_script(
         vec![
             finished("prepared"),
             finished("planned"),
@@ -357,9 +448,13 @@ fn unknown_tool_fails_closed() {
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
-    let profile = write_profile(&root.0, &openai_profile(&base_url, json!({})));
-    assert_fail(&run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]));
-    let _ = server.join();
+    let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
+    assert_scripted_fail(
+        &run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]),
+        "unknown_tool",
+        server,
+        3,
+    );
 }
 
 #[test]
@@ -369,12 +464,11 @@ fn non_progress_loop_fails_closed() {
         "search_code",
         r#""{\"query\":\"retry\",\"path\":\"src\"}""#,
     );
-    let (base_url, server) = serve_script(
+    let server = serve_script(
         vec![
             finished("prepared"),
             finished("planned"),
             call.clone(),
-            finished("searched"),
             call,
         ],
         false,
@@ -382,22 +476,30 @@ fn non_progress_loop_fails_closed() {
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
-    let profile = write_profile(&root.0, &openai_profile(&base_url, json!({})));
-    assert_fail(&run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]));
-    let _ = server.join();
+    let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
+    assert_scripted_fail(
+        &run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]),
+        "non_progress",
+        server,
+        4,
+    );
 }
 
 #[test]
 fn malformed_final_artifact_fails_closed() {
     let mut script = publish_script();
     script[8] = finished("not-a-verdict");
-    let (base_url, server) = serve_script(script, false);
+    let server = serve_script(script, false);
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
-    let profile = write_profile(&root.0, &openai_profile(&base_url, json!({})));
-    assert_fail(&run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]));
-    let _ = server.join();
+    let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
+    assert_scripted_fail(
+        &run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]),
+        "malformed_artifact",
+        server,
+        9,
+    );
 }
 
 #[test]
@@ -407,13 +509,17 @@ fn review_exhaustion_fails_closed() {
     script.push(finished("revised"));
     script.push(finished("valid"));
     script.push(finished("revise"));
-    let (base_url, server) = serve_script(script, false);
+    let server = serve_script(script, false);
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
-    let profile = write_profile(&root.0, &openai_profile(&base_url, json!({})));
-    assert_fail(&run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]));
-    let _ = server.join();
+    let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
+    assert_scripted_fail(
+        &run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]),
+        "review_exhausted",
+        server,
+        13,
+    );
 }
 
 #[test]
@@ -428,7 +534,7 @@ fn capability_denial_fails_closed() {
         &openai_profile("http://127.0.0.1:1/v1", json!({"tools": tools})),
     );
     let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
-    assert_fail(&report);
+    assert_fail(&report, "capability_denied");
     assert!(
         fs::read_dir(&workdir)
             .expect("workdir")
@@ -442,24 +548,24 @@ fn capability_denial_fails_closed() {
 fn valid_abstention_is_abstain() {
     let mut script = publish_script();
     script[6] = finished("impossible");
-    let (base_url, server) = serve_script(script, false);
+    let server = serve_script(script, false);
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
-    let profile = write_profile(&root.0, &openai_profile(&base_url, json!({})));
+    let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
     let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
     assert_eq!(report.disposition(), ConformanceDisposition::Abstain);
     assert_ne!(report.disposition(), ConformanceDisposition::Pass);
-    let _ = server.join();
+    server.finish();
 }
 
 #[test]
 fn scripted_openai_server_full_trace_is_pass() {
-    let (base_url, server) = serve_script(publish_script(), false);
+    let server = serve_script(publish_script(), false);
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
-    let profile = write_profile(&root.0, &openai_profile(&base_url, json!({})));
+    let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
     let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
     assert_eq!(report.disposition(), ConformanceDisposition::Pass);
     let metrics = report.metrics().expect("metrics");
@@ -472,16 +578,16 @@ fn scripted_openai_server_full_trace_is_pass() {
     let text = String::from_utf8(persisted).expect("utf8");
     assert!(!text.contains(CANARY));
     assert!(!text.contains("sk-"));
-    let _ = server.join();
+    server.finish();
 }
 
 #[test]
 fn checkpoint_persistence_failure_fails_closed() {
-    let (base_url, server) = serve_script(publish_script(), false);
+    let server = serve_script(publish_script(), false);
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
-    let profile = write_profile(&root.0, &openai_profile(&base_url, json!({})));
+    let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
     let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
     assert_eq!(report.disposition(), ConformanceDisposition::Pass);
     let Some(run_dir) = fs::read_dir(&workdir)
@@ -512,7 +618,7 @@ fn checkpoint_persistence_failure_fails_closed() {
         .output()
         .expect("resume");
     assert_eq!(resumed.status.code(), Some(2));
-    let _ = server.join();
+    server.finish();
 }
 
 #[test]
@@ -535,5 +641,7 @@ fn unavailable_profile_is_never_pass() {
             "sandbox": {"capabilities": []}
         }),
     );
-    assert_fail(&run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]));
+    let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
+    assert_eq!(report.disposition(), ConformanceDisposition::Fail);
+    assert_ne!(report.disposition(), ConformanceDisposition::Pass);
 }

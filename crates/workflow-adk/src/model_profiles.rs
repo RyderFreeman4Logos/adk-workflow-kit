@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adk_rust::async_trait;
-use adk_rust::futures::{Stream, StreamExt};
+use adk_rust::futures::{Stream, StreamExt, stream};
 use adk_rust::model::{OpenAICompatible, OpenAICompatibleConfig};
 use adk_rust::{AdkError, Content, ErrorCategory, Llm, LlmRequest, LlmResponse, Part};
 use serde::{Deserialize, Serialize};
@@ -1062,7 +1062,7 @@ impl Llm for ModelBinding {
         stream: bool,
     ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
         let request = self.apply_runtime(request);
-        adk_rust::tokio::time::timeout(
+        let mut inner = adk_rust::tokio::time::timeout(
             self.runtime.timeout(),
             self.llm.generate_content(
                 request,
@@ -1077,5 +1077,22 @@ impl Llm for ModelBinding {
                 "model profile timed out",
             )
         })?
+        .map_err(provider_adk_error)?;
+        let item = match inner.next().await {
+            Some(Ok(response)) if response.content.is_none() => {
+                Err(AdkError::agent("model.profile.unreachable"))
+            }
+            Some(item) => item.map_err(provider_adk_error),
+            None => Err(AdkError::agent("model.profile.unreachable")),
+        }?;
+        Ok(Box::pin(stream::once(async move { Ok(item) })) as adk_rust::LlmResponseStream)
+    }
+}
+
+fn provider_adk_error(error: AdkError) -> AdkError {
+    if error.category == ErrorCategory::Timeout {
+        error
+    } else {
+        AdkError::agent("model.profile.unreachable")
     }
 }
