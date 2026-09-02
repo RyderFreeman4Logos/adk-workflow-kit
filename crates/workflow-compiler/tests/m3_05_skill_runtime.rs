@@ -75,3 +75,14 @@ fn resolves_exact_node_skill_and_lock() {
     );
     assert_ne!(plan.plan_hash(), "");
 }
+
+#[test]
+fn rejects_reserved_skill_tool_names_during_compiler_admission() {
+    for name in ["activate_skill", "read_skill_resource", "run_skill_script"] {
+        let workflow = WORKFLOW.replace(
+            "skills = [{ id = \"code-investigation\", version = \"1\" }]",
+            &format!("tools = [{{ id = \"{name}\", version = \"1\" }}]"),
+        );
+        assert!(compile_str("reserved-static-tool.toml", &workflow).is_err());
+    }
+}

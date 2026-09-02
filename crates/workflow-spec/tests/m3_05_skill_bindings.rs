@@ -61,3 +61,17 @@ fn rejects_conflicting_skill_versions_within_and_across_nodes() {
         );
     }
 }
+
+#[test]
+fn rejects_reserved_skill_tool_names_even_without_skill_bindings() {
+    for name in ["activate_skill", "read_skill_resource", "run_skill_script"] {
+        let workflow = WORKFLOW.replace(
+            "skills = [{ id = \"code-investigation\", version = \"1\" }]",
+            &format!("tools = [{{ id = \"{name}\", version = \"1\" }}]"),
+        );
+        assert!(matches!(
+            parse_str("reserved-static-tool.toml", &workflow),
+            Err(workflow_spec::SpecError::InvalidNodeBinding)
+        ));
+    }
+}

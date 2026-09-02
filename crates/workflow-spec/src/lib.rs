@@ -13,6 +13,15 @@ use thiserror::Error;
 /// The only workflow schema version supported by this crate.
 pub const WORKFLOW_SCHEMA_VERSION_V1: u32 = 1;
 
+/// Public Skill tool names reserved from static workflow bindings.
+pub const RESERVED_SKILL_TOOL_NAMES: [&str; 3] =
+    ["activate_skill", "read_skill_resource", "run_skill_script"];
+
+/// Returns whether a static tool name is owned by the Skill runtime.
+pub fn is_reserved_skill_tool_name(name: &str) -> bool {
+    RESERVED_SKILL_TOOL_NAMES.contains(&name)
+}
+
 const MAX_SOURCE_BYTES: usize = 1_048_576;
 
 #[cfg(target_os = "linux")]
@@ -778,6 +787,7 @@ fn valid_tools(tools: &[RawToolReference]) -> bool {
     tools.iter().all(|tool| {
         !tool.id.is_empty()
             && !tool.version.is_empty()
+            && !is_reserved_skill_tool_name(&tool.id)
             && identities.insert((&tool.id, &tool.version))
     })
 }

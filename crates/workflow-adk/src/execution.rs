@@ -42,7 +42,9 @@ use workflow_runtime::{
     intersect_policy_capabilities, redact_json_value, selection_identity,
     verify_sandbox_capabilities,
 };
-use workflow_spec::{SourcePath, read_bounded_regular_file};
+use workflow_spec::{
+    RESERVED_SKILL_TOOL_NAMES, SourcePath, is_reserved_skill_tool_name, read_bounded_regular_file,
+};
 
 use crate::{
     AdkGraphError, AdkGraphTranslator,
@@ -2384,13 +2386,14 @@ impl ExecutionProfileV1 {
             }
         }
         let mut tool_names = BTreeSet::new();
-        if profile
-            .tool_wires()
-            .any(|tool| tool.name.is_empty() || !tool_names.insert(tool.name.as_str()))
-            || profile
-                .pure_transform
-                .as_ref()
-                .is_some_and(|transform| transform.module.is_empty())
+        if profile.tool_wires().any(|tool| {
+            tool.name.is_empty()
+                || is_reserved_skill_tool_name(&tool.name)
+                || !tool_names.insert(tool.name.as_str())
+        }) || profile
+            .pure_transform
+            .as_ref()
+            .is_some_and(|transform| transform.module.is_empty())
         {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
         }
@@ -4728,18 +4731,23 @@ fn build_tool_registry(
     if !packages.is_empty() {
         for (name, action, capabilities, read_only) in [
             (
-                "activate_skill",
+                RESERVED_SKILL_TOOL_NAMES[0],
                 SkillToolAction::Activate,
                 Vec::new(),
                 true,
             ),
             (
-                "read_skill_resource",
+                RESERVED_SKILL_TOOL_NAMES[1],
                 SkillToolAction::Read,
                 vec![SandboxCapability::FilesystemRead],
                 true,
             ),
-            ("run_skill_script", SkillToolAction::Run, Vec::new(), true),
+            (
+                RESERVED_SKILL_TOOL_NAMES[2],
+                SkillToolAction::Run,
+                Vec::new(),
+                true,
+            ),
         ] {
             let registration = match action {
                 SkillToolAction::Activate => {
@@ -4815,12 +4823,8 @@ fn build_toolset(
         .iter()
         .map(|binding| binding.id().to_owned())
         .collect::<Vec<_>>();
-    if !skills.is_empty() && !names.iter().any(|name| name == "activate_skill") {
-        names.extend([
-            "activate_skill".to_owned(),
-            "read_skill_resource".to_owned(),
-            "run_skill_script".to_owned(),
-        ]);
+    if !skills.is_empty() {
+        names.extend(RESERVED_SKILL_TOOL_NAMES.map(str::to_owned));
     }
     let authority = CapabilityIntersection::new(
         effective_capabilities.iter().copied(),

@@ -284,6 +284,37 @@ fn profile(package: &std::path::Path) -> ExecutionProfileV1 {
     ExecutionProfileV1::parse(&serde_json::to_vec(&profile).unwrap()).unwrap()
 }
 
+#[test]
+fn rejects_reserved_skill_tool_names_in_runtime_profiles() {
+    for name in ["activate_skill", "read_skill_resource", "run_skill_script"] {
+        let profile = json!({
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "worker",
+                "version": "1",
+                "model": "worker",
+                "responses": ["finished"]
+            },
+            "tools": [{
+                "name": name,
+                "result": {"value": 42},
+                "input_schema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "additionalProperties": false
+                }
+            }],
+            "sandbox": {"capabilities": []}
+        });
+        let error = match ExecutionProfileV1::parse(&serde_json::to_vec(&profile).unwrap()) {
+            Err(error) => error,
+            Ok(_) => panic!("reserved Skill tool name must fail runtime profile admission"),
+        };
+        assert_eq!(error.kind(), ExecutionErrorKind::InvalidProfile);
+    }
+}
+
 fn discovery_profile(package: &std::path::Path) -> ExecutionProfileV1 {
     let mut value = serde_json::to_value(profile(package)).unwrap();
     value["model"]["responses"] = json!([

@@ -7,6 +7,7 @@ use workflow_runtime::{
     WorkflowRuntimeEventLogV1, WorkflowRuntimeEventV1, argument_fingerprint, redact_json_value,
     redacted_json_digest,
 };
+use workflow_spec::{RESERVED_SKILL_TOOL_NAMES, is_reserved_skill_tool_name};
 
 const MAX_INLINE_STRUCTURED_OUTPUT_BYTES: usize = 4 * 1024;
 
@@ -247,7 +248,7 @@ impl AdkEventMapper {
             if (observation.kind == AdkRuntimeObservationKindV1::ToolCompleted
                 && output.as_array().is_some_and(|results| {
                     results.iter().any(|result| {
-                        result.get("tool_name").and_then(Value::as_str) == Some("run_skill_script")
+                        trusted_skill_tool_name(result) == Some(RESERVED_SKILL_TOOL_NAMES[2])
                     })
                 }))
                 || encoded.len() > MAX_INLINE_STRUCTURED_OUTPUT_BYTES
@@ -532,14 +533,8 @@ fn redact_skill_tool_results(output: Value) -> Result<Value, AdkEventMappingErro
     results
         .into_iter()
         .map(|mut result| {
-            let tool_name = result
-                .get("tool_name")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            if matches!(
-                tool_name.as_deref(),
-                Some("activate_skill" | "read_skill_resource" | "run_skill_script")
-            ) {
+            let tool_name = trusted_skill_tool_name(&result).map(ToOwned::to_owned);
+            if tool_name.is_some() {
                 let response = result
                     .as_object_mut()
                     .and_then(|result| result.remove("response"))
@@ -555,8 +550,10 @@ fn redact_skill_tool_results(output: Value) -> Result<Value, AdkEventMappingErro
                     AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
                 })?;
                 let fields = match tool_name.as_deref() {
-                    Some("activate_skill") => &["skill_id", "version", "instructions_ref"][..],
-                    Some("read_skill_resource") => &[
+                    Some(name) if name == RESERVED_SKILL_TOOL_NAMES[0] => {
+                        &["skill_id", "version", "instructions_ref"][..]
+                    }
+                    Some(name) if name == RESERVED_SKILL_TOOL_NAMES[1] => &[
                         "resource_id",
                         "result_ref",
                         "byte_len",
@@ -579,7 +576,7 @@ fn redact_skill_tool_results(output: Value) -> Result<Value, AdkEventMappingErro
                                     .map(|value| ((*field).to_owned(), value.clone()))
                             })
                             .collect::<Map<_, _>>();
-                        if tool_name.as_deref() == Some("activate_skill") {
+                        if tool_name.as_deref() == Some(RESERVED_SKILL_TOOL_NAMES[0]) {
                             safe.insert("activated".to_owned(), Value::Bool(true));
                             for (name, fields) in [
                                 ("resources", &["id", "sha256"][..]),
@@ -639,6 +636,15 @@ fn redact_skill_tool_results(output: Value) -> Result<Value, AdkEventMappingErro
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Value::Array)
+}
+
+fn trusted_skill_tool_name(result: &Value) -> Option<&str> {
+    let tool_name = result.get("tool_name")?.as_str()?;
+    let provenance = result.get("response")?.get("provenance")?;
+    (is_reserved_skill_tool_name(tool_name)
+        && provenance.get("tool_id")?.as_str()? == "skill.runtime"
+        && provenance.get("tool_version")?.as_str()? == "1")
+        .then_some(tool_name)
 }
 
 fn protect_large_payload<S: ArtifactStore>(
@@ -760,10 +766,20 @@ mod tests {
 
     #[test]
     fn skill_tool_results_keep_metadata_without_durable_content() {
-        let output = redact_skill_tool_results(json!([
-            {
-                "tool_name": "activate_skill",
+        let result = |tool_name, payload| {
+            json!({
+                "tool_name": tool_name,
                 "response": {
+                    "status": "success",
+                    "payload": payload,
+                    "provenance": {"tool_id": "skill.runtime", "tool_version": "1"},
+                },
+            })
+        };
+        let output = redact_skill_tool_results(Value::Array(vec![
+            result(
+                "activate_skill",
+                json!({
                     "skill_id": "code-investigation",
                     "version": "1",
                     "instructions_ref": "sha256:instructions",
@@ -780,23 +796,20 @@ mod tests {
                         "capabilities": ["filesystem.read"],
                         "content": "metadata-canary",
                     }],
-                },
-            },
-            {
-                "tool_name": "read_skill_resource",
-                "response": {
+                }),
+            ),
+            result(
+                "read_skill_resource",
+                json!({
                     "resource_id": "assets/guide.txt",
                     "result_ref": "sha256:resource",
                     "byte_len": 15,
                     "page_byte_len": 15,
                     "next_offset": null,
                     "content": "resource-canary",
-                },
-            },
-            {
-                "tool_name": "run_skill_script",
-                "response": {"value": "script-canary"},
-            },
+                }),
+            ),
+            result("run_skill_script", json!({"value": "script-canary"})),
         ]))
         .unwrap();
         let output = output.as_array().unwrap();
@@ -823,6 +836,48 @@ mod tests {
                 .filter(|result| result.get("response_digest").is_some())
                 .count(),
             3
+        );
+    }
+
+    #[test]
+    fn ordinary_reserved_name_tool_results_keep_structured_projection() {
+        let mut mapper = AdkEventMapper::new("run-static", "workflow-static").unwrap();
+        let mut artifacts = InMemoryArtifactStore::new(
+            NonZeroU64::new(16 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024).unwrap(),
+        );
+        let mut event = Event::new("invocation");
+        event.set_content(Content {
+            role: "function".to_owned(),
+            parts: vec![Part::FunctionResponse {
+                function_response: FunctionResponseData::new(
+                    "activate_skill",
+                    json!({
+                        "status": "success",
+                        "payload": {"value": 42},
+                        "provenance": {
+                            "tool_id": "activate_skill",
+                            "tool_version": "1"
+                        }
+                    }),
+                ),
+                id: Some("call-static".to_owned()),
+                annotations: None,
+            }],
+        });
+
+        let mapped = mapper
+            .map_adk_event("agent".to_owned(), event, &mut artifacts)
+            .unwrap();
+
+        assert_eq!(
+            mapped.payload()["structured_output"][0]["response"]["payload"]["value"],
+            42
+        );
+        assert!(
+            mapped.payload()["structured_output"][0]
+                .get("response_digest")
+                .is_none()
         );
     }
 
