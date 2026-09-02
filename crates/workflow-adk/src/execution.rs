@@ -2565,9 +2565,6 @@ impl ExecutionProfileV1 {
                 skill_snapshot.map_or(Value::Null, |identity| Value::String(identity.to_owned())),
             );
             for model in ["model", "reviewer_model"] {
-                if let Some(object) = projection.get_mut(model).and_then(Value::as_object_mut) {
-                    object.remove("runtime");
-                }
                 if redact_fake_responses && projection[model]["provider"] == "fake" {
                     projection[model]["responses"] =
                         Self::durable_fake_responses(&projection[model]["responses"]);

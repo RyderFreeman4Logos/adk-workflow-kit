@@ -3,6 +3,7 @@ use std::{
     io::{Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -670,6 +671,114 @@ fn external_runtime_extensions_are_applied_and_absent_from_identity() {
         "runtime/extensions must stay out of workflow identity, got {identity}"
     );
     server.finish();
+}
+
+#[test]
+fn resume_replays_runtime_on_provider_requests() {
+    let mut script = publish_script();
+    script.extend(publish_script());
+    let server = serve_script(script, false);
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let runtime = json!({
+        "timeout_ms": 15_000,
+        "sampling": {"temperature": 0.25},
+        "provider_extensions": {"openai": {"trace": "m3-07-resume"}}
+    });
+    let mut profile = openai_profile(&server.base_url, json!({}));
+    profile["model"]["runtime"] = runtime.clone();
+    profile["reviewer_model"]["runtime"] = runtime;
+    let profile = write_profile(&root.0, &profile);
+    let workflow = example_root().join("workflow.toml");
+    let input = fs::read_to_string(example_root().join("input.example.json")).expect("input");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_workflowctl"))
+        .args([
+            "--json",
+            "run",
+            workflow.to_str().expect("workflow"),
+            "--profile",
+            profile.to_str().expect("profile"),
+            "--input",
+            input.trim(),
+            "--workdir",
+            workdir.to_str().expect("workdir"),
+        ])
+        .env(HANDLE, CANARY)
+        .spawn()
+        .expect("run");
+    let started = Instant::now();
+    let run_root = loop {
+        if let Some(path) = fs::read_dir(&workdir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.join("run-manifest.json").is_file())
+        {
+            break path;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "run-manifest.json"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    while server.request_count() == 0 {
+        assert!(started.elapsed() < Duration::from_secs(10), "first request");
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(50));
+    let before = server.request_bodies().len();
+    let _ = child.kill();
+    let _ = child.wait();
+    let run_id = serde_json::from_slice::<Value>(
+        &fs::read(run_root.join("run-manifest.json")).expect("manifest"),
+    )
+    .expect("manifest JSON")["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_owned();
+    let resumed = Command::new(env!("CARGO_BIN_EXE_workflowctl"))
+        .args([
+            "--json",
+            "resume",
+            "--run-id",
+            &run_id,
+            "--workdir",
+            workdir.to_str().expect("workdir"),
+        ])
+        .env(HANDLE, CANARY)
+        .output()
+        .expect("resume");
+    assert!(
+        resumed.status.success(),
+        "resume must run: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let started = Instant::now();
+    while server.request_bodies().len() <= before && started.elapsed() < Duration::from_secs(15) {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let bodies = server.request_bodies();
+    assert!(
+        bodies.len() > before,
+        "resume must issue provider requests after interrupt, before={before} total={} stderr={}",
+        bodies.len(),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let post = &bodies[before..];
+    assert!(
+        post.iter()
+            .any(|body| body.contains("\"temperature\":0.25")),
+        "post-resume requests must keep sampling, got {post:?}"
+    );
+    assert!(
+        post.iter()
+            .any(|body| body.contains("\"trace\":\"m3-07-resume\"")),
+        "post-resume requests must keep provider extensions, got {post:?}"
+    );
 }
 
 #[test]
