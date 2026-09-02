@@ -556,15 +556,7 @@ impl AdkGraph {
         let mut stream = Box::pin(self.graph.stream(state, config, StreamMode::Custom));
         let mut output = None;
         while let Some(item) = stream.next().await {
-            match item.map_err(|error| match &error {
-                GraphError::NodeExecutionFailed { message, .. } => {
-                    terminal_graph_error(message).unwrap_or(AdkGraphError::Failed)
-                }
-                GraphError::Other(message) => {
-                    terminal_graph_error(message).unwrap_or(AdkGraphError::Failed)
-                }
-                _ => AdkGraphError::Failed,
-            })? {
+            match item.map_err(|error| self.map_observed_error(&error))? {
                 StreamEvent::NodeStart { node, step } => {
                     mapper
                         .map_stream_observation(
@@ -719,6 +711,53 @@ impl AdkGraph {
             .any(|terminal| terminal == id)
             .then(|| TerminalOutcome::from_stable_id(id))
             .flatten()
+    }
+
+    fn map_observed_error(&self, error: &GraphError) -> AdkGraphError {
+        match error {
+            GraphError::NodeExecutionFailed { node, message } => {
+                if let Some(error) = terminal_graph_error(message) {
+                    return error;
+                }
+                if let Some(target) = self.fan_in_guard_nodes.get(node)
+                    && let Some(key) = message.strip_prefix("workflow fan-in conflict: ")
+                {
+                    return AdkGraphError::FanInConflict {
+                        target: target.clone(),
+                        key: key.to_owned(),
+                    };
+                }
+                if let Some(from) = self.unknown_route_nodes.get(node)
+                    && let Some(selector) = message.strip_prefix(UNKNOWN_ROUTE_ERROR_PREFIX)
+                {
+                    return AdkGraphError::UnknownRoute {
+                        from: from.clone(),
+                        selector: selector.to_owned(),
+                    };
+                }
+            }
+            GraphError::Other(message) => {
+                if let Some(error) = terminal_graph_error(message) {
+                    return error;
+                }
+                if let Some(selector) = message.strip_prefix(UNKNOWN_ROUTE_ERROR_PREFIX) {
+                    return AdkGraphError::UnknownRoute {
+                        from: String::new(),
+                        selector: selector.to_owned(),
+                    };
+                }
+            }
+            GraphError::UnknownRouteTarget(message) => {
+                return AdkGraphError::UnknownRoute {
+                    from: String::new(),
+                    selector: message.clone(),
+                };
+            }
+            _ => {}
+        }
+        visit_bound_from_error(error)
+            .map(|max_visits| AdkGraphError::VisitBound { max_visits })
+            .unwrap_or(AdkGraphError::Failed)
     }
 
     fn validate_output(&self, state: State) -> Result<State, AdkGraphError> {
