@@ -2923,13 +2923,41 @@ impl ExecutionProfileV1 {
     }
 
     fn profile_identity(&self) -> String {
-        let (worker, worker_version) = self.model_binding();
-        match self.reviewer_model.as_ref().map(Self::wire_binding) {
-            Some((reviewer, reviewer_version)) => {
-                format!("worker={worker}:{worker_version};reviewer={reviewer}:{reviewer_version}")
+        let worker = Self::wire_model_identity("worker", &self.model);
+        match &self.reviewer_model {
+            Some(reviewer) => {
+                format!(
+                    "{worker};{}",
+                    Self::wire_model_identity("reviewer", reviewer)
+                )
             }
-            None => format!("worker={worker}:{worker_version}"),
+            None => worker,
         }
+    }
+
+    fn wire_model_identity(role: &str, model: &ModelWire) -> String {
+        let (name, version, requested, provider) = match model {
+            ModelWire::Fake {
+                name,
+                version,
+                model,
+                ..
+            } => (name.as_str(), version.as_str(), model.as_str(), "fake"),
+            ModelWire::OpenaiCompatible {
+                name,
+                version,
+                model,
+                ..
+            } => (
+                name.as_str(),
+                version.as_str(),
+                model.as_str(),
+                "openai-compatible",
+            ),
+        };
+        format!(
+            "{role}={name}:{version};requested={requested};resolved={requested};provider={provider}"
+        )
     }
 
     fn run_limits(&self) -> RunLimits {

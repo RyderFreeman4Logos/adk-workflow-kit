@@ -2154,7 +2154,10 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     assert_no_canary_bytes(&manifest_bytes, CANARY);
     let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("manifest JSON");
     assert_eq!(manifest["status"], "succeeded");
-    assert_eq!(manifest["profile_identity"], "worker=oracle-model:1");
+    assert_eq!(
+        manifest["profile_identity"],
+        "worker=oracle-model:1;requested=oracle;resolved=oracle;provider=openai-compatible"
+    );
     assert!(
         !manifest["plan_hash"]
             .as_str()

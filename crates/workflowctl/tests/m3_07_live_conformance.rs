@@ -655,6 +655,33 @@ fn external_runtime_extensions_are_applied_and_absent_from_identity() {
 }
 
 #[test]
+fn resolved_model_identity_is_recorded_in_metrics() {
+    let server = serve_script(publish_script(), false);
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
+    let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
+    assert_eq!(report.disposition(), ConformanceDisposition::Pass);
+    let identity = report.metrics().expect("metrics").profile_identity();
+    assert!(
+        identity.contains("requested=conformance-worker")
+            && identity.contains("resolved=conformance-worker")
+            && identity.contains("requested=conformance-reviewer")
+            && identity.contains("resolved=conformance-reviewer")
+            && identity.contains("provider=openai-compatible"),
+        "metrics must persist resolved worker/reviewer identity, got {identity}"
+    );
+    assert!(
+        !identity.contains(&server.base_url)
+            && !identity.contains(HANDLE)
+            && !identity.contains(CANARY),
+        "identity must exclude endpoint/credential material, got {identity}"
+    );
+    server.finish();
+}
+
+#[test]
 fn metrics_write_failure_is_fail_not_pass() {
     let server = serve_script(publish_script(), false);
     let root = temp_root();
