@@ -31,13 +31,6 @@ struct LegacyWorkflowLock {
 impl WorkflowLock {
     /// Generates the current-IR v1 lock entirely in memory.
     pub fn try_from_plan(plan: &CompiledPlan) -> Result<Self, WorkflowLockError> {
-        let registry_binding_count = plan.registry_binding_count();
-        if registry_binding_count != 0 {
-            return Err(WorkflowLockError::UnsupportedSemanticResources {
-                registry_binding_count,
-            });
-        }
-
         let ir = plan.ir();
         let hash = ir.canonical_hash();
         let ir_hash = format!(

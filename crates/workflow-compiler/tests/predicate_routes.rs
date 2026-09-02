@@ -2,8 +2,7 @@ use std::cell::RefCell;
 
 use workflow_compiler::{
     CompileError, GraphValidationError, PredicateRegistry, RegistryCategory, RegistryEntry,
-    RegistryNotFound, WorkflowLock, WorkflowLockError, compile_str, compile_str_with_predicates,
-    validate_graph,
+    RegistryNotFound, WorkflowLock, compile_str, compile_str_with_predicates, validate_graph,
 };
 use workflow_ir::WorkflowIr;
 use workflow_spec::parse_str;
@@ -105,12 +104,8 @@ fn compile_str_with_predicates_resolves_exact_version_and_binds_cases_without_in
     };
 
     assert_eq!(plan.registry_binding_count(), 1);
-    assert!(matches!(
-        WorkflowLock::try_from_plan(&plan),
-        Err(WorkflowLockError::UnsupportedSemanticResources {
-            registry_binding_count: 1
-        })
-    ));
+    let lock = WorkflowLock::try_from_plan(&plan).expect("routed plans lock after exact bind");
+    assert_eq!(lock.workflow_id(), "routed");
     assert_eq!(plan.ir().routes().len(), 1);
     assert_eq!(
         plan.ir().routes()[0]

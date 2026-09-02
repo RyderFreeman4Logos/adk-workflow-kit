@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "workflow_lock": {
+    "toml": "lock_version = 1\n",
+    "sha256": "sha256:placeholder"
+  },
+  "input_sha256": "sha256:placeholder",
+  "events": [
+    { "type": "node_started", "node_id": "prepare_workspace" },
+    { "type": "terminal", "status": "completed", "outcome_sha256": "sha256:placeholder" }
+  ],
+  "fixtures": [],
+  "artifacts": []
+}

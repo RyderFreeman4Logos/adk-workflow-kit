@@ -181,3 +181,33 @@ pub trait SkillRegistry {
         version: &str,
     ) -> Result<RegistryEntry<'_, Self::Implementation>, RegistryNotFound>;
 }
+
+/// Exact allowlist of canonical example predicate identities.
+///
+/// Implementations are never invoked; resolution only proves the ID/version pair.
+pub struct BuiltinPredicateRegistry;
+
+impl PredicateRegistry for BuiltinPredicateRegistry {
+    type Implementation = ();
+
+    fn resolve(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<RegistryEntry<'_, Self::Implementation>, RegistryNotFound> {
+        static IMPLEMENTATION: () = ();
+        let identity = match (id, version) {
+            ("coverage.decision@v1", "1.0.0") => ("coverage.decision@v1", "1.0.0"),
+            ("review.verdict@v1", "1.0.0") => ("review.verdict@v1", "1.0.0"),
+            ("grounding.verdict@v1", "1.0.0") => ("grounding.verdict@v1", "1.0.0"),
+            _ => {
+                return Err(RegistryNotFound::new(
+                    RegistryCategory::Predicate,
+                    id,
+                    version,
+                ));
+            }
+        };
+        Ok(RegistryEntry::new(&IMPLEMENTATION, identity.0, identity.1))
+    }
+}
