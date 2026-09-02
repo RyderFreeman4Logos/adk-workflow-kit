@@ -69,6 +69,7 @@ const LOOP_LEDGER_DIGEST_KEY: &str = "kit_loop_ledger_digest_v1";
 static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
 #[cfg(debug_assertions)]
 static CRASH_BARRIER_HITS: AtomicU64 = AtomicU64::new(0);
+static EFFECT_BARRIER_HITS: AtomicU64 = AtomicU64::new(0);
 type BoundTool = (Vec<String>, Arc<AdkToolBridge<InMemoryArtifactStore>>);
 type CompletedToolResponse = (String, String, String, String, Value);
 
@@ -4455,6 +4456,13 @@ impl EffectFence {
     }
 
     fn admit(&self, tool_deadline: Instant) -> Result<(), ToolBridgeError> {
+        if self
+            .terminal
+            .lock()
+            .map_or(true, |terminal| terminal.is_some())
+        {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
+        }
         let kind = if self.cancellation.load(Ordering::Acquire) {
             Some(ExecutionErrorKind::Cancelled)
         } else if Instant::now() >= self.wall_deadline {
@@ -4498,13 +4506,23 @@ impl EffectFence {
 }
 
 fn test_effect_barrier(cancellation: &AtomicBool) {
-    let Ok(root) = std::env::var("WORKFLOW_KIT_TEST_EFFECT_BARRIER") else {
+    let Ok(configured) = std::env::var("WORKFLOW_KIT_TEST_EFFECT_BARRIER") else {
         return;
     };
+    let (root, hit) = configured
+        .rsplit_once('#')
+        .and_then(|(root, hit)| hit.parse::<u64>().ok().map(|hit| (root, hit)))
+        .unwrap_or((configured.as_str(), 1));
+    if EFFECT_BARRIER_HITS.fetch_add(1, Ordering::Relaxed) + 1 != hit {
+        return;
+    }
     let root = PathBuf::from(root);
     let _ = fs::write(root.join("ready"), b"ready");
     let deadline = Instant::now() + Duration::from_secs(2);
-    while !root.join("cancel").is_file() && Instant::now() < deadline {
+    while !root.join("cancel").is_file()
+        && !root.join("continue").is_file()
+        && Instant::now() < deadline
+    {
         std::thread::sleep(Duration::from_millis(5));
     }
     if root.join("cancel").is_file() {
@@ -4522,6 +4540,7 @@ enum SkillToolAction {
 struct SkillToolHandler {
     action: SkillToolAction,
     ledger: Arc<LoopLedgerStore>,
+    effect_fence: Arc<EffectFence>,
     packages: BTreeMap<String, Arc<SkillPackage>>,
     plan: ResolvedRuntimePlan,
     provenance: ToolProvenance,
@@ -4613,6 +4632,7 @@ impl ToolHandler for SkillToolHandler {
         {
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::CapabilityDenied));
         }
+        let tool_deadline = self.effect_fence.wait(Duration::ZERO)?;
         let payload = match self.action {
             SkillToolAction::Activate => {
                 let activation = activate_skill(skill_id.as_ref(), &skill_id.id, &skill_id.version)
@@ -4633,6 +4653,7 @@ impl ToolHandler for SkillToolHandler {
                         "capabilities": script.capabilities().iter().map(SandboxCapability::as_str).collect::<Vec<_>>(),
                     })).collect::<Vec<_>>(),
                 });
+                self.effect_fence.admit(tool_deadline)?;
                 self.ledger
                     .activate_skill(context.actor(), &skill_name)
                     .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
@@ -4657,6 +4678,7 @@ impl ToolHandler for SkillToolHandler {
                     .get("page_byte_len")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                self.effect_fence.admit(tool_deadline)?;
                 self.ledger
                     .reserve_skill_resource_read(
                         context.actor(),
@@ -4678,6 +4700,7 @@ impl ToolHandler for SkillToolHandler {
                     .scripts
                     .get(&script_id)
                     .ok_or_else(|| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                self.effect_fence.admit(tool_deadline)?;
                 let receipt = execute_registered_script_in_child(
                     &skill_id.runtime,
                     &skill_id.lock,
@@ -4687,6 +4710,7 @@ impl ToolHandler for SkillToolHandler {
                     sandbox,
                 )
                 .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
+                self.effect_fence.admit(tool_deadline)?;
                 if !receipt.exit_success() {
                     return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
                 }
@@ -4694,6 +4718,8 @@ impl ToolHandler for SkillToolHandler {
                     .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?
             }
         };
+        self.effect_fence.admit(tool_deadline)?;
+        self.effect_fence.mark_progress()?;
         Ok(ToolEnvelope::success(payload, self.provenance.clone()))
     }
 }
@@ -4798,6 +4824,7 @@ fn build_tool_registry(
                     SkillToolHandler {
                         action,
                         ledger: Arc::clone(&ledger),
+                        effect_fence: Arc::clone(&effect_fence),
                         packages: packages.clone(),
                         plan: plan.clone(),
                         provenance,

@@ -894,6 +894,152 @@ fn child_sandbox_denies_widening_and_bounds_output() {
 }
 
 #[test]
+fn skill_effect_fence_blocks_terminal_workers_before_ledger_mutations() {
+    if let Ok(case) = env::var("M3_05_EFFECT_FENCE_CASE") {
+        let root = PathBuf::from(env::var("M3_05_EFFECT_FENCE_ROOT").unwrap());
+        let barrier = root.join("effect-barrier");
+        let package = skill_package(&root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let mut value = serde_json::to_value(profile(&package)).unwrap();
+        value["model"]["responses"] = if case == "activate-cancel" {
+            json!([
+                {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+                serde_json::to_string(&json!({"status":"finished","output":{"must_not":"run"}})).unwrap()
+            ])
+        } else {
+            json!([
+                {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+                {"calls": [{"id":"read","name":"read_skill_resource","args":{"skill_id":"code-investigation","resource_id":"assets/guide.txt","offset":0,"limit":64}}]},
+                serde_json::to_string(&json!({"status":"finished","output":{"must_not":"run"}})).unwrap()
+            ])
+        };
+        value["loop_policy"] = json!({
+            "schema_version": 1,
+            "max_model_iterations": 3,
+            "max_total_tool_calls": 2,
+            "max_tool_calls_per_tool": 2,
+            "wall_time_ms": 5_000,
+            "idle_time_ms": 5_000,
+            "tool_time_ms": if case == "activate-cancel" { 1_000 } else { 250 },
+            "max_tool_output_bytes": 262_144
+        });
+        let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let error = ExecutionBackend::run_cancellable(
+            &workflow,
+            ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap(),
+            json!({}),
+            &root,
+            cancellation,
+        )
+        .unwrap_err();
+        if case == "activate-cancel" {
+            assert_eq!(error.kind(), ExecutionErrorKind::Cancelled);
+        } else {
+            assert_eq!(error.kind(), ExecutionErrorKind::ToolTimeLimit);
+            fs::write(barrier.join("continue"), b"continue").unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let ledger: serde_json::Value = serde_json::from_slice(
+            &fs::read(error.receipt().unwrap().run_root().join("loop-ledger.json")).unwrap(),
+        )
+        .unwrap();
+        if case == "activate-cancel" {
+            assert_eq!(ledger["nodes"]["work"]["activated_skills"], json!([]));
+        } else {
+            assert_eq!(
+                ledger["nodes"]["work"]["skill_resource_read_reservations"],
+                json!({})
+            );
+        }
+        return;
+    }
+
+    for (case, hit) in [("activate-cancel", 1), ("resource-timeout", 2)] {
+        let root = root();
+        let barrier = root.join("effect-barrier");
+        fs::create_dir(&barrier).unwrap();
+        let mut child = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "skill_effect_fence_blocks_terminal_workers_before_ledger_mutations",
+                "--nocapture",
+            ])
+            .env("M3_05_EFFECT_FENCE_CASE", case)
+            .env("M3_05_EFFECT_FENCE_ROOT", &root)
+            .env(
+                "WORKFLOW_KIT_TEST_EFFECT_BARRIER",
+                format!("{}#{hit}", barrier.display()),
+            )
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while !barrier.join("ready").is_file()
+            && started.elapsed() < std::time::Duration::from_secs(5)
+        {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(barrier.join("ready").is_file(), "{case} dispatch barrier");
+        if case == "activate-cancel" {
+            fs::write(barrier.join("cancel"), b"cancel").unwrap();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            fs::write(barrier.join("continue"), b"continue").unwrap();
+        }
+        assert!(child.wait().unwrap().success(), "{case}");
+        cleanup_test_root(&root);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+}
+
+#[test]
+fn successful_skill_completion_resets_idle_budget() {
+    let root = root();
+    let package = skill_package(&root);
+    let slow_script = b"import json, sys, time\ntime.sleep(0.12)\nprint(json.dumps({'value': json.load(sys.stdin)['value']}))\n";
+    fs::write(package.join("scripts/content.bin"), slow_script).unwrap();
+    let runtime_path = package.join("skill.runtime.toml");
+    let runtime = fs::read_to_string(&runtime_path).unwrap();
+    fs::write(
+        &runtime_path,
+        runtime.replace(&digest(SCRIPT), &digest(slow_script)),
+    )
+    .unwrap();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let mut value = serde_json::to_value(profile(&package)).unwrap();
+    value["model"]["response_delay_ms"] = json!(120);
+    value["model"]["responses"] = json!([
+        {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
+        {"calls": [{"id":"run","name":"run_skill_script","args":{"skill_id":"code-investigation","script_id":"answer","input":{"value":"done"}}}]},
+        serde_json::to_string(&json!({"status":"finished","output":{"ok":true}})).unwrap()
+    ]);
+    value["loop_policy"] = json!({
+        "schema_version": 1,
+        "max_model_iterations": 3,
+        "max_total_tool_calls": 2,
+        "max_tool_calls_per_tool": 2,
+        "wall_time_ms": 2_000,
+        "idle_time_ms": 200,
+        "tool_time_ms": 500,
+        "max_tool_output_bytes": 262_144
+    });
+    let receipt = ExecutionBackend::run(
+        &workflow,
+        ExecutionProfileV1::parse(&serde_json::to_vec(&value).unwrap()).unwrap(),
+        json!({}),
+        &root,
+    )
+    .unwrap();
+    assert_eq!(receipt.status(), "succeeded");
+    cleanup_test_root(&root);
+    fs::remove_dir_all(root).expect("test cleanup");
+}
+
+#[test]
 fn unchanged_skill_package_resumes_from_snapshot() {
     let root = root();
     let package = skill_package(&root);
