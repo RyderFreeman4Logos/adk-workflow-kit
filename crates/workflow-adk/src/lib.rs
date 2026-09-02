@@ -380,6 +380,21 @@ impl std::error::Error for AdkGraphError {}
 const IR_DEFAULT_KEY: &str = "__ir_default__";
 const UNKNOWN_ROUTE_ERROR_PREFIX: &str = "workflow unknown route selector: ";
 const UNKNOWN_ROUTE_NODE_PREFIX: &str = "__workflow_unknown_route_";
+const REVISE_ADMIT_NODE: &str = "__workflow_revise_admit";
+
+fn unused_node_id(ids: &BTreeSet<&str>, preferred: &str) -> String {
+    if !ids.contains(preferred) {
+        return preferred.to_owned();
+    }
+    let mut index = 0;
+    loop {
+        let candidate = format!("{preferred}_{index}");
+        if !ids.contains(candidate.as_str()) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
 
 fn terminal_graph_error(message: &str) -> Option<AdkGraphError> {
     [
@@ -1292,8 +1307,11 @@ impl AdkGraphTranslator {
                 });
             }
         }
-        if ids.contains("revise") {
-            builder = builder.node_fn("__workflow_revise_admit", |context| {
+        let revise_admit = ids
+            .contains("revise")
+            .then(|| unused_node_id(&ids, REVISE_ADMIT_NODE));
+        if let Some(admit) = &revise_admit {
+            builder = builder.node_fn(admit, |context| {
                 let visits = context
                     .state
                     .get("visits:revise")
@@ -1308,7 +1326,7 @@ impl AdkGraphTranslator {
                     Ok(NodeOutput::new().with_update("visits:revise", json!(visits + 1)))
                 }
             });
-            builder = builder.edge("__workflow_revise_admit", "revise");
+            builder = builder.edge(admit, "revise");
         }
         builder = builder.edge(START, ir.entry_node_id().as_str());
         for edge in ir.edges() {
@@ -1370,8 +1388,10 @@ impl AdkGraphTranslator {
                 Some(unknown_route_node)
             };
             let guarded_target = |target: &str| {
-                if target == "revise" {
-                    return "__workflow_revise_admit".to_owned();
+                if target == "revise"
+                    && let Some(admit) = &revise_admit
+                {
+                    return admit.clone();
                 }
                 fan_in_guards_by_target
                     .get(target)

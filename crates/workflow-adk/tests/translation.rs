@@ -1682,3 +1682,46 @@ fn resolved_plan_rejects_ir_hash_mismatch() {
         TranslationError::ResolvedPlanMismatch { .. }
     ));
 }
+
+#[tokio::test]
+async fn revise_admit_keeps_authored_collision_node() {
+    const SOURCE: &str = r#"
+schema_version = 1
+[workflow]
+id = "revise-admit-collision"
+version = "1"
+entry = "__workflow_revise_admit"
+[[nodes]]
+id = "__workflow_revise_admit"
+kind = "action"
+[[nodes]]
+id = "revise"
+kind = "action"
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "__workflow_revise_admit"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "done"
+"#;
+    let plan =
+        compile_str("revise-admit-collision.workflow.toml", SOURCE).expect("fixture compiles");
+    let graph = AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("translation succeeds");
+    assert!(
+        graph.node_order().contains(&"__workflow_revise_admit"),
+        "authored node must remain"
+    );
+    let state = graph
+        .invoke(State::new(), ExecutionConfig::new("collision"))
+        .await
+        .expect("authored collision node still executes");
+    assert_eq!(
+        state.get("node:__workflow_revise_admit"),
+        Some(&json!(true))
+    );
+}
