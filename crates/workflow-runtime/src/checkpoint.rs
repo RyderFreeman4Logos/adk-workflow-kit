@@ -406,6 +406,9 @@ impl SqliteCheckpointStore {
         &mut self,
         checkpoint: DurableCheckpointV1,
     ) -> Result<(), CheckpointError> {
+        if std::env::var_os("WORKFLOW_KIT_TEST_CHECKPOINT_SAVE_FAIL").is_some() {
+            return Err(CheckpointError::new(CheckpointErrorKind::Unavailable));
+        }
         if checkpoint.run_id
             != RunId::new(self.manifest.run_id.clone())
                 .map_err(|_| CheckpointError::new(CheckpointErrorKind::Corrupt))?

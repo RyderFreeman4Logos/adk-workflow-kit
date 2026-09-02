@@ -3,7 +3,6 @@ use std::{
     io::{Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
-    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -583,42 +582,19 @@ fn scripted_openai_server_full_trace_is_pass() {
 
 #[test]
 fn checkpoint_persistence_failure_fails_closed() {
-    let server = serve_script(publish_script(), false);
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
-    let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
-    let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
-    assert_eq!(report.disposition(), ConformanceDisposition::Pass);
-    let Some(run_dir) = fs::read_dir(&workdir)
-        .expect("runs")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.join("checkpoint.sqlite").is_file())
-    else {
-        panic!("missing run root after PASS");
-    };
-    fs::remove_file(run_dir.join("checkpoint.sqlite-wal")).ok();
-    fs::remove_file(run_dir.join("checkpoint.sqlite-shm")).ok();
-    fs::write(run_dir.join("checkpoint.sqlite"), b"corrupt checkpoint").expect("corrupt");
-    let run_id = run_dir
-        .file_name()
-        .expect("name")
-        .to_string_lossy()
-        .into_owned();
-    let resumed = Command::new(env!("CARGO_BIN_EXE_workflowctl"))
-        .args([
-            "--json",
-            "resume",
-            "--run-id",
-            &run_id,
-            "--workdir",
-            workdir.to_str().unwrap(),
-        ])
-        .output()
-        .expect("resume");
-    assert_eq!(resumed.status.code(), Some(2));
-    server.finish();
+    let profile = write_profile(&root.0, &openai_profile("http://127.0.0.1:1/v1", json!({})));
+    let report = run_opt_in(
+        &profile,
+        &workdir,
+        &[
+            (HANDLE, CANARY),
+            ("WORKFLOW_KIT_TEST_CHECKPOINT_SAVE_FAIL", "1"),
+        ],
+    );
+    assert_fail(&report, "persistence");
 }
 
 #[test]
