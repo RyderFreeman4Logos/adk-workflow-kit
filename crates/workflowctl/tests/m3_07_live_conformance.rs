@@ -179,6 +179,7 @@ struct ScriptedServer {
     requests: Arc<AtomicU64>,
     extra: Arc<AtomicU64>,
     done: Arc<AtomicBool>,
+    first_response_released: Arc<AtomicBool>,
     bodies: Arc<std::sync::Mutex<Vec<String>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -190,6 +191,10 @@ impl ScriptedServer {
 
     fn request_bodies(&self) -> Vec<String> {
         self.bodies.lock().expect("bodies").clone()
+    }
+
+    fn release_first_response(&self) {
+        self.first_response_released.store(true, Ordering::Release);
     }
 
     fn finish(mut self) {
@@ -216,24 +221,36 @@ impl Drop for ScriptedServer {
 }
 
 fn serve_script(responses: Vec<String>, stall: bool) -> ScriptedServer {
-    serve_provider(responses, stall, 0)
+    serve_provider(responses, stall, 0, false)
 }
 
 fn serve_retrying(responses: Vec<String>) -> ScriptedServer {
-    serve_provider(responses, false, 1)
+    serve_provider(responses, false, 1, false)
 }
 
-fn serve_provider(responses: Vec<String>, stall: bool, rate_limits: usize) -> ScriptedServer {
+fn serve_interrupted_script(mut responses: Vec<String>) -> ScriptedServer {
+    responses.insert(0, finished("interrupted"));
+    serve_provider(responses, false, 0, true)
+}
+
+fn serve_provider(
+    responses: Vec<String>,
+    stall: bool,
+    rate_limits: usize,
+    hold_first_response: bool,
+) -> ScriptedServer {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("addr");
     let requests = Arc::new(AtomicU64::new(0));
     let extra = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
+    let first_response_released = Arc::new(AtomicBool::new(!hold_first_response));
     let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
     let request_count = Arc::clone(&requests);
     let extra_count = Arc::clone(&extra);
     let finished = Arc::clone(&done);
+    let released = Arc::clone(&first_response_released);
     let captured = Arc::clone(&bodies);
     let handle = thread::spawn(move || {
         let accept = |timeout: Duration| {
@@ -275,7 +292,10 @@ fn serve_provider(responses: Vec<String>, stall: bool, rate_limits: usize) -> Sc
             );
             return;
         }
-        for body in std::iter::repeat_n(None, rate_limits).chain(responses.into_iter().map(Some)) {
+        for (index, body) in std::iter::repeat_n(None, rate_limits)
+            .chain(responses.into_iter().map(Some))
+            .enumerate()
+        {
             let Some(mut socket) = accept(Duration::from_secs(2)) else {
                 return;
             };
@@ -314,6 +334,15 @@ fn serve_provider(responses: Vec<String>, stall: bool, rate_limits: usize) -> Sc
             if let Ok(mut bodies) = captured.lock() {
                 bodies.push(String::from_utf8_lossy(&request).into_owned());
             }
+            while index == 0
+                && !released.load(Ordering::Acquire)
+                && !finished.load(Ordering::Acquire)
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if finished.load(Ordering::Acquire) {
+                return;
+            }
             match body {
                 None => {
                     let _ = write!(
@@ -338,6 +367,7 @@ fn serve_provider(responses: Vec<String>, stall: bool, rate_limits: usize) -> Sc
         requests,
         extra,
         done,
+        first_response_released,
         bodies,
         handle: Some(handle),
     }
@@ -675,9 +705,7 @@ fn external_runtime_extensions_are_applied_and_absent_from_identity() {
 
 #[test]
 fn resume_replays_runtime_on_provider_requests() {
-    let mut script = publish_script();
-    script.extend(publish_script());
-    let server = serve_script(script, false);
+    let server = serve_interrupted_script(publish_script());
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
@@ -729,10 +757,11 @@ fn resume_replays_runtime_on_provider_requests() {
         assert!(started.elapsed() < Duration::from_secs(10), "first request");
         thread::sleep(Duration::from_millis(20));
     }
-    thread::sleep(Duration::from_millis(50));
-    let before = server.request_bodies().len();
     let _ = child.kill();
     let _ = child.wait();
+    let before = server.request_bodies().len();
+    assert_eq!(before, 1, "only the interrupted request may precede resume");
+    server.release_first_response();
     let run_id = serde_json::from_slice::<Value>(
         &fs::read(run_root.join("run-manifest.json")).expect("manifest"),
     )
@@ -771,14 +800,26 @@ fn resume_replays_runtime_on_provider_requests() {
     let post = &bodies[before..];
     assert!(
         post.iter()
-            .any(|body| body.contains("\"temperature\":0.25")),
+            .all(|body| body.contains("\"temperature\":0.25")),
         "post-resume requests must keep sampling, got {post:?}"
     );
     assert!(
         post.iter()
-            .any(|body| body.contains("\"trace\":\"m3-07-resume\"")),
+            .all(|body| body.contains("\"trace\":\"m3-07-resume\"")),
         "post-resume requests must keep provider extensions, got {post:?}"
     );
+    assert!(
+        post.iter()
+            .any(|body| body.contains("\"name\":\"search_code\"")),
+        "post-resume requests must keep the search tool, got {post:?}"
+    );
+    assert!(
+        post.iter()
+            .any(|body| body.contains("\"name\":\"read_source_range\"")),
+        "post-resume requests must keep the read tool, got {post:?}"
+    );
+    assert_eq!(server.request_count(), 11, "provider request count");
+    server.finish();
 }
 
 #[test]
