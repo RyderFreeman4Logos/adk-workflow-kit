@@ -82,6 +82,14 @@ m3-05-adk test_name:
 m3-06-cli test_name:
     {{_io}} cargo +1.98.0 test -p workflowctl --test m3_06_code_investigation {{test_name}} --locked -- --exact --nocapture
 
+# Focused M3-07 opt-in live OpenAI-compatible conformance tests.
+m3-07-cli test_name="":
+    {{_io}} cargo +1.98.0 test -p workflowctl --test m3_07_live_conformance {{test_name}} --locked -- --nocapture
+
+# Opt in without inspecting credentials; SKIP unless explicitly requested.
+m3-07-live profile="":
+    if test "${WORKFLOW_KIT_M3_07_LIVE:-0}" != 1; then echo "M3-07 live conformance: SKIP (set WORKFLOW_KIT_M3_07_LIVE=1 to opt in)"; exit 0; fi; if test -z "{{profile}}"; then echo "M3-07 live conformance: FAIL (missing profile)"; exit 2; fi; {{_io}} cargo +1.98.0 build -p workflowctl --locked; {{_io}} cargo +1.98.0 run -p workflow-testkit --bin m3-07-live --locked -- ./target/debug/workflowctl "{{profile}}"
+
 m3-04-unit test_name:
     {{_io}} cargo +1.98.0 test -p workflow-adk {{test_name}} --lib --locked -- --exact --nocapture
 

@@ -86,3 +86,16 @@ bytes, so its validation also performs no network access.
 - offline validation of the committed redacted replay bundle.
 
 Keep credentials and machine-specific paths out of every checked-in fixture.
+
+## Opt-in live OpenAI-compatible conformance
+
+Copy `profiles/openai-compatible.template.json`, replace `USER_SUPPLIED_MODEL`
+and `http://example.invalid/v1` with a local profile, and export the credential
+handle named in `credential_env`. Then from the repository root:
+
+```bash
+WORKFLOW_KIT_M3_07_LIVE=1 just m3-07-live path/to/profile.json
+```
+
+Without that opt-in the recipe prints `SKIP` and does not start a provider
+session. Ordinary `just test` never requires the network.
