@@ -5,7 +5,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 #[path = "support/owned_tree.rs"]
 mod owned_tree;
@@ -53,6 +53,79 @@ fn json_receipt(output: &Output) -> Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+fn load_profile() -> Value {
+    serde_json::from_slice(&fs::read(example_root().join("profiles/fake.json")).expect("profile"))
+        .expect("profile JSON")
+}
+
+fn finished(output: &str) -> Value {
+    Value::String(format!(r#"{{"status":"finished","output":"{output}"}}"#))
+}
+
+fn input_json() -> String {
+    fs::read_to_string(example_root().join("input.example.json")).expect("input")
+}
+
+fn write_profile(root: &Path, profile: &Value) -> PathBuf {
+    let path = root.join("profile.json");
+    fs::write(&path, serde_json::to_vec(profile).expect("profile bytes")).expect("write profile");
+    path
+}
+
+fn run_workflow(workflow: &Path, profile: &Path, workdir: &Path) -> Output {
+    command(&[
+        "--json",
+        "run",
+        workflow.to_str().unwrap(),
+        "--profile",
+        profile.to_str().unwrap(),
+        "--input",
+        input_json().trim(),
+        "--workdir",
+        workdir.to_str().unwrap(),
+    ])
+}
+
+fn short_path_profile() -> Value {
+    let mut profile = load_profile();
+    let responses = profile["model"]["responses"]
+        .as_array()
+        .expect("worker responses")
+        .clone();
+    let mut next = responses[..6].to_vec();
+    next.push(finished("sufficient"));
+    next.push(responses[12].clone());
+    next.push(responses[13].clone());
+    profile["model"]["responses"] = Value::Array(next);
+    profile
+}
+
+fn event_node_ids(run_root: &Path) -> Vec<String> {
+    fs::read_to_string(run_root.join("events.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let value: Value = serde_json::from_str(line).ok()?;
+            value.get("node_id")?.as_str().map(str::to_owned)
+        })
+        .collect()
+}
+
+fn assert_fail_closed(output: &Output) {
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("workflow.run.failed"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -199,4 +272,232 @@ fn fake_profile_covers_run_inspect_resume_and_replay() {
     let replay_receipt = json_receipt(&replayed);
     assert_eq!(replay_receipt["disposition"], "replay_run");
     assert!(replay_receipt["fixture_count"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn fake_profile_covers_revision() {
+    let mut profile = short_path_profile();
+    let mut responses = profile["model"]["responses"]
+        .as_array()
+        .expect("worker responses")
+        .clone();
+    responses.push(finished("revised"));
+    responses.push(finished("valid"));
+    profile["model"]["responses"] = Value::Array(responses);
+    profile["reviewer_model"]["responses"] = json!([
+        r#"{"status":"finished","output":"revise"}"#,
+        r#"{"status":"finished","output":"pass"}"#
+    ]);
+
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let profile_path = write_profile(&root.0, &profile);
+    let run = run_workflow(
+        &example_root().join("workflow.toml"),
+        &profile_path,
+        &workdir,
+    );
+    assert!(
+        run.status.success(),
+        "revision run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let receipt = json_receipt(&run);
+    assert_eq!(receipt["status"], "succeeded");
+    let nodes = event_node_ids(Path::new(receipt["run_root"].as_str().expect("run_root")));
+    assert!(nodes.iter().any(|node| node == "revise"), "nodes={nodes:?}");
+    assert!(
+        nodes.iter().any(|node| node == "publish"),
+        "nodes={nodes:?}"
+    );
+}
+
+#[test]
+fn fake_profile_covers_valid_abstention() {
+    let mut profile = load_profile();
+    let mut responses = profile["model"]["responses"]
+        .as_array()
+        .expect("worker responses")
+        .clone();
+    responses.truncate(6);
+    responses.push(finished("impossible"));
+    profile["model"]["responses"] = Value::Array(responses);
+
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let profile_path = write_profile(&root.0, &profile);
+    let run = run_workflow(
+        &example_root().join("workflow.toml"),
+        &profile_path,
+        &workdir,
+    );
+    assert!(
+        run.status.success(),
+        "abstention run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let receipt = json_receipt(&run);
+    assert_eq!(receipt["status"], "succeeded");
+    let nodes = event_node_ids(Path::new(receipt["run_root"].as_str().expect("run_root")));
+    assert!(
+        nodes.iter().any(|node| node == "abstain"),
+        "nodes={nodes:?}"
+    );
+    assert!(
+        !nodes.iter().any(|node| node == "publish"),
+        "valid abstention must not publish, nodes={nodes:?}"
+    );
+}
+
+#[test]
+fn fake_profile_fails_closed_on_invalid_evidence() {
+    let mut profile = short_path_profile();
+    let mut responses = profile["model"]["responses"]
+        .as_array()
+        .expect("worker responses")
+        .clone();
+    *responses.last_mut().expect("grounding response") = finished("not-a-verdict");
+    profile["model"]["responses"] = Value::Array(responses);
+
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let profile_path = write_profile(&root.0, &profile);
+    assert_fail_closed(&run_workflow(
+        &example_root().join("workflow.toml"),
+        &profile_path,
+        &workdir,
+    ));
+}
+
+#[test]
+fn fake_profile_fails_closed_on_unknown_route() {
+    let mut profile = load_profile();
+    let mut responses = profile["model"]["responses"]
+        .as_array()
+        .expect("worker responses")
+        .clone();
+    responses.truncate(6);
+    responses.push(finished("nope"));
+    profile["model"]["responses"] = Value::Array(responses);
+
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let profile_path = write_profile(&root.0, &profile);
+    assert_fail_closed(&run_workflow(
+        &example_root().join("workflow.toml"),
+        &profile_path,
+        &workdir,
+    ));
+}
+
+#[test]
+fn fake_profile_fails_closed_on_malformed_model_output() {
+    let mut profile = load_profile();
+    let mut responses = profile["model"]["responses"]
+        .as_array()
+        .expect("worker responses")
+        .clone();
+    responses.truncate(6);
+    responses.push(Value::String("not-json{".to_owned()));
+    profile["model"]["responses"] = Value::Array(responses);
+
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let profile_path = write_profile(&root.0, &profile);
+    assert_fail_closed(&run_workflow(
+        &example_root().join("workflow.toml"),
+        &profile_path,
+        &workdir,
+    ));
+}
+
+#[test]
+fn fake_profile_fails_closed_on_denied_tools() {
+    let mut profile = load_profile();
+    profile["tools"][0]["required_capabilities"] = json!(["process.spawn"]);
+
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let profile_path = write_profile(&root.0, &profile);
+    let run = run_workflow(
+        &example_root().join("workflow.toml"),
+        &profile_path,
+        &workdir,
+    );
+    assert_fail_closed(&run);
+    assert!(
+        fs::read_dir(&workdir).expect("workdir").next().is_none(),
+        "denied tools must fail before allocating run state"
+    );
+}
+
+#[test]
+fn fake_profile_fails_closed_on_exhausted_review_loop() {
+    let mut profile = short_path_profile();
+    let mut responses = profile["model"]["responses"]
+        .as_array()
+        .expect("worker responses")
+        .clone();
+    responses.push(finished("revised"));
+    responses.push(finished("valid"));
+    responses.push(finished("revised"));
+    responses.push(finished("valid"));
+    profile["model"]["responses"] = Value::Array(responses);
+    profile["reviewer_model"]["responses"] = json!([
+        r#"{"status":"finished","output":"revise"}"#,
+        r#"{"status":"finished","output":"revise"}"#
+    ]);
+
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let profile_path = write_profile(&root.0, &profile);
+    assert_fail_closed(&run_workflow(
+        &example_root().join("workflow.toml"),
+        &profile_path,
+        &workdir,
+    ));
+}
+
+#[test]
+fn fake_profile_fails_closed_on_corrupt_checkpoint() {
+    let example = example_root();
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let run = run_workflow(
+        &example.join("workflow.toml"),
+        &example.join("profiles/fake.json"),
+        &workdir,
+    );
+    assert!(
+        run.status.success(),
+        "seed run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let receipt = json_receipt(&run);
+    let run_id = receipt["run_id"].as_str().expect("run_id");
+    let run_root = Path::new(receipt["run_root"].as_str().expect("run_root"));
+    fs::remove_file(run_root.join("checkpoint.sqlite-wal")).ok();
+    fs::remove_file(run_root.join("checkpoint.sqlite-shm")).ok();
+    fs::write(run_root.join("checkpoint.sqlite"), b"corrupt checkpoint")
+        .expect("corrupt checkpoint");
+    let resumed = command(&[
+        "--json",
+        "resume",
+        "--run-id",
+        run_id,
+        "--workdir",
+        workdir.to_str().unwrap(),
+    ]);
+    assert_fail_closed(&resumed);
 }
