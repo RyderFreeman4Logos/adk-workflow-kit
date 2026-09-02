@@ -1769,3 +1769,92 @@ to = "done"
         "direct to=revise must not bypass one-revision admission, got {err}"
     );
 }
+
+#[tokio::test]
+async fn revise_divergent_predecessors_fan_in_then_admission() {
+    const SOURCE: &str = r#"
+schema_version = 1
+[workflow]
+id = "revise-fan-in"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "left"
+kind = "agent"
+[[nodes]]
+id = "right"
+kind = "agent"
+[[nodes]]
+id = "revise"
+kind = "action"
+max_visits = 16
+idempotent = true
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "left"
+[[edges]]
+from = "start"
+to = "right"
+[[edges]]
+from = "left"
+to = "revise"
+[[edges]]
+from = "right"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "done"
+"#;
+    let plan = compile_str("revise-fan-in.workflow.toml", SOURCE).expect("fixture compiles");
+    let overlap = BTreeMap::from([
+        (
+            "left".to_owned(),
+            state_agent("left", json!({"shared": "left"})),
+        ),
+        (
+            "right".to_owned(),
+            state_agent("right", json!({"shared": "right"})),
+        ),
+    ]);
+    let conflict = AdkGraphTranslator::new()
+        .translate_with_agents(&plan, &overlap)
+        .expect("translation succeeds")
+        .invoke(State::new(), ExecutionConfig::new("revise-fan-in-overlap"))
+        .await
+        .expect_err("divergent writes to revise require the fan-in guard");
+    assert_eq!(
+        conflict.to_string(),
+        "fan-in state conflict at \"revise\" for key \"shared\""
+    );
+
+    let disjoint = BTreeMap::from([
+        (
+            "left".to_owned(),
+            state_agent("left", json!({"left": "left"})),
+        ),
+        (
+            "right".to_owned(),
+            state_agent("right", json!({"right": "right"})),
+        ),
+    ]);
+    let admission = AdkGraphTranslator::new()
+        .translate_with_agents(&plan, &disjoint)
+        .expect("translation succeeds")
+        .invoke(State::new(), ExecutionConfig::new("revise-fan-in-admit"))
+        .await
+        .expect_err("merged fan-in must still pass through revise admission");
+    assert_eq!(
+        admission.to_string(),
+        "visit bound exceeded: max_visits=1",
+        "fan-in guard must route through admission before revise, got {admission}"
+    );
+}

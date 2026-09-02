@@ -1329,15 +1329,15 @@ impl AdkGraphTranslator {
             builder = builder.edge(admit, "revise");
         }
         let rewrite_target = |target: &str| {
+            if let Some(guard) = fan_in_guards_by_target.get(target) {
+                return guard.clone();
+            }
             if target == "revise"
                 && let Some(admit) = &revise_admit
             {
                 return admit.clone();
             }
-            fan_in_guards_by_target
-                .get(target)
-                .cloned()
-                .unwrap_or_else(|| target.to_owned())
+            target.to_owned()
         };
         builder = builder.edge(START, &rewrite_target(ir.entry_node_id().as_str()));
         for edge in ir.edges() {
@@ -1345,7 +1345,12 @@ impl AdkGraphTranslator {
             builder = builder.edge(edge.from().as_str(), &target);
         }
         for (guard, target) in &fan_in_guard_nodes {
-            builder = builder.edge(guard, target);
+            let next = if target == "revise" {
+                revise_admit.as_deref().unwrap_or(target)
+            } else {
+                target.as_str()
+            };
+            builder = builder.edge(guard, next);
         }
         let mut unknown_route_index = 0;
         for route in ir.routes() {
