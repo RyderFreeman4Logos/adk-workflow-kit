@@ -581,6 +581,21 @@ fn scripted_openai_server_full_trace_is_pass() {
 }
 
 #[test]
+fn metrics_write_failure_is_fail_not_pass() {
+    let server = serve_script(publish_script(), false);
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    fs::create_dir(workdir.join("conformance.json")).expect("metrics path is a directory");
+    let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
+    let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
+    assert_eq!(report.disposition(), ConformanceDisposition::Fail);
+    assert_ne!(report.disposition(), ConformanceDisposition::Pass);
+    assert_ne!(report.disposition(), ConformanceDisposition::Abstain);
+    server.finish();
+}
+
+#[test]
 fn checkpoint_persistence_failure_fails_closed() {
     let root = temp_root();
     let run_id = workflow_runtime::RunId::new("run-fail".to_owned()).expect("run ID");

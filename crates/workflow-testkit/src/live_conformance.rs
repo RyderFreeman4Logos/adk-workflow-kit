@@ -198,8 +198,7 @@ fn fail_closed(
         started,
         Some(error_category.unwrap_or("fail_closed")),
     );
-    persist_metrics(workdir, &metrics);
-    report(ConformanceDisposition::Fail, Some(metrics))
+    finish(workdir, ConformanceDisposition::Fail, metrics)
 }
 
 fn classify(
@@ -246,7 +245,17 @@ fn classify(
         );
     }
     let metrics = collect_metrics(disposition, workdir, Some(&run_root), started, None);
-    persist_metrics(workdir, &metrics);
+    finish(workdir, disposition, metrics)
+}
+
+fn finish(
+    workdir: &Path,
+    disposition: ConformanceDisposition,
+    metrics: SafeMetrics,
+) -> ConformanceReport {
+    if persist_metrics(workdir, &metrics).is_err() {
+        return report(ConformanceDisposition::Fail, Some(metrics));
+    }
     report(disposition, Some(metrics))
 }
 
@@ -328,10 +337,16 @@ fn collect_metrics(
     }
 }
 
-fn persist_metrics(workdir: &Path, metrics: &SafeMetrics) {
-    if let Ok(bytes) = serde_json::to_vec(metrics) {
-        let _ = fs::write(workdir.join("conformance.json"), bytes);
+fn persist_metrics(workdir: &Path, metrics: &SafeMetrics) -> Result<(), ()> {
+    let bytes = serde_json::to_vec(metrics).map_err(|_| ())?;
+    let path = workdir.join("conformance.json");
+    let temporary = workdir.join("conformance.json.tmp");
+    fs::write(&temporary, &bytes).map_err(|_| ())?;
+    if fs::rename(&temporary, path).is_err() {
+        let _ = fs::remove_file(&temporary);
+        return Err(());
     }
+    Ok(())
 }
 
 fn event_node_ids(run_root: &Path) -> Vec<String> {
