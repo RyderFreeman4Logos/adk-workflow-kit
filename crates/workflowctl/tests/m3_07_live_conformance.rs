@@ -178,12 +178,17 @@ struct ScriptedServer {
     requests: Arc<AtomicU64>,
     extra: Arc<AtomicU64>,
     done: Arc<AtomicBool>,
+    bodies: Arc<std::sync::Mutex<Vec<String>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl ScriptedServer {
     fn request_count(&self) -> u64 {
         self.requests.load(Ordering::Acquire)
+    }
+
+    fn request_bodies(&self) -> Vec<String> {
+        self.bodies.lock().expect("bodies").clone()
     }
 
     fn finish(mut self) {
@@ -216,9 +221,11 @@ fn serve_script(responses: Vec<String>, stall: bool) -> ScriptedServer {
     let requests = Arc::new(AtomicU64::new(0));
     let extra = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
     let request_count = Arc::clone(&requests);
     let extra_count = Arc::clone(&extra);
     let finished = Arc::clone(&done);
+    let captured = Arc::clone(&bodies);
     let handle = thread::spawn(move || {
         let accept = |timeout: Duration| {
             let started = Instant::now();
@@ -277,6 +284,27 @@ fn serve_script(responses: Vec<String>, stall: bool) -> ScriptedServer {
                     break;
                 }
             }
+            if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let header_end = header_end + 4;
+                let content_length = String::from_utf8_lossy(&request[..header_end])
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(|value| value.trim().to_owned())
+                    })
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    match socket.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(bytes) => request.extend_from_slice(&buffer[..bytes]),
+                    }
+                }
+            }
+            if let Ok(mut bodies) = captured.lock() {
+                bodies.push(String::from_utf8_lossy(&request).into_owned());
+            }
             let _ = write!(
                 socket,
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -291,6 +319,7 @@ fn serve_script(responses: Vec<String>, stall: bool) -> ScriptedServer {
         requests,
         extra,
         done,
+        bodies,
         handle: Some(handle),
     }
 }
@@ -585,6 +614,43 @@ fn scripted_openai_server_full_trace_is_pass() {
     let text = String::from_utf8(persisted).expect("utf8");
     assert!(!text.contains(CANARY));
     assert!(!text.contains("sk-"));
+    server.finish();
+}
+
+#[test]
+fn external_runtime_extensions_are_applied_and_absent_from_identity() {
+    let server = serve_script(publish_script(), false);
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let runtime = json!({
+        "sampling": {"temperature": 0.25},
+        "provider_extensions": {"openai": {"trace": "m3-07-ext"}}
+    });
+    let mut profile = openai_profile(&server.base_url, json!({}));
+    profile["model"]["runtime"] = runtime.clone();
+    profile["reviewer_model"]["runtime"] = runtime;
+    let profile = write_profile(&root.0, &profile);
+    let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
+    assert_eq!(report.disposition(), ConformanceDisposition::Pass);
+    let bodies = server.request_bodies();
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("\"temperature\":0.25")),
+        "worker/reviewer wire must carry sampling"
+    );
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("\"trace\":\"m3-07-ext\"")),
+        "worker/reviewer wire must carry provider extensions"
+    );
+    let identity = report.metrics().expect("metrics").profile_identity();
+    assert!(
+        !identity.contains("m3-07-ext") && !identity.contains("0.25"),
+        "runtime/extensions must stay out of workflow identity, got {identity}"
+    );
     server.finish();
 }
 

@@ -991,3 +991,39 @@ fn checkpoint_tool_identity_comes_from_the_resolved_projection() {
         receipt.resume_identity()
     );
 }
+
+#[test]
+fn openai_compatible_runtime_extensions_parse_for_worker_and_reviewer() {
+    ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "openai-compatible",
+                "name": "worker",
+                "version": "1",
+                "model": "worker-model",
+                "base_url": "http://example.invalid/v1",
+                "credential_env": "ADK_WORKFLOW_KIT_M3_07_TEST_KEY",
+                "runtime": {
+                    "timeout_ms": 2000,
+                    "sampling": {"temperature": 0.2},
+                    "provider_extensions": {"openai": {"trace": "worker-ext"}}
+                }
+            },
+            "reviewer_model": {
+                "provider": "openai-compatible",
+                "name": "reviewer",
+                "version": "1",
+                "model": "reviewer-model",
+                "base_url": "http://example.invalid/v1",
+                "credential_env": "ADK_WORKFLOW_KIT_M3_07_TEST_KEY",
+                "runtime": {
+                    "sampling": {"temperature": 0.1},
+                    "provider_extensions": {"openai": {"trace": "reviewer-ext"}}
+                }
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .expect("external runtime/extensions must parse for worker and reviewer");
+}

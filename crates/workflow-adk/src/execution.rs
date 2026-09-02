@@ -51,7 +51,8 @@ use crate::{
     events::{AdkEventMapper, AdkRuntimeObservationKindV1, AdkRuntimeObservationV1},
     model_profiles::{
         CredentialBroker, CredentialHandle, FakeModelProfile, ModelBinding, ModelProfileErrorKind,
-        ModelProfileRegistry, OpenAiCompatibleProfile, QueuedFakeLlm,
+        ModelProfileRegistry, ModelRuntimeConfig, OpenAiCompatibleProfile, QueuedFakeLlm,
+        SamplingConfig,
     },
     tool_bridge::AdkToolBridge,
 };
@@ -2282,6 +2283,8 @@ enum ModelWire {
         model: String,
         base_url: String,
         credential_env: String,
+        #[serde(default)]
+        runtime: Option<ModelRuntimeWire>,
     },
 }
 
@@ -2306,6 +2309,74 @@ impl ModelWire {
             _ => Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState)),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ModelRuntimeWire {
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    sampling: SamplingConfig,
+    #[serde(default)]
+    tool_parser: Option<String>,
+    #[serde(default)]
+    tool_template: Option<String>,
+    #[serde(default)]
+    provider_extensions: BTreeMap<String, Value>,
+}
+
+impl ModelRuntimeWire {
+    fn to_config(&self) -> Result<ModelRuntimeConfig, ExecutionError> {
+        let invalid = || ExecutionError::new(ExecutionErrorKind::InvalidProfile);
+        if self.timeout_ms == Some(0) || self.timeout_ms.is_some_and(|ms| ms > 60_000) {
+            return Err(invalid());
+        }
+        let encoded = serde_json::to_vec(&self.provider_extensions).map_err(|_| invalid())?;
+        if self.provider_extensions.len() > 8 || encoded.len() > 4096 {
+            return Err(invalid());
+        }
+        if contains_sensitive_key(&json!(self.provider_extensions)) {
+            return Err(invalid());
+        }
+        let mut runtime = ModelRuntimeConfig::default();
+        if let Some(timeout_ms) = self.timeout_ms {
+            runtime = runtime.with_timeout(Duration::from_millis(timeout_ms));
+        }
+        let sampling = self.sampling.clone();
+        runtime = runtime.with_sampling(|_| sampling);
+        if let Some(parser) = &self.tool_parser {
+            runtime = runtime.with_tool_parser(parser.clone());
+        }
+        if let Some(template) = &self.tool_template {
+            runtime = runtime.with_tool_template(template.clone());
+        }
+        for (namespace, value) in &self.provider_extensions {
+            runtime = runtime.with_provider_extension(namespace.clone(), value.clone());
+        }
+        Ok(runtime)
+    }
+}
+
+fn openai_compatible_profile(
+    name: &str,
+    version: &str,
+    model: &str,
+    base_url: &str,
+    credential_env: &str,
+    runtime: &Option<ModelRuntimeWire>,
+) -> Result<OpenAiCompatibleProfile, ExecutionError> {
+    let profile = OpenAiCompatibleProfile::new(
+        name,
+        version,
+        model,
+        base_url,
+        CredentialHandle::environment(credential_env),
+    );
+    Ok(match runtime {
+        Some(runtime) => profile.with_runtime(runtime.to_config()?),
+        None => profile,
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2393,12 +2464,16 @@ impl ExecutionProfileV1 {
                     model,
                     base_url,
                     credential_env,
+                    runtime,
                 } => {
                     if [name, version, model, base_url, credential_env]
                         .into_iter()
                         .any(|value| value.is_empty())
                     {
                         return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+                    }
+                    if let Some(runtime) = runtime {
+                        runtime.to_config()?;
                     }
                 }
             }
@@ -2490,6 +2565,9 @@ impl ExecutionProfileV1 {
                 skill_snapshot.map_or(Value::Null, |identity| Value::String(identity.to_owned())),
             );
             for model in ["model", "reviewer_model"] {
+                if let Some(object) = projection.get_mut(model).and_then(Value::as_object_mut) {
+                    object.remove("runtime");
+                }
                 if redact_fake_responses && projection[model]["provider"] == "fake" {
                     projection[model]["responses"] =
                         Self::durable_fake_responses(&projection[model]["responses"]);
@@ -2644,14 +2722,16 @@ impl ExecutionProfileV1 {
                     model,
                     base_url,
                     credential_env,
+                    runtime,
                 },
-            ) => ModelProfileRegistry::new().with_worker(OpenAiCompatibleProfile::new(
+            ) => ModelProfileRegistry::new().with_worker(openai_compatible_profile(
                 name,
                 version,
                 model,
                 base_url,
-                CredentialHandle::environment(credential_env),
-            )),
+                credential_env,
+                runtime,
+            )?),
             (
                 IrModelRole::Reviewer,
                 ModelWire::OpenaiCompatible {
@@ -2660,14 +2740,16 @@ impl ExecutionProfileV1 {
                     model,
                     base_url,
                     credential_env,
+                    runtime,
                 },
-            ) => ModelProfileRegistry::new().with_reviewer(OpenAiCompatibleProfile::new(
+            ) => ModelProfileRegistry::new().with_reviewer(openai_compatible_profile(
                 name,
                 version,
                 model,
                 base_url,
-                CredentialHandle::environment(credential_env),
-            )),
+                credential_env,
+                runtime,
+            )?),
         }
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
         match role {
