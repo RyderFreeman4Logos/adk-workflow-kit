@@ -2329,6 +2329,9 @@ struct ModelRuntimeWire {
 impl ModelRuntimeWire {
     fn to_config(&self) -> Result<ModelRuntimeConfig, ExecutionError> {
         let invalid = || ExecutionError::new(ExecutionErrorKind::InvalidProfile);
+        if self.tool_parser.is_some() || self.tool_template.is_some() {
+            return Err(invalid());
+        }
         if self.timeout_ms == Some(0) || self.timeout_ms.is_some_and(|ms| ms > 60_000) {
             return Err(invalid());
         }
@@ -2345,12 +2348,6 @@ impl ModelRuntimeWire {
         }
         let sampling = self.sampling.clone();
         runtime = runtime.with_sampling(|_| sampling);
-        if let Some(parser) = &self.tool_parser {
-            runtime = runtime.with_tool_parser(parser.clone());
-        }
-        if let Some(template) = &self.tool_template {
-            runtime = runtime.with_tool_template(template.clone());
-        }
         for (namespace, value) in &self.provider_extensions {
             runtime = runtime.with_provider_extension(namespace.clone(), value.clone());
         }

@@ -1029,6 +1029,52 @@ fn openai_compatible_runtime_extensions_parse_for_worker_and_reviewer() {
 }
 
 #[test]
+fn openai_compatible_tool_parser_is_rejected_until_supported() {
+    let error = match ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "openai-compatible",
+                "name": "worker",
+                "version": "1",
+                "model": "worker-model",
+                "base_url": "http://example.invalid/v1",
+                "credential_env": "ADK_WORKFLOW_KIT_M3_07_TEST_KEY",
+                "runtime": {"tool_parser": "json"}
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    ) {
+        Ok(_) => panic!("unsupported tool_parser must fail closed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidProfile);
+}
+
+#[test]
+fn openai_compatible_tool_template_is_rejected_until_supported() {
+    let error = match ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "openai-compatible",
+                "name": "worker",
+                "version": "1",
+                "model": "worker-model",
+                "base_url": "http://example.invalid/v1",
+                "credential_env": "ADK_WORKFLOW_KIT_M3_07_TEST_KEY",
+                "runtime": {"tool_template": "default"}
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    ) {
+        Ok(_) => panic!("unsupported tool_template must fail closed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidProfile);
+}
+
+#[test]
 fn run_manifest_records_resolved_model_identity() {
     let root = TestRoot::new();
     let profile = ExecutionProfileV1::parse(
