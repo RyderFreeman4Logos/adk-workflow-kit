@@ -4019,6 +4019,9 @@ impl ExecutionBackend {
             persistence_error.get_or_insert(ExecutionError::new(ExecutionErrorKind::Persistence));
         }
         crash_barrier("before-result");
+        if let Err(error) = record_binding_retries(&mut mapper, resolved_models.values().cloned()) {
+            persistence_error.get_or_insert(error);
+        }
         if let Err(error) = write_events(&run_root.join("events.jsonl"), mapper.events()) {
             persistence_error.get_or_insert(error);
         }
@@ -4393,6 +4396,7 @@ impl ExecutionBackend {
         }
         restore_tool_events(&loop_ledger, &tool_event_counts, &mut mapper)?;
 
+        let mut retry_models = Vec::new();
         let agents = compiled
             .ir()
             .nodes()
@@ -4402,6 +4406,7 @@ impl ExecutionBackend {
                 let name = node.id().as_str();
                 let completed_turns = loop_ledger.model_iterations(name)?;
                 let model = profile.bind_resolved_model(&resolved_plan, name, completed_turns)?;
+                retry_models.push(Arc::clone(&model));
                 let agent = if let Some(output) = loop_ledger.finish_successor(name)? {
                     Arc::new(RestoredFinishAgent {
                         name: name.to_owned(),
@@ -4544,6 +4549,7 @@ impl ExecutionBackend {
             .as_str()
             .to_owned();
         crash_barrier("before-result");
+        record_binding_retries(&mut mapper, retry_models)?;
         write_events(&events_path, mapper.events())?;
         crash_barrier("before-checkpoint");
         checkpoint_store
@@ -5525,6 +5531,26 @@ fn read_events(
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))
         })
         .collect()
+}
+
+fn record_binding_retries(
+    mapper: &mut AdkEventMapper,
+    models: impl IntoIterator<Item = Arc<ModelBinding>>,
+) -> Result<(), ExecutionError> {
+    let retries = models
+        .into_iter()
+        .map(|model| model.take_retries())
+        .sum::<u64>();
+    for index in 0..retries {
+        mapper
+            .map(AdkRuntimeObservationV1::new(
+                format!("retry-scheduled-{index}"),
+                "workflowctl",
+                AdkRuntimeObservationKindV1::RetryScheduled,
+            ))
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+    }
+    Ok(())
 }
 
 fn write_events(

@@ -6,12 +6,15 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use adk_rust::async_trait;
 use adk_rust::futures::{Stream, StreamExt, stream};
-use adk_rust::model::{OpenAICompatible, OpenAICompatibleConfig};
+use adk_rust::model::{OpenAICompatible, OpenAICompatibleConfig, RetryConfig};
 use adk_rust::{AdkError, Content, ErrorCategory, Llm, LlmRequest, LlmResponse, Part};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -701,6 +704,7 @@ pub struct ModelBinding {
     runtime: ModelRuntimeConfig,
     llm: Arc<dyn Llm>,
     fake_queue: Option<Arc<QueuedFakeLlm>>,
+    retries: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -780,8 +784,9 @@ impl ModelProfile {
                 let config = OpenAICompatibleConfig::new(secret.expose(), &value.model)
                     .with_provider_name(&value.provider)
                     .with_base_url(&value.base_url);
-                let llm =
-                    OpenAICompatible::new(config).map_err(|_| ModelProfileError::provider())?;
+                let llm = OpenAICompatible::new(config)
+                    .map_err(|_| ModelProfileError::provider())?
+                    .with_retry_config(RetryConfig::disabled());
                 (
                     Arc::new(llm) as Arc<dyn Llm>,
                     value.model.clone(),
@@ -802,6 +807,7 @@ impl ModelProfile {
             runtime: self.runtime().clone(),
             llm,
             fake_queue,
+            retries: Arc::new(AtomicU64::new(0)),
         })
     }
 }
@@ -826,6 +832,7 @@ impl ModelBinding {
                 inner: Arc::clone(&queue),
             }),
             fake_queue: Some(queue),
+            retries: Arc::clone(&self.retries),
         }
     }
     pub fn identity(&self) -> &ModelBindingIdentity {
@@ -848,6 +855,9 @@ impl ModelBinding {
     }
     pub fn resume_compatible(&self, other: &Self) -> bool {
         self.resume_identity() == other.resume_identity()
+    }
+    pub fn take_retries(&self) -> u64 {
+        self.retries.swap(0, Ordering::AcqRel)
     }
 
     pub async fn generate_content(
@@ -1062,31 +1072,54 @@ impl Llm for ModelBinding {
         stream: bool,
     ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
         let request = self.apply_runtime(request);
-        let mut inner = adk_rust::tokio::time::timeout(
-            self.runtime.timeout(),
-            self.llm.generate_content(
-                request,
-                stream && self.identity.provider != "openai-compatible",
-            ),
-        )
-        .await
-        .map_err(|_| {
-            AdkError::timeout(
-                adk_rust::ErrorComponent::Model,
-                "model.profile.timeout",
-                "model profile timed out",
-            )
-        })?
-        .map_err(provider_adk_error)?;
-        let item = match inner.next().await {
-            Some(Ok(response)) if response.content.is_none() => {
-                Err(AdkError::agent("model.profile.unreachable"))
+        let stream = stream && self.identity.provider != "openai-compatible";
+        let mut retried = false;
+        loop {
+            match generate_once(self, request.clone(), stream).await {
+                Ok(item) => {
+                    return Ok(Box::pin(stream::once(async move { Ok(item) }))
+                        as adk_rust::LlmResponseStream);
+                }
+                Err(error) if !retried && retryable_provider_error(&error) => {
+                    self.retries.fetch_add(1, Ordering::Relaxed);
+                    retried = true;
+                }
+                Err(error) => return Err(provider_adk_error(error)),
             }
-            Some(item) => item.map_err(provider_adk_error),
-            None => Err(AdkError::agent("model.profile.unreachable")),
-        }?;
-        Ok(Box::pin(stream::once(async move { Ok(item) })) as adk_rust::LlmResponseStream)
+        }
     }
+}
+
+async fn generate_once(
+    binding: &ModelBinding,
+    request: LlmRequest,
+    stream: bool,
+) -> adk_rust::Result<LlmResponse> {
+    let mut inner = adk_rust::tokio::time::timeout(
+        binding.runtime.timeout(),
+        binding.llm.generate_content(request, stream),
+    )
+    .await
+    .map_err(|_| {
+        AdkError::timeout(
+            adk_rust::ErrorComponent::Model,
+            "model.profile.timeout",
+            "model profile timed out",
+        )
+    })??;
+    match inner.next().await {
+        Some(Ok(response)) if response.content.is_none() => {
+            Err(AdkError::agent("model.profile.unreachable"))
+        }
+        Some(item) => item,
+        None => Err(AdkError::agent("model.profile.unreachable")),
+    }
+}
+
+fn retryable_provider_error(error: &AdkError) -> bool {
+    error.category == ErrorCategory::RateLimited
+        || error.to_string().contains("429")
+        || error.to_string().contains("rate")
 }
 
 fn provider_adk_error(error: AdkError) -> AdkError {

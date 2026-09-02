@@ -215,6 +215,14 @@ impl Drop for ScriptedServer {
 }
 
 fn serve_script(responses: Vec<String>, stall: bool) -> ScriptedServer {
+    serve_provider(responses, stall, 0)
+}
+
+fn serve_retrying(responses: Vec<String>) -> ScriptedServer {
+    serve_provider(responses, false, 1)
+}
+
+fn serve_provider(responses: Vec<String>, stall: bool, rate_limits: usize) -> ScriptedServer {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("addr");
@@ -266,7 +274,7 @@ fn serve_script(responses: Vec<String>, stall: bool) -> ScriptedServer {
             );
             return;
         }
-        for body in responses {
+        for body in std::iter::repeat_n(None, rate_limits).chain(responses.into_iter().map(Some)) {
             let Some(mut socket) = accept(Duration::from_secs(2)) else {
                 return;
             };
@@ -305,12 +313,22 @@ fn serve_script(responses: Vec<String>, stall: bool) -> ScriptedServer {
             if let Ok(mut bodies) = captured.lock() {
                 bodies.push(String::from_utf8_lossy(&request).into_owned());
             }
-            let _ = write!(
-                socket,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
+            match body {
+                None => {
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n"
+                    );
+                }
+                Some(body) => {
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                }
+            }
         }
         drain_extra();
     });
@@ -677,6 +695,24 @@ fn resolved_model_identity_is_recorded_in_metrics() {
             && !identity.contains(HANDLE)
             && !identity.contains(CANARY),
         "identity must exclude endpoint/credential material, got {identity}"
+    );
+    server.finish();
+}
+
+#[test]
+fn production_retry_count_records_provider_retries() {
+    let server = serve_retrying(publish_script());
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
+    let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
+    assert_eq!(report.disposition(), ConformanceDisposition::Pass);
+    let metrics = report.metrics().expect("metrics");
+    assert!(
+        metrics.retry_count() >= 1,
+        "production retry path must record retry_count, got {}",
+        metrics.retry_count()
     );
     server.finish();
 }
