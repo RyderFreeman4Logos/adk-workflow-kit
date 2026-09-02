@@ -296,9 +296,11 @@ pub struct FakeModelProfile {
     response_delay: Duration,
 }
 
-struct QueuedFakeLlm {
+pub(crate) struct QueuedFakeLlm {
     name: String,
+    original: VecDeque<LlmResponse>,
     responses: Mutex<VecDeque<LlmResponse>>,
+    last_node: Mutex<Option<String>>,
     response_delay: Duration,
 }
 
@@ -310,10 +312,62 @@ impl QueuedFakeLlm {
     ) -> Self {
         Self {
             name: name.into(),
+            original: responses.clone(),
             responses: Mutex::new(responses),
+            last_node: Mutex::new(None),
             response_delay,
         }
     }
+
+    pub(crate) fn discard(&self, n: u64) {
+        let Ok(mut responses) = self.responses.lock() else {
+            return;
+        };
+        for _ in 0..n {
+            responses.pop_front();
+        }
+    }
+
+    async fn generate_for(
+        &self,
+        node: &str,
+        request: LlmRequest,
+    ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+        adk_rust::tokio::time::sleep(self.response_delay).await;
+        let mut response = {
+            let mut last = self
+                .last_node
+                .lock()
+                .map_err(|_| AdkError::agent("fake model response queue poisoned"))?;
+            let mut responses = self
+                .responses
+                .lock()
+                .map_err(|_| AdkError::agent("fake model response queue poisoned"))?;
+            // ponytail: refill when a new sequential node finds an empty shared
+            // script so sibling tool-loop limits stay typed; same-node exhaustion
+            // stays fail-closed.
+            if last.as_deref() != Some(node) && responses.is_empty() {
+                *responses = self.original.clone();
+            }
+            *last = Some(node.to_owned());
+            responses
+                .pop_front()
+                .ok_or_else(|| AdkError::agent("fake model response script exhausted"))?
+        };
+        if let Some(content) = response.content.as_mut() {
+            for part in &mut content.parts {
+                if let Part::FunctionCall { args, .. } = part {
+                    resolve_fake_response_reference(args, &request)?;
+                }
+            }
+        }
+        Ok(Box::pin(adk_rust::futures::stream::iter([Ok(response)])))
+    }
+}
+
+struct NodeScopedFakeLlm {
+    node: String,
+    inner: Arc<QueuedFakeLlm>,
 }
 
 fn resolve_fake_response_reference(
@@ -375,21 +429,22 @@ impl Llm for QueuedFakeLlm {
         request: LlmRequest,
         _stream: bool,
     ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
-        adk_rust::tokio::time::sleep(self.response_delay).await;
-        let mut response = self
-            .responses
-            .lock()
-            .map_err(|_| AdkError::agent("fake model response queue poisoned"))?
-            .pop_front()
-            .ok_or_else(|| AdkError::agent("fake model response script exhausted"))?;
-        if let Some(content) = response.content.as_mut() {
-            for part in &mut content.parts {
-                if let Part::FunctionCall { args, .. } = part {
-                    resolve_fake_response_reference(args, &request)?;
-                }
-            }
-        }
-        Ok(Box::pin(adk_rust::futures::stream::iter([Ok(response)])))
+        self.generate_for("", request).await
+    }
+}
+
+#[async_trait]
+impl Llm for NodeScopedFakeLlm {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn generate_content(
+        &self,
+        request: LlmRequest,
+        _stream: bool,
+    ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+        self.inner.generate_for(&self.node, request).await
     }
 }
 
@@ -645,6 +700,7 @@ pub struct ModelBinding {
     identity: ModelBindingIdentity,
     runtime: ModelRuntimeConfig,
     llm: Arc<dyn Llm>,
+    fake_queue: Option<Arc<QueuedFakeLlm>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -676,7 +732,7 @@ impl ModelProfile {
         role: ModelRole,
         broker: &CredentialBroker,
     ) -> Result<ModelBinding, ModelProfileError> {
-        let (llm, requested, provider) = match self {
+        let (llm, requested, provider, fake_queue) = match self {
             Self::Fake(value) => {
                 let mut responses = VecDeque::new();
                 for response in &value.responses {
@@ -705,14 +761,16 @@ impl ModelProfile {
                     };
                     responses.push_back(adk_rust::LlmResponse::new(content));
                 }
+                let queue = Arc::new(QueuedFakeLlm::new(
+                    &value.model,
+                    responses,
+                    value.response_delay,
+                ));
                 (
-                    Arc::new(QueuedFakeLlm::new(
-                        &value.model,
-                        responses,
-                        value.response_delay,
-                    )) as Arc<dyn Llm>,
+                    Arc::clone(&queue) as Arc<dyn Llm>,
                     value.model.clone(),
                     "fake".to_owned(),
+                    Some(queue),
                 )
             }
             Self::OpenAiCompatible(value) => {
@@ -728,6 +786,7 @@ impl ModelProfile {
                     Arc::new(llm) as Arc<dyn Llm>,
                     value.model.clone(),
                     value.provider.clone(),
+                    None,
                 )
             }
         };
@@ -742,6 +801,7 @@ impl ModelProfile {
             },
             runtime: self.runtime().clone(),
             llm,
+            fake_queue,
         })
     }
 }
@@ -752,6 +812,21 @@ impl ModelBinding {
     }
     pub fn llm(&self) -> Arc<dyn Llm> {
         Arc::clone(&self.llm)
+    }
+    pub(crate) fn fake_queue(&self) -> Option<Arc<QueuedFakeLlm>> {
+        self.fake_queue.clone()
+    }
+    pub(crate) fn for_node(&self, node: &str, queue: Arc<QueuedFakeLlm>) -> Self {
+        Self {
+            role: self.role,
+            identity: self.identity.clone(),
+            runtime: self.runtime.clone(),
+            llm: Arc::new(NodeScopedFakeLlm {
+                node: node.to_owned(),
+                inner: Arc::clone(&queue),
+            }),
+            fake_queue: Some(queue),
+        }
     }
     pub fn identity(&self) -> &ModelBindingIdentity {
         &self.identity

@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "model": {
+    "provider": "fake",
+    "name": "code-investigation-fake",
+    "version": "1",
+    "model": "fake-investigation",
+    "responses": [
+      "{\"status\":\"finished\",\"output\":\"prepared\"}",
+      "{\"status\":\"finished\",\"output\":\"planned\"}",
+      {"calls": [{"id": "search-retry", "name": "search_code", "args": {"query": "retry", "path": "src"}}]},
+      "{\"status\":\"finished\",\"output\":\"searched\"}",
+      {"calls": [{"id": "read-retry", "name": "read_source_range", "args": {"path": "src/retry.rs", "start_line": 1, "end_line": 8}}]},
+      "{\"status\":\"finished\",\"output\":\"inspected\"}",
+      "{\"status\":\"finished\",\"output\":\"insufficient\"}",
+      {"calls": [{"id": "retry-search", "name": "search_code", "args": {"query": "pub", "path": "src"}}]},
+      "{\"status\":\"finished\",\"output\":\"retried-search\"}",
+      {"calls": [{"id": "retry-read", "name": "read_source_range", "args": {"path": "src/retry.rs", "start_line": 1, "end_line": 8}}]},
+      "{\"status\":\"finished\",\"output\":\"retried-inspect\"}",
+      "{\"status\":\"finished\",\"output\":\"sufficient\"}",
+      "{\"status\":\"finished\",\"output\":\"drafted\"}",
+      "{\"status\":\"finished\",\"output\":\"valid\"}"
+    ]
+  },
+  "reviewer_model": {
+    "provider": "fake",
+    "name": "code-investigation-reviewer",
+    "version": "1",
+    "model": "fake-reviewer",
+    "responses": ["{\"status\":\"finished\",\"output\":\"pass\"}"]
+  },
+  "tools": [
+    {
+      "name": "search_code",
+      "result": {"path": "src/retry.rs", "line": 1, "snippet": "pub fn default_retry() -> u8 {"},
+      "input_schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}}, "required": ["query"], "additionalProperties": false},
+      "required_capabilities": [],
+      "required_scopes": []
+    },
+    {
+      "name": "read_source_range",
+      "result": {"path": "src/retry.rs", "start_line": 1, "end_line": 8, "snippet": "pub fn default_retry() -> u8 {"},
+      "input_schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}}, "required": ["path", "start_line", "end_line"], "additionalProperties": false},
+      "required_capabilities": [],
+      "required_scopes": []
+    }
+  ],
+  "sandbox": {"capabilities": []}
+}

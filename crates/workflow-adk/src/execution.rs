@@ -51,7 +51,7 @@ use crate::{
     events::{AdkEventMapper, AdkRuntimeObservationKindV1, AdkRuntimeObservationV1},
     model_profiles::{
         CredentialBroker, CredentialHandle, FakeModelProfile, ModelBinding, ModelProfileRegistry,
-        OpenAiCompatibleProfile,
+        OpenAiCompatibleProfile, QueuedFakeLlm,
     },
     tool_bridge::AdkToolBridge,
 };
@@ -2242,6 +2242,10 @@ pub struct ExecutionProfileV1 {
     skill_snapshot: Option<String>,
     #[serde(skip)]
     sealed_skills: Option<BTreeMap<String, Arc<SkillPackage>>>,
+    #[serde(skip)]
+    fake_worker_queue: Arc<Mutex<Option<Arc<QueuedFakeLlm>>>>,
+    #[serde(skip)]
+    fake_reviewer_queue: Arc<Mutex<Option<Arc<QueuedFakeLlm>>>>,
     pure_transform: Option<PureTransformWire>,
     sandbox: SandboxWire,
     #[serde(default)]
@@ -2767,12 +2771,40 @@ impl ExecutionProfileV1 {
                 &BindingRef::new(binding.id(), binding.version()),
             )
             .map_err(|error| map_registry_error(error, Some(binding)))?;
-        self.bind_model(role, completed_turns).map_err(|_| {
+        let bound = self.bind_model(role, 0).map_err(|_| {
             ExecutionError::binding(
                 ExecutionErrorKind::ImplementationBinding,
                 BindingCategory::Model,
                 Some(binding),
             )
+        })?;
+        Ok(match bound.fake_queue() {
+            Some(queue) => {
+                let slot = match role {
+                    IrModelRole::Worker => &self.fake_worker_queue,
+                    IrModelRole::Reviewer => &self.fake_reviewer_queue,
+                };
+                let shared = {
+                    let mut cached = slot.lock().map_err(|_| {
+                        ExecutionError::binding(
+                            ExecutionErrorKind::ImplementationBinding,
+                            BindingCategory::Model,
+                            Some(binding),
+                        )
+                    })?;
+                    cached.get_or_insert(queue).clone()
+                };
+                shared.discard(completed_turns);
+                Arc::new(bound.for_node(node_id, shared))
+            }
+            None if completed_turns == 0 => bound,
+            None => self.bind_model(role, completed_turns).map_err(|_| {
+                ExecutionError::binding(
+                    ExecutionErrorKind::ImplementationBinding,
+                    BindingCategory::Model,
+                    Some(binding),
+                )
+            })?,
         })
     }
 
@@ -2827,6 +2859,14 @@ impl ExecutionRuntimeRegistry {
         if !skills.is_empty() {
             candidates.insert(BindingCategory::Skill, skills);
         }
+        candidates.insert(
+            BindingCategory::Predicate,
+            vec![
+                ResolvedBinding::new("coverage.decision@v1", "1.0.0"),
+                ResolvedBinding::new("review.verdict@v1", "1.0.0"),
+                ResolvedBinding::new("grounding.verdict@v1", "1.0.0"),
+            ],
+        );
         Ok(ExecutionRuntimeRegistry { candidates })
     }
 }

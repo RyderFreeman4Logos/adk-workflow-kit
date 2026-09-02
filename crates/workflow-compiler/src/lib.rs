@@ -24,8 +24,8 @@ pub use diagnostics::{Diagnostic, DiagnosticProjectionError};
 pub use graph_builder::{GraphBuildError, GraphBuilder, RegistryBinding, RegistryIdentityDrift};
 pub use lock::{WorkflowLock, WorkflowLockError, WorkflowLockMigrationError};
 pub use registry::{
-    ModelRegistry, NodeRegistry, PredicateRegistry, RegistryCategory, RegistryEntry,
-    RegistryNotFound, SkillRegistry, ToolRegistry, ValidatorRegistry,
+    BuiltinPredicateRegistry, ModelRegistry, NodeRegistry, PredicateRegistry, RegistryCategory,
+    RegistryEntry, RegistryNotFound, SkillRegistry, ToolRegistry, ValidatorRegistry,
 };
 pub use runtime_plan::{
     BindingCategory, BindingRef, CapabilitySet, PlanResolutionError, PlanResolutionErrorKind,
@@ -147,7 +147,7 @@ pub fn compile_str_with_predicates<R: PredicateRegistry>(
 /// Reads, parses, canonically normalizes, validates, and exact-resolves one workflow file.
 pub fn compile_file(path: impl AsRef<std::path::Path>) -> Result<CompiledPlan, CompileError> {
     let spec = parse_file(path).map_err(CompileError::Parse)?;
-    compile_without_predicates(&spec)
+    compile_with_predicates(&spec, &BuiltinPredicateRegistry)
 }
 
 /// Reads, validates, and exact-resolves registered predicate routes without invoking them.

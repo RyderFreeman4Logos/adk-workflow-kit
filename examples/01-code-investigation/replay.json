@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "workflow_lock": {
+    "toml": "lock_version = 1\ncanonical_ir_wire_version = 7\nir_schema_version = 1\nworkflow_id = \"code.investigation\"\nworkflow_version = \"1\"\nir_hash = \"sha256:d053fee8f15a1a9c77ddf264c807f861da9d1d324c69b4a667d7f443f460813a\"\nsemantic_resource_hashes = [\"sha256:88514865356dc67787a99259300895827f21cbaab0c7b42f0add7fef3d2ec325\", \"sha256:632f3f0af5d7c5454696e9bac01f9e2849bbd99b7cf44ca316bcde284c93bce7\", \"sha256:0493c534da1c066f01d23e87a3426f0ec2184e80ae5f7e25e2b16db6c9a72142\", \"sha256:079e99957548044be0471e22c626114585d9edc01991cc178175145ab745b397\", \"sha256:373e0b3773fc555083922d63e745efd1c22822680ce0a111ced8c6a80828f764\", \"sha256:c4adb08d04aa18d9f870310301d4782a5ea2c5344d024fd4136bab5ffb4fc189\"]\n",
+    "sha256": "sha256:8b554a64c1425dc526dd6d9e557cc98a87dd872fe1f3bef282fd7dadccabda73"
+  },
+  "input_sha256": "sha256:39af49f8dab89c560d875d84f2048c4ff24d84c34187e47e8fe03a5172925439",
+  "events": [
+    {
+      "type": "node_started",
+      "node_id": "planner"
+    },
+    {
+      "type": "policy_decision",
+      "node_id": "planner",
+      "requested": [],
+      "effective": [],
+      "allowed": false
+    },
+    {
+      "type": "node_completed",
+      "node_id": "planner"
+    },
+    {
+      "type": "terminal",
+      "status": "completed",
+      "outcome_sha256": "sha256:d0765f73cd5d1df39be353d538ea7c47a017d66a8bd001dc4707240dbb71e58c"
+    }
+  ],
+  "fixtures": [
+    {
+      "sha256": "sha256:39af49f8dab89c560d875d84f2048c4ff24d84c34187e47e8fe03a5172925439",
+      "bytes": [
+        123,
+        34,
+        113,
+        117,
+        101,
+        115,
+        116,
+        105,
+        111,
+        110,
+        34,
+        58,
+        34,
+        87,
+        104,
+        101,
+        114,
+        101,
+        32,
+        105,
+        115,
+        32,
+        116,
+        104,
+        101,
+        32,
+        100,
+        101,
+        102,
+        97,
+        117,
+        108,
+        116,
+        32,
+        114,
+        101,
+        116,
+        114,
+        121,
+        32,
+        112,
+        97,
+        116,
+        104,
+        63,
+        34,
+        44,
+        34,
+        112,
+        97,
+        116,
+        104,
+        34,
+        58,
+        34,
+        115,
+        114,
+        99,
+        34,
+        125,
+        10
+      ]
+    },
+    {
+      "sha256": "sha256:d0765f73cd5d1df39be353d538ea7c47a017d66a8bd001dc4707240dbb71e58c",
+      "bytes": [
+        123,
+        34,
+        115,
+        116,
+        97,
+        116,
+        117,
+        115,
+        34,
+        58,
+        34,
+        99,
+        111,
+        109,
+        112,
+        108,
+        101,
+        116,
+        101,
+        100,
+        34,
+        125
+      ]
+    }
+  ],
+  "artifacts": []
+}
