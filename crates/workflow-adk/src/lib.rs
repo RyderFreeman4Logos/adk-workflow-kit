@@ -1311,21 +1311,7 @@ impl AdkGraphTranslator {
             .contains("revise")
             .then(|| unused_node_id(&ids, REVISE_ADMIT_NODE));
         if let Some(admit) = &revise_admit {
-            builder = builder.node_fn(admit, |context| {
-                let visits = context
-                    .state
-                    .get("visits:revise")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default();
-                async move {
-                    if visits >= 1 {
-                        return Err(GraphError::Other(
-                            "workflow.loop.review_exhausted".to_owned(),
-                        ));
-                    }
-                    Ok(NodeOutput::new().with_update("visits:revise", json!(visits + 1)))
-                }
-            });
+            builder = builder.node_fn(admit, |_context| async move { Ok(NodeOutput::new()) });
             builder = builder.edge(admit, "revise");
         }
         let rewrite_target = |target: &str| {

@@ -1762,11 +1762,11 @@ to = "done"
     let err = graph
         .invoke(State::new(), ExecutionConfig::new("direct-revise"))
         .await
-        .expect_err("a second direct edge into revise must hit admission");
+        .expect_err("a self-loop into revise must honor authored max_visits");
     assert_eq!(
         err.to_string(),
-        "visit bound exceeded: max_visits=1",
-        "direct to=revise must not bypass one-revision admission, got {err}"
+        "visit bound exceeded: max_visits=4",
+        "authored max_visits=4 must stay authoritative, got {err}"
     );
 }
 
@@ -1854,7 +1854,89 @@ to = "done"
         .expect_err("merged fan-in must still pass through revise admission");
     assert_eq!(
         admission.to_string(),
-        "visit bound exceeded: max_visits=1",
-        "fan-in guard must route through admission before revise, got {admission}"
+        "visit bound exceeded: max_visits=16",
+        "fan-in then admission must keep authored max_visits=16, got {admission}"
+    );
+}
+
+#[tokio::test]
+async fn authored_revise_max_visits_completes_first_visit() {
+    const SOURCE: &str = r#"
+schema_version = 1
+[workflow]
+id = "revise-first-visit"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "revise"
+kind = "action"
+max_visits = 4
+idempotent = true
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "done"
+"#;
+    let plan = compile_str("revise-first-visit.workflow.toml", SOURCE).expect("fixture compiles");
+    let graph = AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("translation succeeds");
+    let state = graph
+        .invoke(State::new(), ExecutionConfig::new("revise-first-visit"))
+        .await
+        .expect("authored max_visits>1 must complete the first revise visit");
+    assert_eq!(state.get("node:revise"), Some(&json!(true)));
+}
+
+#[tokio::test]
+async fn canonical_revise_max_visits_is_not_rewritten_to_one() {
+    const SOURCE: &str = r#"
+schema_version = 1
+[workflow]
+id = "revise-canonical-bound"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "revise"
+kind = "action"
+max_visits = 32
+idempotent = true
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "done"
+"#;
+    let plan =
+        compile_str("revise-canonical-bound.workflow.toml", SOURCE).expect("fixture compiles");
+    let graph = AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("translation succeeds");
+    let err = graph
+        .invoke(State::new(), ExecutionConfig::new("revise-canonical-bound"))
+        .await
+        .expect_err("self-loop must stop at authored max_visits");
+    assert_eq!(
+        err.to_string(),
+        "visit bound exceeded: max_visits=32",
+        "canonical max_visits=32 must not be rewritten to 1, got {err}"
     );
 }

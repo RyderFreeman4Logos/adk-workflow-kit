@@ -511,23 +511,22 @@ fn malformed_final_artifact_fails_closed() {
 }
 
 #[test]
-fn review_exhaustion_fails_closed() {
+fn authored_revise_max_visits_allows_a_second_revision() {
     let mut script = publish_script();
     script[9] = finished("revise");
     script.push(finished("revised"));
     script.push(finished("valid"));
-    script.push(finished("revise"));
+    script.push(finished("pass"));
     let server = serve_script(script, false);
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
     let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
-    assert_scripted_fail(
-        &run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]),
-        "review_exhausted",
-        server,
-        13,
-    );
+    let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
+    assert_eq!(report.disposition(), ConformanceDisposition::Pass);
+    assert_ne!(report.disposition(), ConformanceDisposition::Fail);
+    assert_eq!(server.request_count(), 13, "provider request count");
+    server.finish();
 }
 
 #[test]
