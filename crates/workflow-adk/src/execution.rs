@@ -4058,7 +4058,12 @@ impl ExecutionBackend {
             persistence_error.get_or_insert(ExecutionError::new(ExecutionErrorKind::Persistence));
         }
         crash_barrier("before-result");
-        if let Err(error) = record_binding_retries(&mut mapper, resolved_models.values().cloned()) {
+        if let Err(error) = record_binding_retries(
+            &mut mapper,
+            resolved_models.values().cloned(),
+            run_id.as_str(),
+            0,
+        ) {
             persistence_error.get_or_insert(error);
         }
         if let Err(error) = write_events(&run_root.join("events.jsonl"), mapper.events()) {
@@ -4515,6 +4520,7 @@ impl ExecutionBackend {
         ) {
             Ok(state) => state,
             Err(error) => {
+                let _ = record_binding_retries(&mut mapper, retry_models.clone(), run_id, next);
                 return Err(resume_failure(
                     &root,
                     &events_path,
@@ -4557,6 +4563,7 @@ impl ExecutionBackend {
                 artifact_refs.insert(artifact_id.to_owned());
             }
         }
+        record_binding_retries(&mut mapper, retry_models, run_id, next)?;
         let checkpoint = DurableCheckpointV1::new(
             run_identity.clone(),
             node_id,
@@ -4581,7 +4588,6 @@ impl ExecutionBackend {
             .as_str()
             .to_owned();
         crash_barrier("before-result");
-        record_binding_retries(&mut mapper, retry_models)?;
         write_events(&events_path, mapper.events())?;
         crash_barrier("before-checkpoint");
         checkpoint_store
@@ -5568,15 +5574,26 @@ fn read_events(
 fn record_binding_retries(
     mapper: &mut AdkEventMapper,
     models: impl IntoIterator<Item = Arc<ModelBinding>>,
+    run_id: &str,
+    resume_count: u64,
 ) -> Result<(), ExecutionError> {
     let retries = models
         .into_iter()
         .map(|model| model.take_retries())
         .sum::<u64>();
+    record_retry_count(mapper, run_id, resume_count, retries)
+}
+
+fn record_retry_count(
+    mapper: &mut AdkEventMapper,
+    run_id: &str,
+    resume_count: u64,
+    retries: u64,
+) -> Result<(), ExecutionError> {
     for index in 0..retries {
         mapper
             .map(AdkRuntimeObservationV1::new(
-                format!("retry-scheduled-{index}"),
+                format!("retry-scheduled-{run_id}-{resume_count}-{index}"),
                 "workflowctl",
                 AdkRuntimeObservationKindV1::RetryScheduled,
             ))
@@ -5914,5 +5931,40 @@ mod execution_registry_tests {
                 Value::Bool(false)
             );
         }
+    }
+
+    #[test]
+    fn run_retry_then_resume_retry_uses_unique_event_ids() {
+        let mut mapper = AdkEventMapper::new("run-retry", "wf-retry").unwrap();
+        record_retry_count(&mut mapper, "run-retry", 0, 1).unwrap();
+        let prior = mapper.events().to_vec();
+        let mut mapper = AdkEventMapper::resume("run-retry", "wf-retry", prior).unwrap();
+        record_retry_count(&mut mapper, "run-retry", 1, 1)
+            .expect("resume retry must not collide with run retry id");
+        let ids: Vec<_> = mapper
+            .events()
+            .iter()
+            .filter(|event| event.kind() == WorkflowRuntimeEventKindV1::RetryScheduled)
+            .map(|event| event.event_id().to_owned())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "run and resume retry IDs must be unique");
+    }
+
+    #[test]
+    fn resume_retry_survives_second_resume() {
+        let mut mapper = AdkEventMapper::new("run-retry-2", "wf-retry").unwrap();
+        record_retry_count(&mut mapper, "run-retry-2", 1, 1).unwrap();
+        let after_first = mapper.events().to_vec();
+        let first_seq = after_first.last().expect("first retry").sequence();
+        let mut mapper =
+            AdkEventMapper::resume("run-retry-2", "wf-retry", after_first.clone()).unwrap();
+        record_retry_count(&mut mapper, "run-retry-2", 2, 1)
+            .expect("second resume retry must use a unique id");
+        let after_second = mapper.events().to_vec();
+        let second_seq = after_second.last().expect("second retry").sequence();
+        assert!(second_seq > first_seq);
+        AdkEventMapper::resume("run-retry-2", "wf-retry", after_second)
+            .expect("second resume keeps unique retry events");
     }
 }
