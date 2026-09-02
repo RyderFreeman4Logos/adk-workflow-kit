@@ -1116,3 +1116,49 @@ fn run_manifest_records_resolved_model_identity() {
         "manifest must persist requested/resolved/provider identity, got {identity}"
     );
 }
+
+#[test]
+fn run_manifest_records_bound_resolved_identity_when_it_differs() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "worker-requested",
+                "resolved_model": "worker-bound",
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
+            },
+            "reviewer_model": {
+                "provider": "fake",
+                "name": "fake-reviewer",
+                "version": "1",
+                "model": "reviewer-requested",
+                "resolved_model": "reviewer-bound",
+                "responses": ["{\"status\":\"finished\",\"output\":\"reviewed\"}"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .expect("profile fixture should parse");
+    let receipt = ExecutionBackend::run(workflow(), profile, json!({"request":"public"}), &root.0)
+        .expect("fixture run should succeed");
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("run-manifest.json")).expect("manifest should exist"),
+    )
+    .expect("manifest should be JSON");
+    let identity = manifest["profile_identity"]
+        .as_str()
+        .expect("profile identity");
+    assert!(
+        identity.contains("requested=worker-requested")
+            && identity.contains("resolved=worker-bound")
+            && identity.contains("requested=reviewer-requested")
+            && identity.contains("resolved=reviewer-bound")
+            && !identity.contains("resolved=worker-requested")
+            && !identity.contains("resolved=reviewer-requested"),
+        "manifest must persist bound resolved identity, got {identity}"
+    );
+}

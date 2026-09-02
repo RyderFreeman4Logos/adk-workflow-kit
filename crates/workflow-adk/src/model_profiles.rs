@@ -297,6 +297,8 @@ pub struct FakeModelProfile {
     runtime: ModelRuntimeConfig,
     #[serde(default)]
     response_delay: Duration,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolved_model: Option<String>,
 }
 
 pub(crate) struct QueuedFakeLlm {
@@ -471,10 +473,15 @@ impl FakeModelProfile {
                 .collect(),
             runtime: ModelRuntimeConfig::default(),
             response_delay: Duration::ZERO,
+            resolved_model: None,
         }
     }
     pub fn with_runtime(mut self, runtime: ModelRuntimeConfig) -> Self {
         self.runtime = runtime;
+        self
+    }
+    pub fn with_resolved_model(mut self, name: impl Into<String>) -> Self {
+        self.resolved_model = Some(name.into());
         self
     }
 
@@ -491,6 +498,7 @@ impl FakeModelProfile {
             responses,
             runtime: ModelRuntimeConfig::default(),
             response_delay: Duration::from_millis(response_delay_ms),
+            resolved_model: None,
         }
     }
 }
@@ -766,7 +774,7 @@ impl ModelProfile {
                     responses.push_back(adk_rust::LlmResponse::new(content));
                 }
                 let queue = Arc::new(QueuedFakeLlm::new(
-                    &value.model,
+                    value.resolved_model.as_ref().unwrap_or(&value.model),
                     responses,
                     value.response_delay,
                 ));

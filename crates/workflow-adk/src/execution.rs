@@ -2276,6 +2276,8 @@ enum ModelWire {
         responses: Vec<Value>,
         #[serde(default)]
         response_delay_ms: u64,
+        #[serde(default)]
+        resolved_model: Option<String>,
     },
     OpenaiCompatible {
         name: String,
@@ -2376,6 +2378,56 @@ fn openai_compatible_profile(
     })
 }
 
+fn fake_profile_from_wire(
+    name: &str,
+    version: &str,
+    model: &str,
+    responses: &[Value],
+    response_delay_ms: u64,
+    completed_turns: u64,
+    resolved_model: &Option<String>,
+) -> FakeModelProfile {
+    let profile = FakeModelProfile::from_values(
+        name,
+        version,
+        model,
+        responses
+            .iter()
+            .skip(usize::try_from(completed_turns).unwrap_or(usize::MAX))
+            .cloned()
+            .collect(),
+        response_delay_ms,
+    );
+    match resolved_model {
+        Some(resolved) => profile.with_resolved_model(resolved),
+        None => profile,
+    }
+}
+
+fn bound_profile_identity(profile: &ExecutionProfileV1) -> Result<String, ExecutionError> {
+    let worker = profile.bind_model(IrModelRole::Worker, 0)?;
+    let worker = format_bound_identity("worker", &worker);
+    Ok(match profile.reviewer_model {
+        Some(_) => {
+            let reviewer = profile.bind_model(IrModelRole::Reviewer, 0)?;
+            format!("{worker};{}", format_bound_identity("reviewer", &reviewer))
+        }
+        None => worker,
+    })
+}
+
+fn format_bound_identity(role: &str, model: &ModelBinding) -> String {
+    let identity = model.identity();
+    format!(
+        "{role}={}:{};requested={};resolved={};provider={}",
+        identity.profile().name(),
+        identity.profile().version(),
+        identity.requested_model(),
+        identity.resolved_model(),
+        identity.provider(),
+    )
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ToolWire {
@@ -2437,6 +2489,7 @@ impl ExecutionProfileV1 {
                     model,
                     responses,
                     response_delay_ms,
+                    ..
                 } => {
                     if [name, version, model]
                         .into_iter()
@@ -2676,17 +2729,16 @@ impl ExecutionProfileV1 {
                     model,
                     responses,
                     response_delay_ms,
+                    resolved_model,
                 },
-            ) => ModelProfileRegistry::new().with_worker(FakeModelProfile::from_values(
+            ) => ModelProfileRegistry::new().with_worker(fake_profile_from_wire(
                 name,
                 version,
                 model,
-                responses
-                    .iter()
-                    .skip(usize::try_from(completed_turns).unwrap_or(usize::MAX))
-                    .cloned()
-                    .collect(),
+                responses,
                 *response_delay_ms,
+                completed_turns,
+                resolved_model,
             )),
             (
                 IrModelRole::Reviewer,
@@ -2696,17 +2748,16 @@ impl ExecutionProfileV1 {
                     model,
                     responses,
                     response_delay_ms,
+                    resolved_model,
                 },
-            ) => ModelProfileRegistry::new().with_reviewer(FakeModelProfile::from_values(
+            ) => ModelProfileRegistry::new().with_reviewer(fake_profile_from_wire(
                 name,
                 version,
                 model,
-                responses
-                    .iter()
-                    .skip(usize::try_from(completed_turns).unwrap_or(usize::MAX))
-                    .cloned()
-                    .collect(),
+                responses,
                 *response_delay_ms,
+                completed_turns,
+                resolved_model,
             )),
             (
                 IrModelRole::Worker,
@@ -3650,6 +3701,7 @@ impl ExecutionBackend {
                     .map(|model| (node.id().as_str().to_owned(), model))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let profile_identity = bound_profile_identity(&profile)?;
         let effective_capabilities = sandbox_capabilities;
         let transform_module = profile.transform_module()?;
         let recursion_limit = compiled
@@ -3803,7 +3855,7 @@ impl ExecutionBackend {
                     workflow_id: compiled.ir().workflow_id().as_str().to_owned(),
                     workflow_version: compiled.ir().workflow_version().to_owned(),
                     workdir_id: workdir_id.clone(),
-                    profile_identity: profile.profile_identity(),
+                    profile_identity: profile_identity.clone(),
                     adk_rust_version: "2.1.0".to_owned(),
                     status: "running".to_owned(),
                     artifact_id: "unavailable".to_owned(),
@@ -4126,7 +4178,7 @@ impl ExecutionBackend {
             workflow_id: compiled.ir().workflow_id().as_str().to_owned(),
             workflow_version: compiled.ir().workflow_version().to_owned(),
             workdir_id,
-            profile_identity: profile.profile_identity(),
+            profile_identity: profile_identity.clone(),
             adk_rust_version: "2.1.0".to_owned(),
             status: status.to_owned(),
             artifact_id,
