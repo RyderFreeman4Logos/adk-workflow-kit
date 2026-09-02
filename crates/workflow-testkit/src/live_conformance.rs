@@ -180,7 +180,8 @@ impl LiveConformance {
         for (key, value) in env {
             command.env(key, value);
         }
-        classify(command.output(), workdir, Instant::now())
+        let started = Instant::now();
+        classify(command.output(), workdir, started)
     }
 }
 

@@ -298,8 +298,31 @@ fn provider_timeout_fails_closed() {
         ),
     );
     let started = Instant::now();
-    assert_fail(&run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]));
+    let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
+    assert_fail(&report);
+    let elapsed_ms = report.metrics().expect("metrics").elapsed_ms();
+    assert!(
+        elapsed_ms >= 200,
+        "elapsed_ms={elapsed_ms} must include the delayed provider"
+    );
     assert!(started.elapsed() < Duration::from_secs(5));
+    let _ = server.join();
+}
+
+#[test]
+fn elapsed_ms_includes_delayed_local_server() {
+    let (base_url, server) = serve_script(Vec::new(), true);
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let profile = write_profile(&root.0, &openai_profile(&base_url, json!({})));
+    let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
+    assert_fail(&report);
+    let elapsed_ms = report.metrics().expect("metrics").elapsed_ms();
+    assert!(
+        elapsed_ms >= 1_500,
+        "elapsed_ms={elapsed_ms} must include the delayed local server"
+    );
     let _ = server.join();
 }
 
