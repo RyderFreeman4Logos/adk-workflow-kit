@@ -1682,3 +1682,327 @@ fn resolved_plan_rejects_ir_hash_mismatch() {
         TranslationError::ResolvedPlanMismatch { .. }
     ));
 }
+
+#[tokio::test]
+async fn revise_admit_keeps_authored_collision_node() {
+    const SOURCE: &str = r#"
+schema_version = 1
+[workflow]
+id = "revise-admit-collision"
+version = "1"
+entry = "__workflow_revise_admit"
+[[nodes]]
+id = "__workflow_revise_admit"
+kind = "action"
+[[nodes]]
+id = "revise"
+kind = "action"
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "__workflow_revise_admit"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "done"
+"#;
+    let plan =
+        compile_str("revise-admit-collision.workflow.toml", SOURCE).expect("fixture compiles");
+    let graph = AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("translation succeeds");
+    assert!(
+        graph.node_order().contains(&"__workflow_revise_admit"),
+        "authored node must remain"
+    );
+    let state = graph
+        .invoke(State::new(), ExecutionConfig::new("collision"))
+        .await
+        .expect("authored collision node still executes");
+    assert_eq!(
+        state.get("node:__workflow_revise_admit"),
+        Some(&json!(true))
+    );
+}
+
+#[tokio::test]
+async fn direct_edge_to_revise_uses_admission() {
+    const SOURCE: &str = r#"
+schema_version = 1
+[workflow]
+id = "direct-revise"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "revise"
+kind = "action"
+max_visits = 4
+idempotent = true
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "done"
+"#;
+    let plan = compile_str("direct-revise.workflow.toml", SOURCE).expect("fixture compiles");
+    let graph = AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("translation succeeds");
+    let err = graph
+        .invoke(State::new(), ExecutionConfig::new("direct-revise"))
+        .await
+        .expect_err("a self-loop into revise must honor authored max_visits");
+    assert_eq!(
+        err.to_string(),
+        "visit bound exceeded: max_visits=4",
+        "authored max_visits=4 must stay authoritative, got {err}"
+    );
+}
+
+#[tokio::test]
+async fn authored_revise_max_visits_completes_every_authored_visit() {
+    const SOURCE: &str = r#"
+schema_version = 1
+[workflow]
+id = "direct-revise-budget"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "revise"
+kind = "action"
+max_visits = 4
+idempotent = true
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "done"
+"#;
+    let plan = compile_str("direct-revise-budget.workflow.toml", SOURCE).expect("fixture compiles");
+    let graph = AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("translation succeeds");
+    let mut mapper = AdkEventMapper::new("run-revise-budget", "direct-revise-budget").unwrap();
+    let mut artifacts = InMemoryArtifactStore::new(
+        std::num::NonZeroU64::new(64 * 1024).unwrap(),
+        std::num::NonZeroU64::new(64 * 1024).unwrap(),
+    );
+    let err = graph
+        .invoke_observed(
+            State::new(),
+            ExecutionConfig::new("direct-revise-budget"),
+            &mut mapper,
+            &mut artifacts,
+        )
+        .await
+        .expect_err("a self-loop into revise must honor authored max_visits");
+    let completed = mapper
+        .events()
+        .iter()
+        .filter(|event| {
+            event.kind() == WorkflowRuntimeEventKindV1::NodeCompleted
+                && event.node_id() == Some("revise")
+        })
+        .count();
+    assert_eq!(
+        completed, 4,
+        "authored max_visits=4 must complete 4 revise visits, got {completed}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "visit bound exceeded: max_visits=4",
+        "authored max_visits=4 must stay authoritative, got {err}"
+    );
+}
+
+#[tokio::test]
+async fn revise_divergent_predecessors_fan_in_then_admission() {
+    const SOURCE: &str = r#"
+schema_version = 1
+[workflow]
+id = "revise-fan-in"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "left"
+kind = "agent"
+[[nodes]]
+id = "right"
+kind = "agent"
+[[nodes]]
+id = "revise"
+kind = "action"
+max_visits = 16
+idempotent = true
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "left"
+[[edges]]
+from = "start"
+to = "right"
+[[edges]]
+from = "left"
+to = "revise"
+[[edges]]
+from = "right"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "done"
+"#;
+    let plan = compile_str("revise-fan-in.workflow.toml", SOURCE).expect("fixture compiles");
+    let overlap = BTreeMap::from([
+        (
+            "left".to_owned(),
+            state_agent("left", json!({"shared": "left"})),
+        ),
+        (
+            "right".to_owned(),
+            state_agent("right", json!({"shared": "right"})),
+        ),
+    ]);
+    let conflict = AdkGraphTranslator::new()
+        .translate_with_agents(&plan, &overlap)
+        .expect("translation succeeds")
+        .invoke(State::new(), ExecutionConfig::new("revise-fan-in-overlap"))
+        .await
+        .expect_err("divergent writes to revise require the fan-in guard");
+    assert_eq!(
+        conflict.to_string(),
+        "fan-in state conflict at \"revise\" for key \"shared\""
+    );
+
+    let disjoint = BTreeMap::from([
+        (
+            "left".to_owned(),
+            state_agent("left", json!({"left": "left"})),
+        ),
+        (
+            "right".to_owned(),
+            state_agent("right", json!({"right": "right"})),
+        ),
+    ]);
+    let admission = AdkGraphTranslator::new()
+        .translate_with_agents(&plan, &disjoint)
+        .expect("translation succeeds")
+        .invoke(State::new(), ExecutionConfig::new("revise-fan-in-admit"))
+        .await
+        .expect_err("merged fan-in must still pass through revise admission");
+    assert_eq!(
+        admission.to_string(),
+        "visit bound exceeded: max_visits=16",
+        "fan-in then admission must keep authored max_visits=16, got {admission}"
+    );
+}
+
+#[tokio::test]
+async fn authored_revise_max_visits_completes_first_visit() {
+    const SOURCE: &str = r#"
+schema_version = 1
+[workflow]
+id = "revise-first-visit"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "revise"
+kind = "action"
+max_visits = 4
+idempotent = true
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "done"
+"#;
+    let plan = compile_str("revise-first-visit.workflow.toml", SOURCE).expect("fixture compiles");
+    let graph = AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("translation succeeds");
+    let state = graph
+        .invoke(State::new(), ExecutionConfig::new("revise-first-visit"))
+        .await
+        .expect("authored max_visits>1 must complete the first revise visit");
+    assert_eq!(state.get("node:revise"), Some(&json!(true)));
+}
+
+#[tokio::test]
+async fn canonical_revise_max_visits_is_not_rewritten_to_one() {
+    const SOURCE: &str = r#"
+schema_version = 1
+[workflow]
+id = "revise-canonical-bound"
+version = "1"
+entry = "start"
+[[nodes]]
+id = "start"
+kind = "action"
+[[nodes]]
+id = "revise"
+kind = "action"
+max_visits = 32
+idempotent = true
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "start"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "revise"
+[[edges]]
+from = "revise"
+to = "done"
+"#;
+    let plan =
+        compile_str("revise-canonical-bound.workflow.toml", SOURCE).expect("fixture compiles");
+    let graph = AdkGraphTranslator::new()
+        .translate(&plan)
+        .expect("translation succeeds");
+    let err = graph
+        .invoke(State::new(), ExecutionConfig::new("revise-canonical-bound"))
+        .await
+        .expect_err("self-loop must stop at authored max_visits");
+    assert_eq!(
+        err.to_string(),
+        "visit bound exceeded: max_visits=32",
+        "canonical max_visits=32 must not be rewritten to 1, got {err}"
+    );
+}

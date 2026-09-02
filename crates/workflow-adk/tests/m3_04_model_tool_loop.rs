@@ -284,7 +284,7 @@ fn undeclared_or_unknown_call_fails_before_effect() {
     ];
     let (_root, error) = run(profile_with(responses, None));
     let error = error.unwrap_err();
-    assert_eq!(error.kind(), ExecutionErrorKind::Adk);
+    assert_eq!(error.kind(), ExecutionErrorKind::UnknownTool);
     assert!(!events(&error).contains("tool_completed"));
 }
 
@@ -377,7 +377,7 @@ fn extra_field_finish_run_and_resume_fail_closed_before_dispatch() {
     );
     let (root, error) = run(profile_with(vec![response], None));
     let error = error.unwrap_err();
-    assert_eq!(error.kind(), ExecutionErrorKind::Adk);
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidOutput);
     let run_root = error.receipt().unwrap().run_root();
     let ledger_path = run_root.join("loop-ledger.json");
     let events_path = run_root.join("events.jsonl");
@@ -399,17 +399,20 @@ fn extra_field_finish_run_and_resume_fail_closed_before_dispatch() {
 
 #[test]
 fn empty_response_missing_finish_and_repeated_call_fail_closed() {
-    for responses in [
-        vec![json!(" ")],
-        vec![
-            json!({"calls": [{"id":"call-repeat","name":"search_code","args":{"query":"same"}}]}),
-            json!({"calls": [{"id":"call-repeat","name":"search_code","args":{"query":"same"}}]}),
-            json!("done"),
-        ],
+    for (responses, expected) in [
+        (vec![json!(" ")], ExecutionErrorKind::InvalidOutput),
+        (
+            vec![
+                json!({"calls": [{"id":"call-repeat","name":"search_code","args":{"query":"same"}}]}),
+                json!({"calls": [{"id":"call-repeat","name":"search_code","args":{"query":"same"}}]}),
+                json!("done"),
+            ],
+            ExecutionErrorKind::NonProgress,
+        ),
     ] {
         let (_root, error) = run(profile_with(responses, None));
         let error = error.unwrap_err();
-        assert_eq!(error.kind(), ExecutionErrorKind::Adk);
+        assert_eq!(error.kind(), expected);
         assert_eq!(error.receipt().unwrap().status(), "failed");
     }
 }

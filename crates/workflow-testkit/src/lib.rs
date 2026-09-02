@@ -4,6 +4,7 @@ mod bench;
 pub mod code_investigation;
 pub mod conformance;
 mod eval;
+pub mod live_conformance;
 mod non_progress;
 mod replay;
 mod sandbox;

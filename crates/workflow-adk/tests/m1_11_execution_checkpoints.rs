@@ -991,3 +991,174 @@ fn checkpoint_tool_identity_comes_from_the_resolved_projection() {
         receipt.resume_identity()
     );
 }
+
+#[test]
+fn openai_compatible_runtime_extensions_parse_for_worker_and_reviewer() {
+    ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "openai-compatible",
+                "name": "worker",
+                "version": "1",
+                "model": "worker-model",
+                "base_url": "http://example.invalid/v1",
+                "credential_env": "ADK_WORKFLOW_KIT_M3_07_TEST_KEY",
+                "runtime": {
+                    "timeout_ms": 2000,
+                    "sampling": {"temperature": 0.2},
+                    "provider_extensions": {"openai": {"trace": "worker-ext"}}
+                }
+            },
+            "reviewer_model": {
+                "provider": "openai-compatible",
+                "name": "reviewer",
+                "version": "1",
+                "model": "reviewer-model",
+                "base_url": "http://example.invalid/v1",
+                "credential_env": "ADK_WORKFLOW_KIT_M3_07_TEST_KEY",
+                "runtime": {
+                    "sampling": {"temperature": 0.1},
+                    "provider_extensions": {"openai": {"trace": "reviewer-ext"}}
+                }
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .expect("external runtime/extensions must parse for worker and reviewer");
+}
+
+#[test]
+fn openai_compatible_tool_parser_is_rejected_until_supported() {
+    let error = match ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "openai-compatible",
+                "name": "worker",
+                "version": "1",
+                "model": "worker-model",
+                "base_url": "http://example.invalid/v1",
+                "credential_env": "ADK_WORKFLOW_KIT_M3_07_TEST_KEY",
+                "runtime": {"tool_parser": "json"}
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    ) {
+        Ok(_) => panic!("unsupported tool_parser must fail closed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidProfile);
+}
+
+#[test]
+fn openai_compatible_tool_template_is_rejected_until_supported() {
+    let error = match ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "openai-compatible",
+                "name": "worker",
+                "version": "1",
+                "model": "worker-model",
+                "base_url": "http://example.invalid/v1",
+                "credential_env": "ADK_WORKFLOW_KIT_M3_07_TEST_KEY",
+                "runtime": {"tool_template": "default"}
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    ) {
+        Ok(_) => panic!("unsupported tool_template must fail closed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidProfile);
+}
+
+#[test]
+fn run_manifest_records_resolved_model_identity() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "worker-requested",
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
+            },
+            "reviewer_model": {
+                "provider": "fake",
+                "name": "fake-reviewer",
+                "version": "1",
+                "model": "reviewer-requested",
+                "responses": ["{\"status\":\"finished\",\"output\":\"reviewed\"}"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .expect("profile fixture should parse");
+    let receipt = ExecutionBackend::run(workflow(), profile, json!({"request":"public"}), &root.0)
+        .expect("fixture run should succeed");
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("run-manifest.json")).expect("manifest should exist"),
+    )
+    .expect("manifest should be JSON");
+    let identity = manifest["profile_identity"]
+        .as_str()
+        .expect("profile identity");
+    assert!(
+        identity.contains("requested=worker-requested")
+            && identity.contains("resolved=worker-requested")
+            && identity.contains("provider=fake")
+            && identity.contains("requested=reviewer-requested")
+            && identity.contains("resolved=reviewer-requested"),
+        "manifest must persist requested/resolved/provider identity, got {identity}"
+    );
+}
+
+#[test]
+fn run_manifest_records_bound_resolved_identity_when_it_differs() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "worker-requested",
+                "resolved_model": "worker-bound",
+                "responses": ["{\"status\":\"finished\",\"output\":\"done\"}"]
+            },
+            "reviewer_model": {
+                "provider": "fake",
+                "name": "fake-reviewer",
+                "version": "1",
+                "model": "reviewer-requested",
+                "resolved_model": "reviewer-bound",
+                "responses": ["{\"status\":\"finished\",\"output\":\"reviewed\"}"]
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .expect("profile fixture should parse");
+    let receipt = ExecutionBackend::run(workflow(), profile, json!({"request":"public"}), &root.0)
+        .expect("fixture run should succeed");
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("run-manifest.json")).expect("manifest should exist"),
+    )
+    .expect("manifest should be JSON");
+    let identity = manifest["profile_identity"]
+        .as_str()
+        .expect("profile identity");
+    assert!(
+        identity.contains("requested=worker-requested")
+            && identity.contains("resolved=worker-bound")
+            && identity.contains("requested=reviewer-requested")
+            && identity.contains("resolved=reviewer-bound")
+            && !identity.contains("resolved=worker-requested")
+            && !identity.contains("resolved=reviewer-requested"),
+        "manifest must persist bound resolved identity, got {identity}"
+    );
+}

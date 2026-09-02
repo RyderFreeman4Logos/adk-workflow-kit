@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "model": {
+    "provider": "openai-compatible",
+    "name": "code-investigation-fake",
+    "version": "1",
+    "model": "USER_SUPPLIED_MODEL",
+    "base_url": "http://example.invalid/v1",
+    "credential_env": "ADK_WORKFLOW_KIT_M3_07_API_KEY"
+  },
+  "reviewer_model": {
+    "provider": "openai-compatible",
+    "name": "code-investigation-reviewer",
+    "version": "1",
+    "model": "USER_SUPPLIED_MODEL",
+    "base_url": "http://example.invalid/v1",
+    "credential_env": "ADK_WORKFLOW_KIT_M3_07_API_KEY"
+  },
+  "tools": [
+    {
+      "name": "search_code",
+      "result": {"path": "src/retry.rs", "line": 1, "snippet": "pub fn default_retry() -> u8 {"},
+      "input_schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}}, "required": ["query"], "additionalProperties": false},
+      "required_capabilities": [],
+      "required_scopes": []
+    },
+    {
+      "name": "read_source_range",
+      "result": {"path": "src/retry.rs", "start_line": 1, "end_line": 8, "snippet": "pub fn default_retry() -> u8 {"},
+      "input_schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}}, "required": ["path", "start_line", "end_line"], "additionalProperties": false},
+      "required_capabilities": [],
+      "required_scopes": []
+    }
+  ],
+  "sandbox": {"capabilities": []}
+}

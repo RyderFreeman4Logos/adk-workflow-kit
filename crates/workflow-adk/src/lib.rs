@@ -332,6 +332,10 @@ pub enum AdkGraphError {
     Cancelled,
     ToolFailed,
     InvalidOutput { node: String },
+    Unreachable,
+    MalformedTool,
+    UnknownTool,
+    NonProgress,
     Failed,
 }
 
@@ -363,6 +367,10 @@ impl fmt::Display for AdkGraphError {
             Self::Cancelled => write!(f, "execution cancelled"),
             Self::ToolFailed => write!(f, "tool execution failed"),
             Self::InvalidOutput { node } => write!(f, "invalid output from node {node:?}"),
+            Self::Unreachable => write!(f, "model provider is unreachable"),
+            Self::MalformedTool => write!(f, "model tool call is malformed"),
+            Self::UnknownTool => write!(f, "model requested an unknown tool"),
+            Self::NonProgress => write!(f, "model repeated a tool call without progress"),
             Self::Failed => write!(f, "graph execution failed"),
         }
     }
@@ -372,6 +380,21 @@ impl std::error::Error for AdkGraphError {}
 const IR_DEFAULT_KEY: &str = "__ir_default__";
 const UNKNOWN_ROUTE_ERROR_PREFIX: &str = "workflow unknown route selector: ";
 const UNKNOWN_ROUTE_NODE_PREFIX: &str = "__workflow_unknown_route_";
+const REVISE_ADMIT_NODE: &str = "__workflow_revise_admit";
+
+fn unused_node_id(ids: &BTreeSet<&str>, preferred: &str) -> String {
+    if !ids.contains(preferred) {
+        return preferred.to_owned();
+    }
+    let mut index = 0;
+    loop {
+        let candidate = format!("{preferred}_{index}");
+        if !ids.contains(candidate.as_str()) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
 
 fn terminal_graph_error(message: &str) -> Option<AdkGraphError> {
     [
@@ -401,6 +424,15 @@ fn terminal_graph_error(message: &str) -> Option<AdkGraphError> {
         ("workflow.loop.timeout.tool", AdkGraphError::ToolTimeLimit),
         ("workflow.loop.cancelled", AdkGraphError::Cancelled),
         ("tool.bridge.failed", AdkGraphError::ToolFailed),
+        ("model.profile.timeout", AdkGraphError::IdleTimeLimit),
+        ("model.profile.unreachable", AdkGraphError::Unreachable),
+        ("model.call.malformed_tool", AdkGraphError::MalformedTool),
+        ("model.call.unknown_tool", AdkGraphError::UnknownTool),
+        ("workflow.loop.non_progress", AdkGraphError::NonProgress),
+        (
+            "workflow.loop.review_exhausted",
+            AdkGraphError::VisitBound { max_visits: 1 },
+        ),
     ]
     .into_iter()
     .find_map(|(marker, error)| message.contains(marker).then_some(error))
@@ -455,7 +487,10 @@ impl AdkGraph {
     ) -> Result<State, AdkGraphError> {
         let mut state = self.input.map(state);
         state.retain(|key, _| !key.starts_with("visits:"));
-        let limit = self.recursion_limit.min(config.recursion_limit);
+        let limit = match self.visit_bound {
+            Some(_) => self.recursion_limit,
+            None => self.recursion_limit.min(config.recursion_limit),
+        };
         let mut config = config.with_recursion_limit(limit);
         if let Some(binding) = &self.plan_binding {
             config = config
@@ -478,11 +513,8 @@ impl AdkGraph {
             }
             Err(error) => {
                 if let GraphError::NodeExecutionFailed { node, message } = &error {
-                    if message.contains("tool.bridge.authorization_denied") {
-                        return Err(AdkGraphError::AuthorizationDenied);
-                    }
-                    if message.contains("tool.bridge.sandbox_denied") {
-                        return Err(AdkGraphError::SandboxDenied);
+                    if let Some(error) = terminal_graph_error(message) {
+                        return Err(error);
                     }
                     if let Some(target) = self.fan_in_guard_nodes.get(node)
                         && let Some(key) = message.strip_prefix("workflow fan-in conflict: ")
@@ -527,7 +559,10 @@ impl AdkGraph {
         if config.resume_from.is_none() {
             state.retain(|key, _| !key.starts_with("visits:"));
         }
-        let limit = self.recursion_limit.min(config.recursion_limit);
+        let limit = match self.visit_bound {
+            Some(_) => self.recursion_limit,
+            None => self.recursion_limit.min(config.recursion_limit),
+        };
         let mut config = config.with_recursion_limit(limit);
         if let Some(binding) = &self.plan_binding {
             config = config
@@ -542,12 +577,7 @@ impl AdkGraph {
         let mut stream = Box::pin(self.graph.stream(state, config, StreamMode::Custom));
         let mut output = None;
         while let Some(item) = stream.next().await {
-            match item.map_err(|error| match &error {
-                GraphError::NodeExecutionFailed { message, .. } => {
-                    terminal_graph_error(message).unwrap_or(AdkGraphError::Failed)
-                }
-                _ => AdkGraphError::Failed,
-            })? {
+            match item.map_err(|error| self.map_observed_error(&error))? {
                 StreamEvent::NodeStart { node, step } => {
                     mapper
                         .map_stream_observation(
@@ -648,19 +678,10 @@ impl AdkGraph {
                         )
                         .map_err(|error| AdkGraphError::Observation(error.kind()))?;
                 }
-                StreamEvent::Error { message, node } => {
-                    if let Some(error) = terminal_graph_error(&message) {
-                        return Err(error);
-                    }
-                    mapper
-                        .map_stream_observation(
-                            node,
-                            events::AdkRuntimeObservationKindV1::WorkflowFailed,
-                            Some(json!({ "message": message })),
-                            None,
-                            artifacts,
-                        )
-                        .map_err(|error| AdkGraphError::Observation(error.kind()))?;
+                StreamEvent::Error { message, .. } => {
+                    return Err(
+                        terminal_graph_error(&message).unwrap_or(AdkGraphError::Unreachable)
+                    );
                 }
                 StreamEvent::State { .. }
                 | StreamEvent::Updates { .. }
@@ -711,6 +732,53 @@ impl AdkGraph {
             .any(|terminal| terminal == id)
             .then(|| TerminalOutcome::from_stable_id(id))
             .flatten()
+    }
+
+    fn map_observed_error(&self, error: &GraphError) -> AdkGraphError {
+        match error {
+            GraphError::NodeExecutionFailed { node, message } => {
+                if let Some(error) = terminal_graph_error(message) {
+                    return error;
+                }
+                if let Some(target) = self.fan_in_guard_nodes.get(node)
+                    && let Some(key) = message.strip_prefix("workflow fan-in conflict: ")
+                {
+                    return AdkGraphError::FanInConflict {
+                        target: target.clone(),
+                        key: key.to_owned(),
+                    };
+                }
+                if let Some(from) = self.unknown_route_nodes.get(node)
+                    && let Some(selector) = message.strip_prefix(UNKNOWN_ROUTE_ERROR_PREFIX)
+                {
+                    return AdkGraphError::UnknownRoute {
+                        from: from.clone(),
+                        selector: selector.to_owned(),
+                    };
+                }
+            }
+            GraphError::Other(message) => {
+                if let Some(error) = terminal_graph_error(message) {
+                    return error;
+                }
+                if let Some(selector) = message.strip_prefix(UNKNOWN_ROUTE_ERROR_PREFIX) {
+                    return AdkGraphError::UnknownRoute {
+                        from: String::new(),
+                        selector: selector.to_owned(),
+                    };
+                }
+            }
+            GraphError::UnknownRouteTarget(message) => {
+                return AdkGraphError::UnknownRoute {
+                    from: String::new(),
+                    selector: message.clone(),
+                };
+            }
+            _ => {}
+        }
+        visit_bound_from_error(error)
+            .map(|max_visits| AdkGraphError::VisitBound { max_visits })
+            .unwrap_or(AdkGraphError::Failed)
     }
 
     fn validate_output(&self, state: State) -> Result<State, AdkGraphError> {
@@ -1057,7 +1125,7 @@ impl AdkGraphTranslator {
             }
         }
         let visit_bound = ir_visit_bound(ir);
-        let recursion_limit = visit_bound.unwrap_or(50);
+        let recursion_limit = graph_recursion_limit(ir);
         let mut builder = GraphAgent::builder(ir.workflow_id().as_str())
             .channels(&["terminal"])
             .recursion_limit(recursion_limit);
@@ -1245,15 +1313,36 @@ impl AdkGraphTranslator {
                 });
             }
         }
-        builder = builder.edge(START, ir.entry_node_id().as_str());
+        let revise_admit = ids
+            .contains("revise")
+            .then(|| unused_node_id(&ids, REVISE_ADMIT_NODE));
+        if let Some(admit) = &revise_admit {
+            builder = builder.node_fn(admit, |_context| async move { Ok(NodeOutput::new()) });
+            builder = builder.edge(admit, "revise");
+        }
+        let rewrite_target = |target: &str| {
+            if let Some(guard) = fan_in_guards_by_target.get(target) {
+                return guard.clone();
+            }
+            if target == "revise"
+                && let Some(admit) = &revise_admit
+            {
+                return admit.clone();
+            }
+            target.to_owned()
+        };
+        builder = builder.edge(START, &rewrite_target(ir.entry_node_id().as_str()));
         for edge in ir.edges() {
-            let target = fan_in_guards_by_target
-                .get(edge.to().as_str())
-                .map_or_else(|| edge.to().as_str(), String::as_str);
-            builder = builder.edge(edge.from().as_str(), target);
+            let target = rewrite_target(edge.to().as_str());
+            builder = builder.edge(edge.from().as_str(), &target);
         }
         for (guard, target) in &fan_in_guard_nodes {
-            builder = builder.edge(guard, target);
+            let next = if target == "revise" {
+                revise_admit.as_deref().unwrap_or(target)
+            } else {
+                target.as_str()
+            };
+            builder = builder.edge(guard, next);
         }
         let mut unknown_route_index = 0;
         for route in ir.routes() {
@@ -1277,6 +1366,7 @@ impl AdkGraphTranslator {
                     }
                 };
                 let state_key = format!("route:{from}");
+                let node_key = format!("node:{from}");
                 let node_name = unknown_route_node.clone();
                 builder = builder.node_fn(&node_name, move |context| {
                     let selector = context
@@ -1285,7 +1375,16 @@ impl AdkGraphTranslator {
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_owned();
+                    let invalid_output = context
+                        .state
+                        .get(&node_key)
+                        .and_then(|value| value.get("__workflow_invalid_output"))
+                        .and_then(Value::as_bool)
+                        == Some(true);
                     async move {
+                        if invalid_output {
+                            return Err(GraphError::Other("model.profile.unreachable".to_owned()));
+                        }
                         Err(GraphError::Other(format!(
                             "{UNKNOWN_ROUTE_ERROR_PREFIX}{selector}"
                         )))
@@ -1294,19 +1393,13 @@ impl AdkGraphTranslator {
                 unknown_route_nodes.insert(unknown_route_node.clone(), from.clone());
                 Some(unknown_route_node)
             };
-            let guarded_target = |target: &str| {
-                fan_in_guards_by_target
-                    .get(target)
-                    .cloned()
-                    .unwrap_or_else(|| target.to_owned())
-            };
             let mut cases: Vec<(&'static str, &'static str)> = route
                 .cases()
                 .iter()
                 .map(|case| {
                     (
                         Box::leak(case.key().to_owned().into_boxed_str()) as &'static str,
-                        Box::leak(guarded_target(case.target().as_str()).into_boxed_str())
+                        Box::leak(rewrite_target(case.target().as_str()).into_boxed_str())
                             as &'static str,
                     )
                 })
@@ -1314,7 +1407,7 @@ impl AdkGraphTranslator {
             if let Some(default) = route.default() {
                 cases.push((
                     IR_DEFAULT_KEY,
-                    Box::leak(guarded_target(default.as_str()).into_boxed_str()) as &'static str,
+                    Box::leak(rewrite_target(default.as_str()).into_boxed_str()) as &'static str,
                 ));
             }
             if let Some(unknown_route_node) = &unknown_route_node {
@@ -1436,6 +1529,22 @@ fn ir_visit_bound(ir: &workflow_ir::WorkflowIr) -> Option<usize> {
         .map(|visits| visits as usize)
         .sum();
     (bound != 0).then_some(bound)
+}
+
+fn graph_recursion_limit(ir: &workflow_ir::WorkflowIr) -> usize {
+    let visit_bound = ir_visit_bound(ir).unwrap_or(50);
+    let Some(revise) = ir
+        .nodes()
+        .iter()
+        .find(|node| node.id().as_str() == "revise")
+    else {
+        return visit_bound;
+    };
+    let revise_visits = revise.max_visits().unwrap_or(0) as usize;
+    // ponytail: +16 covers start/fan-in/unknown-route synthetics; raise if a new node class appears
+    visit_bound
+        .saturating_add(revise_visits.saturating_add(1).saturating_mul(2))
+        .saturating_add(16)
 }
 
 fn valid_path(path: &str) -> bool {

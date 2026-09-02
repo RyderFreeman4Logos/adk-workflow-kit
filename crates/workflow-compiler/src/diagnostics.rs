@@ -56,12 +56,17 @@ impl Diagnostic {
 
     /// Returns the fixed diagnostic for a failed `workflowctl run` execution.
     pub fn run_failed() -> Self {
+        Self::run_failed_with_category("fail_closed")
+    }
+
+    /// Returns a failed-run diagnostic tagged with a bounded causal category.
+    pub fn run_failed_with_category(category: &'static str) -> Self {
         Self {
             diagnostic_version: DIAGNOSTIC_VERSION,
             code: "workflow.run.failed",
             message: "workflow run failed",
             location: None,
-            details: DiagnosticDetails::Empty {},
+            details: DiagnosticDetails::RunFailed { category },
         }
     }
 
@@ -181,6 +186,9 @@ struct DiagnosticSpan {
 #[serde(untagged)]
 enum DiagnosticDetails {
     Empty {},
+    RunFailed {
+        category: &'static str,
+    },
     InvalidIdentifier {
         field_path: &'static str,
     },
@@ -582,6 +590,11 @@ impl fmt::Display for DiagnosticDetails {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty {} => formatter.write_str("{}"),
+            Self::RunFailed { category } => {
+                formatter.write_str("{category=")?;
+                write_quoted(formatter, category)?;
+                formatter.write_str("}")
+            }
             Self::InvalidIdentifier { field_path } => {
                 formatter.write_str("{field_path=")?;
                 write_quoted(formatter, field_path)?;

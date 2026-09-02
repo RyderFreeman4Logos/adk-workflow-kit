@@ -6,12 +6,15 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use adk_rust::async_trait;
-use adk_rust::futures::{Stream, StreamExt};
-use adk_rust::model::{OpenAICompatible, OpenAICompatibleConfig};
+use adk_rust::futures::{Stream, StreamExt, stream};
+use adk_rust::model::{OpenAICompatible, OpenAICompatibleConfig, RetryConfig};
 use adk_rust::{AdkError, Content, ErrorCategory, Llm, LlmRequest, LlmResponse, Part};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -294,6 +297,8 @@ pub struct FakeModelProfile {
     runtime: ModelRuntimeConfig,
     #[serde(default)]
     response_delay: Duration,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolved_model: Option<String>,
 }
 
 pub(crate) struct QueuedFakeLlm {
@@ -468,10 +473,15 @@ impl FakeModelProfile {
                 .collect(),
             runtime: ModelRuntimeConfig::default(),
             response_delay: Duration::ZERO,
+            resolved_model: None,
         }
     }
     pub fn with_runtime(mut self, runtime: ModelRuntimeConfig) -> Self {
         self.runtime = runtime;
+        self
+    }
+    pub fn with_resolved_model(mut self, name: impl Into<String>) -> Self {
+        self.resolved_model = Some(name.into());
         self
     }
 
@@ -488,6 +498,7 @@ impl FakeModelProfile {
             responses,
             runtime: ModelRuntimeConfig::default(),
             response_delay: Duration::from_millis(response_delay_ms),
+            resolved_model: None,
         }
     }
 }
@@ -701,6 +712,7 @@ pub struct ModelBinding {
     runtime: ModelRuntimeConfig,
     llm: Arc<dyn Llm>,
     fake_queue: Option<Arc<QueuedFakeLlm>>,
+    retries: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -762,7 +774,7 @@ impl ModelProfile {
                     responses.push_back(adk_rust::LlmResponse::new(content));
                 }
                 let queue = Arc::new(QueuedFakeLlm::new(
-                    &value.model,
+                    value.resolved_model.as_ref().unwrap_or(&value.model),
                     responses,
                     value.response_delay,
                 ));
@@ -780,8 +792,9 @@ impl ModelProfile {
                 let config = OpenAICompatibleConfig::new(secret.expose(), &value.model)
                     .with_provider_name(&value.provider)
                     .with_base_url(&value.base_url);
-                let llm =
-                    OpenAICompatible::new(config).map_err(|_| ModelProfileError::provider())?;
+                let llm = OpenAICompatible::new(config)
+                    .map_err(|_| ModelProfileError::provider())?
+                    .with_retry_config(RetryConfig::disabled());
                 (
                     Arc::new(llm) as Arc<dyn Llm>,
                     value.model.clone(),
@@ -802,6 +815,7 @@ impl ModelProfile {
             runtime: self.runtime().clone(),
             llm,
             fake_queue,
+            retries: Arc::new(AtomicU64::new(0)),
         })
     }
 }
@@ -826,6 +840,7 @@ impl ModelBinding {
                 inner: Arc::clone(&queue),
             }),
             fake_queue: Some(queue),
+            retries: Arc::clone(&self.retries),
         }
     }
     pub fn identity(&self) -> &ModelBindingIdentity {
@@ -849,6 +864,9 @@ impl ModelBinding {
     pub fn resume_compatible(&self, other: &Self) -> bool {
         self.resume_identity() == other.resume_identity()
     }
+    pub fn take_retries(&self) -> u64 {
+        self.retries.swap(0, Ordering::AcqRel)
+    }
 
     pub async fn generate_content(
         &self,
@@ -856,17 +874,16 @@ impl ModelBinding {
         stream: bool,
     ) -> Result<ModelResponseStream, ModelProfileError> {
         let request = self.apply_runtime(request);
-        let result = adk_rust::tokio::time::timeout(
-            self.runtime.timeout(),
-            self.llm.generate_content(request, stream),
-        )
-        .await;
+        let deadline = adk_rust::tokio::time::Instant::now() + self.runtime.timeout();
+        let result =
+            adk_rust::tokio::time::timeout_at(deadline, self.llm.generate_content(request, stream))
+                .await;
         let stream = result
             .map_err(|_| ModelProfileError::timeout())?
             .map_err(|error| self.map_adk_error(error))?;
         Ok(timed_response_stream(
             stream,
-            self.runtime.timeout(),
+            deadline,
             self.identity.profile.clone(),
         ))
     }
@@ -918,7 +935,7 @@ impl ModelBinding {
 
 fn timed_response_stream(
     stream: adk_rust::LlmResponseStream,
-    timeout: Duration,
+    deadline: adk_rust::tokio::time::Instant,
     identity: ModelProfileIdentity,
 ) -> ModelResponseStream {
     Box::pin(adk_rust::futures::stream::unfold(
@@ -927,7 +944,7 @@ fn timed_response_stream(
             let identity = identity.clone();
             async move {
                 let mut inner = stream.take()?;
-                match adk_rust::tokio::time::timeout(timeout, inner.next()).await {
+                match adk_rust::tokio::time::timeout_at(deadline, inner.next()).await {
                     Ok(Some(result)) => Some((
                         result.map_err(|error| map_adk_error(&identity, error)),
                         Some(inner),
@@ -1062,20 +1079,652 @@ impl Llm for ModelBinding {
         stream: bool,
     ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
         let request = self.apply_runtime(request);
-        adk_rust::tokio::time::timeout(
-            self.runtime.timeout(),
-            self.llm.generate_content(
-                request,
-                stream && self.identity.provider != "openai-compatible",
+        let deadline = std::time::Instant::now() + self.runtime.timeout();
+        let mut retried = false;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(provider_adk_error(profile_timeout()));
+            }
+            match generate_once(self, request.clone(), stream, deadline).await {
+                Ok(items) => {
+                    return Ok(Box::pin(stream::iter(items.into_iter().map(Ok)))
+                        as adk_rust::LlmResponseStream);
+                }
+                Err(error) if !retried && retryable_provider_error(&error) => {
+                    self.retries.fetch_add(1, Ordering::Relaxed);
+                    retried = true;
+                }
+                Err(error) => return Err(provider_adk_error(error)),
+            }
+        }
+    }
+}
+
+fn profile_timeout() -> AdkError {
+    AdkError::timeout(
+        adk_rust::ErrorComponent::Model,
+        "model.profile.timeout",
+        "model.profile.timeout",
+    )
+}
+
+async fn collect_payloads(
+    llm: Arc<dyn Llm>,
+    request: LlmRequest,
+) -> adk_rust::Result<Vec<LlmResponse>> {
+    let mut inner = llm.generate_content(request, false).await?;
+    let mut items = Vec::new();
+    while let Some(item) = inner.next().await {
+        let response = item?;
+        if !response_has_model_payload(&response) {
+            continue;
+        }
+        items.push(response);
+    }
+    if items.is_empty() {
+        return Err(AdkError::agent("model.profile.unreachable"));
+    }
+    Ok(items)
+}
+
+async fn generate_once(
+    binding: &ModelBinding,
+    request: LlmRequest,
+    _stream: bool,
+    deadline: std::time::Instant,
+) -> adk_rust::Result<Vec<LlmResponse>> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(profile_timeout());
+    }
+    adk_rust::tokio::time::timeout(
+        remaining,
+        collect_payloads(Arc::clone(&binding.llm), request),
+    )
+    .await
+    .unwrap_or_else(|_| Err(profile_timeout()))
+}
+
+fn response_has_model_payload(response: &LlmResponse) -> bool {
+    response.content.as_ref().is_some_and(|content| {
+        content.parts.iter().any(|part| match part {
+            Part::Text { text } => !text.trim().is_empty(),
+            Part::FunctionCall { .. } => true,
+            _ => false,
+        })
+    })
+}
+
+fn retryable_provider_error(error: &AdkError) -> bool {
+    error.is_rate_limited() || error.details.upstream_status_code == Some(429)
+}
+
+fn provider_adk_error(error: AdkError) -> AdkError {
+    if error.category == ErrorCategory::Timeout {
+        error
+    } else {
+        AdkError::agent("model.profile.unreachable")
+    }
+}
+
+#[cfg(test)]
+mod retry_admission_tests {
+    use super::*;
+
+    async fn expect_profile_timeout(binding: &ModelBinding, request: LlmRequest) -> AdkError {
+        match Llm::generate_content(binding, request, true).await {
+            Err(error) => error,
+            Ok(mut items) => match items.next().await {
+                Some(Err(error)) => error,
+                _ => panic!("body stall must time out"),
+            },
+        }
+    }
+
+    #[test]
+    fn non_retryable_error_message_containing_rate_is_not_retried() {
+        let error = AdkError::agent("failed to generate");
+        assert!(
+            error.to_string().contains("rate"),
+            "fixture must contain rate in the rendered message, got {}",
+            error
+        );
+        assert!(
+            !retryable_provider_error(&error),
+            "substring rate must not admit retry, got {}",
+            error
+        );
+    }
+
+    enum AttemptBehavior {
+        Success,
+        Stall,
+        RetryThenStall,
+    }
+
+    struct AttemptProbe {
+        behavior: AttemptBehavior,
+        dispatches: Arc<AtomicU64>,
+        active: Arc<AtomicU64>,
+    }
+
+    struct ActiveAttempt(Arc<AtomicU64>);
+
+    impl Drop for ActiveAttempt {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    #[async_trait]
+    impl Llm for AttemptProbe {
+        fn name(&self) -> &str {
+            "attempt-probe"
+        }
+
+        async fn generate_content(
+            &self,
+            _request: LlmRequest,
+            _stream: bool,
+        ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+            let dispatch = self.dispatches.fetch_add(1, Ordering::Relaxed);
+            if matches!(self.behavior, AttemptBehavior::RetryThenStall) && dispatch == 0 {
+                let mut error = AdkError::agent("retryable");
+                error.details.upstream_status_code = Some(429);
+                return Err(error);
+            }
+            if matches!(self.behavior, AttemptBehavior::Success) {
+                return Ok(Box::pin(stream::iter([Ok(LlmResponse::new(
+                    Content::new("assistant").with_text("done"),
+                ))])));
+            }
+
+            self.active.fetch_add(1, Ordering::Relaxed);
+            let attempt = ActiveAttempt(Arc::clone(&self.active));
+            Ok(Box::pin(stream::once(async move {
+                let _attempt = attempt;
+                std::future::pending::<adk_rust::Result<LlmResponse>>().await
+            })))
+        }
+    }
+
+    fn model_worker_threads() -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .expect("Linux task directory")
+            .filter_map(Result::ok)
+            .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+            .filter(|name| name.starts_with("workflow-adk-mo"))
+            .count()
+    }
+
+    #[test]
+    fn generate_attempts_are_owned_through_success_timeout_and_retry() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let request = || LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+
+        let success_dispatches = Arc::new(AtomicU64::new(0));
+        let success_active = Arc::new(AtomicU64::new(0));
+        let before = model_worker_threads();
+        let mut success = test_binding(
+            Arc::new(AttemptProbe {
+                behavior: AttemptBehavior::Success,
+                dispatches: Arc::clone(&success_dispatches),
+                active: Arc::clone(&success_active),
+            }),
+            "success",
+        );
+        success.runtime = ModelRuntimeConfig::default().with_timeout(Duration::from_secs(5));
+        runtime.block_on(async {
+            let _stream = Llm::generate_content(&success, request(), false)
+                .await
+                .expect("success");
+        });
+        let success_leftovers = model_worker_threads().saturating_sub(before);
+
+        let stall_dispatches = Arc::new(AtomicU64::new(0));
+        let stall_active = Arc::new(AtomicU64::new(0));
+        let mut stall = test_binding(
+            Arc::new(AttemptProbe {
+                behavior: AttemptBehavior::Stall,
+                dispatches: Arc::clone(&stall_dispatches),
+                active: Arc::clone(&stall_active),
+            }),
+            "stall",
+        );
+        stall.runtime = ModelRuntimeConfig::default().with_timeout(Duration::from_millis(50));
+        runtime.block_on(expect_profile_timeout(&stall, request()));
+
+        let retry_dispatches = Arc::new(AtomicU64::new(0));
+        let retry_active = Arc::new(AtomicU64::new(0));
+        let mut retry = test_binding(
+            Arc::new(AttemptProbe {
+                behavior: AttemptBehavior::RetryThenStall,
+                dispatches: Arc::clone(&retry_dispatches),
+                active: Arc::clone(&retry_active),
+            }),
+            "retry-stall",
+        );
+        retry.runtime = ModelRuntimeConfig::default().with_timeout(Duration::from_millis(50));
+        runtime.block_on(expect_profile_timeout(&retry, request()));
+        std::thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(
+            (
+                success_dispatches.load(Ordering::Relaxed),
+                success_leftovers,
+                stall_dispatches.load(Ordering::Relaxed),
+                stall_active.load(Ordering::Relaxed),
+                retry_dispatches.load(Ordering::Relaxed),
+                retry_active.load(Ordering::Relaxed),
             ),
-        )
-        .await
-        .map_err(|_| {
-            AdkError::timeout(
-                adk_rust::ErrorComponent::Model,
-                "model.profile.timeout",
-                "model profile timed out",
+            (1, 0, 1, 0, 2, 0),
+            "(success dispatches, success leftovers, stall dispatches, stall leftovers, retry dispatches, retry leftovers)"
+        );
+    }
+
+    struct MultiChunkLlm;
+
+    #[async_trait]
+    impl Llm for MultiChunkLlm {
+        fn name(&self) -> &str {
+            "multi-chunk"
+        }
+
+        async fn generate_content(
+            &self,
+            _request: LlmRequest,
+            _stream: bool,
+        ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+            Ok(Box::pin(stream::iter([
+                Ok(LlmResponse::new(Content::new("assistant").with_text("one"))),
+                Ok(LlmResponse::new(Content::new("assistant").with_text("two"))),
+            ])))
+        }
+    }
+
+    struct TrailingEmptyLlm;
+
+    #[async_trait]
+    impl Llm for TrailingEmptyLlm {
+        fn name(&self) -> &str {
+            "trailing-empty"
+        }
+
+        async fn generate_content(
+            &self,
+            _request: LlmRequest,
+            _stream: bool,
+        ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+            let mut empty = LlmResponse::new(Content::new("assistant"));
+            empty.content = None;
+            Ok(Box::pin(stream::iter([
+                Ok(empty),
+                Ok(LlmResponse::new(Content::new("assistant").with_text(
+                    "{\"status\":\"finished\",\"output\":\"oracle-ok\"}",
+                ))),
+                Ok({
+                    let mut trailing = LlmResponse::new(Content::new("assistant"));
+                    trailing.content = None;
+                    trailing
+                }),
+            ])))
+        }
+    }
+
+    fn test_binding(llm: Arc<dyn Llm>, model: &str) -> ModelBinding {
+        ModelBinding {
+            role: ModelRole::Worker,
+            identity: ModelBindingIdentity {
+                profile: ModelProfileIdentity::new("worker", "1"),
+                requested_model: model.to_owned(),
+                resolved_model: model.to_owned(),
+                provider: "custom".to_owned(),
+            },
+            runtime: ModelRuntimeConfig::default(),
+            llm,
+            fake_queue: None,
+            retries: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn streaming_binding_drops_empty_content_chunks() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let binding = test_binding(Arc::new(TrailingEmptyLlm), "trailing-empty");
+                let request =
+                    LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+                let mut items = Llm::generate_content(&binding, request, true)
+                    .await
+                    .expect("contentful chunks must remain after empty wrappers");
+                let first = items
+                    .next()
+                    .await
+                    .expect("content chunk")
+                    .expect("content chunk ok")
+                    .content
+                    .expect("content")
+                    .parts[0]
+                    .text()
+                    .map(str::to_owned);
+                assert_eq!(
+                    first.as_deref(),
+                    Some("{\"status\":\"finished\",\"output\":\"oracle-ok\"}")
+                );
+                assert!(
+                    items.next().await.is_none(),
+                    "empty leading/trailing chunks must not surface to the agent"
+                );
+            });
+    }
+
+    #[test]
+    fn streaming_binding_preserves_every_response_chunk() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let binding = ModelBinding {
+                    role: ModelRole::Worker,
+                    identity: ModelBindingIdentity {
+                        profile: ModelProfileIdentity::new("worker", "1"),
+                        requested_model: "multi-chunk".to_owned(),
+                        resolved_model: "multi-chunk".to_owned(),
+                        provider: "custom".to_owned(),
+                    },
+                    runtime: ModelRuntimeConfig::default(),
+                    llm: Arc::new(MultiChunkLlm),
+                    fake_queue: None,
+                    retries: Arc::new(AtomicU64::new(0)),
+                };
+                let request =
+                    LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+                let mut items = Llm::generate_content(&binding, request, true)
+                    .await
+                    .expect("streamed binding must succeed");
+                let first = items
+                    .next()
+                    .await
+                    .expect("first chunk")
+                    .expect("first chunk ok")
+                    .content
+                    .expect("first content")
+                    .parts[0]
+                    .text()
+                    .map(str::to_owned);
+                let second = items
+                    .next()
+                    .await
+                    .expect("second chunk")
+                    .expect("second chunk ok")
+                    .content
+                    .expect("second content")
+                    .parts[0]
+                    .text()
+                    .map(str::to_owned);
+                assert_eq!(first.as_deref(), Some("one"));
+                assert_eq!(second.as_deref(), Some("two"));
+                assert!(
+                    items.next().await.is_none(),
+                    "stream must end after both chunks"
+                );
+            });
+    }
+
+    struct FixtureSecrets;
+    impl SecretProvider for FixtureSecrets {
+        fn resolve(&self, _handle: &str) -> Result<SecretValue, CredentialError> {
+            Ok(SecretValue::new("fixture-token"))
+        }
+    }
+
+    #[test]
+    fn streamed_openai_compatible_binding_reads_non_sse_json_completion() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let address = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let bytes = socket.read(&mut buffer).expect("read");
+                request.extend_from_slice(&buffer[..bytes]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("headers")
+                + 4;
+            let content_length = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .map(str::trim)
+                        .map(str::to_owned)
+                })
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let bytes = socket.read(&mut buffer).expect("body");
+                request.extend_from_slice(&buffer[..bytes]);
+            }
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"status\":\"finished\",\"output\":\"oracle-ok\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
             )
-        })?
+            .expect("write");
+        });
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let profile = OpenAiCompatibleProfile::new(
+                    "worker",
+                    "1",
+                    "oracle",
+                    format!("http://{address}/v1"),
+                    CredentialHandle::SecretProvider("fixture-key".to_owned()),
+                )
+                .with_runtime(ModelRuntimeConfig::default().with_timeout(Duration::from_secs(2)));
+                let registry = ModelProfileRegistry::new().with_worker(profile).unwrap();
+                let binding = registry
+                    .bind_worker(
+                        &CredentialBroker::new().with_secret_provider(Arc::new(FixtureSecrets)),
+                    )
+                    .unwrap();
+                let request =
+                    LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+                let mut items = Llm::generate_content(&binding, request, true)
+                    .await
+                    .expect("non-SSE JSON completion must be readable when the agent streams");
+                let text = items
+                    .next()
+                    .await
+                    .expect("completion chunk")
+                    .expect("completion ok")
+                    .content
+                    .expect("content")
+                    .parts[0]
+                    .text()
+                    .map(str::to_owned);
+                assert_eq!(
+                    text.as_deref(),
+                    Some("{\"status\":\"finished\",\"output\":\"oracle-ok\"}")
+                );
+                assert!(items.next().await.is_none(), "single completion");
+            });
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn openai_compatible_partial_body_stall_times_out() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let address = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            while let Ok(bytes) = socket.read(&mut buffer) {
+                if bytes == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..bytes]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let partial = r#"{"choices":[{"message":{"role":"assistant","content":""#;
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2048\r\nconnection: close\r\n\r\n{partial}"
+            );
+            let _ = socket.flush();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let profile = OpenAiCompatibleProfile::new(
+                    "worker",
+                    "1",
+                    "oracle",
+                    format!("http://{address}/v1"),
+                    CredentialHandle::SecretProvider("fixture-key".to_owned()),
+                )
+                .with_runtime(
+                    ModelRuntimeConfig::default().with_timeout(Duration::from_millis(400)),
+                );
+                let registry = ModelProfileRegistry::new().with_worker(profile).unwrap();
+                let binding = registry
+                    .bind_worker(
+                        &CredentialBroker::new().with_secret_provider(Arc::new(FixtureSecrets)),
+                    )
+                    .unwrap();
+                let request =
+                    LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+                let started = Instant::now();
+                let error = expect_profile_timeout(&binding, request).await;
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "elapsed {:?}",
+                    started.elapsed()
+                );
+                assert_eq!(error.category, ErrorCategory::Timeout);
+            });
+        let _ = server.join();
+    }
+
+    #[test]
+    fn openai_compatible_retry_keeps_absolute_deadline() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let address = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    return;
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("read timeout");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                while let Ok(bytes) = socket.read(&mut buffer) {
+                    if bytes == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..bytes]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if attempt == 0 {
+                    std::thread::sleep(Duration::from_millis(600));
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n"
+                    );
+                    continue;
+                }
+                let partial = r#"{"choices":[{"message":{"role":"assistant","content":""#;
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2048\r\nconnection: close\r\n\r\n{partial}"
+                );
+                let _ = socket.flush();
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        });
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let profile = OpenAiCompatibleProfile::new(
+                    "worker",
+                    "1",
+                    "oracle",
+                    format!("http://{address}/v1"),
+                    CredentialHandle::SecretProvider("fixture-key".to_owned()),
+                )
+                .with_runtime(
+                    ModelRuntimeConfig::default().with_timeout(Duration::from_millis(1_000)),
+                );
+                let registry = ModelProfileRegistry::new().with_worker(profile).unwrap();
+                let binding = registry
+                    .bind_worker(
+                        &CredentialBroker::new().with_secret_provider(Arc::new(FixtureSecrets)),
+                    )
+                    .unwrap();
+                let request =
+                    LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+                let started = Instant::now();
+                let error = expect_profile_timeout(&binding, request).await;
+                assert!(
+                    started.elapsed() < Duration::from_millis(1_400),
+                    "elapsed {:?}",
+                    started.elapsed()
+                );
+                assert_eq!(error.category, ErrorCategory::Timeout);
+            });
+        let _ = server.join();
     }
 }

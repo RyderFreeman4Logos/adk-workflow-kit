@@ -18,7 +18,7 @@ use std::{
 
 use adk_rust::graph::prelude::{ExecutionConfig, State};
 use adk_rust::graph::{Checkpoint, Checkpointer, GraphError};
-use adk_rust::{Agent, agent::LlmAgentBuilder, async_trait};
+use adk_rust::{Agent, ErrorCategory, Llm, LlmRequest, agent::LlmAgentBuilder, async_trait};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -50,8 +50,9 @@ use crate::{
     AdkGraphError, AdkGraphTranslator,
     events::{AdkEventMapper, AdkRuntimeObservationKindV1, AdkRuntimeObservationV1},
     model_profiles::{
-        CredentialBroker, CredentialHandle, FakeModelProfile, ModelBinding, ModelProfileRegistry,
-        OpenAiCompatibleProfile, QueuedFakeLlm,
+        CredentialBroker, CredentialHandle, FakeModelProfile, ModelBinding, ModelProfileErrorKind,
+        ModelProfileRegistry, ModelRuntimeConfig, OpenAiCompatibleProfile, QueuedFakeLlm,
+        SamplingConfig,
     },
     tool_bridge::AdkToolBridge,
 };
@@ -67,6 +68,7 @@ const LOOP_LEDGER_FILE: &str = "loop-ledger.json";
 const SKILL_SNAPSHOT_FILE: &str = "sealed-skill-snapshot.json";
 const LOOP_LEDGER_DIGEST_KEY: &str = "kit_loop_ledger_digest_v1";
 static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
+static FAIL_CHECKPOINT_SAVES: AtomicBool = AtomicBool::new(false);
 #[cfg(debug_assertions)]
 static CRASH_BARRIER_HITS: AtomicU64 = AtomicU64::new(0);
 static EFFECT_BARRIER_HITS: AtomicU64 = AtomicU64::new(0);
@@ -1275,6 +1277,7 @@ impl LoopController {
 
     fn fail(&self, kind: ExecutionErrorKind, marker: &'static str) -> adk_rust::AdkError {
         record_terminal(&self.terminal, kind);
+        self.cancellation.store(true, Ordering::Release);
         adk_rust::AdkError::agent(marker)
     }
 
@@ -1349,16 +1352,25 @@ impl LoopController {
                     .as_deref()
                     .filter(|id| !id.is_empty())
                     .ok_or_else(|| adk_rust::AdkError::agent("model call missing ID"))?;
-                if !allowed.contains(name) || !args.is_object() {
-                    return Err(adk_rust::AdkError::agent(
-                        "model call is unselected or schema-invalid",
+                if !allowed.contains(name) {
+                    return Err(
+                        self.fail(ExecutionErrorKind::UnknownTool, "model.call.unknown_tool")
+                    );
+                }
+                if !args.is_object() {
+                    return Err(self.fail(
+                        ExecutionErrorKind::MalformedTool,
+                        "model.call.malformed_tool",
                     ));
                 }
                 let fingerprint = workflow_runtime::argument_fingerprint(args);
                 if !next.seen_ids.insert(id.to_owned())
                     || !next.seen_calls.insert((name.clone(), fingerprint.clone()))
                 {
-                    return Err(adk_rust::AdkError::agent("repeated model tool call"));
+                    return Err(self.fail(
+                        ExecutionErrorKind::NonProgress,
+                        "workflow.loop.non_progress",
+                    ));
                 }
                 next.total_tool_calls = next.total_tool_calls.saturating_add(1);
                 *next.tool_calls.entry(name.clone()).or_default() += 1;
@@ -1412,18 +1424,20 @@ impl LoopController {
         context: &dyn adk_rust::CallbackContext,
         response: &Value,
     ) -> adk_rust::Result<()> {
+        if let Some(outcome) = context.tool_outcome()
+            && outcome.duration >= Duration::from_millis(self.limits.max_tool_time_ms().get())
+        {
+            return Err(self.fail(
+                ExecutionErrorKind::ToolTimeLimit,
+                "workflow.loop.timeout.tool",
+            ));
+        }
         if self.cancellation.load(Ordering::Acquire) {
             return Err(self.fail(ExecutionErrorKind::Cancelled, "workflow.loop.cancelled"));
         }
         let outcome = context
             .tool_outcome()
             .ok_or_else(|| self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"))?;
-        if outcome.duration.as_millis() as u64 >= self.limits.max_tool_time_ms().get() {
-            return Err(self.fail(
-                ExecutionErrorKind::ToolTimeLimit,
-                "workflow.loop.timeout.tool",
-            ));
-        }
         if !outcome.success {
             return Err(self.fail(ExecutionErrorKind::Tool, "tool.bridge.failed"));
         }
@@ -2262,6 +2276,8 @@ enum ModelWire {
         responses: Vec<Value>,
         #[serde(default)]
         response_delay_ms: u64,
+        #[serde(default)]
+        resolved_model: Option<String>,
     },
     OpenaiCompatible {
         name: String,
@@ -2269,6 +2285,8 @@ enum ModelWire {
         model: String,
         base_url: String,
         credential_env: String,
+        #[serde(default)]
+        runtime: Option<ModelRuntimeWire>,
     },
 }
 
@@ -2293,6 +2311,121 @@ impl ModelWire {
             _ => Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState)),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ModelRuntimeWire {
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    sampling: SamplingConfig,
+    #[serde(default)]
+    tool_parser: Option<String>,
+    #[serde(default)]
+    tool_template: Option<String>,
+    #[serde(default)]
+    provider_extensions: BTreeMap<String, Value>,
+}
+
+impl ModelRuntimeWire {
+    fn to_config(&self) -> Result<ModelRuntimeConfig, ExecutionError> {
+        let invalid = || ExecutionError::new(ExecutionErrorKind::InvalidProfile);
+        if self.tool_parser.is_some() || self.tool_template.is_some() {
+            return Err(invalid());
+        }
+        if self.timeout_ms == Some(0) || self.timeout_ms.is_some_and(|ms| ms > 60_000) {
+            return Err(invalid());
+        }
+        let encoded = serde_json::to_vec(&self.provider_extensions).map_err(|_| invalid())?;
+        if self.provider_extensions.len() > 8 || encoded.len() > 4096 {
+            return Err(invalid());
+        }
+        if contains_sensitive_key(&json!(self.provider_extensions)) {
+            return Err(invalid());
+        }
+        let mut runtime = ModelRuntimeConfig::default();
+        if let Some(timeout_ms) = self.timeout_ms {
+            runtime = runtime.with_timeout(Duration::from_millis(timeout_ms));
+        }
+        let sampling = self.sampling.clone();
+        runtime = runtime.with_sampling(|_| sampling);
+        for (namespace, value) in &self.provider_extensions {
+            runtime = runtime.with_provider_extension(namespace.clone(), value.clone());
+        }
+        Ok(runtime)
+    }
+}
+
+fn openai_compatible_profile(
+    name: &str,
+    version: &str,
+    model: &str,
+    base_url: &str,
+    credential_env: &str,
+    runtime: &Option<ModelRuntimeWire>,
+) -> Result<OpenAiCompatibleProfile, ExecutionError> {
+    let profile = OpenAiCompatibleProfile::new(
+        name,
+        version,
+        model,
+        base_url,
+        CredentialHandle::environment(credential_env),
+    );
+    Ok(match runtime {
+        Some(runtime) => profile.with_runtime(runtime.to_config()?),
+        None => profile,
+    })
+}
+
+fn fake_profile_from_wire(
+    name: &str,
+    version: &str,
+    model: &str,
+    responses: &[Value],
+    response_delay_ms: u64,
+    completed_turns: u64,
+    resolved_model: &Option<String>,
+) -> FakeModelProfile {
+    let profile = FakeModelProfile::from_values(
+        name,
+        version,
+        model,
+        responses
+            .iter()
+            .skip(usize::try_from(completed_turns).unwrap_or(usize::MAX))
+            .cloned()
+            .collect(),
+        response_delay_ms,
+    );
+    match resolved_model {
+        Some(resolved) => profile.with_resolved_model(resolved),
+        None => profile,
+    }
+}
+
+fn bound_profile_identity(profile: &ExecutionProfileV1) -> Result<String, ExecutionError> {
+    let worker = profile.bind_model(IrModelRole::Worker, 0)?;
+    let worker = format_bound_identity("worker", &worker);
+    Ok(match profile.reviewer_model {
+        Some(_) => {
+            let reviewer = profile.bind_model(IrModelRole::Reviewer, 0)?;
+            format!("{worker};{}", format_bound_identity("reviewer", &reviewer))
+        }
+        None => worker,
+    })
+}
+
+fn format_bound_identity(role: &str, model: &ModelBinding) -> String {
+    let identity = model.identity();
+    format!(
+        "{role}={}:{};requested={};resolved={};provider={}",
+        identity.profile().name(),
+        identity.profile().version(),
+        identity.requested_model(),
+        identity.resolved_model(),
+        identity.provider(),
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2356,6 +2489,7 @@ impl ExecutionProfileV1 {
                     model,
                     responses,
                     response_delay_ms,
+                    ..
                 } => {
                     if [name, version, model]
                         .into_iter()
@@ -2380,12 +2514,16 @@ impl ExecutionProfileV1 {
                     model,
                     base_url,
                     credential_env,
+                    runtime,
                 } => {
                     if [name, version, model, base_url, credential_env]
                         .into_iter()
                         .any(|value| value.is_empty())
                     {
                         return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+                    }
+                    if let Some(runtime) = runtime {
+                        runtime.to_config()?;
                     }
                 }
             }
@@ -2591,17 +2729,16 @@ impl ExecutionProfileV1 {
                     model,
                     responses,
                     response_delay_ms,
+                    resolved_model,
                 },
-            ) => ModelProfileRegistry::new().with_worker(FakeModelProfile::from_values(
+            ) => ModelProfileRegistry::new().with_worker(fake_profile_from_wire(
                 name,
                 version,
                 model,
-                responses
-                    .iter()
-                    .skip(usize::try_from(completed_turns).unwrap_or(usize::MAX))
-                    .cloned()
-                    .collect(),
+                responses,
                 *response_delay_ms,
+                completed_turns,
+                resolved_model,
             )),
             (
                 IrModelRole::Reviewer,
@@ -2611,17 +2748,16 @@ impl ExecutionProfileV1 {
                     model,
                     responses,
                     response_delay_ms,
+                    resolved_model,
                 },
-            ) => ModelProfileRegistry::new().with_reviewer(FakeModelProfile::from_values(
+            ) => ModelProfileRegistry::new().with_reviewer(fake_profile_from_wire(
                 name,
                 version,
                 model,
-                responses
-                    .iter()
-                    .skip(usize::try_from(completed_turns).unwrap_or(usize::MAX))
-                    .cloned()
-                    .collect(),
+                responses,
                 *response_delay_ms,
+                completed_turns,
+                resolved_model,
             )),
             (
                 IrModelRole::Worker,
@@ -2631,14 +2767,16 @@ impl ExecutionProfileV1 {
                     model,
                     base_url,
                     credential_env,
+                    runtime,
                 },
-            ) => ModelProfileRegistry::new().with_worker(OpenAiCompatibleProfile::new(
+            ) => ModelProfileRegistry::new().with_worker(openai_compatible_profile(
                 name,
                 version,
                 model,
                 base_url,
-                CredentialHandle::environment(credential_env),
-            )),
+                credential_env,
+                runtime,
+            )?),
             (
                 IrModelRole::Reviewer,
                 ModelWire::OpenaiCompatible {
@@ -2647,14 +2785,16 @@ impl ExecutionProfileV1 {
                     model,
                     base_url,
                     credential_env,
+                    runtime,
                 },
-            ) => ModelProfileRegistry::new().with_reviewer(OpenAiCompatibleProfile::new(
+            ) => ModelProfileRegistry::new().with_reviewer(openai_compatible_profile(
                 name,
                 version,
                 model,
                 base_url,
-                CredentialHandle::environment(credential_env),
-            )),
+                credential_env,
+                runtime,
+            )?),
         }
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
         match role {
@@ -2662,7 +2802,14 @@ impl ExecutionProfileV1 {
             IrModelRole::Reviewer => registry.bind_reviewer(&CredentialBroker::new()),
         }
         .map(Arc::new)
-        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Model))
+        .map_err(|error| {
+            ExecutionError::new(match error.kind() {
+                ModelProfileErrorKind::Credential => ExecutionErrorKind::Credential,
+                ModelProfileErrorKind::Timeout => ExecutionErrorKind::Timeout,
+                ModelProfileErrorKind::Provider => ExecutionErrorKind::Unreachable,
+                _ => ExecutionErrorKind::Model,
+            })
+        })
     }
 
     fn transform_module(&self) -> Result<Option<Vec<u8>>, ExecutionError> {
@@ -2771,13 +2918,19 @@ impl ExecutionProfileV1 {
                 &BindingRef::new(binding.id(), binding.version()),
             )
             .map_err(|error| map_registry_error(error, Some(binding)))?;
-        let bound = self.bind_model(role, 0).map_err(|_| {
-            ExecutionError::binding(
-                ExecutionErrorKind::ImplementationBinding,
-                BindingCategory::Model,
-                Some(binding),
-            )
-        })?;
+        let bound = match self.bind_model(role, 0) {
+            Ok(bound) => bound,
+            Err(error) if matches!(error.kind(), ExecutionErrorKind::Credential) => {
+                return Err(error);
+            }
+            Err(_) => {
+                return Err(ExecutionError::binding(
+                    ExecutionErrorKind::ImplementationBinding,
+                    BindingCategory::Model,
+                    Some(binding),
+                ));
+            }
+        };
         Ok(match bound.fake_queue() {
             Some(queue) => {
                 let slot = match role {
@@ -2798,24 +2951,58 @@ impl ExecutionProfileV1 {
                 Arc::new(bound.for_node(node_id, shared))
             }
             None if completed_turns == 0 => bound,
-            None => self.bind_model(role, completed_turns).map_err(|_| {
-                ExecutionError::binding(
-                    ExecutionErrorKind::ImplementationBinding,
-                    BindingCategory::Model,
-                    Some(binding),
-                )
-            })?,
+            None => match self.bind_model(role, completed_turns) {
+                Ok(bound) => bound,
+                Err(error) if matches!(error.kind(), ExecutionErrorKind::Credential) => {
+                    return Err(error);
+                }
+                Err(_) => {
+                    return Err(ExecutionError::binding(
+                        ExecutionErrorKind::ImplementationBinding,
+                        BindingCategory::Model,
+                        Some(binding),
+                    ));
+                }
+            },
         })
     }
 
     fn profile_identity(&self) -> String {
-        let (worker, worker_version) = self.model_binding();
-        match self.reviewer_model.as_ref().map(Self::wire_binding) {
-            Some((reviewer, reviewer_version)) => {
-                format!("worker={worker}:{worker_version};reviewer={reviewer}:{reviewer_version}")
+        let worker = Self::wire_model_identity("worker", &self.model);
+        match &self.reviewer_model {
+            Some(reviewer) => {
+                format!(
+                    "{worker};{}",
+                    Self::wire_model_identity("reviewer", reviewer)
+                )
             }
-            None => format!("worker={worker}:{worker_version}"),
+            None => worker,
         }
+    }
+
+    fn wire_model_identity(role: &str, model: &ModelWire) -> String {
+        let (name, version, requested, provider) = match model {
+            ModelWire::Fake {
+                name,
+                version,
+                model,
+                ..
+            } => (name.as_str(), version.as_str(), model.as_str(), "fake"),
+            ModelWire::OpenaiCompatible {
+                name,
+                version,
+                model,
+                ..
+            } => (
+                name.as_str(),
+                version.as_str(),
+                model.as_str(),
+                "openai-compatible",
+            ),
+        };
+        format!(
+            "{role}={name}:{version};requested={requested};resolved={requested};provider={provider}"
+        )
     }
 
     fn run_limits(&self) -> RunLimits {
@@ -3013,6 +3200,34 @@ impl Agent for RestoredFinishAgent {
     }
 }
 
+struct FencedModel {
+    binding: Arc<ModelBinding>,
+    fence: Arc<EffectFence>,
+}
+
+#[async_trait]
+impl Llm for FencedModel {
+    fn name(&self) -> &str {
+        self.binding.resolved_model_identity()
+    }
+
+    async fn generate_content(
+        &self,
+        request: LlmRequest,
+        stream: bool,
+    ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+        let result = Llm::generate_content(&*self.binding, request, stream).await;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.category == ErrorCategory::Timeout)
+        {
+            record_terminal(&self.fence.terminal, ExecutionErrorKind::Timeout);
+            self.fence.cancellation.store(true, Ordering::Release);
+        }
+        result
+    }
+}
+
 fn build_profile_agent(
     name: &str,
     model: Arc<ModelBinding>,
@@ -3038,6 +3253,10 @@ fn build_profile_agent(
     let tool_controller = Arc::clone(&controller);
     let tool_error_controller = Arc::clone(&controller);
     let tool_timeout = std::time::Duration::from_millis(controller.limits.max_tool_time_ms().get());
+    let model = Arc::new(FencedModel {
+        binding: model,
+        fence: Arc::clone(&effect_fence),
+    });
     let mut builder = LlmAgentBuilder::new(name)
         .description("workflow-kit profile-driven agent")
         .model(model)
@@ -3191,7 +3410,15 @@ pub enum ExecutionErrorKind {
     Compile,
     Workdir,
     Model,
+    Credential,
+    Unreachable,
+    Timeout,
     Tool,
+    MalformedTool,
+    UnknownTool,
+    NonProgress,
+    InvalidOutput,
+    VisitBound,
     Adk,
     AuthorizationDenied,
     ModelIterationsLimit,
@@ -3208,6 +3435,27 @@ pub enum ExecutionErrorKind {
     InvalidRunState,
 }
 
+impl ExecutionErrorKind {
+    /// Bounded causal category persisted by live conformance and CLI diagnostics.
+    pub const fn conformance_category(self) -> &'static str {
+        match self {
+            Self::Credential => "missing_credential",
+            Self::Unreachable => "unreachable",
+            Self::Timeout | Self::WallTimeLimit | Self::IdleTimeLimit | Self::ToolTimeLimit => {
+                "timeout"
+            }
+            Self::SandboxDenied | Self::AuthorizationDenied => "capability_denied",
+            Self::MalformedTool => "malformed_tool",
+            Self::UnknownTool => "unknown_tool",
+            Self::NonProgress => "non_progress",
+            Self::InvalidOutput => "malformed_artifact",
+            Self::VisitBound => "review_exhausted",
+            Self::Persistence => "persistence",
+            _ => "fail_closed",
+        }
+    }
+}
+
 fn execution_error_kind(error: AdkGraphError) -> ExecutionErrorKind {
     match error {
         AdkGraphError::AuthorizationDenied => ExecutionErrorKind::AuthorizationDenied,
@@ -3221,6 +3469,14 @@ fn execution_error_kind(error: AdkGraphError) -> ExecutionErrorKind {
         AdkGraphError::ToolTimeLimit => ExecutionErrorKind::ToolTimeLimit,
         AdkGraphError::Cancelled => ExecutionErrorKind::Cancelled,
         AdkGraphError::ToolFailed => ExecutionErrorKind::Tool,
+        AdkGraphError::Unreachable => ExecutionErrorKind::Unreachable,
+        AdkGraphError::MalformedTool => ExecutionErrorKind::MalformedTool,
+        AdkGraphError::UnknownTool => ExecutionErrorKind::UnknownTool,
+        AdkGraphError::NonProgress => ExecutionErrorKind::NonProgress,
+        AdkGraphError::InvalidOutput { .. } | AdkGraphError::UnknownRoute { .. } => {
+            ExecutionErrorKind::InvalidOutput
+        }
+        AdkGraphError::VisitBound { .. } => ExecutionErrorKind::VisitBound,
         _ => ExecutionErrorKind::Adk,
     }
 }
@@ -3231,7 +3487,8 @@ fn execution_status(kind: ExecutionErrorKind) -> &'static str {
         | ExecutionErrorKind::TotalToolCallsLimit
         | ExecutionErrorKind::ToolCallsPerToolLimit
         | ExecutionErrorKind::ToolOutputBytesLimit => "limit_exceeded",
-        ExecutionErrorKind::WallTimeLimit
+        ExecutionErrorKind::Timeout
+        | ExecutionErrorKind::WallTimeLimit
         | ExecutionErrorKind::IdleTimeLimit
         | ExecutionErrorKind::ToolTimeLimit => "timed_out",
         ExecutionErrorKind::Cancelled => "cancelled",
@@ -3397,6 +3654,11 @@ impl std::error::Error for ExecutionError {}
 pub struct ExecutionBackend;
 
 impl ExecutionBackend {
+    /// Test seam: subsequent `run` checkpoint saves use `failing_saves`.
+    pub fn fail_checkpoint_saves_for_tests() {
+        FAIL_CHECKPOINT_SAVES.store(true, Ordering::Relaxed);
+    }
+
     pub fn run(
         workflow: impl AsRef<Path>,
         profile: ExecutionProfileV1,
@@ -3471,16 +3733,10 @@ impl ExecutionBackend {
                     .map(|model| (node.id().as_str().to_owned(), model))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let profile_identity = bound_profile_identity(&profile)?;
         let effective_capabilities = sandbox_capabilities;
         let transform_module = profile.transform_module()?;
-        let recursion_limit = compiled
-            .ir()
-            .nodes()
-            .iter()
-            .filter_map(workflow_ir::IrNode::max_visits)
-            .map(|visits| visits as usize)
-            .sum::<usize>()
-            .max(50);
+        let recursion_limit = crate::graph_recursion_limit(compiled.ir()).max(50);
         let manager = WorkdirManager::new(workdir_base)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let run_id = fresh_run_id()?;
@@ -3559,10 +3815,12 @@ impl ExecutionBackend {
                 None
             }
         };
-        let mut checkpoint_store = match SqliteCheckpointStore::open(
-            run_root.join("checkpoint.sqlite"),
-            checkpoint_manifest.clone(),
-        ) {
+        let checkpoint_path = run_root.join("checkpoint.sqlite");
+        let mut checkpoint_store = match if FAIL_CHECKPOINT_SAVES.load(Ordering::Relaxed) {
+            SqliteCheckpointStore::failing_saves(&checkpoint_path, checkpoint_manifest.clone())
+        } else {
+            SqliteCheckpointStore::open(&checkpoint_path, checkpoint_manifest.clone())
+        } {
             Ok(store) => Some(store),
             Err(_) => {
                 checkpoint_failed = true;
@@ -3622,7 +3880,7 @@ impl ExecutionBackend {
                     workflow_id: compiled.ir().workflow_id().as_str().to_owned(),
                     workflow_version: compiled.ir().workflow_version().to_owned(),
                     workdir_id: workdir_id.clone(),
-                    profile_identity: profile.profile_identity(),
+                    profile_identity: profile_identity.clone(),
                     adk_rust_version: "2.1.0".to_owned(),
                     status: "running".to_owned(),
                     artifact_id: "unavailable".to_owned(),
@@ -3832,6 +4090,14 @@ impl ExecutionBackend {
             persistence_error.get_or_insert(ExecutionError::new(ExecutionErrorKind::Persistence));
         }
         crash_barrier("before-result");
+        if let Err(error) = record_binding_retries(
+            &mut mapper,
+            resolved_models.values().cloned(),
+            run_id.as_str(),
+            0,
+        ) {
+            persistence_error.get_or_insert(error);
+        }
         if let Err(error) = write_events(&run_root.join("events.jsonl"), mapper.events()) {
             persistence_error.get_or_insert(error);
         }
@@ -3942,7 +4208,7 @@ impl ExecutionBackend {
             workflow_id: compiled.ir().workflow_id().as_str().to_owned(),
             workflow_version: compiled.ir().workflow_version().to_owned(),
             workdir_id,
-            profile_identity: profile.profile_identity(),
+            profile_identity: profile_identity.clone(),
             adk_rust_version: "2.1.0".to_owned(),
             status: status.to_owned(),
             artifact_id,
@@ -4206,6 +4472,7 @@ impl ExecutionBackend {
         }
         restore_tool_events(&loop_ledger, &tool_event_counts, &mut mapper)?;
 
+        let mut retry_models = Vec::new();
         let agents = compiled
             .ir()
             .nodes()
@@ -4215,6 +4482,7 @@ impl ExecutionBackend {
                 let name = node.id().as_str();
                 let completed_turns = loop_ledger.model_iterations(name)?;
                 let model = profile.bind_resolved_model(&resolved_plan, name, completed_turns)?;
+                retry_models.push(Arc::clone(&model));
                 let agent = if let Some(output) = loop_ledger.finish_successor(name)? {
                     Arc::new(RestoredFinishAgent {
                         name: name.to_owned(),
@@ -4261,14 +4529,7 @@ impl ExecutionBackend {
                 Some(continuation.clone()),
             )
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let recursion_limit = compiled
-            .ir()
-            .nodes()
-            .iter()
-            .filter_map(workflow_ir::IrNode::max_visits)
-            .map(|visits| visits as usize)
-            .sum::<usize>()
-            .max(50);
+        let recursion_limit = crate::graph_recursion_limit(compiled.ir()).max(50);
         let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4291,6 +4552,7 @@ impl ExecutionBackend {
         ) {
             Ok(state) => state,
             Err(error) => {
+                let _ = record_binding_retries(&mut mapper, retry_models.clone(), run_id, next);
                 return Err(resume_failure(
                     &root,
                     &events_path,
@@ -4333,6 +4595,7 @@ impl ExecutionBackend {
                 artifact_refs.insert(artifact_id.to_owned());
             }
         }
+        record_binding_retries(&mut mapper, retry_models, run_id, next)?;
         let checkpoint = DurableCheckpointV1::new(
             run_identity.clone(),
             node_id,
@@ -5340,6 +5603,37 @@ fn read_events(
         .collect()
 }
 
+fn record_binding_retries(
+    mapper: &mut AdkEventMapper,
+    models: impl IntoIterator<Item = Arc<ModelBinding>>,
+    run_id: &str,
+    resume_count: u64,
+) -> Result<(), ExecutionError> {
+    let retries = models
+        .into_iter()
+        .map(|model| model.take_retries())
+        .sum::<u64>();
+    record_retry_count(mapper, run_id, resume_count, retries)
+}
+
+fn record_retry_count(
+    mapper: &mut AdkEventMapper,
+    run_id: &str,
+    resume_count: u64,
+    retries: u64,
+) -> Result<(), ExecutionError> {
+    for index in 0..retries {
+        mapper
+            .map(AdkRuntimeObservationV1::new(
+                format!("retry-scheduled-{run_id}-{resume_count}-{index}"),
+                "workflowctl",
+                AdkRuntimeObservationKindV1::RetryScheduled,
+            ))
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+    }
+    Ok(())
+}
+
 fn write_events(
     path: &Path,
     events: &[workflow_runtime::WorkflowRuntimeEventV1],
@@ -5669,5 +5963,40 @@ mod execution_registry_tests {
                 Value::Bool(false)
             );
         }
+    }
+
+    #[test]
+    fn run_retry_then_resume_retry_uses_unique_event_ids() {
+        let mut mapper = AdkEventMapper::new("run-retry", "wf-retry").unwrap();
+        record_retry_count(&mut mapper, "run-retry", 0, 1).unwrap();
+        let prior = mapper.events().to_vec();
+        let mut mapper = AdkEventMapper::resume("run-retry", "wf-retry", prior).unwrap();
+        record_retry_count(&mut mapper, "run-retry", 1, 1)
+            .expect("resume retry must not collide with run retry id");
+        let ids: Vec<_> = mapper
+            .events()
+            .iter()
+            .filter(|event| event.kind() == WorkflowRuntimeEventKindV1::RetryScheduled)
+            .map(|event| event.event_id().to_owned())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "run and resume retry IDs must be unique");
+    }
+
+    #[test]
+    fn resume_retry_survives_second_resume() {
+        let mut mapper = AdkEventMapper::new("run-retry-2", "wf-retry").unwrap();
+        record_retry_count(&mut mapper, "run-retry-2", 1, 1).unwrap();
+        let after_first = mapper.events().to_vec();
+        let first_seq = after_first.last().expect("first retry").sequence();
+        let mut mapper =
+            AdkEventMapper::resume("run-retry-2", "wf-retry", after_first.clone()).unwrap();
+        record_retry_count(&mut mapper, "run-retry-2", 2, 1)
+            .expect("second resume retry must use a unique id");
+        let after_second = mapper.events().to_vec();
+        let second_seq = after_second.last().expect("second retry").sequence();
+        assert!(second_seq > first_seq);
+        AdkEventMapper::resume("run-retry-2", "wf-retry", after_second)
+            .expect("second resume keeps unique retry events");
     }
 }
