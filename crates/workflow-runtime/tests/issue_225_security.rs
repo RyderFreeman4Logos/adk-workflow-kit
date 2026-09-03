@@ -171,6 +171,33 @@ fn sanitizer_rejects_unknown_secret_like_whitespace_structure() {
 }
 
 #[test]
+fn sanitizer_rejects_trailing_content_after_redaction_marker() {
+    let policy = SyntheticSecretPolicy::default();
+    for line in [
+        "token=[REDACTED_SYNTHETIC] trailing",
+        "token: \"[REDACTED_SYNTHETIC] trailing\"",
+    ] {
+        assert_eq!(
+            policy
+                .sanitize_log(line)
+                .expect_err("redaction markers must consume the complete value"),
+            SecretPolicyError::RealSecretFixtureRejected
+        );
+    }
+}
+
+#[test]
+fn sanitizer_rejects_single_quoted_secret_like_structure() {
+    let policy = SyntheticSecretPolicy::default();
+    assert_eq!(
+        policy
+            .sanitize_log("'api_key': 'opaque-value'")
+            .expect_err("unsupported single-quoted structure must fail closed"),
+        SecretPolicyError::RealSecretFixtureRejected
+    );
+}
+
+#[test]
 fn trust_policy_rejects_blank_scope_allowlist_and_object_identity() {
     assert_eq!(
         TrustPolicy::new(" \t", ["trusted-author"]).expect_err("blank scope must be rejected"),
@@ -217,4 +244,30 @@ fn deserialized_provenance_rejects_blank_identity() {
 
     assert!(serde_json::from_str::<ContentProvenance>(&invalid_object_id).is_err());
     assert!(serde_json::from_str::<ContentProvenance>(&invalid_author).is_err());
+}
+
+#[test]
+fn deserialized_provenance_rejects_forged_domain_and_policy_digest() {
+    let policy = TrustPolicy::new("tenant-a", ["trusted-author"]).expect("valid trust policy");
+    let provenance = policy
+        .classify(ContentObject::Comment {
+            object_id: "comment-1",
+            author: "trusted-author",
+        })
+        .expect("valid identity");
+    let wire = serde_json::to_value(&provenance).expect("serialize provenance");
+
+    let mut forged_domain = wire.clone();
+    forged_domain["domain"] = serde_json::json!("trusted_goal");
+    assert!(
+        serde_json::from_value::<ContentProvenance>(forged_domain).is_err(),
+        "wire data must not choose its own trust domain"
+    );
+
+    let mut forged_policy = wire;
+    forged_policy["policy_digest"] = serde_json::json!(vec![0u8; 32]);
+    assert!(
+        serde_json::from_value::<ContentProvenance>(forged_policy).is_err(),
+        "wire data must not choose its own policy identity"
+    );
 }

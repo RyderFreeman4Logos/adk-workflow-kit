@@ -114,31 +114,13 @@ impl ContentProvenance {
 }
 
 impl<'de> Deserialize<'de> for ContentProvenance {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct RawContentProvenance {
-            kind: ContentObjectKind,
-            scope: String,
-            object_id: String,
-            author: String,
-            domain: TrustDomain,
-            policy_digest: [u8; 32],
-        }
-
-        let raw = RawContentProvenance::deserialize(deserializer)?;
-        Self::from_parts(
-            raw.kind,
-            raw.scope,
-            raw.object_id,
-            raw.author,
-            raw.domain,
-            raw.policy_digest,
-        )
-        .map_err(D::Error::custom)
+        Err(D::Error::custom(
+            "content provenance must be reclassified from a TrustPolicy",
+        ))
     }
 }
 
@@ -444,6 +426,9 @@ fn contains_unknown_secret_like_structure(line: &str) -> bool {
                 key_end += 1;
             }
             if is_key_boundary(&lower, start, key_end) {
+                if is_single_quoted_key(&lower, start, key_end) {
+                    return true;
+                }
                 let mut value_start = key_end;
                 if lower.as_bytes().get(value_start) == Some(&b'"') {
                     value_start += 1;
@@ -488,13 +473,31 @@ fn is_key_boundary(line: &str, start: usize, end: usize) -> bool {
             .is_none_or(|byte| !is_key_byte(*byte))
 }
 
+fn is_single_quoted_key(line: &str, start: usize, end: usize) -> bool {
+    line.as_bytes().get(start.wrapping_sub(1)) == Some(&b'\'')
+        || line.as_bytes().get(end) == Some(&b'\'')
+}
+
 fn is_redaction_value(line: &str, value_start: usize) -> bool {
     let value = &line[value_start..];
-    value.starts_with(REDACTION_MARKER)
-        || value
-            .strip_prefix('"')
-            .is_some_and(|value| value.starts_with(REDACTION_MARKER))
-        || value
-            .strip_prefix('\'')
-            .is_some_and(|value| value.starts_with(REDACTION_MARKER))
+    if let Some(suffix) = value.strip_prefix(REDACTION_MARKER) {
+        return is_redaction_suffix(suffix);
+    }
+    let Some(value) = value.strip_prefix('"') else {
+        return false;
+    };
+    let Some(value) = value.strip_prefix(REDACTION_MARKER) else {
+        return false;
+    };
+    let Some(suffix) = value.strip_prefix('"') else {
+        return false;
+    };
+    is_redaction_suffix(suffix)
+}
+
+fn is_redaction_suffix(suffix: &str) -> bool {
+    matches!(
+        suffix.trim_start().as_bytes().first(),
+        None | Some(b',') | Some(b'}') | Some(b']')
+    )
 }
