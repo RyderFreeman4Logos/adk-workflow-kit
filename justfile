@@ -107,6 +107,10 @@ m1-15-test:
 m1-15-translation:
     {{_io}} cargo +1.98.0 test -p workflow-adk --test translation --locked
 
+# Focused #223 ADK-Rust 2.1.0 production-path probe.
+adk-2-1-probe:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test adk_2_1_compat --locked -- --nocapture
+
 # Focused M1-15 production ToolBridge terminal-outcome tests.
 m1-15-adk-tool-bridge:
     {{_io}} cargo +1.98.0 test -p workflow-adk --test tool_bridge --locked
