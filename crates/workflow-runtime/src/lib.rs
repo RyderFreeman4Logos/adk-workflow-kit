@@ -16,6 +16,7 @@ mod policy;
 mod production_profile;
 mod pure_transform;
 mod sandbox_execution;
+mod security;
 mod session;
 mod tool;
 mod workdir;
@@ -79,6 +80,12 @@ pub use pure_transform::{
     PureTransformBackend, PureTransformError, PureTransformRequest, PureTransformRequestError,
 };
 pub use sandbox_execution::{ChildSandbox, RunSandbox, SandboxCommand, SandboxExecutionError};
+pub use security::{
+    CacheKey, ContentObject, ContentObjectKind, ContentProvenance, ExecutorTarget,
+    ProbeBindingError, SECRET_POLICY_VERSION, SECURITY_MODEL_VERSION, SYNTHETIC_HONEYTOKEN_PREFIX,
+    SecretPolicyError, SentinelProbe, SyntheticHoneytoken, SyntheticSecretPolicy, TrustDomain,
+    TrustPolicy,
+};
 pub use session::{
     RunSessionIds, SessionId, SessionIdentityError, SessionIdentityErrorKind, SessionRole,
 };
