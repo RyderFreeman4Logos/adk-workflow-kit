@@ -3251,6 +3251,7 @@ name = "workflow-adk"
 version = "0.2.2"
 dependencies = [
  "adk-rust",
+ "jsonschema 0.45.1",
  "libc",
  "rusqlite",
  "serde",

@@ -2,6 +2,14 @@
 
 pub mod events;
 pub mod execution;
+pub mod model_invocation;
+pub use model_invocation::{
+    EscalationPolicy, InferenceBudget, InferenceBudgetError, InvocationProvenance,
+    MAX_INVOCATION_RETRIES, ModelInvocationError, ModelInvocationErrorKind, ModelInvocationResult,
+    ModelInvocationSpec, ModelRouteIdentity, PROMPT_PROTOCOL_VERSION, PromptProtocol,
+    PromptProtocolError, PromptTool, ProviderRouteIdentity, ReasoningEffort, RenderedPrompt,
+    StructuredOutputContract, StructuredOutputContractError, ToolDefinition, ToolSpec,
+};
 pub mod model_profiles;
 pub mod tool_bridge;
 
