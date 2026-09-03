@@ -88,3 +88,24 @@ bytes, so its validation also performs no network access.
 The example intentionally does not claim model-directed multi-tool behavior,
 Skill execution, code investigation, or live provider conformance. Keep
 credentials and machine-specific paths out of every checked-in fixture.
+
+## Reference package contract
+
+A reference workflow package keeps these roles together:
+
+- `workflow.toml` and `workflow.lock.toml`: the workflow and sealed plan;
+- `input.example.json`: the bounded example input;
+- `profiles/fake.json`: the provider-free scripted profile;
+- `profiles/openai-compatible.template.json`: a credential-free live profile template;
+- `traces/scripted.json`: the checked-in deterministic model/tool trace;
+- `replay.json`: the redacted offline replay bundle; and
+- `run.sh`: the one runner entry point.
+
+Run `bash examples/00-runtime-smoke/run.sh --scripted` for the deterministic,
+network-free path. Run `.../run.sh --replay` to validate only the recorded
+bundle; it does not re-execute a model or tool. Live mode is an explicit opt-in:
+`.../run.sh --live` requires `WORKFLOW_KIT_LIVE_BASE_URL` and
+`WORKFLOW_KIT_LIVE_API_KEY`, rejects a non-HTTP(S) endpoint, and reports the
+missing variable names without retaining credential values. Set
+`WORKFLOW_KIT_LIVE_MODEL` only when the local OpenAI-compatible server needs a
+model name other than `local-model`.
