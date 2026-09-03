@@ -4174,7 +4174,6 @@ impl ExecutionBackend {
             status = "failed";
         }
         let terminal = match bounded_terminal_artifact(
-            run_id.as_str(),
             status,
             execution
                 .as_ref()
@@ -4605,7 +4604,6 @@ impl ExecutionBackend {
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let terminal = bounded_terminal_artifact(
-            run_id,
             "succeeded",
             state.get("terminal"),
             &BTreeMap::<String, ProtectedArtifactReferenceV1>::new(),
@@ -5488,7 +5486,6 @@ fn fresh_run_id() -> Result<RunId, ExecutionError> {
 }
 
 fn bounded_terminal_artifact(
-    run_id: &str,
     status: &str,
     terminal: Option<&Value>,
     node_output_refs: &BTreeMap<String, ProtectedArtifactReferenceV1>,
@@ -5498,7 +5495,6 @@ fn bounded_terminal_artifact(
 ) -> Result<Vec<u8>, ExecutionError> {
     let terminal = terminal.map(redact_json_value).unwrap_or(Value::Null);
     let complete = serde_json::to_vec(&json!({
-        "run_id": run_id,
         "status": status,
         "terminal": &terminal,
         "node_output_refs": node_output_refs,
@@ -5514,7 +5510,6 @@ fn bounded_terminal_artifact(
         "overflowed": references_overflowed,
     });
     let bounded = serde_json::to_vec(&json!({
-        "run_id": run_id,
         "status": status,
         "terminal": &terminal,
         "node_output_refs": {},
@@ -5528,7 +5523,6 @@ fn bounded_terminal_artifact(
     let terminal_bytes = serde_json::to_vec(&terminal)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
     serde_json::to_vec(&json!({
-        "run_id": run_id,
         "status": status,
         "terminal": Value::Null,
         "terminal_digest": format!("sha256:{:x}", Sha256::digest(&terminal_bytes)),

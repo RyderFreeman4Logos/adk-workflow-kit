@@ -429,7 +429,11 @@ fn require_intended_example_files(files: &BTreeMap<PathBuf, Vec<u8>>) -> Result<
         "expected-output.md",
         "input.example.json",
         "profiles/fake.json",
+        "profiles/openai-compatible.template.json",
         "replay.json",
+        "run.sh",
+        "traces/scripted.json",
+        "workflow.lock.toml",
         "workflow.toml",
     ];
     let actual = files

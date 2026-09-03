@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "model": {
+    "provider": "openai-compatible",
+    "name": "m3-00-live",
+    "version": "1",
+    "model": "USER_SUPPLIED_MODEL",
+    "base_url": "http://example.invalid/v1",
+    "credential_env": "WORKFLOW_KIT_LIVE_API_KEY"
+  },
+  "tool": {
+    "name": "echo",
+    "result": {"echo": "runtime smoke"},
+    "input_schema": {"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false},
+    "required_capabilities": [],
+    "required_scopes": []
+  },
+  "sandbox": {"capabilities": []}
+}

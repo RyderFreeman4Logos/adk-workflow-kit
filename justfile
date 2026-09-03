@@ -90,6 +90,10 @@ m3-07-cli test_name="":
 m3-07-live profile="":
     if test "${WORKFLOW_KIT_M3_07_LIVE:-0}" != 1; then echo "M3-07 live conformance: SKIP (set WORKFLOW_KIT_M3_07_LIVE=1 to opt in)"; exit 0; fi; if test -z "{{profile}}"; then echo "M3-07 live conformance: FAIL (missing profile)"; exit 2; fi; {{_io}} cargo +1.98.0 build -p workflowctl --locked; {{_io}} cargo +1.98.0 run -p workflow-testkit --bin m3-07-live --locked -- ./target/debug/workflowctl "{{profile}}"
 
+# Focused #224 reference-workflow package and runner contract tests.
+m3-08-reference:
+    {{_io}} cargo +1.98.0 test -p workflowctl --test m3_08_reference_workflow --locked -- --nocapture
+
 m3-04-unit test_name:
     {{_io}} cargo +1.98.0 test -p workflow-adk {{test_name}} --lib --locked -- --exact --nocapture
 

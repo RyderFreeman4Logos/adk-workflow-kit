@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "workflow_id": "m3-00-runtime-smoke",
+  "workflow_version": "1",
+  "mode": "scripted",
+  "network_access": "forbidden",
+  "model": {
+    "provider": "fake",
+    "name": "m3-00-fake",
+    "version": "1",
+    "response": "{\"status\":\"finished\",\"output\":\"runtime smoke complete\"}"
+  },
+  "tool": {
+    "name": "echo",
+    "result": {"echo": "runtime smoke"}
+  }
+}
