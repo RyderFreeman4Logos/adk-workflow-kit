@@ -84,7 +84,7 @@ pub use security::{
     CacheKey, ContentObject, ContentObjectKind, ContentProvenance, ExecutorTarget,
     ProbeBindingError, SECRET_POLICY_VERSION, SECURITY_MODEL_VERSION, SYNTHETIC_HONEYTOKEN_PREFIX,
     SecretPolicyError, SentinelProbe, SyntheticHoneytoken, SyntheticSecretPolicy, TrustDomain,
-    TrustPolicy,
+    TrustPolicy, TrustPolicyError,
 };
 pub use session::{
     RunSessionIds, SessionId, SessionIdentityError, SessionIdentityErrorKind, SessionRole,

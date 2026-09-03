@@ -5,7 +5,7 @@ use std::{
 };
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use sha2::{Digest, Sha256};
 
 pub const SECURITY_MODEL_VERSION: &str = "security-threat-model-v1";
@@ -33,18 +33,6 @@ impl TrustDomain {
             Self::SyntheticTrap => "trust-domain:synthetic-trap:v1",
         }
     }
-
-    pub fn cache_key(self, content: &[u8]) -> CacheKey {
-        let mut hasher = Sha256::new();
-        hasher.update(SECURITY_MODEL_VERSION.as_bytes());
-        hasher.update([0]);
-        hasher.update(SECRET_POLICY_VERSION.as_bytes());
-        hasher.update([0]);
-        hasher.update(self.cache_salt().as_bytes());
-        hasher.update([0]);
-        hasher.update(content);
-        CacheKey(hasher.finalize().into())
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
@@ -54,17 +42,44 @@ pub enum ContentObjectKind {
     Comment,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct ContentProvenance {
     kind: ContentObjectKind,
+    scope: String,
     object_id: String,
     author: String,
     domain: TrustDomain,
+    policy_digest: [u8; 32],
 }
 
 impl ContentProvenance {
+    fn from_parts(
+        kind: ContentObjectKind,
+        scope: String,
+        object_id: String,
+        author: String,
+        domain: TrustDomain,
+        policy_digest: [u8; 32],
+    ) -> Result<Self, TrustPolicyError> {
+        validate_non_blank(&scope, TrustPolicyError::EmptyScope)?;
+        validate_non_blank(&object_id, TrustPolicyError::EmptyObjectId)?;
+        validate_non_blank(&author, TrustPolicyError::EmptyAuthor)?;
+        Ok(Self {
+            kind,
+            scope,
+            object_id,
+            author,
+            domain,
+            policy_digest,
+        })
+    }
+
     pub fn kind(&self) -> ContentObjectKind {
         self.kind
+    }
+
+    pub fn scope(&self) -> &str {
+        &self.scope
     }
 
     pub fn object_id(&self) -> &str {
@@ -80,7 +95,50 @@ impl ContentProvenance {
     }
 
     pub fn cache_key(&self, content: &[u8]) -> CacheKey {
-        self.domain.cache_key(content)
+        let mut hasher = Sha256::new();
+        update_field(&mut hasher, SECURITY_MODEL_VERSION.as_bytes());
+        update_field(&mut hasher, SECRET_POLICY_VERSION.as_bytes());
+        update_field(&mut hasher, &self.policy_digest);
+        update_field(&mut hasher, self.scope.as_bytes());
+        update_field(&mut hasher, self.kind.cache_tag().as_bytes());
+        update_field(&mut hasher, self.object_id.as_bytes());
+        update_field(&mut hasher, self.author.as_bytes());
+        update_field(&mut hasher, self.domain.cache_salt().as_bytes());
+        update_field(&mut hasher, content);
+        CacheKey(hasher.finalize().into())
+    }
+
+    pub fn policy_digest(&self) -> &[u8; 32] {
+        &self.policy_digest
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentProvenance {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawContentProvenance {
+            kind: ContentObjectKind,
+            scope: String,
+            object_id: String,
+            author: String,
+            domain: TrustDomain,
+            policy_digest: [u8; 32],
+        }
+
+        let raw = RawContentProvenance::deserialize(deserializer)?;
+        Self::from_parts(
+            raw.kind,
+            raw.scope,
+            raw.object_id,
+            raw.author,
+            raw.domain,
+            raw.policy_digest,
+        )
+        .map_err(D::Error::custom)
     }
 }
 
@@ -89,23 +147,62 @@ pub enum ContentObject<'a> {
     Comment { object_id: &'a str, author: &'a str },
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrustPolicyError {
+    EmptyScope,
+    EmptyAllowlistedAuthor,
+    EmptyObjectId,
+    EmptyAuthor,
+}
+
+impl Display for TrustPolicyError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::EmptyScope => "trust scope must not be empty or blank",
+            Self::EmptyAllowlistedAuthor => "allowlisted author must not be empty or blank",
+            Self::EmptyObjectId => "object ID must not be empty or blank",
+            Self::EmptyAuthor => "author must not be empty or blank",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl Error for TrustPolicyError {}
+
+#[derive(Clone, Debug)]
 pub struct TrustPolicy {
+    scope: String,
     allowlisted_authors: BTreeSet<String>,
+    policy_digest: [u8; 32],
 }
 
 impl TrustPolicy {
-    pub fn new<I, S>(allowlisted_authors: I) -> Self
+    pub fn new<I, S, A>(scope: S, allowlisted_authors: I) -> Result<Self, TrustPolicyError>
     where
-        I: IntoIterator<Item = S>,
+        I: IntoIterator<Item = A>,
         S: Into<String>,
+        A: Into<String>,
     {
-        Self {
-            allowlisted_authors: allowlisted_authors.into_iter().map(Into::into).collect(),
+        let scope = scope.into();
+        validate_non_blank(&scope, TrustPolicyError::EmptyScope)?;
+        let mut authors = BTreeSet::new();
+        for author in allowlisted_authors {
+            let author = author.into();
+            validate_non_blank(&author, TrustPolicyError::EmptyAllowlistedAuthor)?;
+            authors.insert(author);
         }
+        let policy_digest = canonical_policy_digest(&authors);
+        Ok(Self {
+            scope,
+            allowlisted_authors: authors,
+            policy_digest,
+        })
     }
 
-    pub fn classify(&self, object: ContentObject<'_>) -> ContentProvenance {
+    pub fn classify(
+        &self,
+        object: ContentObject<'_>,
+    ) -> Result<ContentProvenance, TrustPolicyError> {
         let (kind, object_id, author) = match object {
             ContentObject::IssueBody { object_id, author } => {
                 (ContentObjectKind::IssueBody, object_id, author)
@@ -119,11 +216,46 @@ impl TrustPolicy {
         } else {
             TrustDomain::UntrustedContent
         };
-        ContentProvenance {
+        ContentProvenance::from_parts(
             kind,
-            object_id: object_id.to_owned(),
-            author: author.to_owned(),
+            self.scope.clone(),
+            object_id.to_owned(),
+            author.to_owned(),
             domain,
+            self.policy_digest,
+        )
+    }
+}
+
+fn validate_non_blank(value: &str, error: TrustPolicyError) -> Result<(), TrustPolicyError> {
+    if value.trim().is_empty() {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn canonical_policy_digest(allowlisted_authors: &BTreeSet<String>) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    update_field(&mut hasher, SECURITY_MODEL_VERSION.as_bytes());
+    update_field(&mut hasher, SECRET_POLICY_VERSION.as_bytes());
+    update_field(&mut hasher, b"trust-policy-allowlist-v1");
+    for author in allowlisted_authors {
+        update_field(&mut hasher, author.as_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn update_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+impl ContentObjectKind {
+    fn cache_tag(self) -> &'static str {
+        match self {
+            Self::IssueBody => "issue_body",
+            Self::Comment => "comment",
         }
     }
 }
@@ -183,10 +315,10 @@ pub struct SyntheticHoneytoken {
 
 impl SyntheticHoneytoken {
     pub fn for_scope(scope: &str, nonce: &str) -> Result<Self, SecretPolicyError> {
-        if scope.is_empty() {
+        if scope.trim().is_empty() {
             return Err(SecretPolicyError::EmptyScope);
         }
-        if nonce.is_empty() {
+        if nonce.trim().is_empty() {
             return Err(SecretPolicyError::EmptyNonce);
         }
         let mut hasher = Sha256::new();
@@ -232,7 +364,7 @@ impl Error for SecretPolicyError {}
 
 #[derive(Clone, Debug, Default)]
 pub struct SyntheticSecretPolicy {
-    tokens: BTreeSet<String>,
+    _private: (),
 }
 
 impl SyntheticSecretPolicy {
@@ -241,23 +373,56 @@ impl SyntheticSecretPolicy {
         scope: &str,
         nonce: &str,
     ) -> Result<SyntheticHoneytoken, SecretPolicyError> {
-        let token = SyntheticHoneytoken::for_scope(scope, nonce)?;
-        self.tokens.insert(token.value.clone());
-        Ok(token)
+        SyntheticHoneytoken::for_scope(scope, nonce)
     }
 
     pub fn sanitize_log(&self, line: &str) -> Result<String, SecretPolicyError> {
-        let redacted = self.tokens.iter().fold(line.to_owned(), |line, token| {
-            line.replace(token, "[REDACTED_SYNTHETIC]")
-        });
-        if contains_secret_fixture_pattern(&redacted) {
+        let redacted = redact_synthetic_markers(line);
+        if contains_unknown_secret_like_structure(&redacted) {
             return Err(SecretPolicyError::RealSecretFixtureRejected);
         }
         Ok(redacted)
     }
 }
 
-fn contains_secret_fixture_pattern(line: &str) -> bool {
+const REDACTION_MARKER: &str = "[REDACTED_SYNTHETIC]";
+const SECRET_LIKE_KEYS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "secret",
+    "secret_key",
+    "secret_access_key",
+    "access_token",
+    "auth_token",
+    "private_key",
+    "password",
+    "credential",
+    "credentials",
+    "token",
+];
+
+fn redact_synthetic_markers(line: &str) -> String {
+    let mut redacted = String::with_capacity(line.len());
+    let mut cursor = 0;
+    while let Some(offset) = line[cursor..].find(SYNTHETIC_HONEYTOKEN_PREFIX) {
+        let start = cursor + offset;
+        redacted.push_str(&line[cursor..start]);
+        redacted.push_str(REDACTION_MARKER);
+        cursor = start + SYNTHETIC_HONEYTOKEN_PREFIX.len();
+        while cursor < line.len() {
+            let byte = line.as_bytes()[cursor];
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+                cursor += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    redacted.push_str(&line[cursor..]);
+    redacted
+}
+
+fn contains_unknown_secret_like_structure(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     if ["real-secret-fixture", "fixture-placeholder"]
         .into_iter()
@@ -265,21 +430,71 @@ fn contains_secret_fixture_pattern(line: &str) -> bool {
     {
         return true;
     }
-    [
-        "api_key=",
-        "apikey=",
-        "secret=",
-        "secret_key=",
-        "secret_access_key=",
-        "access_token=",
-        "auth_token=",
-        "private_key=",
-        "password=",
-    ]
-    .into_iter()
-    .any(|pattern| {
-        lower
-            .split_once(pattern)
-            .is_some_and(|(_, value)| !value.starts_with("[redacted_synthetic]"))
+    SECRET_LIKE_KEYS.iter().any(|key| {
+        let mut search_from = 0;
+        while let Some(offset) = lower[search_from..].find(key) {
+            let start = search_from + offset;
+            let end = start + key.len();
+            let mut key_end = end;
+            while lower
+                .as_bytes()
+                .get(key_end)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                key_end += 1;
+            }
+            if is_key_boundary(&lower, start, key_end) {
+                let mut value_start = key_end;
+                if lower.as_bytes().get(value_start) == Some(&b'"') {
+                    value_start += 1;
+                }
+                while lower
+                    .as_bytes()
+                    .get(value_start)
+                    .is_some_and(u8::is_ascii_whitespace)
+                {
+                    value_start += 1;
+                }
+                if lower.as_bytes().get(value_start) == Some(&b'=')
+                    || lower.as_bytes().get(value_start) == Some(&b':')
+                {
+                    value_start += 1;
+                    while lower
+                        .as_bytes()
+                        .get(value_start)
+                        .is_some_and(u8::is_ascii_whitespace)
+                    {
+                        value_start += 1;
+                    }
+                    if !is_redaction_value(line, value_start) {
+                        return true;
+                    }
+                }
+            }
+            search_from = end;
+        }
+        false
     })
+}
+
+fn is_key_boundary(line: &str, start: usize, end: usize) -> bool {
+    let is_key_byte = |byte: u8| byte.is_ascii_alphanumeric();
+    line.as_bytes()
+        .get(start.wrapping_sub(1))
+        .is_none_or(|byte| !is_key_byte(*byte))
+        && line
+            .as_bytes()
+            .get(end)
+            .is_none_or(|byte| !is_key_byte(*byte))
+}
+
+fn is_redaction_value(line: &str, value_start: usize) -> bool {
+    let value = &line[value_start..];
+    value.starts_with(REDACTION_MARKER)
+        || value
+            .strip_prefix('"')
+            .is_some_and(|value| value.starts_with(REDACTION_MARKER))
+        || value
+            .strip_prefix('\'')
+            .is_some_and(|value| value.starts_with(REDACTION_MARKER))
 }
