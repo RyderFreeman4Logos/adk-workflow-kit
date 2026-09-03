@@ -358,14 +358,14 @@ impl ProviderRouteIdentity {
         }
     }
 
-    pub fn from_binding(binding: &ModelBinding, tokenizer: impl Into<String>) -> Self {
+    pub fn from_binding(binding: &ModelBinding) -> Self {
         let identity = binding.identity();
         Self::new(
             identity.profile().clone(),
             identity.provider(),
             identity.requested_model(),
             identity.resolved_model(),
-            tokenizer,
+            identity.tokenizer(),
         )
     }
 
@@ -395,6 +395,7 @@ impl ProviderRouteIdentity {
             && self.provider == identity.provider()
             && self.requested_model == identity.requested_model()
             && self.resolved_model == identity.resolved_model()
+            && self.tokenizer == identity.tokenizer()
     }
 }
 
@@ -484,7 +485,9 @@ pub struct InvocationProvenance {
     tool_schema_hash: String,
     output_schema_hash: String,
     prefix_hash: String,
-    shared_prefix_token_count: usize,
+    shared_prefix_token_count_estimate: usize,
+    max_output_tokens: u32,
+    seed: i64,
     cache_salt: String,
     provider_route: ProviderRouteIdentity,
 }
@@ -518,8 +521,17 @@ impl InvocationProvenance {
         &self.prefix_hash
     }
 
-    pub fn shared_prefix_token_count(&self) -> usize {
-        self.shared_prefix_token_count
+    /// Whitespace-based estimate; this is not a tokenizer-derived count.
+    pub fn shared_prefix_token_count_estimate(&self) -> usize {
+        self.shared_prefix_token_count_estimate
+    }
+
+    pub fn max_output_tokens(&self) -> u32 {
+        self.max_output_tokens
+    }
+
+    pub fn seed(&self) -> i64 {
+        self.seed
     }
 
     pub fn cache_salt(&self) -> &str {
@@ -640,6 +652,19 @@ pub struct ModelInvocationSpec {
     output: StructuredOutputContract,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelInvocationSpecError {
+    OutputSchemaMismatch,
+}
+
+impl fmt::Display for ModelInvocationSpecError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("prompt and decode output schemas must match")
+    }
+}
+
+impl std::error::Error for ModelInvocationSpecError {}
+
 impl ModelInvocationSpec {
     pub fn new(
         protocol: PromptProtocol,
@@ -647,14 +672,17 @@ impl ModelInvocationSpec {
         route: ProviderRouteIdentity,
         budget: InferenceBudget,
         output: StructuredOutputContract,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ModelInvocationSpecError> {
+        if protocol.output_schema() != output.schema() {
+            return Err(ModelInvocationSpecError::OutputSchemaMismatch);
+        }
+        Ok(Self {
             protocol,
             task_suffix: task_suffix.into(),
             route,
             budget,
             output,
-        }
+        })
     }
 
     /// Adds run metadata without allowing it into the prompt or invocation identity.
@@ -686,25 +714,38 @@ impl ModelInvocationSpec {
     pub fn invocation_identity(&self) -> String {
         let prompt = self.prompt();
         let material = [
-            PROMPT_PROTOCOL_VERSION,
-            self.protocol.protocol_hash(),
-            self.protocol.tool_schema_hash(),
-            self.output.schema_hash(),
-            self.route.profile().name(),
-            self.route.profile().version(),
-            self.route.provider(),
-            self.route.requested_model(),
-            self.route.resolved_model(),
-            self.route.tokenizer(),
-            self.protocol.trust_domain().cache_salt(),
-            &digest(prompt.prefix().as_bytes()),
-            &digest(prompt.dynamic_suffix().as_bytes()),
-            &self.budget.reasoning_effort().to_string(),
-            &self.budget.max_output_tokens().to_string(),
-            &self.budget.max_retries().to_string(),
-            &self.budget.escalation().to_string(),
-        ];
-        digest(material.join("\n").as_bytes())
+            frame("PROMPT_PROTOCOL_VERSION", PROMPT_PROTOCOL_VERSION),
+            frame("PROTOCOL_HASH", self.protocol.protocol_hash()),
+            frame("TOOL_SCHEMA_HASH", self.protocol.tool_schema_hash()),
+            frame("OUTPUT_SCHEMA_HASH", self.output.schema_hash()),
+            frame("PROFILE_NAME", self.route.profile().name()),
+            frame("PROFILE_VERSION", self.route.profile().version()),
+            frame("PROVIDER", self.route.provider()),
+            frame("REQUESTED_MODEL", self.route.requested_model()),
+            frame("RESOLVED_MODEL", self.route.resolved_model()),
+            frame("TOKENIZER", self.route.tokenizer()),
+            frame(
+                "TRUST_DOMAIN_CACHE_SALT",
+                self.protocol.trust_domain().cache_salt(),
+            ),
+            frame("PREFIX_HASH", &digest(prompt.prefix().as_bytes())),
+            frame(
+                "DYNAMIC_SUFFIX_HASH",
+                &digest(prompt.dynamic_suffix().as_bytes()),
+            ),
+            frame(
+                "REASONING_EFFORT",
+                &self.budget.reasoning_effort().to_string(),
+            ),
+            frame(
+                "MAX_OUTPUT_TOKENS",
+                &self.budget.max_output_tokens().to_string(),
+            ),
+            frame("MAX_RETRIES", &self.budget.max_retries().to_string()),
+            frame("ESCALATION", &self.budget.escalation().to_string()),
+        ]
+        .join("\n");
+        digest(material.as_bytes())
     }
 
     pub fn deterministic_seed(&self) -> i64 {
@@ -725,7 +766,9 @@ impl ModelInvocationSpec {
             tool_schema_hash: self.protocol.tool_schema_hash().to_owned(),
             output_schema_hash: self.output.schema_hash().to_owned(),
             prefix_hash: digest(prefix.as_bytes()),
-            shared_prefix_token_count: prefix.split_whitespace().count(),
+            shared_prefix_token_count_estimate: prefix.split_whitespace().count(),
+            max_output_tokens: self.budget.max_output_tokens() as u32,
+            seed: self.deterministic_seed(),
             cache_salt: self.protocol.trust_domain().cache_salt().to_owned(),
             provider_route: self.route.clone(),
         }

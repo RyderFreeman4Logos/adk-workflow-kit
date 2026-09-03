@@ -38,6 +38,8 @@ fn spec(
     tokenizer: &str,
     trust_domain: TrustDomain,
 ) -> ModelInvocationSpec {
+    let output =
+        StructuredOutputContract::new(output_schema.clone(), 1024).expect("valid output contract");
     let protocol = PromptProtocol::new(
         policy,
         tools,
@@ -51,8 +53,29 @@ fn spec(
         "inspect this task",
         route(model, tokenizer),
         InferenceBudget::medium(),
-        contract(),
+        output,
     )
+    .expect("matching protocol and output schema")
+}
+
+fn spec_with_route(route: ProviderRouteIdentity) -> ModelInvocationSpec {
+    let output = contract();
+    let protocol = PromptProtocol::new(
+        "stable policy",
+        vec![],
+        output.schema().clone(),
+        json!({"issue": 226}),
+        TrustDomain::TrustedGoal,
+    )
+    .expect("valid prompt protocol");
+    ModelInvocationSpec::new(
+        protocol,
+        "inspect this task",
+        route,
+        InferenceBudget::medium(),
+        output,
+    )
+    .expect("matching protocol and output schema")
 }
 
 #[test]
@@ -167,6 +190,30 @@ fn invocation_identity_binds_policy_tools_schema_route_tokenizer_and_trust_domai
 }
 
 #[test]
+fn invocation_identity_length_frames_newline_containing_route_fields() {
+    let first = spec_with_route(ProviderRouteIdentity::new(
+        ModelProfileIdentity::new("worker", "1"),
+        "p\nq",
+        "r",
+        "resolved-model",
+        "tokenizer",
+    ));
+    let second = spec_with_route(ProviderRouteIdentity::new(
+        ModelProfileIdentity::new("worker", "1"),
+        "p",
+        "q\nr",
+        "resolved-model",
+        "tokenizer",
+    ));
+
+    assert_ne!(
+        first.invocation_identity(),
+        second.invocation_identity(),
+        "route field boundaries must survive embedded newlines"
+    );
+}
+
+#[test]
 fn run_metadata_does_not_enter_prompt_identity_and_budget_is_one_policy() {
     let base = spec(
         "policy-a",
@@ -200,7 +247,8 @@ async fn malformed_structured_output_fail_closes_after_bounded_retries() {
         "1",
         "fake-model",
         ["not json", "still not json", r#"{"answer":"ok"}"#],
-    );
+    )
+    .with_tokenizer("tokenizer-v1");
     let registry = ModelProfileRegistry::new()
         .with_worker(profile)
         .expect("valid fake profile");
@@ -219,10 +267,11 @@ async fn malformed_structured_output_fail_closes_after_bounded_retries() {
     let spec = ModelInvocationSpec::new(
         protocol,
         "task",
-        ProviderRouteIdentity::from_binding(&binding, "tokenizer-v1"),
+        ProviderRouteIdentity::from_binding(&binding),
         budget,
         contract(),
-    );
+    )
+    .expect("matching protocol and output schema");
 
     let error = spec
         .invoke(&binding)
@@ -233,8 +282,117 @@ async fn malformed_structured_output_fail_closes_after_bounded_retries() {
 }
 
 #[tokio::test]
+async fn invocation_route_tokenizer_is_binding_authoritative() {
+    let registry = ModelProfileRegistry::new()
+        .with_worker(
+            FakeModelProfile::new("worker", "1", "fake-model", [r#"{"answer":"ok"}"#])
+                .with_tokenizer("tokenizer-v1"),
+        )
+        .expect("valid fake profile");
+    let binding = registry
+        .bind_worker(&CredentialBroker::new())
+        .expect("fake binding");
+    let canonical = ProviderRouteIdentity::from_binding(&binding);
+    assert_eq!(canonical.tokenizer(), "tokenizer-v1");
+
+    let protocol = PromptProtocol::new(
+        "stable policy",
+        vec![],
+        contract().schema().clone(),
+        json!({"safe": true}),
+        TrustDomain::TrustedGoal,
+    )
+    .unwrap();
+    let result = ModelInvocationSpec::new(
+        protocol,
+        "task",
+        route("fake-model", "caller-supplied-tokenizer"),
+        InferenceBudget::low(),
+        contract(),
+    )
+    .expect("matching protocol and output schema")
+    .invoke(&binding)
+    .await;
+    assert!(result.is_err(), "a forged tokenizer route must be rejected");
+}
+
+#[tokio::test]
+async fn invoke_rejects_a_prompt_and_decode_schema_mismatch() {
+    let protocol = PromptProtocol::new(
+        "stable policy",
+        vec![],
+        json!({"type": "object", "required": ["answer"]}),
+        json!({"safe": true}),
+        TrustDomain::TrustedGoal,
+    )
+    .unwrap();
+    let registry = ModelProfileRegistry::new()
+        .with_worker(FakeModelProfile::new(
+            "worker",
+            "1",
+            "fake-model",
+            [r#"{"answer":"ok"}"#],
+        ))
+        .expect("valid fake profile");
+    let binding = registry
+        .bind_worker(&CredentialBroker::new())
+        .expect("fake binding");
+
+    let result = ModelInvocationSpec::new(
+        protocol,
+        "task",
+        ProviderRouteIdentity::from_binding(&binding),
+        InferenceBudget::low(),
+        StructuredOutputContract::new(json!({"type": "object", "required": ["result"]}), 1024)
+            .unwrap(),
+    );
+
+    assert!(
+        result.is_err(),
+        "construction must reject protocol/decode schema mismatches"
+    );
+}
+
+#[test]
+fn request_identity_and_provenance_share_budget_and_seed() {
+    let budget = InferenceBudget::new(ReasoningEffort::XHigh, 2048, 1).unwrap();
+    let output = contract();
+    let protocol = PromptProtocol::new(
+        "stable policy",
+        vec![],
+        output.schema().clone(),
+        json!({"safe": true}),
+        TrustDomain::TrustedGoal,
+    )
+    .unwrap();
+    let spec = ModelInvocationSpec::new(
+        protocol,
+        "task",
+        route("fake-model", "tokenizer-v1"),
+        budget.clone(),
+        output,
+    )
+    .expect("matching protocol and output schema");
+    let request = spec.to_llm_request();
+    let config = request.config.as_ref().expect("request config");
+    let provenance = spec.provenance();
+
+    assert_eq!(
+        config.max_output_tokens,
+        Some(budget.max_output_tokens() as i32)
+    );
+    assert_eq!(config.seed, Some(spec.deterministic_seed()));
+    assert_eq!(
+        provenance.max_output_tokens() as usize,
+        budget.max_output_tokens()
+    );
+    assert_eq!(provenance.seed(), spec.deterministic_seed());
+}
+
+#[tokio::test]
 async fn valid_structured_output_is_typed_and_provenance_is_cache_complete() {
-    let profile = FakeModelProfile::new("worker", "1", "fake-model", [r#"{"answer":"ok"}"#]);
+    let profile = FakeModelProfile::new("worker", "1", "fake-model", [r#"{"answer":"ok"}"#])
+        .with_tokenizer("tokenizer-v1");
     let registry = ModelProfileRegistry::new()
         .with_worker(profile)
         .expect("valid fake profile");
@@ -252,10 +410,11 @@ async fn valid_structured_output_is_typed_and_provenance_is_cache_complete() {
     let spec = ModelInvocationSpec::new(
         protocol,
         "task",
-        ProviderRouteIdentity::from_binding(&binding, "tokenizer-v1"),
+        ProviderRouteIdentity::from_binding(&binding),
         InferenceBudget::low(),
         contract(),
-    );
+    )
+    .expect("matching protocol and output schema");
 
     let result = spec.invoke(&binding).await.expect("valid output");
     assert_eq!(result.output()["answer"], "ok");
@@ -265,7 +424,7 @@ async fn valid_structured_output_is_typed_and_provenance_is_cache_complete() {
     assert!(!result.provenance().protocol_hash().is_empty());
     assert!(!result.provenance().tool_schema_hash().is_empty());
     assert!(!result.provenance().prefix_hash().is_empty());
-    assert!(result.provenance().shared_prefix_token_count() > 0);
+    assert!(result.provenance().shared_prefix_token_count_estimate() > 0);
     assert_eq!(
         result.provenance().cache_salt(),
         TrustDomain::TrustedGoal.cache_salt()
