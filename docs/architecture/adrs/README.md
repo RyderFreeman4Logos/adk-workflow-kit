@@ -27,5 +27,7 @@ The following decisions accept the proposed initial set in [planning-pack 18](..
 | [ADR-0021](ADR-0021.md) | #49 | Multi-reviewer disagreement defers by default |
 | [ADR-0022](ADR-0022.md) | #74 | Typed subworkflow invocation is deferred |
 | [ADR-0023](ADR-0023.md) | #170 | Isolate ADK-Rust 2.1 graph ownership at the integration boundary |
+| [ADR-0024](ADR-0024.md) | #187 | Do not create a companion recipes repository |
+| [ADR-0025](ADR-0025.md) | #223 | Freeze ADK-Rust 2.1.0 as the production pin |
 
-The [architecture boundary](../BOUNDARY.md) makes the ADK/domain separation explicit. ADR-0014 is accepted without conflict: the existing GOV-002 baseline records the exact `adk-rust =1.0.0` pin, selected features, committed lockfile policy, and MSRV 1.94.0.
+The [architecture boundary](../BOUNDARY.md) makes the ADK/domain separation explicit. ADR-0025 freezes the production pin at `adk-rust =2.1.0`; ADR-0014 still requires exact pins and a committed lockfile.
