@@ -53,15 +53,19 @@ fn write_profile(root: &Path, profile: &Value) -> PathBuf {
     path
 }
 
-fn fake_tools() -> Value {
-    let profile: Value = serde_json::from_slice(
+fn fake_profile() -> Value {
+    serde_json::from_slice(
         &fs::read(example_root().join("profiles/fake.json")).expect("fake profile"),
     )
-    .expect("fake JSON");
-    profile["tools"].clone()
+    .expect("fake JSON")
+}
+
+fn fake_tools() -> Value {
+    fake_profile()["tools"].clone()
 }
 
 fn openai_profile(base_url: &str, extra: Value) -> Value {
+    let fake = fake_profile();
     let mut profile = json!({
         "schema_version": 1,
         "model": {
@@ -80,8 +84,8 @@ fn openai_profile(base_url: &str, extra: Value) -> Value {
             "base_url": base_url,
             "credential_env": HANDLE
         },
-        "tools": fake_tools(),
-        "sandbox": {"capabilities": []}
+        "tools": fake["tools"].clone(),
+        "sandbox": fake["sandbox"].clone()
     });
     if let Some(object) = extra.as_object() {
         for (key, value) in object {
