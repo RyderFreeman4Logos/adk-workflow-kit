@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     fmt, fs,
+    io::{BufRead, BufReader},
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -16,6 +17,9 @@ use crate::{
     ChildSandbox, SandboxCapability, ToolBridgeError, ToolBridgeErrorKind, ToolCallContext,
     ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance, ToolRegistration,
 };
+
+const MAX_SEARCH_MATCHES: usize = 1_024;
+const MAX_LINE_BYTES: usize = 4_096;
 
 /// Exact ID/version lookup for a registered tool implementation.
 #[derive(Clone, Default)]
@@ -128,7 +132,7 @@ impl SearchCodeTool {
     /// Binds the tool to one existing repository root.
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
-            root: root.as_ref().to_path_buf(),
+            root: fs::canonicalize(root.as_ref()).unwrap_or_else(|_| root.as_ref().to_path_buf()),
         }
     }
 
@@ -154,6 +158,7 @@ impl SearchCodeTool {
         })
         .expect("search_code registration")
         .with_required_capabilities([SandboxCapability::FilesystemRead])
+        .with_paging(true)
     }
 }
 
@@ -203,8 +208,34 @@ impl ReadSourceRangeTool {
     /// Binds the tool to one existing repository root.
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
-            root: root.as_ref().to_path_buf(),
+            root: fs::canonicalize(root.as_ref()).unwrap_or_else(|_| root.as_ref().to_path_buf()),
         }
+    }
+
+    /// Returns the kit registration for this implementation.
+    pub fn registration(&self) -> ToolRegistration {
+        ToolRegistration::for_types::<Value, Value>(
+            "read_source_range",
+            ToolProvenance::new("read_source_range", "1"),
+            ToolFlags::new(true, true, true),
+        )
+        .and_then(|registration| {
+            registration.with_input_schema(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1}
+                },
+                "required": ["path", "start_line", "end_line"],
+                "additionalProperties": false,
+                "unevaluatedProperties": false
+            }))
+        })
+        .expect("read_source_range registration")
+        .with_required_capabilities([SandboxCapability::FilesystemRead])
+        .with_paging(true)
     }
 }
 
@@ -227,6 +258,10 @@ impl ToolHandler for ReadSourceRangeTool {
         let path = contained_path(&self.root, &input.path)?;
         let source = fs::read_to_string(&path)
             .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput))?;
+        if source.len() > MAX_SEARCH_MATCHES.saturating_mul(MAX_LINE_BYTES) {
+            // ponytail: 4 MiB file cap; stream-by-range if large files become a product path.
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
+        }
         let lines: Vec<&str> = source.lines().collect();
         if input.start_line == 0
             || input.end_line < input.start_line
@@ -339,7 +374,7 @@ fn search_dir(
         if !file_type.is_file() {
             continue;
         }
-        let Ok(source) = fs::read_to_string(&path) else {
+        let Ok(file) = fs::File::open(&path) else {
             continue;
         };
         let relative = path
@@ -347,13 +382,29 @@ fn search_dir(
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        for (index, line) in source.lines().enumerate() {
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut index = 0_usize;
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            index += 1;
+            if line.len() > MAX_LINE_BYTES {
+                continue;
+            }
             if line.to_ascii_lowercase().contains(query) {
                 matches.push(json!({
                     "path": relative,
-                    "line": index + 1,
-                    "snippet": line,
+                    "line": index,
+                    "snippet": line.trim_end_matches(['\r', '\n']),
                 }));
+                if matches.len() >= MAX_SEARCH_MATCHES {
+                    return Ok(());
+                }
             }
         }
     }

@@ -2934,11 +2934,16 @@ impl ExecutionProfileV1 {
         .and_then(|registration| registration.with_input_schema(tool.input_schema.clone()))
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))
         .map(|registration| {
-            registration
+            let registration = registration
                 .with_required_capabilities(required_capabilities)
                 .with_required_scopes(tool.required_scopes.iter().cloned())
                 .with_timeout(self.run_limits().max_tool_time_ms())
-                .with_implementation_digest(implementation_digest)
+                .with_implementation_digest(implementation_digest);
+            if tool.result.is_none() {
+                registration.with_paging(true)
+            } else {
+                registration
+            }
         })
     }
 

@@ -2,9 +2,10 @@ use std::{fs, num::NonZeroU64, sync::Arc, time::Duration};
 
 use serde_json::{Value, json};
 use workflow_runtime::{
-    CapabilityIntersection, ChildSandbox, InMemoryArtifactStore, RunContext, RunId, RunLimits,
-    RunSandbox, SandboxCapability, SearchCodeTool, ToolBridge, ToolCall, ToolCallContext,
-    ToolEnvelope, ToolHandler, ToolImplementationRegistry, ToolProvenance, WorkdirManager,
+    CapabilityIntersection, ChildSandbox, InMemoryArtifactStore, PageRequest, RunContext, RunId,
+    RunLimits, RunSandbox, SandboxCapability, SearchCodeTool, ToolBridge, ToolCall,
+    ToolCallContext, ToolEnvelope, ToolHandler, ToolImplementationRegistry, ToolProvenance,
+    WorkdirManager,
 };
 
 struct EchoTool;
@@ -174,4 +175,62 @@ fn search_code_returns_argument_dependent_repo_hits() {
         &mut artifacts,
     );
     assert!(denied.is_err() || matches!(denied, Ok(ToolEnvelope::Failure { .. })));
+}
+
+#[test]
+fn search_code_over_inline_ceiling_returns_artifact_page() {
+    let repo = std::env::temp_dir().join(format!(
+        "workflow-runtime-issue-265-page-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(repo.join("src")).expect("repo");
+    let snippet = "needle ".repeat(80);
+    let mut source = String::new();
+    for index in 0..400 {
+        source.push_str(&format!("hit {index} {snippet}\n"));
+    }
+    fs::write(repo.join("src/lib.rs"), source).expect("large search corpus");
+
+    let tool = SearchCodeTool::new(&repo);
+    let mut registry = ToolImplementationRegistry::new();
+    registry
+        .register("search_code", "1", Arc::new(tool.clone()))
+        .expect("register search_code");
+    let mut bridge = ToolBridge::new(sandbox());
+    bridge
+        .register(
+            tool.registration(),
+            registry.resolve("search_code", "1").expect("resolve"),
+        )
+        .expect("bridge register");
+    let mut artifacts = InMemoryArtifactStore::new(
+        NonZeroU64::new(2 * 1024 * 1024).expect("positive"),
+        NonZeroU64::new(4_096).expect("positive"),
+    );
+    let result = bridge
+        .invoke(
+            ToolCall::new(
+                "search_code",
+                "page",
+                "actor",
+                json!({"query": "needle", "path": "src"}),
+            ),
+            &authority(),
+            None,
+            Duration::ZERO,
+            &mut artifacts,
+        )
+        .expect("over-ceiling search must page, not fail");
+    let handle = result
+        .artifact_id()
+        .expect("over-ceiling search must return an artifact handle");
+    assert!(result.next_offset().is_some());
+    let page = bridge
+        .read_artifact_page(
+            &artifacts,
+            handle,
+            PageRequest::new(0, NonZeroU64::new(1_024).expect("positive")),
+        )
+        .expect("paged search artifact must be readable");
+    assert!(!page.bytes().is_empty());
 }
