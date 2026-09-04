@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -22,6 +22,8 @@ const HANDLE: &str = "ADK_WORKFLOW_KIT_M3_07_TEST_KEY";
 const CANARY: &str = "synthetic-m3-07-canary-not-a-secret";
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+// ponytail: one lock serializes loopback fixtures; use per-fixture isolation if M3-07 grows.
+static LIVE_RUN: Mutex<()> = Mutex::new(());
 
 struct TempRoot(PathBuf);
 
@@ -182,6 +184,7 @@ struct ScriptedServer {
     first_response_released: Arc<AtomicBool>,
     bodies: Arc<std::sync::Mutex<Vec<String>>>,
     handle: Option<thread::JoinHandle<()>>,
+    _run_guard: MutexGuard<'static, ()>,
 }
 
 impl ScriptedServer {
@@ -252,6 +255,7 @@ fn serve_provider(
     stall_body: bool,
     rate_limit_delay: Duration,
 ) -> ScriptedServer {
+    let run_guard = LIVE_RUN.lock().expect("live conformance run lock");
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("addr");
@@ -401,6 +405,7 @@ fn serve_provider(
         first_response_released,
         bodies,
         handle: Some(handle),
+        _run_guard: run_guard,
     }
 }
 
