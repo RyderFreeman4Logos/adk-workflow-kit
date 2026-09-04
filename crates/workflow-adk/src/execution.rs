@@ -2438,6 +2438,8 @@ struct ToolWire {
     result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     root: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    custom: bool,
     input_schema: Value,
     #[serde(default)]
     delay_ms: u64,
@@ -2574,7 +2576,7 @@ impl ExecutionProfileV1 {
             .chain(self.tools.iter_mut())
             .collect::<Vec<_>>();
         for tool in tools {
-            if tool.result.is_some() {
+            if tool.result.is_some() || tool.custom {
                 continue;
             }
             let root = resolve_tool_root(workflow, tool.root.as_deref())?;
@@ -2615,8 +2617,11 @@ impl ExecutionProfileV1 {
             let handler = registry
                 .resolve(&tool.name, "1")
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
-            if let Some(root) = implementation_root(&tool.name, handler.as_ref()) {
-                tool.root = Some(root);
+            if let Some(root) = handler.rebuildable_root() {
+                tool.root = Some(root.to_string_lossy().into_owned());
+                tool.custom = false;
+            } else {
+                tool.custom = true;
             }
         }
         Ok(())
@@ -3257,14 +3262,6 @@ fn resolve_tool_root(workflow: &Path, declared: Option<&str>) -> Result<PathBuf,
         .ok()
         .filter(|path| path.is_dir())
         .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))
-}
-
-fn implementation_root(name: &str, handler: &dyn ToolHandler) -> Option<String> {
-    handler
-        .implementation_identity()
-        .strip_prefix(&format!("{name}:1:"))
-        .filter(|root| !root.is_empty())
-        .map(str::to_owned)
 }
 
 struct RestoredFinishAgent {

@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
+    path::PathBuf,
     sync::{Arc, mpsc},
     thread,
     time::Duration,
@@ -125,6 +126,11 @@ pub trait ToolHandler: Send + Sync {
     fn implementation_identity(&self) -> String {
         String::new()
     }
+
+    /// Returns a constructor-owned root only for controlled builtin tools.
+    fn rebuildable_root(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 impl<F> ToolHandler for F
@@ -170,6 +176,10 @@ impl ToolHandler for Arc<dyn ToolHandler> {
 
     fn implementation_identity(&self) -> String {
         (**self).implementation_identity()
+    }
+
+    fn rebuildable_root(&self) -> Option<PathBuf> {
+        (**self).rebuildable_root()
     }
 }
 

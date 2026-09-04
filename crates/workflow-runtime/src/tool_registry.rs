@@ -200,6 +200,10 @@ impl ToolHandler for SearchCodeTool {
     fn implementation_identity(&self) -> String {
         format!("search_code:1:{}", self.root.display())
     }
+
+    fn rebuildable_root(&self) -> Option<PathBuf> {
+        Some(self.root.clone())
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -295,6 +299,10 @@ impl ToolHandler for ReadSourceRangeTool {
 
     fn implementation_identity(&self) -> String {
         format!("read_source_range:1:{}", self.root.display())
+    }
+
+    fn rebuildable_root(&self) -> Option<PathBuf> {
+        Some(self.root.clone())
     }
 }
 

@@ -234,6 +234,67 @@ fn run_with_implementations_resume_keeps_custom_handler() {
     assert_eq!(mismatch.kind(), ExecutionErrorKind::InvalidRunState);
 }
 
+struct PrefixedSearch {
+    root: PathBuf,
+}
+
+impl ToolHandler for PrefixedSearch {
+    fn required_capabilities(
+        &self,
+        _arguments: &Value,
+    ) -> Result<Vec<SandboxCapability>, ToolBridgeError> {
+        Ok(vec![SandboxCapability::FilesystemRead])
+    }
+
+    fn execute(
+        &self,
+        _sandbox: &ChildSandbox<'_>,
+        _context: &ToolCallContext,
+        _arguments: &Value,
+    ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        Ok(ToolEnvelope::success(
+            json!({"matches": [{"path": "prefixed-custom", "line": 1, "snippet": "marker"}]}),
+            ToolProvenance::new("search_code", "1"),
+        ))
+    }
+
+    fn implementation_identity(&self) -> String {
+        format!("search_code:1:{}", self.root.display())
+    }
+}
+
+#[test]
+fn run_with_implementations_resume_rejects_prefixed_custom_handler() {
+    let root = test_root();
+    let repo = repo(&root);
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).expect("workflow fixture");
+
+    let mut registry = ToolImplementationRegistry::new();
+    registry
+        .register("search_code", "1", Arc::new(PrefixedSearch { root: repo }))
+        .expect("register prefixed custom handler");
+
+    let receipt = ExecutionBackend::run_with_implementations(
+        &workflow,
+        profile(),
+        json!({}),
+        &root,
+        &registry,
+    )
+    .expect("prefixed custom handler executes");
+    let events = tool_events(receipt.run_root());
+    assert!(events.contains("prefixed-custom"), "{events}");
+
+    let error = ExecutionBackend::resume(&root, receipt.run_id())
+        .expect_err("ordinary resume must not rebuild SearchCodeTool from a spoofed prefix");
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+
+    let resumed = ExecutionBackend::resume_with_implementations(&root, receipt.run_id(), &registry)
+        .expect("the original custom registry must still resume");
+    assert_eq!(resumed.run_id(), receipt.run_id());
+}
+
 struct EmptyA;
 
 impl ToolHandler for EmptyA {
