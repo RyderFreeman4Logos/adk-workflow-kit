@@ -307,3 +307,77 @@ fn search_code_over_inline_ceiling_returns_artifact_page() {
         .expect("paged search artifact must be readable");
     assert!(!page.bytes().is_empty());
 }
+
+fn search_payload(result: &workflow_runtime::ToolEnvelope<Value>) -> Value {
+    match result {
+        workflow_runtime::ToolEnvelope::Success { payload, .. } => payload.clone(),
+        other => panic!("expected success, got {other:?}"),
+    }
+}
+
+#[test]
+fn search_code_skips_nested_denied_dirs_without_omitted_path() {
+    let repo = std::env::temp_dir().join(format!(
+        "workflow-runtime-issue-265-deny-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(repo.join("src")).expect("src");
+    fs::create_dir_all(repo.join("secrets")).expect("denied dir");
+    fs::create_dir_all(repo.join("src/secrets")).expect("nested denied dir");
+    fs::write(repo.join("src/lib.rs"), "pub fn canary_source() {}\n").expect("source");
+    fs::write(repo.join("secrets/token.txt"), "canary_secret_token\n").expect("denied canary");
+    fs::write(
+        repo.join("src/secrets/nested.txt"),
+        "canary_nested_secret\n",
+    )
+    .expect("nested denied canary");
+
+    let tool = SearchCodeTool::new(&repo);
+    let mut bridge = ToolBridge::new(sandbox());
+    bridge
+        .register(tool.registration(), tool)
+        .expect("bridge register");
+    let mut artifacts = InMemoryArtifactStore::new(
+        NonZeroU64::new(4_096).expect("positive"),
+        NonZeroU64::new(1_024).expect("positive"),
+    );
+
+    let omitted = bridge
+        .invoke(
+            ToolCall::new("search_code", "omit", "actor", json!({"query": "canary"})),
+            &authority(),
+            None,
+            Duration::ZERO,
+            &mut artifacts,
+        )
+        .expect("omitted path must search");
+    let omitted = search_payload(&omitted).to_string();
+    assert!(omitted.contains("lib.rs"), "{omitted}");
+    assert!(
+        !omitted.contains("canary_secret_token")
+            && !omitted.contains("canary_nested_secret")
+            && !omitted.contains("secrets/"),
+        "{omitted}"
+    );
+
+    let ancestor = bridge
+        .invoke(
+            ToolCall::new(
+                "search_code",
+                "ancestor",
+                "actor",
+                json!({"query": "canary", "path": "src"}),
+            ),
+            &authority(),
+            None,
+            Duration::ZERO,
+            &mut artifacts,
+        )
+        .expect("safe ancestor must search");
+    let ancestor = search_payload(&ancestor).to_string();
+    assert!(ancestor.contains("lib.rs"), "{ancestor}");
+    assert!(
+        !ancestor.contains("canary_secret_token") && !ancestor.contains("canary_nested_secret"),
+        "{ancestor}"
+    );
+}

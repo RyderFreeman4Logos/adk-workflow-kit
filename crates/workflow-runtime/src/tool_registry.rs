@@ -308,6 +308,13 @@ fn search_repo(
     Ok(matches)
 }
 
+fn denied_component(part: &str) -> bool {
+    matches!(
+        part,
+        ".git" | ".hg" | ".svn" | ".hermes" | "target" | "node_modules" | "secrets" | ".env"
+    )
+}
+
 fn contained_dir(root: &Path, path: Option<&str>) -> Result<PathBuf, ToolBridgeError> {
     let Some(path) = path else {
         return Ok(root.to_path_buf());
@@ -318,22 +325,9 @@ fn contained_dir(root: &Path, path: Option<&str>) -> Result<PathBuf, ToolBridgeE
 fn contained_path(root: &Path, path: &str) -> Result<PathBuf, ToolBridgeError> {
     if path.is_empty()
         || Path::new(path).is_absolute()
-        || path.split(['/', '\\']).any(|part| {
-            part.is_empty()
-                || part == "."
-                || part == ".."
-                || matches!(
-                    part,
-                    ".git"
-                        | ".hg"
-                        | ".svn"
-                        | ".hermes"
-                        | "target"
-                        | "node_modules"
-                        | "secrets"
-                        | ".env"
-                )
-        })
+        || path
+            .split(['/', '\\'])
+            .any(|part| part.is_empty() || part == "." || part == ".." || denied_component(part))
         || path
             .chars()
             .any(|character| ";&|$><`!{}[]()".contains(character))
@@ -371,6 +365,11 @@ fn search_dir(
             .file_type()
             .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
         let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if denied_component(name.as_ref()) {
+            continue;
+        }
         if file_type.is_symlink() {
             continue;
         }
