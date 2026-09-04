@@ -710,7 +710,7 @@ fn capability_denial_fails_closed() {
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
     let mut tools = fake_tools();
-    tools[0]["required_capabilities"] = json!(["process.spawn"]);
+    tools[0]["required_capabilities"] = json!(["network"]);
     let profile = write_profile(
         &root.0,
         &openai_profile("http://127.0.0.1:1/v1", json!({"tools": tools})),
