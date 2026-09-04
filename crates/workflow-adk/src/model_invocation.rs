@@ -236,6 +236,7 @@ pub enum EscalationPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InferenceBudgetError {
     ZeroOutputTokens,
+    OutputTokensOutOfRange,
     RetryLimitExceeded,
 }
 
@@ -243,6 +244,9 @@ impl fmt::Display for InferenceBudgetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::ZeroOutputTokens => "inference output token budget must be positive",
+            Self::OutputTokensOutOfRange => {
+                "inference output token budget exceeds the shared request/provenance range"
+            }
             Self::RetryLimitExceeded => "inference retries exceed the bounded protocol limit",
         })
     }
@@ -266,6 +270,9 @@ impl InferenceBudget {
     ) -> Result<Self, InferenceBudgetError> {
         if max_output_tokens == 0 {
             return Err(InferenceBudgetError::ZeroOutputTokens);
+        }
+        if max_output_tokens > i32::MAX as usize {
+            return Err(InferenceBudgetError::OutputTokensOutOfRange);
         }
         if max_retries > MAX_INVOCATION_RETRIES {
             return Err(InferenceBudgetError::RetryLimitExceeded);
@@ -304,6 +311,9 @@ impl InferenceBudget {
     ) -> Result<Self, InferenceBudgetError> {
         if max_output_tokens == 0 {
             return Err(InferenceBudgetError::ZeroOutputTokens);
+        }
+        if max_output_tokens > i32::MAX as usize {
+            return Err(InferenceBudgetError::OutputTokensOutOfRange);
         }
         self.max_output_tokens = max_output_tokens;
         Ok(self)
@@ -484,6 +494,7 @@ pub struct InvocationProvenance {
     model_identity: String,
     tool_schema_hash: String,
     output_schema_hash: String,
+    max_output_bytes: usize,
     prefix_hash: String,
     shared_prefix_token_count_estimate: usize,
     max_output_tokens: u32,
@@ -515,6 +526,10 @@ impl InvocationProvenance {
 
     pub fn output_schema_hash(&self) -> &str {
         &self.output_schema_hash
+    }
+
+    pub fn max_output_bytes(&self) -> usize {
+        self.max_output_bytes
     }
 
     pub fn prefix_hash(&self) -> &str {
@@ -718,6 +733,10 @@ impl ModelInvocationSpec {
             frame("PROTOCOL_HASH", self.protocol.protocol_hash()),
             frame("TOOL_SCHEMA_HASH", self.protocol.tool_schema_hash()),
             frame("OUTPUT_SCHEMA_HASH", self.output.schema_hash()),
+            frame(
+                "MAX_OUTPUT_BYTES",
+                &self.output.max_output_bytes().to_string(),
+            ),
             frame("PROFILE_NAME", self.route.profile().name()),
             frame("PROFILE_VERSION", self.route.profile().version()),
             frame("PROVIDER", self.route.provider()),
@@ -765,6 +784,7 @@ impl ModelInvocationSpec {
             model_identity: self.route.resolved_model().to_owned(),
             tool_schema_hash: self.protocol.tool_schema_hash().to_owned(),
             output_schema_hash: self.output.schema_hash().to_owned(),
+            max_output_bytes: self.output.max_output_bytes(),
             prefix_hash: digest(prefix.as_bytes()),
             shared_prefix_token_count_estimate: prefix.split_whitespace().count(),
             max_output_tokens: self.budget.max_output_tokens() as u32,
@@ -813,6 +833,16 @@ impl ModelInvocationSpec {
                 if let Some(content) = response.content {
                     for part in content.parts {
                         if let Part::Text { text } = part {
+                            if output
+                                .len()
+                                .checked_add(text.len())
+                                .is_none_or(|length| length > self.output.max_output_bytes())
+                            {
+                                return Err(ModelInvocationError::structured(
+                                    StructuredOutputError::OutputTooLarge,
+                                    attempts,
+                                ));
+                            }
                             output.push_str(&text);
                         }
                     }

@@ -213,6 +213,62 @@ fn invocation_identity_length_frames_newline_containing_route_fields() {
     );
 }
 
+fn spec_with_output_limit(max_output_bytes: usize) -> ModelInvocationSpec {
+    let output = StructuredOutputContract::new(contract().schema().clone(), max_output_bytes)
+        .expect("valid output contract");
+    let protocol = PromptProtocol::new(
+        "stable policy",
+        vec![],
+        output.schema().clone(),
+        json!({"safe": true}),
+        TrustDomain::TrustedGoal,
+    )
+    .expect("valid prompt protocol");
+    ModelInvocationSpec::new(
+        protocol,
+        "inspect this task",
+        route("fake-model", "tokenizer-v1"),
+        InferenceBudget::medium(),
+        output,
+    )
+    .expect("matching protocol and output schema")
+}
+
+#[test]
+fn output_byte_limit_is_bound_to_identity_and_provenance() {
+    let first = spec_with_output_limit(1024);
+    let second = spec_with_output_limit(2048);
+
+    assert_ne!(
+        first.invocation_identity(),
+        second.invocation_identity(),
+        "different decode byte limits must not share invocation identity"
+    );
+    assert_ne!(
+        first.provenance().invocation_identity(),
+        second.provenance().invocation_identity(),
+        "different decode byte limits must not share provenance identity"
+    );
+    assert_eq!(first.provenance().max_output_bytes(), 1024);
+    assert_eq!(second.provenance().max_output_bytes(), 2048);
+}
+
+#[test]
+fn over_range_output_token_budgets_are_rejected_at_every_constructor() {
+    let too_large = i32::MAX as usize + 1;
+
+    assert!(
+        InferenceBudget::new(ReasoningEffort::Low, too_large, 0).is_err(),
+        "request/provenance cannot represent an over-range token budget"
+    );
+    assert!(
+        InferenceBudget::low()
+            .with_max_output_tokens(too_large)
+            .is_err(),
+        "updated request/provenance cannot represent an over-range token budget"
+    );
+}
+
 #[test]
 fn run_metadata_does_not_enter_prompt_identity_and_budget_is_one_policy() {
     let base = spec(
@@ -238,6 +294,51 @@ fn run_metadata_does_not_enter_prompt_identity_and_budget_is_one_policy() {
     assert_eq!(budget.reasoning_effort(), ReasoningEffort::XHigh);
     assert_eq!(budget.max_retries(), 2);
     assert_eq!(budget.escalation(), EscalationPolicy::CloudThenHitl);
+}
+
+#[tokio::test]
+async fn oversized_stream_chunk_fails_without_retrying() {
+    let profile = FakeModelProfile::new(
+        "worker",
+        "1",
+        "fake-model",
+        [
+            r#"{"answer":"this response is too large"}"#,
+            r#"{"answer":"ok"}"#,
+        ],
+    )
+    .with_tokenizer("tokenizer-v1");
+    let registry = ModelProfileRegistry::new()
+        .with_worker(profile)
+        .expect("valid fake profile");
+    let binding = registry
+        .bind_worker(&CredentialBroker::new())
+        .expect("fake binding");
+    let output = StructuredOutputContract::new(contract().schema().clone(), 32).unwrap();
+    let protocol = PromptProtocol::new(
+        "stable policy",
+        vec![],
+        output.schema().clone(),
+        json!({"safe": true}),
+        TrustDomain::TrustedGoal,
+    )
+    .unwrap();
+    let spec = ModelInvocationSpec::new(
+        protocol,
+        "task",
+        ProviderRouteIdentity::from_binding(&binding),
+        InferenceBudget::medium().with_max_retries(1).unwrap(),
+        output,
+    )
+    .expect("matching protocol and output schema");
+
+    let error = spec
+        .invoke(&binding)
+        .await
+        .expect_err("oversized output must fail before a retry");
+    assert_eq!(error.kind(), ModelInvocationErrorKind::StructuredOutput);
+    assert_eq!(error.attempts(), 1);
+    assert!(error.output_error().is_some());
 }
 
 #[tokio::test]
