@@ -3228,10 +3228,113 @@ impl Llm for FencedModel {
     }
 }
 
+#[derive(Clone)]
+struct RuntimeAgentContract {
+    instruction_path: String,
+    instruction: String,
+    schema_path: String,
+    schema_bytes: Vec<u8>,
+    output_schema: Value,
+}
+
+fn resolve_agent_contracts(
+    workflow: &Path,
+    ir: &workflow_ir::WorkflowIr,
+) -> Result<BTreeMap<String, RuntimeAgentContract>, ()> {
+    if ir
+        .nodes()
+        .iter()
+        .all(|node| node.agent_contract().is_none())
+    {
+        return Ok(BTreeMap::new());
+    }
+    let root = workflow
+        .parent()
+        .ok_or(())?
+        .canonicalize()
+        .map_err(|_| ())?;
+    ir.nodes()
+        .iter()
+        .filter_map(|node| node.agent_contract().map(|contract| (node, contract)))
+        .map(|(node, contract)| {
+            let resource = |path: &str| {
+                let relative = Path::new(path);
+                if relative.is_absolute()
+                    || relative.components().any(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::ParentDir
+                                | std::path::Component::RootDir
+                                | std::path::Component::Prefix(_)
+                        )
+                    })
+                {
+                    return Err(());
+                }
+                let path = root.join(relative).canonicalize().map_err(|_| ())?;
+                path.starts_with(&root).then_some(path).ok_or(())
+            };
+            let instruction_path = contract.instruction().path().to_owned();
+            let instruction = fs::read(resource(&instruction_path)?).map_err(|_| ())?;
+            if instruction.len() > MAX_STATE_BYTES
+                || format!("sha256:{:x}", Sha256::digest(&instruction))
+                    != contract.instruction().sha256()
+            {
+                return Err(());
+            }
+            let instruction = String::from_utf8(instruction).map_err(|_| ())?;
+            let schema_path = contract.output().schema().to_owned();
+            let schema_bytes = fs::read(resource(&schema_path)?).map_err(|_| ())?;
+            let output_schema = serde_json::from_slice(&schema_bytes).map_err(|_| ())?;
+            jsonschema::validator_for(&output_schema).map_err(|_| ())?;
+            Ok((
+                node.id().as_str().to_owned(),
+                RuntimeAgentContract {
+                    instruction_path,
+                    instruction,
+                    schema_path,
+                    schema_bytes,
+                    output_schema,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn agent_output_schema(contract: Option<&RuntimeAgentContract>) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": {"const": "finished"},
+            "output": contract.map_or_else(|| json!({}), |contract| contract.output_schema.clone())
+        },
+        "required": ["status", "output"],
+        "additionalProperties": false
+    })
+}
+
+fn persist_agent_contracts(
+    root: &Path,
+    contracts: &BTreeMap<String, RuntimeAgentContract>,
+) -> Result<(), ()> {
+    for contract in contracts.values() {
+        for (path, bytes) in [
+            (&contract.instruction_path, contract.instruction.as_bytes()),
+            (&contract.schema_path, contract.schema_bytes.as_slice()),
+        ] {
+            let destination = root.join(path);
+            fs::create_dir_all(destination.parent().ok_or(())?).map_err(|_| ())?;
+            write_atomic(&destination, bytes).map_err(|_| ())?;
+        }
+    }
+    Ok(())
+}
+
 fn build_profile_agent(
     name: &str,
     model: Arc<ModelBinding>,
     tool: Option<BoundTool>,
+    contract: Option<&RuntimeAgentContract>,
     limits: RunLimits,
     ledger: Arc<LoopLedgerStore>,
     effect_fence: Arc<EffectFence>,
@@ -3241,6 +3344,7 @@ fn build_profile_agent(
         None => (Vec::new(), None),
     };
     let allowed = Arc::new(names.into_iter().collect::<BTreeSet<_>>());
+    let output_schema = contract.map(|contract| contract.output_schema.clone());
     let controller = Arc::new(LoopController::new(
         name,
         limits,
@@ -3260,15 +3364,7 @@ fn build_profile_agent(
     let mut builder = LlmAgentBuilder::new(name)
         .description("workflow-kit profile-driven agent")
         .model(model)
-        .output_schema(json!({
-            "type": "object",
-            "properties": {
-                "status": {"const": "finished"},
-                "output": {}
-            },
-            "required": ["status", "output"],
-            "additionalProperties": false
-        }))
+        .output_schema(agent_output_schema(contract))
         .output_max_retries(0)
         .max_iterations(
             u32::try_from(controller.limits.max_model_turns().get())
@@ -3287,7 +3383,30 @@ fn build_profile_agent(
         .after_model_callback(Box::new(move |_context, response| {
             let allowed = Arc::clone(&allowed);
             let controller = Arc::clone(&controller);
+            let output_schema = output_schema.clone();
             Box::pin(async move {
+                if let Some(schema) = output_schema
+                    && let Some(content) = response.content.as_ref()
+                    && let Some(output) = admitted_finish(content).map_err(|_| {
+                        controller.fail(
+                            ExecutionErrorKind::InvalidOutput,
+                            "workflow.node.invalid_output",
+                        )
+                    })?
+                    && !jsonschema::validator_for(&schema)
+                        .map_err(|_| {
+                            controller.fail(
+                                ExecutionErrorKind::InvalidOutput,
+                                "workflow.node.invalid_output",
+                            )
+                        })?
+                        .is_valid(&output)
+                {
+                    return Err(controller.fail(
+                        ExecutionErrorKind::InvalidOutput,
+                        "workflow.node.invalid_output",
+                    ));
+                }
                 controller.observe_model(&response, &allowed)?;
                 Ok(None)
             })
@@ -3324,6 +3443,9 @@ fn build_profile_agent(
                 Err(controller.fail(kind, code))
             })
         }));
+    if let Some(contract) = contract {
+        builder = builder.instruction(contract.instruction.clone());
+    }
     if let Some(toolset) = toolset {
         builder = builder.toolset(toolset);
     }
@@ -3691,6 +3813,8 @@ impl ExecutionBackend {
         }
         let compiled = compile_file(workflow.as_ref().to_string_lossy().as_ref())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Compile))?;
+        let agent_contracts = resolve_agent_contracts(workflow.as_ref(), compiled.ir())
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
         let skill_snapshot = SealedSkillSnapshotV1::from_packages(
             profile.planned_skill_packages(compiled.ir())?,
             &profile.model,
@@ -3767,6 +3891,7 @@ impl ExecutionBackend {
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let run_root = run_workdir.root().to_path_buf();
         let workdir_id = run_workdir.id().as_str().to_owned();
+        let contracts_persisted = persist_agent_contracts(&run_root, &agent_contracts).is_ok();
         let workflow_source = fs::read(workflow.as_ref())
             .ok()
             .filter(|bytes| !bytes.is_empty() && bytes.len() <= MAX_STATE_BYTES);
@@ -3779,9 +3904,10 @@ impl ExecutionBackend {
         .ok();
         let mut persistence_error = None;
         let mut checkpoint_failed = false;
-        if workflow_source
-            .as_deref()
-            .is_none_or(|source| write_atomic(&run_root.join("workflow.toml"), source).is_err())
+        if !contracts_persisted
+            || workflow_source
+                .as_deref()
+                .is_none_or(|source| write_atomic(&run_root.join("workflow.toml"), source).is_err())
             || skill_snapshot_bytes.as_ref().is_some_and(|snapshot| {
                 write_atomic(&run_root.join(SKILL_SNAPSHOT_FILE), snapshot).is_err()
             })
@@ -3949,6 +4075,7 @@ impl ExecutionBackend {
                                 resolved_plan.node_skills(node.id().as_str()),
                                 &effective_capabilities,
                             )?,
+                            agent_contracts.get(node.id().as_str()),
                             profile.run_limits(),
                             Arc::clone(&loop_ledger),
                             Arc::clone(&effect_fence),
@@ -4316,6 +4443,8 @@ impl ExecutionBackend {
         let workflow = root.join("workflow.toml");
         let compiled = compile_file(workflow.to_string_lossy().as_ref())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let agent_contracts = resolve_agent_contracts(&workflow, compiled.ir())
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         if compiled.ir().workflow_id().as_str() != manifest.workflow_id
             || compiled.ir().workflow_version() != manifest.workflow_version
         {
@@ -4492,6 +4621,7 @@ impl ExecutionBackend {
                         name,
                         model,
                         toolsets.get(name).cloned().flatten(),
+                        agent_contracts.get(name),
                         profile.run_limits(),
                         Arc::clone(&loop_ledger),
                         Arc::clone(&effect_fence),
@@ -5992,5 +6122,36 @@ mod execution_registry_tests {
         assert!(second_seq > first_seq);
         AdkEventMapper::resume("run-retry-2", "wf-retry", after_second)
             .expect("second resume keeps unique retry events");
+    }
+
+    #[test]
+    fn uncontracted_nodes_do_not_require_a_resource_root() {
+        let plan = workflow_compiler::compile_str(
+            "workflow.toml",
+            r#"
+                schema_version = 1
+                [workflow]
+                id = "uncontracted"
+                version = "1"
+                entry = "worker"
+                [[nodes]]
+                id = "worker"
+                kind = "agent"
+                model = { role = "worker", id = "worker", version = "1" }
+                [[nodes]]
+                id = "done"
+                kind = "terminal"
+                [[edges]]
+                from = "worker"
+                to = "done"
+            "#,
+        )
+        .expect("uncontracted workflow compiles");
+
+        assert!(
+            resolve_agent_contracts(Path::new("workflow.toml"), plan.ir())
+                .expect("uncontracted workflow needs no resource root")
+                .is_empty()
+        );
     }
 }

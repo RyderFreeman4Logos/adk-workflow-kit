@@ -18,7 +18,8 @@ clippy:
 
 test:
     {{_io}} cargo +1.98.0 build -p workflowctl --locked
-    {{_io}} cargo +1.98.0 test --workspace --locked
+    {{_io}} cargo +1.98.0 test --workspace --exclude workflow-adk --locked
+    {{_io}} cargo +1.98.0 test -p workflow-adk --locked -- --test-threads=1
     ./target/debug/workflowctl test crates/workflowctl/tests/fixtures/cli004-test.json
     ./target/debug/workflowctl eval crates/workflowctl/tests/fixtures/cli004-eval.json
     ./target/debug/workflowctl replay crates/workflowctl/tests/fixtures/cli004-replay.json

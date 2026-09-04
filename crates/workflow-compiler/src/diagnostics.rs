@@ -453,6 +453,11 @@ impl TryFrom<&StateValidationError> for Diagnostic {
                 "invalid state handle shape",
                 DiagnosticDetails::Empty {},
             ),
+            StateValidationError::UndeclaredAgentStateKey { .. } => (
+                "workflow.state.undeclared_agent_key",
+                "agent node references undeclared state",
+                DiagnosticDetails::Empty {},
+            ),
         };
 
         Ok(Self {
