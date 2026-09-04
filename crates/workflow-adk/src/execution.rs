@@ -35,12 +35,12 @@ use workflow_runtime::{
     CheckpointManifestV1, DurableCheckpointV1, EffectCommit, EffectJournal, EffectKey,
     FilesystemArtifactStore, InMemoryArtifactStore, Materialization, PageRequest,
     PolicyCapabilities, ProtectedArtifactReferenceV1, PureTransformRequest, ReadSkillResourceInput,
-    RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox, RunSkillScriptInput,
-    SandboxCapability, SqliteCheckpointStore, ToolBridge, ToolBridgeError, ToolBridgeErrorKind,
-    ToolCall, ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler, ToolImplementationRegistry,
-    ToolProvenance, ToolRegistration, WorkdirManager, WorkflowRuntimeEventKindV1,
-    contains_sensitive_key, intersect_policy_capabilities, redact_json_value, selection_identity,
-    verify_sandbox_capabilities,
+    ReadSourceRangeTool, RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox,
+    RunSkillScriptInput, SandboxCapability, SearchCodeTool, SqliteCheckpointStore, ToolBridge,
+    ToolBridgeError, ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolEnvelope, ToolFlags,
+    ToolHandler, ToolImplementationRegistry, ToolProvenance, ToolRegistration, WorkdirManager,
+    WorkflowRuntimeEventKindV1, contains_sensitive_key, intersect_policy_capabilities,
+    redact_json_value, selection_identity, verify_sandbox_capabilities,
 };
 use workflow_spec::{
     RESERVED_SKILL_TOOL_NAMES, SourcePath, is_reserved_skill_tool_name, read_bounded_regular_file,
@@ -2436,6 +2436,8 @@ struct ToolWire {
     name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root: Option<String>,
     input_schema: Value,
     #[serde(default)]
     delay_ms: u64,
@@ -2557,6 +2559,43 @@ impl ExecutionProfileV1 {
         }
         profile.capabilities()?;
         Ok(profile)
+    }
+
+    fn bind_declared_implementations(&mut self, workflow: &Path) -> Result<(), ExecutionError> {
+        if self.tool_implementations.is_some() {
+            return Ok(());
+        }
+        let mut registry = ToolImplementationRegistry::new();
+        let mut bound = false;
+        let tools = self
+            .tool
+            .iter_mut()
+            .chain(self.tools.iter_mut())
+            .collect::<Vec<_>>();
+        for tool in tools {
+            if tool.result.is_some() {
+                continue;
+            }
+            let root = resolve_tool_root(workflow, tool.root.as_deref())?;
+            tool.root = Some(root.to_string_lossy().into_owned());
+            let handler: Arc<dyn ToolHandler> = match tool.name.as_str() {
+                "search_code" => Arc::new(SearchCodeTool::new(&root)),
+                "read_source_range" => Arc::new(ReadSourceRangeTool::new(&root)),
+                _ => {
+                    return Err(ExecutionError::new(
+                        ExecutionErrorKind::ImplementationBinding,
+                    ));
+                }
+            };
+            registry
+                .register(&tool.name, "1", handler)
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+            bound = true;
+        }
+        if bound {
+            self.tool_implementations = Some(Arc::new(registry));
+        }
+        Ok(())
     }
 
     fn durable_fake_responses(responses: &Value) -> Value {
@@ -3168,6 +3207,27 @@ fn parse_capability(value: &str) -> Result<SandboxCapability, ExecutionError> {
         "device.access" => Ok(SandboxCapability::DeviceAccess),
         _ => Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile)),
     }
+}
+
+fn resolve_tool_root(workflow: &Path, declared: Option<&str>) -> Result<PathBuf, ExecutionError> {
+    let parent = workflow
+        .parent()
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    let candidate = match declared {
+        Some(root) if !root.is_empty() => {
+            let path = PathBuf::from(root);
+            if path.is_absolute() {
+                path
+            } else {
+                parent.join(path)
+            }
+        }
+        _ => parent.join("repo"),
+    };
+    fs::canonicalize(&candidate)
+        .ok()
+        .filter(|path| path.is_dir())
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))
 }
 
 struct RestoredFinishAgent {
@@ -3860,6 +3920,7 @@ impl ExecutionBackend {
             }
         };
         skill_snapshot_test_barrier();
+        profile.bind_declared_implementations(workflow.as_ref())?;
         let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
         let requested = RequestedCapabilities::new(required_capabilities.iter().copied());
         verify_sandbox_capabilities(
@@ -4464,6 +4525,7 @@ impl ExecutionBackend {
             serde_json::from_slice::<Value>(&bounded_read(&root.join("execution-input.json"))?)
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let workflow = root.join("workflow.toml");
+        profile.bind_declared_implementations(&workflow)?;
         let compiled = compile_file(workflow.to_string_lossy().as_ref())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let agent_contracts = resolve_agent_contracts(&workflow, compiled.ir())

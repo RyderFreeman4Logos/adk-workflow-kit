@@ -185,6 +185,72 @@ impl ToolHandler for SearchCodeTool {
     }
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadSourceRangeInput {
+    path: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+/// Bounded source-range reader over a caller-supplied repository root.
+#[derive(Clone, Debug)]
+pub struct ReadSourceRangeTool {
+    root: PathBuf,
+}
+
+impl ReadSourceRangeTool {
+    /// Binds the tool to one existing repository root.
+    pub fn new(root: impl AsRef<Path>) -> Self {
+        Self {
+            root: root.as_ref().to_path_buf(),
+        }
+    }
+}
+
+impl ToolHandler for ReadSourceRangeTool {
+    fn required_capabilities(
+        &self,
+        _arguments: &Value,
+    ) -> Result<Vec<SandboxCapability>, ToolBridgeError> {
+        Ok(vec![SandboxCapability::FilesystemRead])
+    }
+
+    fn execute(
+        &self,
+        _sandbox: &ChildSandbox<'_>,
+        _context: &ToolCallContext,
+        arguments: &Value,
+    ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        let input = serde_json::from_value::<ReadSourceRangeInput>(arguments.clone())
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput))?;
+        let path = contained_path(&self.root, &input.path)?;
+        let source = fs::read_to_string(&path)
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput))?;
+        let lines: Vec<&str> = source.lines().collect();
+        if input.start_line == 0
+            || input.end_line < input.start_line
+            || input.end_line > lines.len()
+        {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
+        }
+        let snippet = lines[(input.start_line - 1)..input.end_line].join("\n");
+        Ok(ToolEnvelope::success(
+            json!({
+                "path": input.path,
+                "start_line": input.start_line,
+                "end_line": input.end_line,
+                "snippet": snippet,
+            }),
+            ToolProvenance::new("read_source_range", "1"),
+        ))
+    }
+
+    fn implementation_identity(&self) -> String {
+        format!("read_source_range:1:{}", self.root.display())
+    }
+}
+
 fn search_repo(
     root: &Path,
     query: &str,

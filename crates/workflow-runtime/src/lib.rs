@@ -96,7 +96,8 @@ pub use tool::{
     ToolRegistrationError, decode_structured_tool_output,
 };
 pub use tool_registry::{
-    SearchCodeTool, ToolImplementationRegistry, ToolImplementationRegistryError,
+    ReadSourceRangeTool, SearchCodeTool, ToolImplementationRegistry,
+    ToolImplementationRegistryError,
 };
 pub use workdir::{
     CleanupOutcome, Materialization, RunWorkdir, WorkdirError, WorkdirErrorKind, WorkdirId,
