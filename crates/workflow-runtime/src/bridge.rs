@@ -127,6 +127,11 @@ pub trait ToolHandler: Send + Sync {
         String::new()
     }
 
+    /// Returns explicit safety, concurrency, approval, and idempotency metadata owned by this implementation.
+    fn registration(&self) -> Option<ToolRegistration> {
+        None
+    }
+
     /// Returns a constructor-owned root only for controlled builtin tools.
     fn rebuildable_root(&self) -> Option<PathBuf> {
         None
@@ -176,6 +181,10 @@ impl ToolHandler for Arc<dyn ToolHandler> {
 
     fn implementation_identity(&self) -> String {
         (**self).implementation_identity()
+    }
+
+    fn registration(&self) -> Option<ToolRegistration> {
+        (**self).registration()
     }
 
     fn rebuildable_root(&self) -> Option<PathBuf> {

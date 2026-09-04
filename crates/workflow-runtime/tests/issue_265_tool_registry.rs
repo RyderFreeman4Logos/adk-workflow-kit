@@ -101,12 +101,13 @@ fn authority() -> CapabilityIntersection {
 #[test]
 fn register_resolves_exact_id_and_version() {
     let mut registry = ToolImplementationRegistry::new();
+    let repo = repo();
     registry
-        .register("echo", "1", Arc::new(EchoTool))
+        .register("search_code", "1", Arc::new(SearchCodeTool::new(&repo)))
         .expect("register");
-    assert!(registry.resolve("echo", "1").is_ok());
-    assert!(registry.resolve("echo", "2").is_err());
-    assert!(registry.resolve("search_code", "1").is_err());
+    assert!(registry.resolve("search_code", "1").is_ok());
+    assert!(registry.resolve("search_code", "2").is_err());
+    assert!(registry.resolve("echo", "1").is_err());
 }
 
 #[test]
@@ -598,7 +599,7 @@ fn search_code_stops_miss_heavy_traversal_within_budget() {
         for file in 0..40 {
             fs::write(
                 nested.join(format!("f{file}.rs")),
-                "pub fn miss() {}\n".repeat(80),
+                "pub fn miss() {}\\n".repeat(80),
             )
             .expect("miss file");
         }
@@ -607,5 +608,60 @@ fn search_code_stops_miss_heavy_traversal_within_budget() {
     assert!(
         result.is_err() || matches!(result, Ok(workflow_runtime::ToolEnvelope::Failure { .. })),
         "miss-heavy walk must fail closed instead of unbounded scanning, got {result:?}"
+    );
+}
+
+#[test]
+fn registry_rejects_unannotated_implementation_metadata() {
+    let mut registry = ToolImplementationRegistry::new();
+    assert!(
+        registry.register("echo", "1", Arc::new(EchoTool)).is_err(),
+        "implementations without explicit safety/idempotency metadata must fail closed"
+    );
+}
+
+#[test]
+fn search_code_rejects_overlong_line_when_skip_exhausts_byte_budget() {
+    let repo = std::env::temp_dir().join(format!(
+        "workflow-runtime-issue-265-overlong-budget-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&repo).expect("repo");
+    let mut source = vec![b'x'; 1_100_000];
+    source.extend_from_slice(b"\nneedle-after-overlong-line\n");
+    fs::write(repo.join("source.rs"), source).expect("overlong source");
+
+    let result = invoke_search(SearchCodeTool::new(&repo), "needle-after", None);
+    assert!(
+        result.is_err() || matches!(result, Ok(workflow_runtime::ToolEnvelope::Failure { .. })),
+        "overlong-line skipping must stop at the byte budget, got {result:?}"
+    );
+}
+
+#[test]
+fn search_code_fails_closed_when_bound_root_is_replaced() {
+    let repo = std::env::temp_dir().join(format!(
+        "workflow-runtime-issue-265-root-replaced-{}",
+        std::process::id()
+    ));
+    let replacement = std::env::temp_dir().join(format!(
+        "workflow-runtime-issue-265-root-replacement-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&repo).expect("repo");
+    fs::create_dir_all(&replacement).expect("replacement");
+    fs::write(repo.join("trusted.rs"), "trusted_canary\n").expect("trusted source");
+    fs::write(replacement.join("replacement.rs"), "replacement_canary\n")
+        .expect("replacement source");
+
+    let tool = SearchCodeTool::new(&repo);
+    let moved = repo.with_extension("moved");
+    fs::rename(&repo, &moved).expect("move bound root");
+    fs::rename(&replacement, &repo).expect("replace bound root");
+
+    let result = invoke_search(tool, "replacement_canary", None);
+    assert!(
+        result.is_err() || matches!(result, Ok(workflow_runtime::ToolEnvelope::Failure { .. })),
+        "replacement root must not be searched, got {result:?}"
     );
 }
