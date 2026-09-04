@@ -272,20 +272,39 @@ impl ToolHandler for ReadSourceRangeTool {
         let input = serde_json::from_value::<ReadSourceRangeInput>(arguments.clone())
             .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput))?;
         let path = contained_path(&self.root, &input.path)?;
-        let source = fs::read_to_string(&path)
+        let metadata = fs::metadata(&path)
             .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput))?;
-        if source.len() > MAX_SEARCH_MATCHES.saturating_mul(MAX_LINE_BYTES) {
-            // ponytail: 4 MiB file cap; stream-by-range if large files become a product path.
-            return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
-        }
-        let lines: Vec<&str> = source.lines().collect();
-        if input.start_line == 0
-            || input.end_line < input.start_line
-            || input.end_line > lines.len()
+        if !metadata.is_file()
+            || metadata.len() > MAX_SEARCH_MATCHES.saturating_mul(MAX_LINE_BYTES) as u64
         {
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
         }
-        let snippet = lines[(input.start_line - 1)..input.end_line].join("\n");
+        if input.start_line == 0 || input.end_line < input.start_line {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
+        }
+        let file = fs::File::open(&path)
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput))?;
+        let mut reader = BufReader::new(file);
+        let mut skipped = 0_usize;
+        while skipped + 1 < input.start_line {
+            match read_bounded_line(&mut reader) {
+                Ok(None) => return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput)),
+                Ok(Some(_)) => skipped += 1,
+                Err(_) => return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput)),
+            }
+        }
+        let mut snippet = String::new();
+        for index in input.start_line..=input.end_line {
+            match read_bounded_line(&mut reader) {
+                Ok(Some(Some(line))) => {
+                    if index > input.start_line {
+                        snippet.push('\n');
+                    }
+                    snippet.push_str(line.trim_end_matches(['\r', '\n']));
+                }
+                _ => return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput)),
+            }
+        }
         Ok(ToolEnvelope::success(
             json!({
                 "path": input.path,

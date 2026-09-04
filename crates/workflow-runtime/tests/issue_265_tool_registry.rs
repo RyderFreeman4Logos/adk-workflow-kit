@@ -541,3 +541,47 @@ fn repo_tools_deny_safe_named_symlink_aliases() {
         "read alias must fail closed, got {read:?}"
     );
 }
+
+#[test]
+fn read_source_range_bounds_before_whole_file() {
+    let repo = std::env::temp_dir().join(format!(
+        "workflow-runtime-issue-265-range-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(repo.join("src")).expect("src");
+    let oversized = repo.join("src/huge.rs");
+    let mut file = fs::File::create(&oversized).expect("create oversized");
+    use std::io::Write;
+    let chunk = vec![b'x'; 64 * 1024];
+    for _ in 0..80 {
+        file.write_all(&chunk).expect("write chunk");
+    }
+    file.write_all(b"\ncanary_last_line\n").expect("tail");
+    drop(file);
+
+    let before = fs::read_to_string("/proc/self/io").ok().and_then(|text| {
+        text.lines()
+            .find_map(|line| line.strip_prefix("rchar: "))
+            .and_then(|value| value.parse::<u64>().ok())
+    });
+    let result = invoke_read(ReadSourceRangeTool::new(&repo), "src/huge.rs", 1, 1);
+    assert!(
+        result.is_err() || matches!(result, Ok(workflow_runtime::ToolEnvelope::Failure { .. })),
+        "oversized file must fail closed, got {result:?}"
+    );
+    if let Some(before) = before {
+        let after = fs::read_to_string("/proc/self/io")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix("rchar: "))
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .expect("rchar after");
+        assert!(
+            after.saturating_sub(before) < 2 * 1024 * 1024,
+            "range reader must not ingest the whole oversized file, read {}",
+            after.saturating_sub(before)
+        );
+    }
+}
