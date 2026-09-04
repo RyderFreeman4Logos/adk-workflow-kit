@@ -3241,6 +3241,13 @@ fn resolve_agent_contracts(
     workflow: &Path,
     ir: &workflow_ir::WorkflowIr,
 ) -> Result<BTreeMap<String, RuntimeAgentContract>, ()> {
+    if ir
+        .nodes()
+        .iter()
+        .all(|node| node.agent_contract().is_none())
+    {
+        return Ok(BTreeMap::new());
+    }
     let root = workflow
         .parent()
         .ok_or(())?
@@ -6115,5 +6122,36 @@ mod execution_registry_tests {
         assert!(second_seq > first_seq);
         AdkEventMapper::resume("run-retry-2", "wf-retry", after_second)
             .expect("second resume keeps unique retry events");
+    }
+
+    #[test]
+    fn uncontracted_nodes_do_not_require_a_resource_root() {
+        let plan = workflow_compiler::compile_str(
+            "workflow.toml",
+            r#"
+                schema_version = 1
+                [workflow]
+                id = "uncontracted"
+                version = "1"
+                entry = "worker"
+                [[nodes]]
+                id = "worker"
+                kind = "agent"
+                model = { role = "worker", id = "worker", version = "1" }
+                [[nodes]]
+                id = "done"
+                kind = "terminal"
+                [[edges]]
+                from = "worker"
+                to = "done"
+            "#,
+        )
+        .expect("uncontracted workflow compiles");
+
+        assert!(
+            resolve_agent_contracts(Path::new("workflow.toml"), plan.ir())
+                .expect("uncontracted workflow needs no resource root")
+                .is_empty()
+        );
     }
 }

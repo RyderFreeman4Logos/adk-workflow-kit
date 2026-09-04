@@ -87,6 +87,13 @@ fn profile(output: Value) -> ExecutionProfileV1 {
             "model": "worker",
             "responses": [serde_json::to_string(&json!({"status":"finished","output":output})).expect("response")]
         },
+        "tool": {
+            "name": "echo",
+            "result": {"echo": "runtime smoke"},
+            "input_schema": {"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false},
+            "required_capabilities": [],
+            "required_scopes": []
+        },
         "sandbox": {"capabilities": []}
     });
     ExecutionProfileV1::parse(&serde_json::to_vec(&profile).expect("profile JSON"))
@@ -99,6 +106,44 @@ fn checkpoint_state(run_root: &Path) -> Value {
         .query_row("SELECT state FROM kit_checkpoints", [], |row| row.get(0))
         .expect("checkpoint state");
     serde_json::from_slice(&state).expect("state JSON")
+}
+
+fn uncontracted_workflow() -> &'static str {
+    r#"
+ schema_version = 1
+ [workflow]
+ id = "issue-264-uncontracted"
+ version = "1"
+ entry = "worker"
+ [[nodes]]
+ id = "worker"
+ kind = "agent"
+ model = { role = "worker", id = "worker", version = "1" }
+ tools = [{ id = "echo", version = "1" }]
+ [[nodes]]
+ id = "done"
+ kind = "terminal"
+ [[edges]]
+ from = "worker"
+ to = "done"
+ "#
+}
+
+#[test]
+fn uncontracted_agent_preserves_prior_unstructured_output_behavior() {
+    let root = TestRoot::new();
+    let workflow_path = root.write("workflow.toml", uncontracted_workflow().as_bytes());
+
+    let receipt = ExecutionBackend::run(
+        &workflow_path,
+        profile(json!("runtime smoke complete")),
+        json!({"request": "public"}),
+        &root.0,
+    )
+    .expect("uncontracted agent executes");
+
+    let state = checkpoint_state(receipt.run_root());
+    assert_eq!(state["node:worker"], json!("runtime smoke complete"));
 }
 
 #[test]
