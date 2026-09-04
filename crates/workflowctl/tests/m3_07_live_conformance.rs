@@ -84,6 +84,7 @@ fn openai_profile(base_url: &str, extra: Value) -> Value {
             "base_url": base_url,
             "credential_env": HANDLE
         },
+        "skills": fake["skills"].clone(),
         "tools": fake["tools"].clone(),
         "sandbox": fake["sandbox"].clone()
     });
