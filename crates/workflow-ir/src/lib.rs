@@ -2,8 +2,8 @@
 
 use sha2::{Digest, Sha256};
 use workflow_spec::{
-    ModelRole as SpecModelRole, NodeKind as SpecNodeKind, ResourceReference, RouteOperator,
-    SchemaVersion, WorkflowSpec,
+    AgentNodeContract, ModelRole as SpecModelRole, NodeKind as SpecNodeKind, ResourceReference,
+    RouteOperator, SchemaVersion, WorkflowSpec,
 };
 
 /// The canonical byte-wire version used for content identity.
@@ -22,6 +22,9 @@ pub const CANONICAL_IR_WIRE_VERSION_V6: u16 = 6;
 pub const CANONICAL_IR_WIRE_VERSION_V7: u16 = 7;
 /// The canonical byte-wire version for per-node Skill subsets.
 pub const CANONICAL_IR_WIRE_VERSION_V8: u16 = 8;
+
+/// The canonical byte-wire version for per-node agent contracts.
+pub const CANONICAL_IR_WIRE_VERSION_V9: u16 = 9;
 
 const DOMAIN: &[u8] = b"adk-workflow-kit/workflow-ir\0";
 const IR_SCHEMA_VERSION_V1: u32 = 1;
@@ -241,6 +244,7 @@ pub struct IrNode {
     model: Option<IrModelReference>,
     tools: Vec<IrToolReference>,
     skills: Vec<IrSkillReference>,
+    agent_contract: Option<AgentNodeContract>,
 }
 
 impl IrNode {
@@ -282,6 +286,11 @@ impl IrNode {
     /// Returns the node-owned Skill subset in canonical raw UTF-8 order.
     pub fn skills(&self) -> &[IrSkillReference] {
         &self.skills
+    }
+
+    /// Returns the first-class agent contract, when declared.
+    pub fn agent_contract(&self) -> Option<&AgentNodeContract> {
+        self.agent_contract.as_ref()
     }
 }
 
@@ -598,6 +607,7 @@ impl From<&WorkflowSpec> for WorkflowIr {
                         });
                         skills
                     },
+                    agent_contract: node.agent_contract().cloned(),
                 }
             })
             .collect::<Vec<_>>();
@@ -810,6 +820,26 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
                     write_frame(sink, &skill.version);
                 }
             }
+            if canonical_wire_version(ir) >= CANONICAL_IR_WIRE_VERSION_V9 {
+                match &node.agent_contract {
+                    Some(contract) => {
+                        sink.write_chunk(&[1]);
+                        sink.write_chunk(&[match contract.session() {
+                            workflow_spec::SessionMode::Isolated => 1,
+                            workflow_spec::SessionMode::Shared => 2,
+                        }]);
+                        write_frame(sink, contract.instruction().path());
+                        write_frame(sink, contract.instruction().sha256());
+                        write_u64(sink, u64_from_usize(contract.input().state_keys().len()));
+                        for key in contract.input().state_keys() {
+                            write_frame(sink, key);
+                        }
+                        write_frame(sink, contract.output().state_key());
+                        write_frame(sink, contract.output().schema());
+                    }
+                    None => sink.write_chunk(&[0]),
+                }
+            }
         }
     }
     write_u64(sink, u64_from_usize(ir.edges.len()));
@@ -874,7 +904,9 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
 }
 
 fn canonical_wire_version(ir: &WorkflowIr) -> u16 {
-    if ir.nodes.iter().any(|node| !node.skills.is_empty()) {
+    if ir.nodes.iter().any(|node| node.agent_contract.is_some()) {
+        CANONICAL_IR_WIRE_VERSION_V9
+    } else if ir.nodes.iter().any(|node| !node.skills.is_empty()) {
         CANONICAL_IR_WIRE_VERSION_V8
     } else if ir
         .nodes

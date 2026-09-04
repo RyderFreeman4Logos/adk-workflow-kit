@@ -390,6 +390,159 @@ impl SkillReference {
     }
 }
 
+/// The execution-session scope of an agent node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionMode {
+    /// Create a fresh model session for each node execution.
+    Isolated,
+    /// Reuse the workflow's shared model session.
+    Shared,
+}
+
+/// Errors returned when constructing an agent-node contract.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum AgentContractError {
+    /// A required contract field was empty.
+    #[error("agent-node contract field is empty: {0}")]
+    EmptyField(&'static str),
+    /// A state key was declared more than once.
+    #[error("agent-node input state key is duplicated")]
+    DuplicateStateKey,
+    /// The session scope is not part of the closed contract vocabulary.
+    #[error("agent-node session must be isolated or shared")]
+    InvalidSession,
+}
+
+/// Immutable instruction resource identity for an agent node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstructionContract {
+    path: String,
+    sha256: String,
+}
+
+impl InstructionContract {
+    pub fn new(
+        path: impl Into<String>,
+        sha256: impl Into<String>,
+    ) -> Result<Self, AgentContractError> {
+        let path = path.into();
+        let sha256 = sha256.into();
+        if path.is_empty() {
+            return Err(AgentContractError::EmptyField("instruction.path"));
+        }
+        if sha256.is_empty() {
+            return Err(AgentContractError::EmptyField("instruction.sha256"));
+        }
+        Ok(Self { path, sha256 })
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+/// State visibility contract for an agent node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InputContract {
+    state_keys: Vec<String>,
+}
+
+impl InputContract {
+    pub fn new(state_keys: Vec<String>) -> Result<Self, AgentContractError> {
+        let mut seen = BTreeSet::new();
+        for key in &state_keys {
+            if key.is_empty() {
+                return Err(AgentContractError::EmptyField("input.state_keys"));
+            }
+            if !seen.insert(key) {
+                return Err(AgentContractError::DuplicateStateKey);
+            }
+        }
+        Ok(Self { state_keys })
+    }
+
+    pub fn state_keys(&self) -> &[String] {
+        &self.state_keys
+    }
+}
+
+/// Output state and schema contract for an agent node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutputContract {
+    state_key: String,
+    schema: String,
+}
+
+impl OutputContract {
+    pub fn new(
+        state_key: impl Into<String>,
+        schema: impl Into<String>,
+    ) -> Result<Self, AgentContractError> {
+        let state_key = state_key.into();
+        let schema = schema.into();
+        if state_key.is_empty() {
+            return Err(AgentContractError::EmptyField("output.state_key"));
+        }
+        if schema.is_empty() {
+            return Err(AgentContractError::EmptyField("output.schema"));
+        }
+        Ok(Self { state_key, schema })
+    }
+
+    pub fn state_key(&self) -> &str {
+        &self.state_key
+    }
+
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+}
+
+/// Complete authored contract for an agent node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentNodeContract {
+    instruction: InstructionContract,
+    input: InputContract,
+    output: OutputContract,
+    session: SessionMode,
+}
+
+impl AgentNodeContract {
+    pub fn new(
+        instruction: InstructionContract,
+        input: InputContract,
+        output: OutputContract,
+        session: SessionMode,
+    ) -> Self {
+        Self {
+            instruction,
+            input,
+            output,
+            session,
+        }
+    }
+
+    pub fn instruction(&self) -> &InstructionContract {
+        &self.instruction
+    }
+
+    pub fn input(&self) -> &InputContract {
+        &self.input
+    }
+
+    pub fn output(&self) -> &OutputContract {
+        &self.output
+    }
+
+    pub fn session(&self) -> SessionMode {
+        self.session
+    }
+}
+
 /// A source-level node with its closed kind and optional approval timeout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Node {
@@ -402,6 +555,7 @@ pub struct Node {
     model: Option<ModelReference>,
     tools: Vec<ToolReference>,
     skills: Vec<SkillReference>,
+    agent_contract: Option<AgentNodeContract>,
 }
 
 impl Node {
@@ -448,6 +602,31 @@ impl Node {
     /// Returns the explicitly declared Skill subset in source order.
     pub fn skills(&self) -> &[SkillReference] {
         &self.skills
+    }
+
+    /// Returns the complete first-class agent contract, when declared.
+    pub fn agent_contract(&self) -> Option<&AgentNodeContract> {
+        self.agent_contract.as_ref()
+    }
+
+    /// Returns the authored instruction identity, when declared.
+    pub fn instruction(&self) -> Option<&InstructionContract> {
+        self.agent_contract().map(AgentNodeContract::instruction)
+    }
+
+    /// Returns the state visibility contract, when declared.
+    pub fn input(&self) -> Option<&InputContract> {
+        self.agent_contract().map(AgentNodeContract::input)
+    }
+
+    /// Returns the output state and schema contract, when declared.
+    pub fn output(&self) -> Option<&OutputContract> {
+        self.agent_contract().map(AgentNodeContract::output)
+    }
+
+    /// Returns the authored session scope, when declared.
+    pub fn session(&self) -> Option<SessionMode> {
+        self.agent_contract().map(AgentNodeContract::session)
     }
 }
 
@@ -705,36 +884,40 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
         nodes: raw
             .nodes
             .into_iter()
-            .map(|node| Node {
-                id: NodeId(node.id),
-                kind: node.kind,
-                timeout_ms: node.timeout_ms,
-                max_visits: node.max_visits,
-                idempotent: node.idempotent,
-                resources: node.resources.into_iter().map(resource).collect(),
-                model: node.model.map(|model| ModelReference {
-                    role: model.role,
-                    id: model.id,
-                    version: model.version,
-                }),
-                tools: node
-                    .tools
-                    .into_iter()
-                    .map(|tool| ToolReference {
-                        id: tool.id,
-                        version: tool.version,
-                    })
-                    .collect(),
-                skills: node
-                    .skills
-                    .into_iter()
-                    .map(|skill| SkillReference {
-                        id: skill.id,
-                        version: skill.version,
-                    })
-                    .collect(),
+            .map(|node| {
+                let agent_contract = parse_agent_contract(&node)?;
+                Ok(Node {
+                    id: NodeId(node.id),
+                    kind: node.kind,
+                    timeout_ms: node.timeout_ms,
+                    max_visits: node.max_visits,
+                    idempotent: node.idempotent,
+                    resources: node.resources.into_iter().map(resource).collect(),
+                    model: node.model.map(|model| ModelReference {
+                        role: model.role,
+                        id: model.id,
+                        version: model.version,
+                    }),
+                    tools: node
+                        .tools
+                        .into_iter()
+                        .map(|tool| ToolReference {
+                            id: tool.id,
+                            version: tool.version,
+                        })
+                        .collect(),
+                    skills: node
+                        .skills
+                        .into_iter()
+                        .map(|skill| SkillReference {
+                            id: skill.id,
+                            version: skill.version,
+                        })
+                        .collect(),
+                    agent_contract,
+                })
             })
-            .collect(),
+            .collect::<Result<_, SpecError>>()?,
         edges: raw
             .edges
             .into_iter()
@@ -780,6 +963,41 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
         }),
         resources: raw.resources.into_iter().map(resource).collect(),
     })
+}
+
+fn parse_agent_contract(node: &RawNode) -> Result<Option<AgentNodeContract>, SpecError> {
+    let present = [
+        node.instruction.is_some(),
+        node.input.is_some(),
+        node.output.is_some(),
+        node.session.is_some(),
+    ];
+    if present.iter().all(|present| !present) {
+        return Ok(None);
+    }
+    if present.iter().any(|present| !present) {
+        return Err(SpecError::InvalidNodeBinding);
+    }
+    let instruction = node.instruction.as_ref().expect("checked above");
+    let input = node.input.as_ref().expect("checked above");
+    let output = node.output.as_ref().expect("checked above");
+    let instruction = InstructionContract::new(&instruction.path, &instruction.sha256)
+        .map_err(|_| SpecError::InvalidNodeBinding)?;
+    let input =
+        InputContract::new(input.state_keys.clone()).map_err(|_| SpecError::InvalidNodeBinding)?;
+    let output = OutputContract::new(&output.state_key, &output.schema)
+        .map_err(|_| SpecError::InvalidNodeBinding)?;
+    let session = match node.session.as_deref() {
+        Some("isolated") => SessionMode::Isolated,
+        Some("shared") => SessionMode::Shared,
+        _ => return Err(SpecError::InvalidNodeBinding),
+    };
+    Ok(Some(AgentNodeContract::new(
+        instruction,
+        input,
+        output,
+        session,
+    )))
 }
 
 fn valid_tools(tools: &[RawToolReference]) -> bool {
@@ -933,6 +1151,34 @@ struct RawNode {
     tools: Vec<RawToolReference>,
     #[serde(default)]
     skills: Vec<RawSkillReference>,
+    #[serde(default)]
+    instruction: Option<RawInstructionContract>,
+    #[serde(default)]
+    input: Option<RawInputContract>,
+    #[serde(default)]
+    output: Option<RawOutputContract>,
+    #[serde(default)]
+    session: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInstructionContract {
+    path: String,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInputContract {
+    state_keys: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOutputContract {
+    state_key: String,
+    schema: String,
 }
 
 #[derive(Deserialize)]

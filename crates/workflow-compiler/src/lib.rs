@@ -222,7 +222,10 @@ impl std::error::Error for BindingValidationError {}
 fn validate_node_bindings(spec: &WorkflowSpec) -> Result<(), CompileError> {
     for node in spec.nodes() {
         if node.kind() != NodeKind::Agent
-            && (node.model().is_some() || !node.tools().is_empty() || !node.skills().is_empty())
+            && (node.model().is_some()
+                || !node.tools().is_empty()
+                || !node.skills().is_empty()
+                || node.agent_contract().is_some())
         {
             return Err(CompileError::Binding(
                 BindingValidationError::InvalidPlacement,
@@ -503,6 +506,11 @@ pub enum StateValidationError {
         /// The authored handle shape token.
         shape: String,
     },
+    /// A contract references a state key not declared by the workflow.
+    UndeclaredAgentStateKey {
+        /// The opaque state key name.
+        key_name: String,
+    },
 }
 
 /// Validates the declared v1 state contract: identifiers, schema version,
@@ -511,7 +519,25 @@ pub enum StateValidationError {
 /// The validator is deterministic, purely in-memory, and never touches the
 /// host filesystem, subprocesses, or the network.
 pub fn validate_state(ir: &WorkflowIr) -> Result<(), StateValidationError> {
-    let Some(state) = ir.state() else {
+    let state = ir.state();
+    for node in ir.nodes() {
+        let Some(contract) = node.agent_contract() else {
+            continue;
+        };
+        for key_name in contract
+            .input()
+            .state_keys()
+            .iter()
+            .chain(std::iter::once(&contract.output().state_key().to_owned()))
+        {
+            if state.is_none_or(|state| !state.keys().iter().any(|key| key.name() == key_name)) {
+                return Err(StateValidationError::UndeclaredAgentStateKey {
+                    key_name: key_name.clone(),
+                });
+            }
+        }
+    }
+    let Some(state) = state else {
         return Ok(());
     };
 
