@@ -50,6 +50,10 @@ m3-02-compiler test_name:
 m3-02-adk test_name:
     {{_io}} cargo +1.98.0 test -p workflow-adk --test m3_02_node_bindings {{test_name}} --locked -- --exact --nocapture
 
+# Focused #265 tool implementation registry tests.
+issue-265-runtime test_name:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_265_tool_registry {{test_name}} --locked -- --exact --nocapture
+
 # Focused M3-03 per-node multi-tool registry tests.
 m3-03-spec test_name:
     {{_io}} cargo +1.98.0 test -p workflow-spec --test m3_03_multi_tool_registry {{test_name}} --locked -- --exact --nocapture
