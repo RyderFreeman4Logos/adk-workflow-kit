@@ -95,7 +95,9 @@ pub use tool::{
     ToolEnvelope, ToolFailure, ToolFlags, ToolIdempotency, ToolProvenance, ToolRegistration,
     ToolRegistrationError, decode_structured_tool_output,
 };
-pub use tool_registry::{ToolImplementationRegistry, ToolImplementationRegistryError};
+pub use tool_registry::{
+    SearchCodeTool, ToolImplementationRegistry, ToolImplementationRegistryError,
+};
 pub use workdir::{
     CleanupOutcome, Materialization, RunWorkdir, WorkdirError, WorkdirErrorKind, WorkdirId,
     WorkdirManager,
