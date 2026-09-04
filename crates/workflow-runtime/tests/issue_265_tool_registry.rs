@@ -381,3 +381,62 @@ fn search_code_skips_nested_denied_dirs_without_omitted_path() {
         "{ancestor}"
     );
 }
+
+#[test]
+fn search_code_hard_caps_matches_and_line_bytes() {
+    let repo = std::env::temp_dir().join(format!(
+        "workflow-runtime-issue-265-bounds-{}",
+        std::process::id()
+    ));
+    for index in 0..12 {
+        let dir = repo.join(format!("src{index}"));
+        fs::create_dir_all(&dir).expect("wide tree");
+        let mut source = String::new();
+        for line in 0..200 {
+            source.push_str(&format!("needle {index}-{line}\n"));
+        }
+        fs::write(dir.join("lib.rs"), source).expect("hits");
+    }
+    fs::create_dir_all(repo.join("long")).expect("long dir");
+    let mut overlong = "x".repeat(8_192);
+    overlong.push_str("needle-overlong\n");
+    fs::write(repo.join("long/line.rs"), overlong).expect("overlong");
+
+    let tool = SearchCodeTool::new(&repo);
+    let mut bridge = ToolBridge::new(sandbox());
+    bridge
+        .register(tool.registration(), tool)
+        .expect("bridge register");
+    let mut artifacts = InMemoryArtifactStore::new(
+        NonZeroU64::new(2 * 1024 * 1024).expect("positive"),
+        NonZeroU64::new(4_096).expect("positive"),
+    );
+
+    let wide = bridge
+        .invoke(
+            ToolCall::new("search_code", "wide", "actor", json!({"query": "needle"})),
+            &authority(),
+            None,
+            Duration::ZERO,
+            &mut artifacts,
+        )
+        .expect("wide search");
+    let payload = search_payload(&wide);
+    let matches = payload["matches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("matches array, {payload}"));
+    assert_eq!(
+        matches.len(),
+        1_024,
+        "MAX_SEARCH_MATCHES must be a hard cap, got {}",
+        matches.len()
+    );
+    assert!(
+        matches.iter().all(|hit| {
+            hit["snippet"].as_str().is_some_and(|snippet| {
+                snippet.len() <= 4_096 && !snippet.contains("needle-overlong")
+            })
+        }),
+        "{payload}"
+    );
+}

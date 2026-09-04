@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     fmt, fs,
-    io::{BufRead, BufReader},
+    io::{self, BufRead, BufReader, Read},
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -356,10 +356,13 @@ fn search_dir(
     root: &Path,
     query: &str,
     matches: &mut Vec<Value>,
-) -> Result<(), ToolBridgeError> {
+) -> Result<bool, ToolBridgeError> {
     let entries =
         fs::read_dir(dir).map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
     for entry in entries {
+        if matches.len() >= MAX_SEARCH_MATCHES {
+            return Ok(true);
+        }
         let entry = entry.map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
         let file_type = entry
             .file_type()
@@ -374,7 +377,9 @@ fn search_dir(
             continue;
         }
         if file_type.is_dir() {
-            search_dir(&path, root, query, matches)?;
+            if search_dir(&path, root, query, matches)? {
+                return Ok(true);
+            }
             continue;
         }
         if !file_type.is_file() {
@@ -389,30 +394,67 @@ fn search_dir(
             .to_string_lossy()
             .replace('\\', "/");
         let mut reader = BufReader::new(file);
-        let mut line = String::new();
         let mut index = 0_usize;
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => break,
+            if matches.len() >= MAX_SEARCH_MATCHES {
+                return Ok(true);
             }
-            index += 1;
-            if line.len() > MAX_LINE_BYTES {
-                continue;
-            }
-            if line.to_ascii_lowercase().contains(query) {
-                matches.push(json!({
-                    "path": relative,
-                    "line": index,
-                    "snippet": line.trim_end_matches(['\r', '\n']),
-                }));
-                if matches.len() >= MAX_SEARCH_MATCHES {
-                    return Ok(());
+            match read_bounded_line(&mut reader) {
+                Ok(None) => break,
+                Ok(Some(None)) => index += 1,
+                Ok(Some(Some(line))) => {
+                    index += 1;
+                    if line.to_ascii_lowercase().contains(query) {
+                        matches.push(json!({
+                            "path": relative,
+                            "line": index,
+                            "snippet": line.trim_end_matches(['\r', '\n']),
+                        }));
+                        if matches.len() >= MAX_SEARCH_MATCHES {
+                            return Ok(true);
+                        }
+                    }
                 }
+                Err(_) => break,
             }
         }
     }
-    Ok(())
+    Ok(matches.len() >= MAX_SEARCH_MATCHES)
+}
+
+fn read_bounded_line(reader: &mut impl BufRead) -> io::Result<Option<Option<String>>> {
+    let mut buf = Vec::new();
+    let read = reader
+        .take(MAX_LINE_BYTES as u64)
+        .read_until(b'\n', &mut buf)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if buf.len() == MAX_LINE_BYTES && buf.last() != Some(&b'\n') {
+        let more = !reader.fill_buf()?.is_empty();
+        if more {
+            skip_rest_of_line(reader)?;
+            return Ok(Some(None));
+        }
+    }
+    Ok(Some(Some(String::from_utf8_lossy(&buf).into_owned())))
+}
+
+fn skip_rest_of_line(reader: &mut impl BufRead) -> io::Result<()> {
+    loop {
+        let (n, done) = {
+            let buf = reader.fill_buf()?;
+            if buf.is_empty() {
+                return Ok(());
+            }
+            match buf.iter().position(|&b| b == b'\n') {
+                Some(index) => (index + 1, true),
+                None => (buf.len(), false),
+            }
+        };
+        reader.consume(n);
+        if done {
+            return Ok(());
+        }
+    }
 }
