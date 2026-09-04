@@ -2,9 +2,9 @@ use std::{fs, num::NonZeroU64, sync::Arc, time::Duration};
 
 use serde_json::{Value, json};
 use workflow_runtime::{
-    CapabilityIntersection, ChildSandbox, InMemoryArtifactStore, PageRequest, RunContext, RunId,
-    RunLimits, RunSandbox, SandboxCapability, SearchCodeTool, ToolBridge, ToolCall,
-    ToolCallContext, ToolEnvelope, ToolHandler, ToolImplementationRegistry,
+    CapabilityIntersection, ChildSandbox, InMemoryArtifactStore, PageRequest, ReadSourceRangeTool,
+    RunContext, RunId, RunLimits, RunSandbox, SandboxCapability, SearchCodeTool, ToolBridge,
+    ToolCall, ToolCallContext, ToolEnvelope, ToolHandler, ToolImplementationRegistry,
     ToolImplementationRegistryError, ToolProvenance, WorkdirManager,
 };
 
@@ -450,5 +450,94 @@ fn search_code_hard_caps_matches_and_line_bytes() {
             })
         }),
         "{payload}"
+    );
+}
+
+fn invoke_search(
+    tool: SearchCodeTool,
+    query: &str,
+    path: Option<&str>,
+) -> Result<workflow_runtime::ToolEnvelope<Value>, workflow_runtime::ToolBridgeError> {
+    let mut bridge = ToolBridge::new(sandbox());
+    bridge
+        .register(tool.registration(), tool)
+        .expect("bridge register");
+    let mut artifacts = InMemoryArtifactStore::new(
+        NonZeroU64::new(4_096).expect("positive"),
+        NonZeroU64::new(1_024).expect("positive"),
+    );
+    let mut args = json!({"query": query});
+    if let Some(path) = path {
+        args["path"] = json!(path);
+    }
+    bridge.invoke(
+        ToolCall::new("search_code", "search", "actor", args),
+        &authority(),
+        None,
+        Duration::ZERO,
+        &mut artifacts,
+    )
+}
+
+fn invoke_read(
+    tool: ReadSourceRangeTool,
+    path: &str,
+    start_line: usize,
+    end_line: usize,
+) -> Result<workflow_runtime::ToolEnvelope<Value>, workflow_runtime::ToolBridgeError> {
+    let authority = CapabilityIntersection::new(
+        [SandboxCapability::FilesystemRead],
+        ["read_source_range"],
+        ["read_source_range"],
+        std::iter::empty::<String>(),
+        ["read_source_range"],
+        ["read_source_range"],
+        [SandboxCapability::FilesystemRead],
+    );
+    let mut bridge = ToolBridge::new(sandbox());
+    bridge
+        .register(tool.registration(), tool)
+        .expect("bridge register");
+    let mut artifacts = InMemoryArtifactStore::new(
+        NonZeroU64::new(4_096).expect("positive"),
+        NonZeroU64::new(1_024).expect("positive"),
+    );
+    bridge.invoke(
+        ToolCall::new(
+            "read_source_range",
+            "read",
+            "actor",
+            json!({"path": path, "start_line": start_line, "end_line": end_line}),
+        ),
+        &authority,
+        None,
+        Duration::ZERO,
+        &mut artifacts,
+    )
+}
+
+#[test]
+fn repo_tools_deny_safe_named_symlink_aliases() {
+    let repo = std::env::temp_dir().join(format!(
+        "workflow-runtime-issue-265-symlink-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(repo.join("src")).expect("src");
+    fs::write(repo.join("src/lib.rs"), "pub fn canary_source() {}\n").expect("source");
+    fs::write(repo.join(".env"), "canary_secret_token=1\n").expect("denied file");
+    fs::create_dir_all(repo.join("secrets")).expect("denied dir");
+    fs::write(repo.join("secrets/token.txt"), "canary_nested_secret\n").expect("denied nested");
+    std::os::unix::fs::symlink(repo.join(".env"), repo.join("src/notes.rs")).expect("file alias");
+    std::os::unix::fs::symlink(repo.join("secrets"), repo.join("docs")).expect("dir alias");
+
+    let search = invoke_search(SearchCodeTool::new(&repo), "canary", Some("docs"));
+    assert!(
+        search.is_err() || matches!(search, Ok(workflow_runtime::ToolEnvelope::Failure { .. })),
+        "search alias must fail closed, got {search:?}"
+    );
+    let read = invoke_read(ReadSourceRangeTool::new(&repo), "src/notes.rs", 1, 1);
+    assert!(
+        read.is_err() || matches!(read, Ok(workflow_runtime::ToolEnvelope::Failure { .. })),
+        "read alias must fail closed, got {read:?}"
     );
 }

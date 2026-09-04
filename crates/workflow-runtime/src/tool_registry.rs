@@ -354,11 +354,29 @@ fn contained_path(root: &Path, path: &str) -> Result<PathBuf, ToolBridgeError> {
     {
         return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
     }
+    let mut current = root.to_path_buf();
+    for part in Path::new(path).components() {
+        current.push(part);
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput))?;
+        if metadata.file_type().is_symlink() {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
+        }
+    }
     let canonical_root = fs::canonicalize(root)
         .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput))?;
     let canonical = fs::canonicalize(&candidate)
         .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput))?;
     if !canonical.starts_with(&canonical_root) {
+        return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
+    }
+    let relative = canonical
+        .strip_prefix(&canonical_root)
+        .unwrap_or(canonical.as_path());
+    if relative
+        .components()
+        .any(|component| denied_component(&component.as_os_str().to_string_lossy()))
+    {
         return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
     }
     Ok(canonical)
