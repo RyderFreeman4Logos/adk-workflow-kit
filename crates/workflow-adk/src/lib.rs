@@ -1209,6 +1209,10 @@ impl AdkGraphTranslator {
                         )
                     })
                     .collect::<BTreeMap<_, _>>();
+                let output_key = node
+                    .agent_contract()
+                    .map(|contract| contract.output().state_key().to_owned())
+                    .unwrap_or_else(|| format!("node:{id}"));
                 builder = builder.node(AgentNode::new(agent).with_output_mapper(move |events| {
                     let value = events
                         .iter()
@@ -1251,7 +1255,7 @@ impl AdkGraphTranslator {
                             }
                         }
                     }
-                    output.insert(format!("node:{id}"), node_value);
+                    output.insert(output_key.clone(), node_value);
                     output
                 }));
             } else {
