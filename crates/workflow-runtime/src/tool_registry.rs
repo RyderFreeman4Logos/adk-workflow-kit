@@ -6,6 +6,7 @@ use std::{
     io::{self, BufRead, BufReader, Read},
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use schemars::JsonSchema;
@@ -20,6 +21,10 @@ use crate::{
 
 const MAX_SEARCH_MATCHES: usize = 1_024;
 const MAX_LINE_BYTES: usize = 4_096;
+const MAX_SEARCH_FILES: usize = 256;
+const MAX_SEARCH_DIRS: usize = 64;
+const MAX_SEARCH_BYTES: u64 = 1_048_576;
+const MAX_SEARCH_DEPTH: usize = 8;
 
 /// Exact ID/version lookup for a registered tool implementation.
 #[derive(Clone, Default)]
@@ -185,12 +190,17 @@ impl ToolHandler for SearchCodeTool {
     fn execute(
         &self,
         _sandbox: &ChildSandbox<'_>,
-        _context: &ToolCallContext,
+        context: &ToolCallContext,
         arguments: &Value,
     ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
         let input = serde_json::from_value::<SearchCodeInput>(arguments.clone())
             .map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput))?;
-        let matches = search_repo(&self.root, &input.query, input.path.as_deref())?;
+        let matches = search_repo(
+            &self.root,
+            &input.query,
+            input.path.as_deref(),
+            Instant::now() + context.deadline(),
+        )?;
         Ok(ToolEnvelope::success(
             json!({"matches": matches}),
             ToolProvenance::new("search_code", "1"),
@@ -329,6 +339,7 @@ fn search_repo(
     root: &Path,
     query: &str,
     path: Option<&str>,
+    deadline: Instant,
 ) -> Result<Vec<Value>, ToolBridgeError> {
     if query.trim().is_empty() {
         return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
@@ -336,8 +347,24 @@ fn search_repo(
     let scoped = contained_dir(root, path)?;
     let query = query.to_ascii_lowercase();
     let mut matches = Vec::new();
-    search_dir(&scoped, root, &query, &mut matches)?;
+    let mut budget = SearchBudget::default();
+    search_dir(
+        &scoped,
+        root,
+        &query,
+        &mut matches,
+        &mut budget,
+        0,
+        deadline,
+    )?;
     Ok(matches)
+}
+
+#[derive(Default)]
+struct SearchBudget {
+    files: usize,
+    dirs: usize,
+    bytes: u64,
 }
 
 fn denied_component(part: &str) -> bool {
@@ -406,10 +433,23 @@ fn search_dir(
     root: &Path,
     query: &str,
     matches: &mut Vec<Value>,
+    budget: &mut SearchBudget,
+    depth: usize,
+    deadline: Instant,
 ) -> Result<bool, ToolBridgeError> {
+    if Instant::now() >= deadline {
+        return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
+    }
+    if depth > MAX_SEARCH_DEPTH || budget.dirs >= MAX_SEARCH_DIRS {
+        return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
+    }
+    budget.dirs += 1;
     let entries =
         fs::read_dir(dir).map_err(|_| ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))?;
     for entry in entries {
+        if Instant::now() >= deadline {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
+        }
         if matches.len() >= MAX_SEARCH_MATCHES {
             return Ok(true);
         }
@@ -427,7 +467,7 @@ fn search_dir(
             continue;
         }
         if file_type.is_dir() {
-            if search_dir(&path, root, query, matches)? {
+            if search_dir(&path, root, query, matches, budget, depth + 1, deadline)? {
                 return Ok(true);
             }
             continue;
@@ -435,6 +475,10 @@ fn search_dir(
         if !file_type.is_file() {
             continue;
         }
+        if budget.files >= MAX_SEARCH_FILES {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
+        }
+        budget.files += 1;
         let Ok(file) = fs::File::open(&path) else {
             continue;
         };
@@ -446,14 +490,24 @@ fn search_dir(
         let mut reader = BufReader::new(file);
         let mut index = 0_usize;
         loop {
+            if Instant::now() >= deadline {
+                return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
+            }
             if matches.len() >= MAX_SEARCH_MATCHES {
                 return Ok(true);
             }
             match read_bounded_line(&mut reader) {
                 Ok(None) => break,
-                Ok(Some(None)) => index += 1,
+                Ok(Some(None)) => {
+                    index += 1;
+                    budget.bytes = budget.bytes.saturating_add(MAX_LINE_BYTES as u64);
+                }
                 Ok(Some(Some(line))) => {
                     index += 1;
+                    budget.bytes = budget.bytes.saturating_add(line.len() as u64);
+                    if budget.bytes > MAX_SEARCH_BYTES {
+                        return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
+                    }
                     if line.to_ascii_lowercase().contains(query) {
                         matches.push(json!({
                             "path": relative,
@@ -466,6 +520,9 @@ fn search_dir(
                     }
                 }
                 Err(_) => break,
+            }
+            if budget.bytes > MAX_SEARCH_BYTES {
+                return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
             }
         }
     }

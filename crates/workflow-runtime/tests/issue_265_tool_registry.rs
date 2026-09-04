@@ -585,3 +585,27 @@ fn read_source_range_bounds_before_whole_file() {
         );
     }
 }
+
+#[test]
+fn search_code_stops_miss_heavy_traversal_within_budget() {
+    let repo = std::env::temp_dir().join(format!(
+        "workflow-runtime-issue-265-budget-{}",
+        std::process::id()
+    ));
+    for dir in 0..40 {
+        let nested = repo.join(format!("wide{dir}"));
+        fs::create_dir_all(&nested).expect("wide dir");
+        for file in 0..40 {
+            fs::write(
+                nested.join(format!("f{file}.rs")),
+                "pub fn miss() {}\n".repeat(80),
+            )
+            .expect("miss file");
+        }
+    }
+    let result = invoke_search(SearchCodeTool::new(&repo), "no-such-canary-token", None);
+    assert!(
+        result.is_err() || matches!(result, Ok(workflow_runtime::ToolEnvelope::Failure { .. })),
+        "miss-heavy walk must fail closed instead of unbounded scanning, got {result:?}"
+    );
+}
