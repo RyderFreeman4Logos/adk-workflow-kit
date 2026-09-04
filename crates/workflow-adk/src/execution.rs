@@ -4195,6 +4195,7 @@ impl ExecutionBackend {
                                 resolved_plan.node_tools(node.id().as_str()),
                                 resolved_plan.node_skills(node.id().as_str()),
                                 &effective_capabilities,
+                                profile.run_limits().max_tool_output_bytes(),
                             )?,
                             agent_contracts.get(node.id().as_str()),
                             profile.run_limits(),
@@ -4726,6 +4727,7 @@ impl ExecutionBackend {
                         resolved_plan.node_tools(node.id().as_str()),
                         resolved_plan.node_skills(node.id().as_str()),
                         &effective_capabilities,
+                        profile.run_limits().max_tool_output_bytes(),
                     )?,
                 ))
             })
@@ -5449,6 +5451,7 @@ fn build_toolset(
     bindings: &[ResolvedBinding],
     skills: &[ResolvedBinding],
     effective_capabilities: &[SandboxCapability],
+    max_tool_output_bytes: NonZeroU64,
 ) -> Result<Option<BoundTool>, ExecutionError> {
     if bindings.is_empty() && skills.is_empty() {
         return Ok(None);
@@ -5469,6 +5472,9 @@ fn build_toolset(
         names.iter(),
         effective_capabilities.iter().copied(),
     );
+    let artifact_limit = max_tool_output_bytes
+        .get()
+        .max(ARTIFACT_LIMIT.saturating_add(1));
     let adapter = AdkToolBridge::for_selected(
         bridge,
         names.iter().map(String::as_str),
@@ -5476,7 +5482,7 @@ fn build_toolset(
         authority,
         None,
         InMemoryArtifactStore::new(
-            NonZeroU64::new(ARTIFACT_LIMIT).expect("positive artifact limit"),
+            NonZeroU64::new(artifact_limit).expect("positive artifact limit"),
             NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page limit"),
         ),
     )

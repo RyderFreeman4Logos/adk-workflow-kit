@@ -1,5 +1,6 @@
 use std::{
     fs,
+    num::NonZeroU64,
     path::PathBuf,
     sync::{
         Arc,
@@ -10,8 +11,9 @@ use std::{
 use serde_json::{Value, json};
 use workflow_adk::execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1};
 use workflow_runtime::{
-    ChildSandbox, SandboxCapability, SearchCodeTool, ToolBridgeError, ToolCallContext,
-    ToolEnvelope, ToolHandler, ToolImplementationRegistry, ToolProvenance,
+    ArtifactStore, ChildSandbox, FilesystemArtifactStore, PageRequest, SandboxCapability,
+    SearchCodeTool, ToolBridgeError, ToolCallContext, ToolEnvelope, ToolHandler,
+    ToolImplementationRegistry, ToolProvenance,
 };
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -303,4 +305,122 @@ fn run_with_implementations_rejects_empty_default_identity_or_resume_mismatch() 
     closures
         .register("search_code", "1", Arc::from(empty_closure))
         .expect_err("default closure identity must fail closed at register");
+}
+
+#[test]
+fn execution_backend_pages_oversized_repo_tool_output() {
+    let root = test_root();
+    let repo = root.join("repo");
+    fs::create_dir_all(repo.join("src")).expect("repo");
+    let snippet = "needle ".repeat(80);
+    let mut source = String::new();
+    for index in 0..400 {
+        source.push_str(&format!("hit {index} {snippet}\n"));
+    }
+    fs::write(repo.join("src/lib.rs"), source).expect("large search corpus");
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).expect("workflow fixture");
+
+    let mut registry = ToolImplementationRegistry::new();
+    registry
+        .register("search_code", "1", Arc::new(SearchCodeTool::new(&repo)))
+        .expect("register search_code");
+
+    let profile = ExecutionProfileV1::parse(
+        &serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "worker",
+                "version": "1",
+                "model": "worker",
+                "responses": [
+                    {"calls": [{"id":"call-page","name":"search_code","args":{"query":"needle","path":"src"}}]},
+                    finish(json!({"answer":"done"}))
+                ]
+            },
+            "tools": [{
+                "name": "search_code",
+                "input_schema": {
+                    "$schema":"https://json-schema.org/draft/2020-12/schema",
+                    "type":"object",
+                    "properties":{"query":{"type":"string"},"path":{"type":"string"}},
+                    "required":["query"],
+                    "additionalProperties":false
+                },
+                "required_capabilities": ["filesystem.read"]
+            }],
+            "sandbox": {"capabilities": ["filesystem.read"]},
+            "loop_policy": {
+                "schema_version": 1,
+                "max_model_iterations": 100,
+                "max_total_tool_calls": 100,
+                "max_tool_calls_per_tool": 100,
+                "wall_time_ms": 60000,
+                "idle_time_ms": 60000,
+                "tool_time_ms": 60000,
+                "max_tool_output_bytes": 262144
+            }
+        }))
+        .expect("profile serializes"),
+    )
+    .expect("profile parses");
+
+    let receipt =
+        ExecutionBackend::run_with_implementations(&workflow, profile, json!({}), &root, &registry)
+            .expect("production ADK path must page >64 KiB repo-tool output");
+    assert_eq!(receipt.status(), "succeeded");
+
+    let events = tool_events(receipt.run_root());
+    let parsed = events
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("event json"))
+        .collect::<Vec<_>>();
+    let completed = parsed
+        .iter()
+        .find(|event| event["kind"] == "tool_completed")
+        .unwrap_or_else(|| panic!("tool_completed event missing, events={events}"));
+    let event_artifact = completed
+        .pointer("/payload/artifact_reference/artifact_id")
+        .and_then(Value::as_str)
+        .expect("large tool output must retain an event artifact");
+    let store = FilesystemArtifactStore::try_new(
+        receipt.run_root().join("artifacts"),
+        NonZeroU64::new(262_144).expect("positive"),
+        NonZeroU64::new(65_536).expect("positive"),
+    )
+    .expect("production artifact store");
+    let page_limit = NonZeroU64::new(65_536).expect("positive");
+    let mut bytes = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = store
+            .read_page(
+                &workflow_runtime::ArtifactId::parse(event_artifact).expect("artifact id"),
+                PageRequest::new(offset, page_limit),
+            )
+            .expect("page must be readable from the production store");
+        bytes.extend_from_slice(page.bytes());
+        match page.next_offset() {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    let body: Value = serde_json::from_slice(&bytes).expect("paged event payload");
+    let handle = body
+        .pointer("/0/response/artifact_id")
+        .or_else(|| body.pointer("/response/artifact_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("production paging must expose artifact_id, page={body}, events={events}")
+        });
+    let next_offset = body
+        .pointer("/0/response/next_offset")
+        .or_else(|| body.pointer("/response/next_offset"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| {
+            panic!("production paging must expose next_offset, page={body}, events={events}")
+        });
+    assert_eq!(handle.len(), 64);
+    assert!(next_offset > 0);
 }
