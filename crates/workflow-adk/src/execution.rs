@@ -158,6 +158,7 @@ struct LoopLedgerStore {
     run_id: RunId,
     persist_raw_loop_state: bool,
     nodes: Mutex<BTreeMap<String, LoopState>>,
+    replaying_skill_resource_reads: Mutex<BTreeSet<(String, String)>>,
 }
 
 impl LoopLedgerStore {
@@ -177,6 +178,7 @@ impl LoopLedgerStore {
             run_id,
             persist_raw_loop_state,
             nodes: Mutex::new(BTreeMap::new()),
+            replaying_skill_resource_reads: Mutex::new(BTreeSet::new()),
         };
         store.persist_ledger(&BTreeMap::new())?;
         Ok(store)
@@ -216,6 +218,7 @@ impl LoopLedgerStore {
             run_id,
             persist_raw_loop_state,
             nodes: Mutex::new(nodes),
+            replaying_skill_resource_reads: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -562,6 +565,12 @@ impl LoopLedgerStore {
                 for completed in &mut state.completed_calls {
                     let call = completed.call_mut();
                     call.args = durable_pending_args(call).expect("checked completed calls");
+                    if matches!(
+                        call.name.as_str(),
+                        "activate_skill" | "read_skill_resource" | "run_skill_script"
+                    ) {
+                        call.response = None;
+                    }
                 }
             }
         }
@@ -621,6 +630,12 @@ impl LoopLedgerStore {
                 for completed in &mut state.completed_calls {
                     let call = completed.call_mut();
                     call.args = durable_pending_args(call).expect("checked completed calls");
+                    if matches!(
+                        call.name.as_str(),
+                        "activate_skill" | "read_skill_resource" | "run_skill_script"
+                    ) {
+                        call.response = None;
+                    }
                 }
             }
         }
@@ -677,6 +692,12 @@ impl LoopLedgerStore {
                 for completed in &mut state.completed_calls {
                     let call = completed.call_mut();
                     call.args = durable_pending_args(call).expect("checked completed calls");
+                    if matches!(
+                        call.name.as_str(),
+                        "activate_skill" | "read_skill_resource" | "run_skill_script"
+                    ) {
+                        call.response = None;
+                    }
                 }
             }
         }
@@ -732,6 +753,18 @@ impl LoopLedgerStore {
         let state = nodes
             .get_mut(node)
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if self
+            .replaying_skill_resource_reads
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?
+            .contains(&(node.to_owned(), fingerprint.to_owned()))
+        {
+            return Ok(state
+                .skill_resource_read_bytes
+                .get(skill)
+                .copied()
+                .unwrap_or_default());
+        }
         if let Some(reserved) = state.skill_resource_read_reservations.get(fingerprint) {
             if *reserved != page_bytes {
                 return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
@@ -763,6 +796,25 @@ impl LoopLedgerStore {
         };
         self.persist_locked(&nodes)?;
         Ok(total)
+    }
+
+    fn set_replaying_skill_resource_read(
+        &self,
+        node: &str,
+        fingerprint: &str,
+        replaying: bool,
+    ) -> Result<(), ExecutionError> {
+        let mut reads = self
+            .replaying_skill_resource_reads
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let key = (node.to_owned(), fingerprint.to_owned());
+        if replaying {
+            reads.insert(key);
+        } else {
+            reads.remove(&key);
+        }
+        Ok(())
     }
 }
 
@@ -4764,17 +4816,19 @@ impl ExecutionBackend {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        if let Err(error) = restore_completed_calls(&loop_ledger).and_then(|()| {
-            replay_pending_tools(
-                &loop_ledger,
-                &toolsets,
-                &profile,
-                &effect_journal,
-                &run_identity,
-                profile.run_limits(),
-                &effect_fence,
-            )
-        }) {
+        if let Err(error) = restore_completed_calls(&loop_ledger, &toolsets, &effect_fence)
+            .and_then(|()| {
+                replay_pending_tools(
+                    &loop_ledger,
+                    &toolsets,
+                    &profile,
+                    &effect_journal,
+                    &run_identity,
+                    profile.run_limits(),
+                    &effect_fence,
+                )
+            })
+        {
             return Err(resume_failure(
                 &root,
                 &events_path,
@@ -5636,17 +5690,37 @@ fn invoke_restored_tool(
     serde_json::to_value(response).map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))
 }
 
-fn restore_completed_calls(ledger: &LoopLedgerStore) -> Result<(), ExecutionError> {
+fn restore_completed_calls(
+    ledger: &LoopLedgerStore,
+    toolsets: &BTreeMap<String, Option<BoundTool>>,
+    effect_fence: &EffectFence,
+) -> Result<(), ExecutionError> {
     let mut restored = Vec::new();
     for (node, completed) in ledger.completed_calls()? {
         let call = completed.call();
-        if is_redacted_script_pending(call) {
-            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
-        }
-        let response = call
-            .response
-            .clone()
-            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        let response = if matches!(call.name.as_str(), "activate_skill" | "read_skill_resource") {
+            let (_, toolset) = toolsets
+                .get(&node)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+            let replaying_read = call.name == "read_skill_resource";
+            let replay_fingerprint = workflow_runtime::argument_fingerprint(&call.args);
+            if replaying_read {
+                ledger.set_replaying_skill_resource_read(&node, &replay_fingerprint, true)?;
+            }
+            let response = invoke_restored_tool(&node, call, Arc::clone(toolset), effect_fence);
+            if replaying_read {
+                ledger.set_replaying_skill_resource_read(&node, &replay_fingerprint, false)?;
+            }
+            response?
+        } else {
+            if is_redacted_script_pending(call) {
+                return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+            }
+            call.response
+                .clone()
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+        };
         restored.push((node, completed, response));
     }
     for turn in restored.chunk_by(|left, right| {
