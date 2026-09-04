@@ -37,9 +37,9 @@ use workflow_runtime::{
     PolicyCapabilities, ProtectedArtifactReferenceV1, PureTransformRequest, ReadSkillResourceInput,
     RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox, RunSkillScriptInput,
     SandboxCapability, SqliteCheckpointStore, ToolBridge, ToolBridgeError, ToolBridgeErrorKind,
-    ToolCall, ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler, ToolProvenance,
-    ToolRegistration, WorkdirManager, WorkflowRuntimeEventKindV1, contains_sensitive_key,
-    intersect_policy_capabilities, redact_json_value, selection_identity,
+    ToolCall, ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler, ToolImplementationRegistry,
+    ToolProvenance, ToolRegistration, WorkdirManager, WorkflowRuntimeEventKindV1,
+    contains_sensitive_key, intersect_policy_capabilities, redact_json_value, selection_identity,
     verify_sandbox_capabilities,
 };
 use workflow_spec::{
@@ -2250,6 +2250,8 @@ pub struct ExecutionProfileV1 {
     tool: Option<ToolWire>,
     #[serde(default)]
     tools: Vec<ToolWire>,
+    #[serde(skip)]
+    tool_implementations: Option<Arc<ToolImplementationRegistry>>,
     #[serde(default)]
     skills: Vec<SkillWire>,
     #[serde(default)]
@@ -2432,7 +2434,8 @@ fn format_bound_identity(role: &str, model: &ModelBinding) -> String {
 #[serde(deny_unknown_fields)]
 struct ToolWire {
     name: String,
-    result: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
     input_schema: Value,
     #[serde(default)]
     delay_ms: u64,
@@ -2849,9 +2852,17 @@ impl ExecutionProfileV1 {
             .iter()
             .map(|capability| parse_capability(capability))
             .collect::<Result<Vec<_>, _>>()?;
-        let implementation_digest = serde_json::to_vec(&tool.result)
-            .map(|result| format!("sha256:{:x}", Sha256::digest(result)))
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+        let implementation_digest = if let Some(result) = &tool.result {
+            serde_json::to_vec(result)
+                .map(|result| format!("sha256:{:x}", Sha256::digest(result)))
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?
+        } else {
+            self.tool_implementations
+                .as_ref()
+                .and_then(|registry| registry.resolve(&tool.name, "1").ok())
+                .map(|handler| handler.implementation_identity())
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?
+        };
         ToolRegistration::for_types::<Value, Value>(
             &tool.name,
             ToolProvenance::new(&tool.name, "1"),
@@ -3794,6 +3805,18 @@ impl ExecutionBackend {
             workdir_base,
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    /// Runs with named, versioned Rust tool implementations instead of fabricated results.
+    pub fn run_with_implementations(
+        workflow: impl AsRef<Path>,
+        mut profile: ExecutionProfileV1,
+        input: Value,
+        workdir_base: impl AsRef<Path>,
+        implementations: &ToolImplementationRegistry,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
+        profile.tool_implementations = Some(Arc::new(implementations.clone()));
+        Self::run(workflow, profile, input, workdir_base)
     }
 
     pub fn run_cancellable(
@@ -4806,6 +4829,9 @@ fn build_checkpoint_manifest(
         ))
         .with_implementation("toolset", plan.resume_identity())
         .with_event_log_identity("workflow-runtime-events-v1");
+    if let Some(registry) = &profile.tool_implementations {
+        manifest = manifest.with_implementation("tool-implementations", registry.identity());
+    }
     if let Some(transform) = transform_module {
         manifest = manifest.with_resource_hash(
             "pure-transform",
@@ -5168,11 +5194,25 @@ fn build_tool_registry(
     for tool in profile.tool_wires() {
         let registration = profile.tool_registration(tool)?;
         let provenance = registration.provenance().clone();
+        if let Some(handler) = profile
+            .tool_implementations
+            .as_ref()
+            .and_then(|registry| registry.resolve(&tool.name, "1").ok())
+        {
+            bridge
+                .register_shared(registration, handler)
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+            continue;
+        }
+        let result = tool
+            .result
+            .clone()
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
         bridge
             .register(
                 registration,
                 StaticToolHandler {
-                    result: tool.result.clone(),
+                    result,
                     provenance,
                     run_id: run_id.as_str().to_owned(),
                     node_id: tool.name.clone(),
@@ -5411,9 +5451,18 @@ fn restore_completed_calls(
                     .tool_wires()
                     .find(|tool| tool.name == call.name)
                     .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-                let provenance = profile.tool_registration(tool)?.provenance().clone();
-                serde_json::to_value(ToolEnvelope::success(tool.result.clone(), provenance))
-                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+                if let Some(result) = tool.result.clone() {
+                    let provenance = profile.tool_registration(tool)?.provenance().clone();
+                    serde_json::to_value(ToolEnvelope::success(result, provenance))
+                        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+                } else {
+                    let toolset = toolsets
+                        .get(&node)
+                        .and_then(Option::as_ref)
+                        .map(|(_, toolset)| Arc::clone(toolset))
+                        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+                    invoke_restored_tool(&node, call, toolset, effect_fence)?
+                }
             }
         };
         restored.push((node, completed, response));
@@ -5456,11 +5505,15 @@ fn invoke_restored_ordinary_tool(
         &tool.name,
         &call.fingerprint,
     );
+    let committed = tool
+        .result
+        .clone()
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
     let result = match effect_journal
-        .commit(&key, &tool.result)
+        .commit(&key, &committed)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))?
     {
-        EffectCommit::Committed => tool.result.clone(),
+        EffectCommit::Committed => committed,
         EffectCommit::AlreadyCommitted(result) => result,
     };
     effect_fence
@@ -5491,7 +5544,11 @@ fn replay_pending_tools(
         if !names.contains(&pending.name) {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
-        let response = if is_redacted_ordinary_pending(&pending) {
+        let response = if is_redacted_ordinary_pending(&pending)
+            && profile
+                .tool_wires()
+                .any(|tool| tool.name == pending.name && tool.result.is_some())
+        {
             invoke_restored_ordinary_tool(profile, &pending, effect_journal, run_id, effect_fence)?
         } else {
             invoke_restored_tool(&node, &pending, Arc::clone(toolset), effect_fence)?

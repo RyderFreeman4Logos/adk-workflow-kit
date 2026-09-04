@@ -18,6 +18,7 @@ use crate::{
 };
 
 /// Exact ID/version lookup for a registered tool implementation.
+#[derive(Clone, Default)]
 pub struct ToolImplementationRegistry {
     tools: BTreeMap<(String, String), Arc<dyn ToolHandler>>,
 }
@@ -74,12 +75,6 @@ impl ToolImplementationRegistry {
             hasher.update([0]);
         }
         format!("sha256:{:x}", hasher.finalize())
-    }
-}
-
-impl Default for ToolImplementationRegistry {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
