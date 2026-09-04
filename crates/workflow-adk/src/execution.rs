@@ -2562,7 +2562,8 @@ impl ExecutionProfileV1 {
     }
 
     fn bind_declared_implementations(&mut self, workflow: &Path) -> Result<(), ExecutionError> {
-        if self.tool_implementations.is_some() {
+        if let Some(existing) = self.tool_implementations.clone() {
+            self.persist_implementation_bindings(&existing)?;
             return Ok(());
         }
         let mut registry = ToolImplementationRegistry::new();
@@ -2594,6 +2595,29 @@ impl ExecutionProfileV1 {
         }
         if bound {
             self.tool_implementations = Some(Arc::new(registry));
+        }
+        Ok(())
+    }
+
+    fn persist_implementation_bindings(
+        &mut self,
+        registry: &ToolImplementationRegistry,
+    ) -> Result<(), ExecutionError> {
+        let tools = self
+            .tool
+            .iter_mut()
+            .chain(self.tools.iter_mut())
+            .collect::<Vec<_>>();
+        for tool in tools {
+            if tool.result.is_some() {
+                continue;
+            }
+            let handler = registry
+                .resolve(&tool.name, "1")
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+            if let Some(root) = implementation_root(&tool.name, handler.as_ref()) {
+                tool.root = Some(root);
+            }
         }
         Ok(())
     }
@@ -3228,6 +3252,14 @@ fn resolve_tool_root(workflow: &Path, declared: Option<&str>) -> Result<PathBuf,
         .ok()
         .filter(|path| path.is_dir())
         .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))
+}
+
+fn implementation_root(name: &str, handler: &dyn ToolHandler) -> Option<String> {
+    handler
+        .implementation_identity()
+        .strip_prefix(&format!("{name}:1:"))
+        .filter(|root| !root.is_empty())
+        .map(str::to_owned)
 }
 
 struct RestoredFinishAgent {
@@ -4452,10 +4484,33 @@ impl ExecutionBackend {
         Self::resume_cancellable(workdir_base, run_id, Arc::new(AtomicBool::new(false)))
     }
 
+    /// Resumes with the same named implementations used by the original run.
+    pub fn resume_with_implementations(
+        workdir_base: impl AsRef<Path>,
+        run_id: &str,
+        implementations: &ToolImplementationRegistry,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
+        Self::resume_bound(
+            workdir_base,
+            run_id,
+            Arc::new(AtomicBool::new(false)),
+            Some(implementations),
+        )
+    }
+
     pub fn resume_cancellable(
         workdir_base: impl AsRef<Path>,
         run_id: &str,
         cancellation: Arc<AtomicBool>,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
+        Self::resume_bound(workdir_base, run_id, cancellation, None)
+    }
+
+    fn resume_bound(
+        workdir_base: impl AsRef<Path>,
+        run_id: &str,
+        cancellation: Arc<AtomicBool>,
+        implementations: Option<&ToolImplementationRegistry>,
     ) -> Result<ExecutionReceipt, ExecutionError> {
         let (root, mut manifest) = find_run(workdir_base.as_ref(), run_id)?;
         if !matches!(manifest.status.as_str(), "running" | "succeeded") {
@@ -4515,6 +4570,9 @@ impl ExecutionBackend {
         let mut profile =
             ExecutionProfileV1::parse(&bounded_read(&root.join("execution-profile.json"))?)?;
         profile.restore_skill_snapshot(&root)?;
+        if let Some(implementations) = implementations {
+            profile.tool_implementations = Some(Arc::new(implementations.clone()));
+        }
         let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
         verify_sandbox_capabilities(
             &RequestedCapabilities::new(required_capabilities.iter().copied()),
@@ -4525,7 +4583,18 @@ impl ExecutionBackend {
             serde_json::from_slice::<Value>(&bounded_read(&root.join("execution-input.json"))?)
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let workflow = root.join("workflow.toml");
-        profile.bind_declared_implementations(&workflow)?;
+        profile
+            .bind_declared_implementations(&workflow)
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        if let Some(expected) = checkpoint_manifest.implementation("tool-implementations") {
+            let live = profile
+                .tool_implementations
+                .as_ref()
+                .map(|registry| registry.identity());
+            if live.as_deref() != Some(expected) {
+                return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+            }
+        }
         let compiled = compile_file(workflow.to_string_lossy().as_ref())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let agent_contracts = resolve_agent_contracts(&workflow, compiled.ir())

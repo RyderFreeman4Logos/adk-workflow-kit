@@ -8,8 +8,11 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use workflow_adk::execution::{ExecutionBackend, ExecutionProfileV1};
-use workflow_runtime::{SearchCodeTool, ToolImplementationRegistry};
+use workflow_adk::execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1};
+use workflow_runtime::{
+    ChildSandbox, SandboxCapability, SearchCodeTool, ToolBridgeError, ToolCallContext,
+    ToolEnvelope, ToolHandler, ToolImplementationRegistry, ToolProvenance,
+};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -128,4 +131,103 @@ fn search_code_registry_returns_argument_dependent_hits() {
         retry, run,
         "valid arguments must not share a fabricated result"
     );
+}
+
+struct MarkerSearch;
+
+impl ToolHandler for MarkerSearch {
+    fn required_capabilities(
+        &self,
+        _arguments: &Value,
+    ) -> Result<Vec<SandboxCapability>, ToolBridgeError> {
+        Ok(vec![SandboxCapability::FilesystemRead])
+    }
+
+    fn execute(
+        &self,
+        _sandbox: &ChildSandbox<'_>,
+        _context: &ToolCallContext,
+        _arguments: &Value,
+    ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        Ok(ToolEnvelope::success(
+            json!({"matches": [{"path": "custom-handler", "line": 1, "snippet": "marker"}]}),
+            ToolProvenance::new("search_code", "1"),
+        ))
+    }
+
+    fn implementation_identity(&self) -> String {
+        "search_code:custom-marker".to_owned()
+    }
+}
+
+#[test]
+fn run_with_implementations_resume_keeps_nondefault_root() {
+    let root = test_root();
+    let repo = repo(&root.join("elsewhere"));
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).expect("workflow fixture");
+
+    let mut registry = ToolImplementationRegistry::new();
+    registry
+        .register("search_code", "1", Arc::new(SearchCodeTool::new(&repo)))
+        .expect("register search_code");
+
+    let receipt = ExecutionBackend::run_with_implementations(
+        &workflow,
+        profile(),
+        json!({}),
+        &root,
+        &registry,
+    )
+    .expect("registered search_code executes");
+    let resumed = ExecutionBackend::resume(&root, receipt.run_id())
+        .expect("public resume must keep the bound non-default root");
+    assert_eq!(resumed.run_id(), receipt.run_id());
+    let events = tool_events(receipt.run_root());
+    assert!(events.contains("retry.rs"), "{events}");
+}
+
+#[test]
+fn run_with_implementations_resume_keeps_custom_handler() {
+    let root = test_root();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).expect("workflow fixture");
+
+    let mut registry = ToolImplementationRegistry::new();
+    registry
+        .register("search_code", "1", Arc::new(MarkerSearch))
+        .expect("register custom handler");
+
+    let receipt = ExecutionBackend::run_with_implementations(
+        &workflow,
+        profile(),
+        json!({}),
+        &root,
+        &registry,
+    )
+    .expect("custom handler executes");
+    let events = tool_events(receipt.run_root());
+    assert!(events.contains("custom-handler"), "{events}");
+
+    let error = ExecutionBackend::resume(&root, receipt.run_id())
+        .expect_err("public resume must not silently rebuild a different handler");
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+
+    let resumed = ExecutionBackend::resume_with_implementations(&root, receipt.run_id(), &registry)
+        .expect("resume must accept the same registry against checkpoint identity");
+    assert_eq!(resumed.run_id(), receipt.run_id());
+    let events = tool_events(receipt.run_root());
+    assert!(events.contains("custom-handler"), "{events}");
+
+    let mut other = ToolImplementationRegistry::new();
+    other
+        .register(
+            "search_code",
+            "1",
+            Arc::new(SearchCodeTool::new(repo(&root.join("elsewhere")))),
+        )
+        .expect("register other");
+    let mismatch = ExecutionBackend::resume_with_implementations(&root, receipt.run_id(), &other)
+        .expect_err("a different registry must not pass checkpoint identity");
+    assert_eq!(mismatch.kind(), ExecutionErrorKind::InvalidRunState);
 }

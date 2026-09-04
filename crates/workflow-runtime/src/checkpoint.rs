@@ -205,6 +205,11 @@ impl CheckpointCompatibilityManifestV1 {
         self
     }
 
+    /// Returns a kit-owned implementation identity.
+    pub fn implementation(&self, name: &str) -> Option<&str> {
+        self.implementation_identities.get(name).map(String::as_str)
+    }
+
     /// Returns the run identity carried by this manifest.
     pub fn run_id(&self) -> &str {
         &self.run_id
