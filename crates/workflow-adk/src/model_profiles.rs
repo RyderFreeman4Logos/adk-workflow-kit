@@ -295,6 +295,8 @@ pub struct FakeModelProfile {
     model: String,
     responses: Vec<serde_json::Value>,
     runtime: ModelRuntimeConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tokenizer: Option<String>,
     #[serde(default)]
     response_delay: Duration,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -472,6 +474,7 @@ impl FakeModelProfile {
                 .map(|response| serde_json::Value::String(response.into()))
                 .collect(),
             runtime: ModelRuntimeConfig::default(),
+            tokenizer: None,
             response_delay: Duration::ZERO,
             resolved_model: None,
         }
@@ -482,6 +485,10 @@ impl FakeModelProfile {
     }
     pub fn with_resolved_model(mut self, name: impl Into<String>) -> Self {
         self.resolved_model = Some(name.into());
+        self
+    }
+    pub fn with_tokenizer(mut self, tokenizer: impl Into<String>) -> Self {
+        self.tokenizer = Some(tokenizer.into());
         self
     }
 
@@ -497,6 +504,7 @@ impl FakeModelProfile {
             model: model.into(),
             responses,
             runtime: ModelRuntimeConfig::default(),
+            tokenizer: None,
             response_delay: Duration::from_millis(response_delay_ms),
             resolved_model: None,
         }
@@ -512,6 +520,8 @@ pub struct OpenAiCompatibleProfile {
     base_url: String,
     credential: CredentialHandle,
     runtime: ModelRuntimeConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tokenizer: Option<String>,
 }
 
 impl OpenAiCompatibleProfile {
@@ -529,10 +539,15 @@ impl OpenAiCompatibleProfile {
             base_url: base_url.into(),
             credential,
             runtime: ModelRuntimeConfig::default(),
+            tokenizer: None,
         }
     }
     pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
         self.provider = provider.into();
+        self
+    }
+    pub fn with_tokenizer(mut self, tokenizer: impl Into<String>) -> Self {
+        self.tokenizer = Some(tokenizer.into());
         self
     }
     pub fn with_runtime(mut self, runtime: ModelRuntimeConfig) -> Self {
@@ -721,6 +736,7 @@ pub struct ModelBindingIdentity {
     requested_model: String,
     resolved_model: String,
     provider: String,
+    tokenizer: String,
 }
 
 impl ModelBindingIdentity {
@@ -735,6 +751,9 @@ impl ModelBindingIdentity {
     }
     pub fn provider(&self) -> &str {
         &self.provider
+    }
+    pub fn tokenizer(&self) -> &str {
+        &self.tokenizer
     }
 }
 
@@ -804,6 +823,12 @@ impl ModelProfile {
             }
         };
         let resolved = llm.name().to_owned();
+        let tokenizer = match self {
+            Self::Fake(value) => value.tokenizer.as_deref(),
+            Self::OpenAiCompatible(value) => value.tokenizer.as_deref(),
+        }
+        .unwrap_or(&resolved)
+        .to_owned();
         Ok(ModelBinding {
             role,
             identity: ModelBindingIdentity {
@@ -811,6 +836,7 @@ impl ModelProfile {
                 requested_model: requested,
                 resolved_model: resolved,
                 provider,
+                tokenizer: tokenizer.clone(),
             },
             runtime: self.runtime().clone(),
             llm,
@@ -910,10 +936,11 @@ impl ModelBinding {
         if sampling.presence_penalty.is_some() {
             config.presence_penalty = sampling.presence_penalty;
         }
-        if sampling.max_output_tokens.is_some() {
+        // Invocation-bound values are authoritative; profile runtime fills only omissions.
+        if config.max_output_tokens.is_none() {
             config.max_output_tokens = sampling.max_output_tokens;
         }
-        if sampling.seed.is_some() {
+        if config.seed.is_none() {
             config.seed = sampling.seed;
         }
         for (namespace, value) in self.runtime.provider_extensions() {
@@ -1374,6 +1401,67 @@ mod retry_admission_tests {
         }
     }
 
+    struct RequestCapture {
+        request: Arc<Mutex<Option<LlmRequest>>>,
+    }
+
+    #[async_trait]
+    impl Llm for RequestCapture {
+        fn name(&self) -> &str {
+            "request-capture"
+        }
+
+        async fn generate_content(
+            &self,
+            request: LlmRequest,
+            _stream: bool,
+        ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+            *self.request.lock().expect("capture lock") = Some(request);
+            Ok(Box::pin(stream::iter([Ok(LlmResponse::new(
+                Content::new("assistant").with_text("done"),
+            ))])))
+        }
+    }
+
+    #[test]
+    fn invocation_budget_wins_over_binding_runtime_overrides() {
+        let captured = Arc::new(Mutex::new(None));
+        let mut binding = test_binding(
+            Arc::new(RequestCapture {
+                request: Arc::clone(&captured),
+            }),
+            "request-capture",
+        );
+        binding.runtime = ModelRuntimeConfig::default()
+            .with_sampling(|sampling| sampling.with_max_output_tokens(999).with_seed(123));
+        let mut request = LlmRequest::new(
+            "request-capture",
+            vec![Content::new("user").with_text("hello")],
+        );
+        let config = request.config.get_or_insert_with(Default::default);
+        config.max_output_tokens = Some(2048);
+        config.seed = Some(77);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let _stream = Llm::generate_content(&binding, request, false)
+                    .await
+                    .expect("captured request");
+            });
+
+        let request = captured
+            .lock()
+            .expect("capture lock")
+            .clone()
+            .expect("request captured");
+        let config = request.config.expect("request config");
+        assert_eq!(config.max_output_tokens, Some(2048));
+        assert_eq!(config.seed, Some(77));
+    }
+
     fn test_binding(llm: Arc<dyn Llm>, model: &str) -> ModelBinding {
         ModelBinding {
             role: ModelRole::Worker,
@@ -1382,6 +1470,7 @@ mod retry_admission_tests {
                 requested_model: model.to_owned(),
                 resolved_model: model.to_owned(),
                 provider: "custom".to_owned(),
+                tokenizer: model.to_owned(),
             },
             runtime: ModelRuntimeConfig::default(),
             llm,
@@ -1438,6 +1527,7 @@ mod retry_admission_tests {
                         requested_model: "multi-chunk".to_owned(),
                         resolved_model: "multi-chunk".to_owned(),
                         provider: "custom".to_owned(),
+                        tokenizer: "multi-chunk".to_owned(),
                     },
                     runtime: ModelRuntimeConfig::default(),
                     llm: Arc::new(MultiChunkLlm),
