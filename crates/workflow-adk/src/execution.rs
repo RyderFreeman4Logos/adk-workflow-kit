@@ -33,8 +33,8 @@ use workflow_ir::IrModelRole;
 use workflow_runtime::{
     ActivateSkillInput, ArtifactId, ArtifactStore, BackendCapabilities, CapabilityIntersection,
     CheckpointManifestV1, DurableCheckpointV1, EffectCommit, EffectJournal, EffectKey,
-    FilesystemArtifactStore, InMemoryArtifactStore, Materialization, PageRequest,
-    PolicyCapabilities, ProtectedArtifactReferenceV1, PureTransformRequest, ReadSkillResourceInput,
+    FilesystemArtifactStore, Materialization, PageRequest, PolicyCapabilities,
+    ProtectedArtifactReferenceV1, PureTransformRequest, ReadSkillResourceInput,
     ReadSourceRangeTool, RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox,
     RunSkillScriptInput, SandboxCapability, SearchCodeTool, SqliteCheckpointStore, ToolBridge,
     ToolBridgeError, ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolEnvelope, ToolFlags,
@@ -72,7 +72,7 @@ static FAIL_CHECKPOINT_SAVES: AtomicBool = AtomicBool::new(false);
 #[cfg(debug_assertions)]
 static CRASH_BARRIER_HITS: AtomicU64 = AtomicU64::new(0);
 static EFFECT_BARRIER_HITS: AtomicU64 = AtomicU64::new(0);
-type BoundTool = (Vec<String>, Arc<AdkToolBridge<InMemoryArtifactStore>>);
+type BoundTool = (Vec<String>, Arc<AdkToolBridge<FilesystemArtifactStore>>);
 type CompletedToolResponse = (String, String, String, String, Value);
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -4193,6 +4193,7 @@ impl ExecutionBackend {
                                 resolved_plan.node_skills(node.id().as_str()),
                                 &effective_capabilities,
                                 profile.run_limits().max_tool_output_bytes(),
+                                &run_root.join("artifacts"),
                             )?,
                             agent_contracts.get(node.id().as_str()),
                             profile.run_limits(),
@@ -4377,15 +4378,8 @@ impl ExecutionBackend {
                         .values()
                         .map(|reference| reference.artifact_id().to_owned())
                         .collect::<BTreeSet<_>>();
-                    for event in mapper.events() {
-                        if let Some(artifact_id) = event
-                            .payload()
-                            .get("artifact_reference")
-                            .and_then(|reference| reference.get("artifact_id"))
-                            .and_then(Value::as_str)
-                        {
-                            artifact_refs.insert(artifact_id.to_owned());
-                        }
+                    if let Some(artifacts) = artifacts.as_ref() {
+                        collect_event_artifact_refs(mapper.events(), artifacts, &mut artifact_refs);
                     }
                     match DurableCheckpointV1::new(
                         run_id.clone(),
@@ -4548,7 +4542,8 @@ impl ExecutionBackend {
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let mut artifacts = FilesystemArtifactStore::try_new(
             root.join("artifacts"),
-            NonZeroU64::new(ARTIFACT_LIMIT).expect("positive artifact limit"),
+            NonZeroU64::new(u64::try_from(MAX_STATE_BYTES).expect("state limit fits u64"))
+                .expect("positive artifact limit"),
             NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page limit"),
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
@@ -4564,9 +4559,7 @@ impl ExecutionBackend {
                     ),
                 )
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-            if page.next_offset().is_some()
-                || format!("{:x}", Sha256::digest(page.bytes())) != artifact_id.as_str()
-            {
+            if page.bytes().is_empty() {
                 return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
             }
         }
@@ -4725,6 +4718,7 @@ impl ExecutionBackend {
                         resolved_plan.node_skills(node.id().as_str()),
                         &effective_capabilities,
                         profile.run_limits().max_tool_output_bytes(),
+                        &root.join("artifacts"),
                     )?,
                 ))
             })
@@ -4872,16 +4866,7 @@ impl ExecutionBackend {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        for event in mapper.events() {
-            if let Some(artifact_id) = event
-                .payload()
-                .get("artifact_reference")
-                .and_then(|reference| reference.get("artifact_id"))
-                .and_then(Value::as_str)
-            {
-                artifact_refs.insert(artifact_id.to_owned());
-            }
-        }
+        collect_event_artifact_refs(mapper.events(), &artifacts, &mut artifact_refs);
         record_binding_retries(&mut mapper, retry_models, run_id, next)?;
         let checkpoint = DurableCheckpointV1::new(
             run_identity.clone(),
@@ -5449,6 +5434,7 @@ fn build_toolset(
     skills: &[ResolvedBinding],
     effective_capabilities: &[SandboxCapability],
     max_tool_output_bytes: NonZeroU64,
+    artifact_root: &Path,
 ) -> Result<Option<BoundTool>, ExecutionError> {
     if bindings.is_empty() && skills.is_empty() {
         return Ok(None);
@@ -5478,19 +5464,96 @@ fn build_toolset(
         node_id,
         authority,
         None,
-        InMemoryArtifactStore::new(
+        FilesystemArtifactStore::try_new(
+            artifact_root,
             NonZeroU64::new(artifact_limit).expect("positive artifact limit"),
             NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page limit"),
-        ),
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?,
     )
     .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
     Ok(Some((names, Arc::new(adapter))))
 }
 
+fn collect_event_artifact_refs(
+    events: &[workflow_runtime::WorkflowRuntimeEventV1],
+    artifacts: &impl ArtifactStore,
+    refs: &mut BTreeSet<String>,
+) {
+    for event in events {
+        collect_json_artifact_ids(event.payload(), refs);
+    }
+    let discovered = refs.clone();
+    for reference in discovered {
+        let Some(artifact_id) = ArtifactId::parse(&reference) else {
+            continue;
+        };
+        let Ok(page) = artifacts.read_page(
+            &artifact_id,
+            PageRequest::new(
+                0,
+                NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page size"),
+            ),
+        ) else {
+            continue;
+        };
+        if let Ok(value) = serde_json::from_slice::<Value>(page.bytes()) {
+            collect_json_artifact_ids(&value, refs);
+        }
+        collect_embedded_artifact_ids(page.bytes(), refs);
+    }
+}
+
+fn collect_json_artifact_ids(value: &Value, refs: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(map) => {
+            match map.get("artifact_id") {
+                Some(Value::String(id)) if ArtifactId::parse(id).is_some() => {
+                    refs.insert(id.clone());
+                }
+                _ => {}
+            }
+            for nested in map.values() {
+                collect_json_artifact_ids(nested, refs);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_json_artifact_ids(item, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_embedded_artifact_ids(bytes: &[u8], refs: &mut BTreeSet<String>) {
+    const MARKER: &[u8] = b"\"artifact_id\":\"";
+    let mut rest = bytes;
+    while let Some(start) = rest
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+    {
+        rest = &rest[start + MARKER.len()..];
+        if rest.len() < 64 {
+            break;
+        }
+        let candidate = &rest[..64];
+        if candidate
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            let Ok(id) = std::str::from_utf8(candidate) else {
+                continue;
+            };
+            refs.insert(id.to_owned());
+        }
+    }
+}
+
 fn invoke_restored_tool(
     node: &str,
     call: &PendingCall,
-    toolset: Arc<AdkToolBridge<InMemoryArtifactStore>>,
+    toolset: Arc<AdkToolBridge<FilesystemArtifactStore>>,
     effect_fence: &EffectFence,
 ) -> Result<Value, ExecutionError> {
     let (sender, receiver) = mpsc::sync_channel(1);

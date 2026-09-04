@@ -484,4 +484,36 @@ fn execution_backend_pages_oversized_repo_tool_output() {
         });
     assert_eq!(handle.len(), 64);
     assert!(next_offset > 0);
+
+    let inner_id = workflow_runtime::ArtifactId::parse(handle).expect("inner artifact id");
+    let mut inner = Vec::new();
+    let mut inner_offset = 0;
+    loop {
+        let page = store
+            .read_page(&inner_id, PageRequest::new(inner_offset, page_limit))
+            .expect("inner paging handle must be readable from the production store");
+        inner.extend_from_slice(page.bytes());
+        match page.next_offset() {
+            Some(next) => inner_offset = next,
+            None => break,
+        }
+    }
+    let inner_body: Value = serde_json::from_slice(&inner).expect("inner paged tool output");
+    assert!(
+        inner_body.to_string().contains("needle"),
+        "inner handle must round-trip search hits, page={inner_body}"
+    );
+
+    let resumed = ExecutionBackend::resume(&root, receipt.run_id())
+        .expect("resume must keep durable paging artifacts");
+    assert_eq!(resumed.run_id(), receipt.run_id());
+    let resumed_store = FilesystemArtifactStore::try_new(
+        resumed.run_root().join("artifacts"),
+        NonZeroU64::new(262_144).expect("positive"),
+        NonZeroU64::new(65_536).expect("positive"),
+    )
+    .expect("resumed production artifact store");
+    resumed_store
+        .read_page(&inner_id, PageRequest::new(0, page_limit))
+        .expect("inner paging handle must remain readable after resume");
 }
