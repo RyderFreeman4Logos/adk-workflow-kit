@@ -19,6 +19,7 @@ mod sandbox_execution;
 mod security;
 mod session;
 mod tool;
+mod tool_registry;
 mod workdir;
 
 pub use approval::{
@@ -93,6 +94,10 @@ pub use tool::{
     ActivateSkillInput, ReadSkillResourceInput, RunSkillScriptInput, StructuredOutputError,
     ToolEnvelope, ToolFailure, ToolFlags, ToolIdempotency, ToolProvenance, ToolRegistration,
     ToolRegistrationError, decode_structured_tool_output,
+};
+pub use tool_registry::{
+    ReadSourceRangeTool, SearchCodeTool, ToolImplementationRegistry,
+    ToolImplementationRegistryError,
 };
 pub use workdir::{
     CleanupOutcome, Materialization, RunWorkdir, WorkdirError, WorkdirErrorKind, WorkdirId,

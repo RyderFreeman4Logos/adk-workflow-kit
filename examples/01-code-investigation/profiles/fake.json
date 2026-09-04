@@ -32,18 +32,18 @@
   "tools": [
     {
       "name": "search_code",
-      "result": {"path": "src/retry.rs", "line": 1, "snippet": "pub fn default_retry() -> u8 {"},
+      "root": "repo",
       "input_schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}}, "required": ["query"], "additionalProperties": false},
-      "required_capabilities": [],
+      "required_capabilities": ["filesystem.read"],
       "required_scopes": []
     },
     {
       "name": "read_source_range",
-      "result": {"path": "src/retry.rs", "start_line": 1, "end_line": 8, "snippet": "pub fn default_retry() -> u8 {"},
+      "root": "repo",
       "input_schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}}, "required": ["path", "start_line", "end_line"], "additionalProperties": false},
-      "required_capabilities": [],
+      "required_capabilities": ["filesystem.read"],
       "required_scopes": []
     }
   ],
-  "sandbox": {"capabilities": []}
+  "sandbox": {"capabilities": ["filesystem.read"]}
 }

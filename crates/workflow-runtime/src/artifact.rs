@@ -542,6 +542,9 @@ impl ArtifactStore for FilesystemArtifactStore {
         request: PageRequest,
     ) -> Result<ArtifactPage, ArtifactError> {
         let bytes = fs::read(self.path_for(id)).map_err(Self::storage_error)?;
+        if encode_hex(&Sha256::digest(&bytes)) != id.as_str() {
+            return Err(ArtifactError::new(ArtifactErrorKind::ContentIdCollision));
+        }
         let content_len = u64::try_from(bytes.len())
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ContentTooLarge))?;
         if request.offset > content_len {

@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
+    path::PathBuf,
     sync::{Arc, mpsc},
     thread,
     time::Duration,
@@ -120,6 +121,21 @@ pub trait ToolHandler: Send + Sync {
         context: &ToolCallContext,
         arguments: &Value,
     ) -> Result<ToolEnvelope<Value>, ToolBridgeError>;
+
+    /// Returns a stable identity for lock/resume compatibility.
+    fn implementation_identity(&self) -> String {
+        String::new()
+    }
+
+    /// Returns explicit safety, concurrency, approval, and idempotency metadata owned by this implementation.
+    fn registration(&self) -> Option<ToolRegistration> {
+        None
+    }
+
+    /// Returns a constructor-owned root only for controlled builtin tools.
+    fn rebuildable_root(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 impl<F> ToolHandler for F
@@ -139,6 +155,40 @@ where
         arguments: &Value,
     ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
         self(sandbox, context, arguments)
+    }
+}
+
+impl ToolHandler for Arc<dyn ToolHandler> {
+    fn required_capabilities(
+        &self,
+        arguments: &Value,
+    ) -> Result<Vec<SandboxCapability>, ToolBridgeError> {
+        (**self).required_capabilities(arguments)
+    }
+
+    fn requires_approval(&self, arguments: &Value) -> Result<bool, ToolBridgeError> {
+        (**self).requires_approval(arguments)
+    }
+
+    fn execute(
+        &self,
+        sandbox: &ChildSandbox<'_>,
+        context: &ToolCallContext,
+        arguments: &Value,
+    ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        (**self).execute(sandbox, context, arguments)
+    }
+
+    fn implementation_identity(&self) -> String {
+        (**self).implementation_identity()
+    }
+
+    fn registration(&self) -> Option<ToolRegistration> {
+        (**self).registration()
+    }
+
+    fn rebuildable_root(&self) -> Option<PathBuf> {
+        (**self).rebuildable_root()
     }
 }
 

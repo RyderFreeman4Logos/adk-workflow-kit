@@ -113,6 +113,19 @@ fn event_node_ids(run_root: &Path) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn fake_profile_does_not_embed_tool_results() {
+    let profile = load_profile();
+    let tools = profile["tools"].as_array().expect("tools");
+    assert!(!tools.is_empty(), "example must declare tools");
+    for tool in tools {
+        assert!(
+            tool.get("result").is_none(),
+            "runtime profile must not embed a fabricated successful result: {tool}"
+        );
+    }
+}
+
 fn assert_fail_closed(output: &Output) {
     assert_eq!(
         output.status.code(),
