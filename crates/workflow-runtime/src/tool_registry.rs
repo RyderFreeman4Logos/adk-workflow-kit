@@ -45,10 +45,9 @@ impl ToolImplementationRegistry {
         let id = id.into();
         let version = version.into();
         let implementation_identity = implementation.implementation_identity();
-        if id.is_empty()
-            || version.is_empty()
-            || implementation_identity.is_empty()
-            || implementation_identity.as_bytes().contains(&0)
+        if invalid_identity_field(&id)
+            || invalid_identity_field(&version)
+            || invalid_identity_field(&implementation_identity)
         {
             return Err(ToolImplementationRegistryError::InvalidIdentity);
         }
@@ -76,12 +75,9 @@ impl ToolImplementationRegistry {
     pub fn identity(&self) -> String {
         let mut hasher = Sha256::new();
         for ((id, version), handler) in &self.tools {
-            hasher.update(id.as_bytes());
-            hasher.update([0]);
-            hasher.update(version.as_bytes());
-            hasher.update([0]);
-            hasher.update(handler.implementation_identity().as_bytes());
-            hasher.update([0]);
+            hash_identity_field(&mut hasher, id.as_bytes());
+            hash_identity_field(&mut hasher, version.as_bytes());
+            hash_identity_field(&mut hasher, handler.implementation_identity().as_bytes());
         }
         format!("sha256:{:x}", hasher.finalize())
     }
@@ -111,6 +107,15 @@ impl fmt::Display for ToolImplementationRegistryError {
 }
 
 impl std::error::Error for ToolImplementationRegistryError {}
+
+fn invalid_identity_field(value: &str) -> bool {
+    value.is_empty() || value.as_bytes().contains(&0)
+}
+
+fn hash_identity_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
 
 impl From<ToolImplementationRegistryError> for ToolBridgeError {
     fn from(error: ToolImplementationRegistryError) -> Self {

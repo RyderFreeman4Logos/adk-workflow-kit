@@ -163,6 +163,18 @@ impl ToolHandler for NulIdentityTool {
 }
 
 #[test]
+fn registry_identity_does_not_collide_across_nul_field_boundaries() {
+    let mut left = ToolImplementationRegistry::new();
+    let left_ok = left.register("a\0b", "c", Arc::new(EchoTool));
+    let mut right = ToolImplementationRegistry::new();
+    let right_ok = right.register("a", "b\0c", Arc::new(EchoTool));
+    assert!(
+        left_ok.is_err() || right_ok.is_err() || left.identity() != right.identity(),
+        "id/version NUL must not collapse distinct registry entries into one identity"
+    );
+}
+
+#[test]
 fn search_code_returns_argument_dependent_repo_hits() {
     let repo = repo();
     let tool = SearchCodeTool::new(&repo);
