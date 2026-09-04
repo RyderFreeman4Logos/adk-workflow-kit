@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "code-investigation/input-v1",
+  "type": "object",
+  "required": ["question", "path"],
+  "properties": {
+    "question": { "type": "string", "minLength": 1 },
+    "path": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

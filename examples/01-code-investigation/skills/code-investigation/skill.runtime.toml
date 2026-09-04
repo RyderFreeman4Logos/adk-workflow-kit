@@ -1,0 +1,26 @@
+schema_version = 1
+
+[skill]
+id = "code-investigation"
+version = "1"
+
+[[scripts]]
+id = "digest"
+path = "scripts/digest.py"
+runtime = "python3"
+sha256 = "sha256:c90e741221a2ad89fc41df073991ea5fff88432c8a9596d47a2ee5f1d7fb8996"
+input_schema = "references/investigation-input.json"
+output_schema = "references/investigation-output.json"
+capabilities = ["process.spawn"]
+
+[[resources]]
+id = "references/grounding.md"
+sha256 = "sha256:1e51089a115c8998ffa2ed8cc5b1b52c637a156596540a3a98c4152eaf9601b9"
+
+[[resources]]
+id = "references/investigation-input.json"
+sha256 = "sha256:079e99957548044be0471e22c626114585d9edc01991cc178175145ab745b397"
+
+[[resources]]
+id = "references/investigation-output.json"
+sha256 = "sha256:373e0b3773fc555083922d63e745efd1c22822680ce0a111ced8c6a80828f764"

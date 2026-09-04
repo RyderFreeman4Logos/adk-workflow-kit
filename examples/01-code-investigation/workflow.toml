@@ -13,6 +13,7 @@ model = { role = "worker", id = "code-investigation-fake", version = "1" }
 id = "planner"
 kind = "agent"
 model = { role = "worker", id = "code-investigation-fake", version = "1" }
+skills = [{ id = "code-investigation", version = "1" }]
 [[nodes]]
 id = "search_code"
 kind = "agent"

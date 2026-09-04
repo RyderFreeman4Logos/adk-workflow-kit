@@ -2631,6 +2631,17 @@ impl ExecutionProfileV1 {
         Ok(profile)
     }
 
+    fn bind_declared_skill_roots(&mut self, workflow: &Path) -> Result<(), ExecutionError> {
+        if self.sealed_skills.is_some() {
+            return Ok(());
+        }
+        for skill in &mut self.skills {
+            let root = resolve_tool_root(workflow, Some(&skill.root.to_string_lossy()))?;
+            skill.root = root;
+        }
+        Ok(())
+    }
+
     fn bind_declared_implementations(&mut self, workflow: &Path) -> Result<(), ExecutionError> {
         if let Some(existing) = self.tool_implementations.clone() {
             self.persist_implementation_bindings(&existing)?;
@@ -4029,6 +4040,7 @@ impl ExecutionBackend {
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Compile))?;
         let agent_contracts = resolve_agent_contracts(workflow.as_ref(), compiled.ir())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
+        profile.bind_declared_skill_roots(workflow.as_ref())?;
         let skill_snapshot = SealedSkillSnapshotV1::from_packages(
             profile.planned_skill_packages(compiled.ir())?,
             &profile.model,
