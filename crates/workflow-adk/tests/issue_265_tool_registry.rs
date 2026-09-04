@@ -231,3 +231,76 @@ fn run_with_implementations_resume_keeps_custom_handler() {
         .expect_err("a different registry must not pass checkpoint identity");
     assert_eq!(mismatch.kind(), ExecutionErrorKind::InvalidRunState);
 }
+
+struct EmptyA;
+
+impl ToolHandler for EmptyA {
+    fn required_capabilities(
+        &self,
+        _arguments: &Value,
+    ) -> Result<Vec<SandboxCapability>, ToolBridgeError> {
+        Ok(vec![SandboxCapability::FilesystemRead])
+    }
+
+    fn execute(
+        &self,
+        _sandbox: &ChildSandbox<'_>,
+        _context: &ToolCallContext,
+        _arguments: &Value,
+    ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        Ok(ToolEnvelope::success(
+            json!({"matches": [{"path": "empty-a", "line": 1, "snippet": "a"}]}),
+            ToolProvenance::new("search_code", "1"),
+        ))
+    }
+}
+
+struct EmptyB;
+
+impl ToolHandler for EmptyB {
+    fn required_capabilities(
+        &self,
+        _arguments: &Value,
+    ) -> Result<Vec<SandboxCapability>, ToolBridgeError> {
+        Ok(vec![SandboxCapability::FilesystemRead])
+    }
+
+    fn execute(
+        &self,
+        _sandbox: &ChildSandbox<'_>,
+        _context: &ToolCallContext,
+        _arguments: &Value,
+    ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        Ok(ToolEnvelope::success(
+            json!({"matches": [{"path": "empty-b", "line": 1, "snippet": "b"}]}),
+            ToolProvenance::new("search_code", "1"),
+        ))
+    }
+}
+
+fn empty_closure(
+    _sandbox: &ChildSandbox<'_>,
+    _context: &ToolCallContext,
+    _arguments: &Value,
+) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+    Ok(ToolEnvelope::success(
+        json!({"matches": [{"path": "empty-closure", "line": 1, "snippet": "c"}]}),
+        ToolProvenance::new("search_code", "1"),
+    ))
+}
+
+#[test]
+fn run_with_implementations_rejects_empty_default_identity_or_resume_mismatch() {
+    let mut first = ToolImplementationRegistry::new();
+    first
+        .register("search_code", "1", Arc::new(EmptyA))
+        .expect_err("empty default identity must fail closed at register");
+    let mut second = ToolImplementationRegistry::new();
+    second
+        .register("search_code", "1", Arc::new(EmptyB))
+        .expect_err("sibling empty default identity must fail closed at register");
+    let mut closures = ToolImplementationRegistry::new();
+    closures
+        .register("search_code", "1", Arc::from(empty_closure))
+        .expect_err("default closure identity must fail closed at register");
+}

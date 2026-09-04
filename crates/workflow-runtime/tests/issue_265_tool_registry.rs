@@ -4,13 +4,33 @@ use serde_json::{Value, json};
 use workflow_runtime::{
     CapabilityIntersection, ChildSandbox, InMemoryArtifactStore, PageRequest, RunContext, RunId,
     RunLimits, RunSandbox, SandboxCapability, SearchCodeTool, ToolBridge, ToolCall,
-    ToolCallContext, ToolEnvelope, ToolHandler, ToolImplementationRegistry, ToolProvenance,
-    WorkdirManager,
+    ToolCallContext, ToolEnvelope, ToolHandler, ToolImplementationRegistry,
+    ToolImplementationRegistryError, ToolProvenance, WorkdirManager,
 };
 
 struct EchoTool;
 
 impl ToolHandler for EchoTool {
+    fn execute(
+        &self,
+        _sandbox: &ChildSandbox<'_>,
+        _context: &ToolCallContext,
+        arguments: &Value,
+    ) -> Result<ToolEnvelope<Value>, workflow_runtime::ToolBridgeError> {
+        Ok(ToolEnvelope::success(
+            arguments.clone(),
+            ToolProvenance::new("echo", "1"),
+        ))
+    }
+
+    fn implementation_identity(&self) -> String {
+        "echo:1".to_owned()
+    }
+}
+
+struct EmptyIdentityTool;
+
+impl ToolHandler for EmptyIdentityTool {
     fn execute(
         &self,
         _sandbox: &ChildSandbox<'_>,
@@ -87,6 +107,59 @@ fn register_resolves_exact_id_and_version() {
     assert!(registry.resolve("echo", "1").is_ok());
     assert!(registry.resolve("echo", "2").is_err());
     assert!(registry.resolve("search_code", "1").is_err());
+}
+
+#[test]
+fn register_rejects_empty_implementation_identity() {
+    let mut registry = ToolImplementationRegistry::new();
+    assert_eq!(
+        registry
+            .register("echo", "1", Arc::new(EmptyIdentityTool))
+            .expect_err("empty identity must fail closed"),
+        ToolImplementationRegistryError::InvalidIdentity
+    );
+
+    let mut first = ToolImplementationRegistry::new();
+    first
+        .register(
+            "echo",
+            "1",
+            Arc::from(
+                |_: &ChildSandbox<'_>, _: &ToolCallContext, arguments: &Value| {
+                    Ok(ToolEnvelope::success(
+                        arguments.clone(),
+                        ToolProvenance::new("echo", "1"),
+                    ))
+                },
+            ),
+        )
+        .expect_err("default closure identity must fail closed");
+    assert_eq!(
+        registry
+            .register("echo", "2", Arc::new(NulIdentityTool))
+            .expect_err("NUL in identity must fail closed"),
+        ToolImplementationRegistryError::InvalidIdentity
+    );
+}
+
+struct NulIdentityTool;
+
+impl ToolHandler for NulIdentityTool {
+    fn execute(
+        &self,
+        _sandbox: &ChildSandbox<'_>,
+        _context: &ToolCallContext,
+        arguments: &Value,
+    ) -> Result<ToolEnvelope<Value>, workflow_runtime::ToolBridgeError> {
+        Ok(ToolEnvelope::success(
+            arguments.clone(),
+            ToolProvenance::new("echo", "1"),
+        ))
+    }
+
+    fn implementation_identity(&self) -> String {
+        "echo\0v1".to_owned()
+    }
 }
 
 #[test]

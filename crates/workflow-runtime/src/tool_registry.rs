@@ -44,7 +44,12 @@ impl ToolImplementationRegistry {
     ) -> Result<(), ToolImplementationRegistryError> {
         let id = id.into();
         let version = version.into();
-        if id.is_empty() || version.is_empty() {
+        let implementation_identity = implementation.implementation_identity();
+        if id.is_empty()
+            || version.is_empty()
+            || implementation_identity.is_empty()
+            || implementation_identity.as_bytes().contains(&0)
+        {
             return Err(ToolImplementationRegistryError::InvalidIdentity);
         }
         let key = (id, version);
@@ -89,7 +94,7 @@ pub enum ToolImplementationRegistryError {
     NotFound,
     /// The ID/version pair is already registered.
     Duplicate,
-    /// An ID or version was empty.
+    /// An ID, version, or implementation identity was empty or ambiguous.
     InvalidIdentity,
 }
 
@@ -98,7 +103,9 @@ impl fmt::Display for ToolImplementationRegistryError {
         formatter.write_str(match self {
             Self::NotFound => "tool implementation was not registered",
             Self::Duplicate => "tool implementation is already registered",
-            Self::InvalidIdentity => "tool implementation ID and version must not be empty",
+            Self::InvalidIdentity => {
+                "tool implementation ID, version, and identity must be non-empty and unambiguous"
+            }
         })
     }
 }
