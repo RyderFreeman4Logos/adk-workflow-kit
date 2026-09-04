@@ -115,6 +115,8 @@ struct PendingCall {
     fingerprint: String,
     model_iteration: u64,
     admission_ordinal: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -494,9 +496,15 @@ impl LoopLedgerStore {
             call.name.as_str(),
             "activate_skill" | "read_skill_resource" | "run_skill_script"
         ) {
-            CompletedCall::Skill(call.clone())
+            CompletedCall::Skill(PendingCall {
+                response: Some(response.clone()),
+                ..call.clone()
+            })
         } else {
-            CompletedCall::Ordinary(call.clone())
+            CompletedCall::Ordinary(PendingCall {
+                response: Some(response.clone()),
+                ..call.clone()
+            })
         };
         state.completed_calls.push(completed);
         if !state
@@ -1103,6 +1111,7 @@ fn valid_loop_state(state: &LoopState) -> bool {
                         fingerprint,
                         model_iteration: model_iterations,
                         admission_ordinal,
+                        response: None,
                     });
                 }
                 adk_rust::Part::FunctionCall { .. } => return false,
@@ -1381,6 +1390,7 @@ impl LoopController {
                     fingerprint,
                     model_iteration: next.model_iterations + 1,
                     admission_ordinal: next.total_tool_calls,
+                    response: None,
                 });
             }
         }
@@ -1525,9 +1535,15 @@ impl LoopController {
             _ => None,
         };
         let completed = if completion_barrier.is_some() {
-            CompletedCall::Skill(call.clone())
+            CompletedCall::Skill(PendingCall {
+                response: Some(response.clone()),
+                ..call.clone()
+            })
         } else {
-            CompletedCall::Ordinary(call.clone())
+            CompletedCall::Ordinary(PendingCall {
+                response: Some(response.clone()),
+                ..call.clone()
+            })
         };
         next.completed_calls.push(completed);
         next.conversation
@@ -2666,6 +2682,7 @@ impl ExecutionProfileV1 {
                     args,
                     model_iteration: 0,
                     admission_ordinal: 0,
+                    response: None,
                 })?;
                 Some(json!({"id": id, "name": name, "args": args}))
             })
@@ -2931,25 +2948,49 @@ impl ExecutionProfileV1 {
                 .map(|handler| handler.implementation_identity())
                 .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?
         };
-        ToolRegistration::for_types::<Value, Value>(
-            &tool.name,
-            ToolProvenance::new(&tool.name, "1"),
-            ToolFlags::new(true, true, true),
-        )
-        .and_then(|registration| registration.with_input_schema(tool.input_schema.clone()))
-        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))
-        .map(|registration| {
-            let registration = registration
+        let (flags, idempotency, registration) = if tool.result.is_some() {
+            (
+                ToolFlags::new(true, true, true),
+                workflow_runtime::ToolIdempotency::NotRequired,
+                None,
+            )
+        } else {
+            let handler = self
+                .tool_implementations
+                .as_ref()
+                .and_then(|registry| registry.resolve(&tool.name, "1").ok())
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+            let registration = handler
+                .registration()
+                .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+            (
+                registration.flags(),
+                registration.idempotency(),
+                Some(registration),
+            )
+        };
+        let registration = if let Some(registration) = registration {
+            registration
                 .with_required_capabilities(required_capabilities)
                 .with_required_scopes(tool.required_scopes.iter().cloned())
                 .with_timeout(self.run_limits().max_tool_time_ms())
-                .with_implementation_digest(implementation_digest);
-            if tool.result.is_none() {
-                registration.with_paging(true)
-            } else {
-                registration
-            }
-        })
+                .with_implementation_digest(implementation_digest)
+                .with_paging(true)
+        } else {
+            ToolRegistration::for_types::<Value, Value>(
+                &tool.name,
+                ToolProvenance::new(&tool.name, "1"),
+                flags,
+            )
+            .and_then(|registration| registration.with_input_schema(tool.input_schema.clone()))
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?
+            .with_required_capabilities(required_capabilities)
+            .with_required_scopes(tool.required_scopes.iter().cloned())
+            .with_timeout(self.run_limits().max_tool_time_ms())
+            .with_implementation_digest(implementation_digest)
+            .with_idempotency(idempotency)
+        };
+        Ok(registration)
     }
 
     fn tool_bindings(&self) -> Result<Vec<ResolvedBinding>, ExecutionError> {
@@ -4723,14 +4764,7 @@ impl ExecutionBackend {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        if let Err(error) = restore_completed_calls(
-            &loop_ledger,
-            &toolsets,
-            &profile.skill_packages()?,
-            &effect_fence,
-            &profile,
-        )
-        .and_then(|()| {
+        if let Err(error) = restore_completed_calls(&loop_ledger).and_then(|()| {
             replay_pending_tools(
                 &loop_ledger,
                 &toolsets,
@@ -5481,11 +5515,16 @@ fn collect_event_artifact_refs(
     refs: &mut BTreeSet<String>,
 ) {
     for event in events {
-        collect_json_artifact_ids(event.payload(), refs);
+        collect_trusted_envelope_artifact_ids(event.payload(), refs);
     }
-    let discovered = refs.clone();
-    for reference in discovered {
+    let mut pending: Vec<String> = refs.iter().cloned().collect();
+    let mut seen = BTreeSet::new();
+    while let Some(reference) = pending.pop() {
+        if !seen.insert(reference.clone()) {
+            continue;
+        }
         let Some(artifact_id) = ArtifactId::parse(&reference) else {
+            refs.remove(&reference);
             continue;
         };
         let Ok(page) = artifacts.read_page(
@@ -5495,58 +5534,57 @@ fn collect_event_artifact_refs(
                 NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page size"),
             ),
         ) else {
+            refs.remove(&reference);
             continue;
         };
-        if let Ok(value) = serde_json::from_slice::<Value>(page.bytes()) {
-            collect_json_artifact_ids(&value, refs);
+        if page.bytes().is_empty() {
+            refs.remove(&reference);
+            continue;
         }
-        collect_embedded_artifact_ids(page.bytes(), refs);
+        let Ok(value) = serde_json::from_slice::<Value>(page.bytes()) else {
+            continue;
+        };
+        let mut nested = BTreeSet::new();
+        collect_trusted_envelope_artifact_ids(&value, &mut nested);
+        for id in nested {
+            if refs.insert(id.clone()) {
+                pending.push(id);
+            }
+        }
     }
 }
 
-fn collect_json_artifact_ids(value: &Value, refs: &mut BTreeSet<String>) {
+fn collect_trusted_envelope_artifact_ids(value: &Value, refs: &mut BTreeSet<String>) {
     match value {
         Value::Object(map) => {
-            match map.get("artifact_id") {
-                Some(Value::String(id)) if ArtifactId::parse(id).is_some() => {
-                    refs.insert(id.clone());
-                }
-                _ => {}
+            if let Some(Value::Object(reference)) = map.get("artifact_reference") {
+                insert_trusted_artifact_id(reference.get("artifact_id"), refs);
             }
-            for nested in map.values() {
-                collect_json_artifact_ids(nested, refs);
+            if map.contains_key("status") {
+                insert_trusted_artifact_id(map.get("artifact_id"), refs);
+            }
+            if let Some(response) = map.get("response") {
+                collect_trusted_envelope_artifact_ids(response, refs);
+            }
+            if let Some(output) = map.get("structured_output") {
+                collect_trusted_envelope_artifact_ids(output, refs);
             }
         }
         Value::Array(items) => {
             for item in items {
-                collect_json_artifact_ids(item, refs);
+                collect_trusted_envelope_artifact_ids(item, refs);
             }
         }
         _ => {}
     }
 }
 
-fn collect_embedded_artifact_ids(bytes: &[u8], refs: &mut BTreeSet<String>) {
-    const MARKER: &[u8] = b"\"artifact_id\":\"";
-    let mut rest = bytes;
-    while let Some(start) = rest
-        .windows(MARKER.len())
-        .position(|window| window == MARKER)
-    {
-        rest = &rest[start + MARKER.len()..];
-        if rest.len() < 64 {
-            break;
-        }
-        let candidate = &rest[..64];
-        if candidate
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
-            let Ok(id) = std::str::from_utf8(candidate) else {
-                continue;
-            };
-            refs.insert(id.to_owned());
-        }
+fn insert_trusted_artifact_id(candidate: Option<&Value>, refs: &mut BTreeSet<String>) {
+    let Some(Value::String(id)) = candidate else {
+        return;
+    };
+    if ArtifactId::parse(id).is_some() {
+        refs.insert(id.clone());
     }
 }
 
@@ -5598,75 +5636,17 @@ fn invoke_restored_tool(
     serde_json::to_value(response).map_err(|_| ExecutionError::new(ExecutionErrorKind::Tool))
 }
 
-fn restore_completed_calls(
-    ledger: &LoopLedgerStore,
-    toolsets: &BTreeMap<String, Option<BoundTool>>,
-    packages: &BTreeMap<String, Arc<SkillPackage>>,
-    effect_fence: &EffectFence,
-    profile: &ExecutionProfileV1,
-) -> Result<(), ExecutionError> {
+fn restore_completed_calls(ledger: &LoopLedgerStore) -> Result<(), ExecutionError> {
     let mut restored = Vec::new();
     for (node, completed) in ledger.completed_calls()? {
         let call = completed.call();
-        let response = match &completed {
-            CompletedCall::Skill(_) => {
-                if is_redacted_script_pending(call) {
-                    return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
-                }
-                let toolset = toolsets
-                    .get(&node)
-                    .and_then(Option::as_ref)
-                    .map(|(_, toolset)| Arc::clone(toolset))
-                    .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-                if call.name == "read_skill_resource" {
-                    let input = serde_json::from_value::<ReadSkillResourceInput>(call.args.clone())
-                        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-                    let resource_id = SkillResourceId::new(&input.resource_id)
-                        .ok()
-                        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-                    let payload = packages
-                        .get(&input.skill_id)
-                        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
-                        .read_resource(
-                            &resource_id,
-                            PageRequest::new(
-                                input.offset,
-                                NonZeroU64::new(input.limit).ok_or_else(|| {
-                                    ExecutionError::new(ExecutionErrorKind::InvalidRunState)
-                                })?,
-                            ),
-                            NonZeroU64::new(SKILL_RESOURCE_READ_LIMIT)
-                                .expect("positive resource read limit"),
-                        )
-                        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-                    serde_json::to_value(ToolEnvelope::success(
-                        payload,
-                        ToolProvenance::new("skill.runtime", "1"),
-                    ))
-                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
-                } else {
-                    invoke_restored_tool(&node, call, toolset, effect_fence)?
-                }
-            }
-            CompletedCall::Ordinary(_) => {
-                let tool = profile
-                    .tool_wires()
-                    .find(|tool| tool.name == call.name)
-                    .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-                if let Some(result) = tool.result.clone() {
-                    let provenance = profile.tool_registration(tool)?.provenance().clone();
-                    serde_json::to_value(ToolEnvelope::success(result, provenance))
-                        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
-                } else {
-                    let toolset = toolsets
-                        .get(&node)
-                        .and_then(Option::as_ref)
-                        .map(|(_, toolset)| Arc::clone(toolset))
-                        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-                    invoke_restored_tool(&node, call, toolset, effect_fence)?
-                }
-            }
-        };
+        if is_redacted_script_pending(call) {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        let response = call
+            .response
+            .clone()
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         restored.push((node, completed, response));
     }
     for turn in restored.chunk_by(|left, right| {
@@ -6411,6 +6391,36 @@ mod execution_registry_tests {
             resolve_agent_contracts(Path::new("workflow.toml"), plan.ir())
                 .expect("uncontracted workflow needs no resource root")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn business_payload_artifact_id_is_not_checkpoint_reference() {
+        let mut artifacts = workflow_runtime::InMemoryArtifactStore::new(
+            NonZeroU64::new(1024).expect("positive content limit"),
+            NonZeroU64::new(1024).expect("positive page limit"),
+        );
+        let staged = artifacts
+            .stage(b"trusted artifact")
+            .expect("stage artifact");
+        let id = artifacts.commit(staged).expect("commit artifact");
+        let mut mapper =
+            AdkEventMapper::new("run-artifact-poison", "workflow-artifact-poison").expect("mapper");
+        let event = mapper
+            .map(
+                AdkRuntimeObservationV1::new(
+                    "event-artifact-poison",
+                    "2026-08-27T20:00:00Z",
+                    AdkRuntimeObservationKindV1::ModelRequestCompleted,
+                )
+                .with_structured_output(json!({"business": {"artifact_id": id.as_str()}})),
+            )
+            .expect("event");
+        let mut refs = BTreeSet::new();
+        collect_event_artifact_refs(&[event], &artifacts, &mut refs);
+        assert!(
+            refs.is_empty(),
+            "business payload artifact_id must not become a checkpoint reference"
         );
     }
 }

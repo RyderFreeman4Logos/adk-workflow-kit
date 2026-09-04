@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use workflow_adk::execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1};
 use workflow_runtime::{
     ArtifactStore, ChildSandbox, FilesystemArtifactStore, PageRequest, SandboxCapability,
-    SearchCodeTool, ToolBridgeError, ToolCallContext, ToolEnvelope, ToolHandler,
-    ToolImplementationRegistry, ToolProvenance,
+    SearchCodeTool, ToolBridgeError, ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler,
+    ToolImplementationRegistry, ToolProvenance, ToolRegistration,
 };
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -104,6 +104,17 @@ fn tool_events(root: &std::path::Path) -> String {
     fs::read_to_string(root.join("events.jsonl")).expect("events exist")
 }
 
+fn search_code_registration(digest: impl Into<String>) -> ToolRegistration {
+    ToolRegistration::for_types::<Value, Value>(
+        "search_code",
+        ToolProvenance::new("search_code", "1"),
+        ToolFlags::new(true, true, true),
+    )
+    .expect("search_code registration")
+    .with_required_capabilities([SandboxCapability::FilesystemRead])
+    .with_implementation_digest(digest)
+}
+
 #[test]
 fn search_code_registry_returns_argument_dependent_hits() {
     let root = test_root();
@@ -159,6 +170,10 @@ impl ToolHandler for MarkerSearch {
 
     fn implementation_identity(&self) -> String {
         "search_code:custom-marker".to_owned()
+    }
+
+    fn registration(&self) -> Option<ToolRegistration> {
+        Some(search_code_registration(self.implementation_identity()))
     }
 }
 
@@ -260,6 +275,10 @@ impl ToolHandler for PrefixedSearch {
 
     fn implementation_identity(&self) -> String {
         format!("search_code:1:{}", self.root.display())
+    }
+
+    fn registration(&self) -> Option<ToolRegistration> {
+        Some(search_code_registration(self.implementation_identity()))
     }
 }
 
