@@ -115,6 +115,66 @@ fn search_code_registration(digest: impl Into<String>) -> ToolRegistration {
     .with_implementation_digest(digest)
 }
 
+struct ImplementationOwnedRequirements;
+
+impl ToolHandler for ImplementationOwnedRequirements {
+    fn execute(
+        &self,
+        _sandbox: &ChildSandbox<'_>,
+        _context: &ToolCallContext,
+        _arguments: &Value,
+    ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        Ok(ToolEnvelope::success(
+            json!({"matches": [{"path": "implementation-owned", "line": 1, "snippet": "marker"}]}),
+            ToolProvenance::new("search_code", "1"),
+        ))
+    }
+
+    fn implementation_identity(&self) -> String {
+        "implementation-owned-requirements".to_owned()
+    }
+
+    fn registration(&self) -> Option<ToolRegistration> {
+        Some(
+            ToolRegistration::for_types::<Value, Value>(
+                "search_code",
+                ToolProvenance::new("search_code", "1"),
+                ToolFlags::new(true, true, true),
+            )
+            .expect("implementation-owned registration")
+            .with_required_capabilities([SandboxCapability::FilesystemWrite])
+            .with_required_scopes(["implementation.elevated"])
+            .with_implementation_digest(self.implementation_identity()),
+        )
+    }
+}
+
+#[test]
+fn profile_cannot_weaken_implementation_owned_requirements() {
+    let root = test_root();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).expect("workflow fixture");
+
+    let mut registry = ToolImplementationRegistry::new();
+    registry
+        .register(
+            "search_code",
+            "1",
+            Arc::new(ImplementationOwnedRequirements),
+        )
+        .expect("register implementation-owned requirements");
+
+    let error = ExecutionBackend::run_with_implementations(
+        &workflow,
+        profile(),
+        json!({}),
+        &root,
+        &registry,
+    )
+    .expect_err("profile must not erase implementation-owned requirements");
+    assert_eq!(error.kind(), ExecutionErrorKind::AuthorizationDenied);
+}
+
 #[test]
 fn search_code_registry_returns_argument_dependent_hits() {
     let root = test_root();

@@ -3022,9 +3022,13 @@ impl ExecutionProfileV1 {
             )
         };
         let registration = if let Some(registration) = registration {
+            let mut effective_capabilities = registration.required_capabilities().to_vec();
+            effective_capabilities.extend(required_capabilities);
+            let mut effective_scopes = registration.required_scopes().to_vec();
+            effective_scopes.extend(tool.required_scopes.iter().cloned());
             registration
-                .with_required_capabilities(required_capabilities)
-                .with_required_scopes(tool.required_scopes.iter().cloned())
+                .with_required_capabilities(effective_capabilities)
+                .with_required_scopes(effective_scopes)
                 .with_timeout(self.run_limits().max_tool_time_ms())
                 .with_implementation_digest(implementation_digest)
                 .with_paging(true)
