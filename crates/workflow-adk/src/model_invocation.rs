@@ -16,10 +16,26 @@ pub const PROMPT_PROTOCOL_VERSION: &str = "cache-aware-prompt-v1";
 pub const MAX_INVOCATION_RETRIES: u8 = 3;
 
 /// A tool schema included in the stable prompt prefix.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ToolDefinition {
     name: String,
     schema: Value,
+}
+
+#[derive(Deserialize)]
+struct ToolDefinitionFields {
+    name: String,
+    schema: Value,
+}
+
+impl<'de> Deserialize<'de> for ToolDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let fields = ToolDefinitionFields::deserialize(deserializer)?;
+        Self::new(fields.name, fields.schema).map_err(serde::de::Error::custom)
+    }
 }
 
 impl ToolDefinition {
@@ -254,12 +270,36 @@ impl fmt::Display for InferenceBudgetError {
 
 impl std::error::Error for InferenceBudgetError {}
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InferenceBudget {
     reasoning_effort: ReasoningEffort,
     max_output_tokens: usize,
     max_retries: u8,
     escalation: EscalationPolicy,
+}
+
+#[derive(Deserialize)]
+struct InferenceBudgetFields {
+    reasoning_effort: ReasoningEffort,
+    max_output_tokens: usize,
+    max_retries: u8,
+    escalation: EscalationPolicy,
+}
+
+impl<'de> Deserialize<'de> for InferenceBudget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let fields = InferenceBudgetFields::deserialize(deserializer)?;
+        Self::new(
+            fields.reasoning_effort,
+            fields.max_output_tokens,
+            fields.max_retries,
+        )
+        .map(|budget| budget.with_escalation(fields.escalation))
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl InferenceBudget {

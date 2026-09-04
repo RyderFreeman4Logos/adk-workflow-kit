@@ -270,6 +270,53 @@ fn over_range_output_token_budgets_are_rejected_at_every_constructor() {
 }
 
 #[test]
+fn serde_deserialization_reuses_constructor_validation() {
+    let too_large = i32::MAX as usize + 1;
+    let budget = |max_output_tokens, max_retries| {
+        json!({
+            "reasoning_effort": "low",
+            "max_output_tokens": max_output_tokens,
+            "max_retries": max_retries,
+            "escalation": "none"
+        })
+    };
+
+    for invalid_budget in [budget(0, 0), budget(4096, 4), budget(too_large, 0)] {
+        assert!(
+            serde_json::from_value::<InferenceBudget>(invalid_budget).is_err(),
+            "invalid deserialized inference budgets must fail closed"
+        );
+    }
+    assert!(
+        serde_json::from_value::<ToolDefinition>(json!({
+            "name": "   ",
+            "schema": {"type": "object"}
+        }))
+        .is_err(),
+        "empty deserialized tool names must fail closed"
+    );
+    assert!(
+        serde_json::from_value::<ToolDefinition>(json!({
+            "name": "lookup",
+            "schema": {"type": "not-a-schema"}
+        }))
+        .is_err(),
+        "invalid deserialized tool schemas must fail closed"
+    );
+
+    let valid_budget = serde_json::from_value::<InferenceBudget>(budget(4096, 2))
+        .expect("valid budget should deserialize");
+    assert_eq!(valid_budget.max_output_tokens(), 4096);
+    assert_eq!(valid_budget.max_retries(), 2);
+    let valid_tool = serde_json::from_value::<ToolDefinition>(json!({
+        "name": "lookup",
+        "schema": {"type": "object"}
+    }))
+    .expect("valid tool should deserialize");
+    assert_eq!(valid_tool.name(), "lookup");
+}
+
+#[test]
 fn run_metadata_does_not_enter_prompt_identity_and_budget_is_one_policy() {
     let base = spec(
         "policy-a",
