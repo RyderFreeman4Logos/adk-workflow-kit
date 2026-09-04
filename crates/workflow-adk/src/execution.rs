@@ -2631,12 +2631,17 @@ impl ExecutionProfileV1 {
         Ok(profile)
     }
 
-    fn bind_declared_skill_roots(&mut self, workflow: &Path) -> Result<(), ExecutionError> {
+    fn bind_declared_skill_roots(
+        &mut self,
+        workflow: &Path,
+        ir: &workflow_ir::WorkflowIr,
+    ) -> Result<(), ExecutionError> {
         if self.sealed_skills.is_some() {
             return Ok(());
         }
+        self.validate_skill_package_plan(ir)?;
         for skill in &mut self.skills {
-            let root = resolve_tool_root(workflow, Some(&skill.root.to_string_lossy()))?;
+            let root = resolve_skill_root(workflow, Some(&skill.root.to_string_lossy()))?;
             skill.root = root;
         }
         Ok(())
@@ -2790,13 +2795,29 @@ impl ExecutionProfileV1 {
         &self,
         ir: &workflow_ir::WorkflowIr,
     ) -> Result<BTreeMap<String, Arc<SkillPackage>>, ExecutionError> {
+        self.validate_skill_package_plan(ir)?;
+        self.load_skill_packages(None)
+    }
+
+    fn validate_skill_package_plan(
+        &self,
+        ir: &workflow_ir::WorkflowIr,
+    ) -> Result<(), ExecutionError> {
         let required = ir
             .nodes()
             .iter()
             .flat_map(|node| node.skills())
             .map(|skill| (skill.id().to_owned(), skill.version().to_owned()))
             .collect::<BTreeSet<_>>();
-        self.load_skill_packages(Some(&required))
+        if self.skills.len() > SKILL_PACKAGE_LIMIT
+            || self
+                .skills
+                .iter()
+                .any(|wire| !required.contains(&(wire.id.clone(), wire.version.clone())))
+        {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
+        }
+        Ok(())
     }
 
     fn load_skill_packages(
@@ -3370,6 +3391,31 @@ fn resolve_tool_root(workflow: &Path, declared: Option<&str>) -> Result<PathBuf,
         .ok()
         .filter(|path| path.is_dir())
         .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))
+}
+
+fn resolve_skill_root(workflow: &Path, declared: Option<&str>) -> Result<PathBuf, ExecutionError> {
+    let parent = workflow
+        .parent()
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    let candidate = match declared {
+        Some(root) if !root.is_empty() => {
+            let path = PathBuf::from(root);
+            if path.is_absolute() {
+                path
+            } else {
+                parent.join(path)
+            }
+        }
+        _ => parent.join("repo"),
+    };
+    let metadata = fs::symlink_metadata(&candidate)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ExecutionError::new(
+            ExecutionErrorKind::ImplementationBinding,
+        ));
+    }
+    Ok(candidate)
 }
 
 struct RestoredFinishAgent {
@@ -4040,7 +4086,7 @@ impl ExecutionBackend {
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Compile))?;
         let agent_contracts = resolve_agent_contracts(workflow.as_ref(), compiled.ir())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
-        profile.bind_declared_skill_roots(workflow.as_ref())?;
+        profile.bind_declared_skill_roots(workflow.as_ref(), compiled.ir())?;
         let skill_snapshot = SealedSkillSnapshotV1::from_packages(
             profile.planned_skill_packages(compiled.ir())?,
             &profile.model,
