@@ -14,7 +14,7 @@ from typing import NoReturn
 
 ROOT = Path(__file__).resolve().parents[1]
 DOWNSTREAM = Path(
-    os.environ.get("ISSUE_269_DOWNSTREAM", "/home/obj/project/downstream/adk-workflow-kit-269")
+    os.environ.get("ISSUE_269_DOWNSTREAM", str(Path.home() / "project/downstream/adk-workflow-kit-269"))
 )
 PINNED_REVISION = "026b883a58bab6cc2d0c8610b44e3983e6017cb8"
 EXPECTED_TARGET = f"/ssd/mirror-rootfs{DOWNSTREAM}/target"

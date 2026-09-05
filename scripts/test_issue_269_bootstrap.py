@@ -9,7 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> None:
-    with tempfile.TemporaryDirectory(prefix="269-bootstrap-", dir=Path.home() / "project/downstream") as base:
+    parent = Path.home() / "project/downstream"
+    parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="269-bootstrap-", dir=parent) as base:
         consumer = Path(base) / "consumer"
         env = dict(os.environ, ISSUE_269_DOWNSTREAM=str(consumer))
         command = ["python3", str(ROOT / "scripts/test_issue_269_downstream.py"), "--prepare"]

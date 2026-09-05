@@ -11,7 +11,9 @@ CONSUMER = Path(os.environ.get("ISSUE_269_DOWNSTREAM", str(Path.home() / "projec
 
 
 def main() -> None:
-    env = dict(os.environ, ISSUE_269_TMPDIR=str((Path.home() / "tmp").resolve()))
+    env = dict(os.environ, ISSUE_269_DOWNSTREAM=str(CONSUMER))
+    env.setdefault("ISSUE_269_TMPDIR", str(Path.home() / "tmp"))
+    env["ISSUE_269_TMPDIR"] = str(Path(env["ISSUE_269_TMPDIR"]).resolve())
     prepare = ["python3", str(Path(__file__).with_name("test_issue_269_downstream.py")), "--prepare"]
     subprocess.run(prepare, env=env, capture_output=True, text=True, check=True)
     failures = []

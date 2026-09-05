@@ -161,6 +161,7 @@ issue-269-acceptance:
     python3 scripts/test_issue_269_downstream.py
 
 issue-269-bootstrap-test:
+    python3 scripts/test_issue_269_paths.py
     python3 scripts/test_issue_269_bootstrap.py
 
 issue-269-semantics-test:

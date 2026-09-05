@@ -5,7 +5,7 @@ _target := "/ssd/mirror-rootfs" + justfile_directory() + "/target"
 
 _guard:
     test -L target
-    test "$(readlink target)" = "{{_target}}"
+    test "$(readlink target)" = {{quote(_target)}}
 
 lock: _guard
     {{_io}} cargo +1.98.0 generate-lockfile
@@ -14,13 +14,13 @@ build: _guard
     {{_io}} cargo +1.98.0 build --locked
 
 run: build
-    {{_io}} cargo +1.98.0 run --locked -- "{{justfile_directory()}}" "{{env_var('ISSUE_269_TMPDIR')}}"
+    {{_io}} cargo +1.98.0 run --locked -- {{quote(justfile_directory())}} {{quote(env_var('ISSUE_269_TMPDIR'))}}
 
 acceptance: run
 
 # Recheck retained artifacts/effects through the same public readers.
 verify run_id: build
-    {{_io}} cargo +1.98.0 run --locked -- "{{justfile_directory()}}" "{{env_var('ISSUE_269_TMPDIR')}}" "{{run_id}}"
+    {{_io}} cargo +1.98.0 run --locked -- {{quote(justfile_directory())}} {{quote(env_var('ISSUE_269_TMPDIR'))}} {{quote(run_id)}}
 
 fmt:
     {{_io}} cargo +1.98.0 fmt -- --check
