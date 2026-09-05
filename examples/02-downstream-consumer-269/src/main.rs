@@ -12,8 +12,6 @@ use workflow_compiler::{WorkflowLock, compile_file};
 use workflow_testkit::ReplayBundle;
 
 const PIN: &str = "026b883a58bab6cc2d0c8610b44e3983e6017cb8";
-const EXPECTED_TARGET: &str =
-    "/ssd/mirror-rootfs/home/obj/project/downstream/adk-workflow-kit-269/target";
 
 fn require(
     checks: &mut Vec<&'static str>,
@@ -46,7 +44,22 @@ fn field(receipt: &Value, name: &str) -> String {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = PathBuf::from(
+        std::env::args()
+            .nth(1)
+            .ok_or("missing logical consumer root")?,
+    );
+    let workdir_base = PathBuf::from(
+        std::env::args()
+            .nth(2)
+            .ok_or("missing prepared temporary base")?,
+    );
+    if !root.is_absolute()
+        || fs::canonicalize(&root)? != fs::canonicalize(env!("CARGO_MANIFEST_DIR"))?
+    {
+        return Err("consumer root differs from compiled manifest root".into());
+    }
+    let expected_target = format!("/ssd/mirror-rootfs{}/target", root.display());
     let fixtures = root.join("fixtures");
     let assets = root.join("assets");
     let source = String::from_utf8(read(&root.join("src/main.rs"))?)?;
@@ -83,7 +96,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &mut checks,
         "lexical target symlink",
         fs::symlink_metadata(&target)?.file_type().is_symlink()
-            && fs::read_link(&target)?.to_string_lossy() == EXPECTED_TARGET,
+            && fs::read_link(&target)?.to_string_lossy() == expected_target,
     )?;
 
     let required_assets = [
@@ -155,7 +168,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         lock_toml.contains("lock_version = 1") && lock.ir_hash().starts_with("sha256:"),
     )?;
 
-    let workdir_base = fs::canonicalize("/home/obj/tmp")?;
+    if !workdir_base.is_absolute() || workdir_base.as_os_str().len() > 48 || !workdir_base.is_dir()
+    {
+        return Err("invalid prepared temporary base".into());
+    }
     let run = ExecutionBackend::run(&workflow, profile, input, &workdir_base)?;
     let run_json = serde_json::to_value(&run)?;
     let run_id = field(&run_json, "run_id");

@@ -160,6 +160,9 @@ m2-02-green:
 issue-269-acceptance:
     python3 scripts/test_issue_269_downstream.py
 
+issue-269-bootstrap-test:
+    python3 scripts/test_issue_269_bootstrap.py
+
 # Validate the machine-readable ADK-Rust pattern catalog.
 pattern-catalog-test:
     python3 scripts/test_pattern_catalog.py
@@ -210,7 +213,7 @@ check-branch:
 
 pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit pattern-catalog-test m2-02-green test-local-gates
 
-_quality-gates: fmt-check check clippy dependency-audit pattern-catalog-test m2-02-green test test-local-gates
+_quality-gates: fmt-check check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance test test-local-gates
 
 quality-gates:
     scripts/local-gates.sh produce

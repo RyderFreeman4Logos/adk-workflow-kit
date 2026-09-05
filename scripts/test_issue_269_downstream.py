@@ -8,6 +8,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import NoReturn
 
@@ -18,15 +19,58 @@ DOWNSTREAM = Path(
 PINNED_REVISION = "026b883a58bab6cc2d0c8610b44e3983e6017cb8"
 EXPECTED_TARGET = f"/ssd/mirror-rootfs{DOWNSTREAM}/target"
 DIRECT_DEPENDENCIES = ("workflow-compiler", "workflow-adk", "workflow-testkit")
+TEMPLATE = ROOT / "examples/02-downstream-consumer-269"
 
 
 def fail(message: str) -> NoReturn:
     raise SystemExit(f"issue-269 acceptance: FAIL: {message}")
 
 
+def prepare() -> dict[str, str]:
+    if not DOWNSTREAM.is_absolute() or ".." in DOWNSTREAM.parts or DOWNSTREAM.resolve().is_relative_to(ROOT):
+        fail("consumer must be an absolute external directory")
+    sources = sorted(path for path in TEMPLATE.rglob("*") if path.is_file())
+    if not (TEMPLATE / "Cargo.lock").is_file():
+        fail("tracked consumer lock is missing")
+    # Check every destination before writing anything; unknown files are untouched.
+    for source in sources:
+        destination = DOWNSTREAM / source.relative_to(TEMPLATE)
+        if any(parent.is_symlink() for parent in (destination, *destination.parents)):
+            fail(f"linked consumer path: {destination}")
+        if destination.exists() and (not destination.is_file() or destination.read_bytes() != source.read_bytes()):
+            fail(f"candidate mismatch: {destination}")
+    target = DOWNSTREAM / "target"
+    if target.is_symlink():
+        if os.readlink(target) != EXPECTED_TARGET:
+            fail(f"target symlink is not lexical {EXPECTED_TARGET}")
+    elif target.exists():
+        fail("refusing to replace existing target")
+    DOWNSTREAM.mkdir(parents=True, exist_ok=True)
+    for source in sources:
+        destination = DOWNSTREAM / source.relative_to(TEMPLATE)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.exists():
+            with destination.open("xb") as output:
+                output.write(source.read_bytes())
+    Path(EXPECTED_TARGET).mkdir(parents=True, exist_ok=True)
+    if not target.is_symlink():
+        target.symlink_to(EXPECTED_TARGET)
+    temporary = Path(os.environ.get("ISSUE_269_TMPDIR", str(Path.home() / "tmp")))
+    temporary.mkdir(parents=True, exist_ok=True)
+    temporary = temporary.resolve(strict=True)
+    if len(os.fsencode(temporary)) > 48:
+        fail("prepared runtime temporary base exceeds 48 bytes")
+    os.environ["ISSUE_269_TMPDIR"] = str(temporary)
+    return {str(path.relative_to(TEMPLATE)): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources}
+
+
 def main() -> int:
-    if not DOWNSTREAM.is_dir():
-        fail(f"missing external consumer: {DOWNSTREAM}")
+    identity = prepare()
+    if sys.argv[1:] == ["--prepare"]:
+        print(json.dumps(identity, sort_keys=True))
+        return 0
+    if sys.argv[1:]:
+        fail("only --prepare is supported")
     manifest = (DOWNSTREAM / "Cargo.toml").read_text(encoding="utf-8")
     if "[workspace]" in manifest or "path =" in manifest or "../" in manifest or "workflowctl" in manifest:
         fail("consumer manifest uses a workspace, path dependency, traversal, or workflowctl")
@@ -101,6 +145,11 @@ def main() -> int:
     if len(receipts) != 1:
         fail("external acceptance did not emit one receipt")
     receipt = json.loads(receipts[0])
+    if prepare() != identity:
+        fail("candidate changed during acceptance")
+    receipt["candidate_files_sha256"] = identity
+    receipt["consumer_root"] = str(DOWNSTREAM)
+    receipt["target"] = EXPECTED_TARGET
     if receipt.get("revision") != PINNED_REVISION:
         fail("receipt revision does not match the exact dependency pin")
     if receipt.get("operations") != ["validate", "lock", "run", "inspect", "resume", "replay"]:

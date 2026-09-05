@@ -1,7 +1,7 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
 _io := "ionice -c 3"
-_target := "/ssd/mirror-rootfs/home/obj/project/downstream/adk-workflow-kit-269/target"
+_target := "/ssd/mirror-rootfs" + justfile_directory() + "/target"
 
 _guard:
     test -L target
@@ -14,6 +14,12 @@ build: _guard
     {{_io}} cargo +1.98.0 build --locked
 
 run: build
-    {{_io}} cargo +1.98.0 run --locked
+    {{_io}} cargo +1.98.0 run --locked -- "{{justfile_directory()}}" "{{env_var('ISSUE_269_TMPDIR')}}"
 
-acceptance: lock run
+acceptance: run
+
+fmt:
+    {{_io}} cargo +1.98.0 fmt -- --check
+
+lint: _guard
+    {{_io}} cargo +1.98.0 clippy --locked -- -D warnings
