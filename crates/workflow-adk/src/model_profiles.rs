@@ -847,6 +847,15 @@ impl ModelProfile {
 }
 
 impl ModelBinding {
+    /// Replace provider I/O for offline integration tests, preserving profile metadata.
+    /// This opt-in seam does not change streaming or retry policy.
+    #[cfg(feature = "test-support")]
+    pub fn with_test_llm(mut self, llm: Arc<dyn Llm>) -> Self {
+        self.llm = llm;
+        self.fake_queue = None;
+        self
+    }
+
     pub fn role(&self) -> ModelRole {
         self.role
     }

@@ -21,5 +21,6 @@ workflow-review = { path = "../workflow-review" }
 workflow-runtime = { path = "../workflow-runtime" }
 
 [dev-dependencies]
+workflow-adk = { path = "../workflow-adk", features = ["test-support"] }
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
 workflow-spec = { path = "../workflow-spec" }

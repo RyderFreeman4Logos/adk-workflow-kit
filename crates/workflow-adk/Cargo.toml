@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Opt-in injection for downstream offline boundary tests; disabled in production.
+test-support = []
+
 [dependencies]
 adk-rust.workspace = true
 jsonschema.workspace = true
