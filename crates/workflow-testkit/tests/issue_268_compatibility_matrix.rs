@@ -1,17 +1,24 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 use adk_rust::futures::StreamExt;
-use adk_rust::{Content, LlmRequest};
+use adk_rust::graph::prelude::{END, ExecutionConfig, GraphError, NodeOutput, START, State};
+use adk_rust::graph::{StateGraph, retry::RetryPolicy};
+use adk_rust::{Content, Llm, LlmRequest, LlmResponse, LlmResponseStream, async_trait};
 use serde_json::{Value, json};
 use workflow_adk::execution::{
     ExecutionBackend, ExecutionError, ExecutionErrorKind, ExecutionProfileV1,
 };
 use workflow_adk::model_profiles::{
-    CredentialBroker, FakeModelProfile, ModelProfileRegistry, ModelRole, ModelRuntimeConfig,
+    CredentialBroker, FakeModelProfile, ModelBinding, ModelProfileRegistry, ModelRole,
+    ModelRuntimeConfig,
 };
 use workflow_adk::{InferenceBudget, InferenceBudgetError, ReasoningEffort};
 use workflow_review::{REVIEW_SCHEMA_VERSION_V1, ReviewResult, ReviewVerdict};
@@ -21,6 +28,38 @@ use workflow_testkit::compatibility::{
 use workflow_testkit::{NoProgressReason, NonProgressDetector};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+struct LocalStreamingLlm {
+    requests: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Llm for LocalStreamingLlm {
+    fn name(&self) -> &str {
+        "issue-268-streaming-double"
+    }
+
+    async fn generate_content(
+        &self,
+        _request: LlmRequest,
+        stream: bool,
+    ) -> adk_rust::Result<LlmResponseStream> {
+        if !stream {
+            return Err(adk_rust::AdkError::agent(
+                "streaming double requires streaming mode",
+            ));
+        }
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(adk_rust::futures::stream::iter([
+            Ok(LlmResponse::new(
+                Content::new("assistant").with_text("chunk-one"),
+            )),
+            Ok(LlmResponse::new(
+                Content::new("assistant").with_text("chunk-two"),
+            )),
+        ])))
+    }
+}
 
 struct TestRoot(PathBuf);
 
@@ -73,6 +112,24 @@ fn fake_profile(responses: Vec<Value>) -> FakeModelProfile {
 
 fn finish(output: Value) -> Value {
     json!(serde_json::to_string(&json!({"status":"finished", "output":output})).unwrap())
+}
+
+fn assert_fake_profile_response(binding: &ModelBinding, expected: &str) {
+    let observed = adk_rust::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let request = LlmRequest::new("fake", vec![Content::new("user").with_text("ping")]);
+            let mut stream = binding.generate_content(request, false).await.unwrap();
+            let response = stream.next().await.unwrap().unwrap();
+            assert!(stream.next().await.is_none());
+            response.content.unwrap().parts[0]
+                .text()
+                .unwrap()
+                .to_owned()
+        });
+    assert_eq!(observed, expected);
 }
 
 fn execution_profile(
@@ -184,6 +241,7 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
             .iter()
             .all(|case| case.outcome == CompatibilityOutcome::Pass)
     );
+    assert!(matrix.iter().all(|case| case.stack == "fake-profile"));
 
     for case in matrix {
         match case.dimension {
@@ -215,6 +273,7 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                     "{}",
                     case.name
                 );
+                assert_fake_profile_response(&binding, "ok");
             }
             CompatibilityDimension::InferenceEngineVersion => {
                 let package = include_str!("../../../Cargo.lock")
@@ -222,6 +281,12 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                     .find(|block| block.contains("\nname = \"adk-rust\"\n"))
                     .expect("ADK-Rust must be locked");
                 assert!(package.contains("\nversion = \"2.1.0\"\n"), "{}", case.name);
+                let binding = ModelProfileRegistry::new()
+                    .with_worker(fake_profile(vec![json!("engine-ok")]))
+                    .unwrap()
+                    .bind_worker(&CredentialBroker::new())
+                    .unwrap();
+                assert_fake_profile_response(&binding, "engine-ok");
             }
             CompatibilityDimension::ToolParserChatTemplate => {
                 let runtime = ModelRuntimeConfig::default()
@@ -234,13 +299,18 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                     "{}",
                     case.name
                 );
-            }
-            CompatibilityDimension::Streaming => {
                 let binding = ModelProfileRegistry::new()
-                    .with_worker(fake_profile(vec![json!("chunk-one"), json!("chunk-two")]))
+                    .with_worker(fake_profile(vec![json!("configured-ok")]).with_runtime(runtime))
                     .unwrap()
                     .bind_worker(&CredentialBroker::new())
                     .unwrap();
+                assert_fake_profile_response(&binding, "configured-ok");
+            }
+            CompatibilityDimension::Streaming => {
+                let requests = Arc::new(AtomicUsize::new(0));
+                let binding = LocalStreamingLlm {
+                    requests: Arc::clone(&requests),
+                };
                 let observed = adk_rust::tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -249,17 +319,15 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                         let request =
                             LlmRequest::new("fake", vec![Content::new("user").with_text("ping")]);
                         let mut stream = binding.generate_content(request, true).await.unwrap();
-                        let first = stream.next().await.unwrap().unwrap().content.unwrap().parts[0]
-                            .text()
-                            .map(str::to_owned);
-                        (first, stream.next().await.is_none())
+                        let mut chunks = Vec::new();
+                        while let Some(response) = stream.next().await {
+                            let content = response.unwrap().content.unwrap();
+                            chunks.push(content.parts[0].text().unwrap().to_owned());
+                        }
+                        chunks
                     });
-                assert_eq!(
-                    observed,
-                    (Some("chunk-one".to_owned()), true),
-                    "{}",
-                    case.name
-                );
+                assert_eq!(requests.load(Ordering::SeqCst), 1, "{}", case.name);
+                assert_eq!(observed, ["chunk-one", "chunk-two"], "{}", case.name);
             }
             CompatibilityDimension::SingleToolCall => {
                 let (_root, result) = run(
@@ -319,6 +387,85 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                     "{}",
                     case.name
                 );
+                let attempts = Arc::new(AtomicUsize::new(0));
+                let counter = Arc::clone(&attempts);
+                let graph = StateGraph::with_channels(&["result"])
+                    .add_node_fn("model", move |_context| {
+                        let counter = Arc::clone(&counter);
+                        async move {
+                            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                                return Err(GraphError::Other(
+                                    "injected transient fake-provider failure".to_owned(),
+                                ));
+                            }
+                            Ok(NodeOutput::new().with_update("result", json!("recovered")))
+                        }
+                    })
+                    .add_edge(START, "model")
+                    .add_edge("model", END)
+                    .compile()
+                    .unwrap()
+                    .with_node_retry(
+                        "model",
+                        RetryPolicy::new(2)
+                            .with_initial_delay(Duration::ZERO)
+                            .with_jitter(0.0),
+                    );
+                let state = adk_rust::tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(graph.invoke(State::new(), ExecutionConfig::new("retry-success")))
+                    .unwrap();
+                assert_eq!(attempts.load(Ordering::SeqCst), 2, "{}", case.name);
+                assert_eq!(
+                    state.get("result"),
+                    Some(&json!("recovered")),
+                    "{}",
+                    case.name
+                );
+
+                let exhausted_attempts = Arc::new(AtomicUsize::new(0));
+                let exhausted_counter = Arc::clone(&exhausted_attempts);
+                let exhausted = StateGraph::with_channels(&[])
+                    .add_node_fn("model", move |_context| {
+                        let counter = Arc::clone(&exhausted_counter);
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            Err(GraphError::Other(
+                                "injected terminal fake-provider failure".to_owned(),
+                            ))
+                        }
+                    })
+                    .add_edge(START, "model")
+                    .add_edge("model", END)
+                    .compile()
+                    .unwrap()
+                    .with_node_retry(
+                        "model",
+                        RetryPolicy::new(2)
+                            .with_initial_delay(Duration::ZERO)
+                            .with_jitter(0.0),
+                    );
+                assert!(
+                    adk_rust::tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(
+                            exhausted
+                                .invoke(State::new(), ExecutionConfig::new("retry-exhausted"),)
+                        )
+                        .is_err(),
+                    "{}",
+                    case.name
+                );
+                assert_eq!(
+                    exhausted_attempts.load(Ordering::SeqCst),
+                    2,
+                    "{}",
+                    case.name
+                );
                 let budget = InferenceBudget::new(ReasoningEffort::Low, 128, 2).unwrap();
                 assert_eq!(budget.max_retries(), 2, "{}", case.name);
                 assert_eq!(
@@ -346,6 +493,12 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                 );
             }
             CompatibilityDimension::Abstention => {
+                let binding = ModelProfileRegistry::new()
+                    .with_worker(fake_profile(vec![json!("abstain-ok")]))
+                    .unwrap()
+                    .bind_worker(&CredentialBroker::new())
+                    .unwrap();
+                assert_fake_profile_response(&binding, "abstain-ok");
                 let mut detector = NonProgressDetector::new(2);
                 let observation = review("no progress");
                 assert_eq!(
