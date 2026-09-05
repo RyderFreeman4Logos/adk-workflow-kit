@@ -1,7 +1,13 @@
 //! The offline provider/model compatibility contract used by issue #268.
 //!
 //! Every row is exercised by `issue_268_compatibility_matrix`; no row permits
-//! a network or credential-backed probe.
+//! a network or credential-backed probe. Identity/parser rows cover metadata only;
+//! the engine row pins the ADK dependency, not an inference server. Streaming tests
+//! the inherent ModelBinding wrapper with injected I/O; retry tests its buffered
+//! Llm trait route and fixed one-retry policy (InferenceBudget is not its owner).
+//! Tool batches prove acceptance, not scheduling overlap. Abstention is a detector
+//! decision, not a workflow terminal. Resume retention covers an already finished
+//! node, not arbitrary interrupted-provider replay or all session-store backends.
 
 /// A compatibility-matrix dimension from the issue's DONE WHEN contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,25 +46,25 @@ pub struct CompatibilityCase {
 pub const COMPATIBILITY_MATRIX: &[CompatibilityCase] = &[
     CompatibilityCase {
         dimension: CompatibilityDimension::ModelIdentityRevision,
-        name: "model identity and revision",
+        name: "fake profile identity and revision metadata",
         stack: "fake-profile",
         outcome: CompatibilityOutcome::Pass,
     },
     CompatibilityCase {
         dimension: CompatibilityDimension::InferenceEngineVersion,
-        name: "inference engine and version",
+        name: "locked ADK dependency version",
         stack: "fake-profile",
         outcome: CompatibilityOutcome::Pass,
     },
     CompatibilityCase {
         dimension: CompatibilityDimension::ToolParserChatTemplate,
-        name: "tool parser and chat template",
+        name: "tool parser and chat template configuration metadata",
         stack: "fake-profile",
         outcome: CompatibilityOutcome::Pass,
     },
     CompatibilityCase {
         dimension: CompatibilityDimension::Streaming,
-        name: "streaming",
+        name: "inherent binding streaming with injected fake I/O",
         stack: "fake-profile",
         outcome: CompatibilityOutcome::Pass,
     },
@@ -70,7 +76,7 @@ pub const COMPATIBILITY_MATRIX: &[CompatibilityCase] = &[
     },
     CompatibilityCase {
         dimension: CompatibilityDimension::ParallelToolCalls,
-        name: "parallel tool calls",
+        name: "batched tool call acceptance",
         stack: "fake-profile",
         outcome: CompatibilityOutcome::Pass,
     },
@@ -88,7 +94,7 @@ pub const COMPATIBILITY_MATRIX: &[CompatibilityCase] = &[
     },
     CompatibilityCase {
         dimension: CompatibilityDimension::TimeoutRetry,
-        name: "timeout and bounded retry",
+        name: "backend timeout and binding fixed one-retry policy",
         stack: "fake-profile",
         outcome: CompatibilityOutcome::Pass,
     },
@@ -100,13 +106,13 @@ pub const COMPATIBILITY_MATRIX: &[CompatibilityCase] = &[
     },
     CompatibilityCase {
         dimension: CompatibilityDimension::Abstention,
-        name: "abstention",
+        name: "detector-level abstention decision",
         stack: "fake-profile",
         outcome: CompatibilityOutcome::Pass,
     },
     CompatibilityCase {
         dimension: CompatibilityDimension::RunResumeSessionRetention,
-        name: "run and resume session retention",
+        name: "finished-node run/resume output and identity retention",
         stack: "fake-profile",
         outcome: CompatibilityOutcome::Pass,
     },

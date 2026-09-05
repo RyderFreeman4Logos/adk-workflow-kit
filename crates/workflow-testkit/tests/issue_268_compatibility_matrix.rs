@@ -176,13 +176,105 @@ fn run(
     (root, result)
 }
 
-fn completed_tools(run_root: &Path) -> usize {
+fn read_json(run_root: &Path, name: &str) -> Value {
+    serde_json::from_slice(&fs::read(run_root.join(name)).unwrap()).unwrap()
+}
+
+fn node_state(run_root: &Path) -> Value {
+    read_json(run_root, "loop-ledger.json")["nodes"]["work"].clone()
+}
+
+fn events(run_root: &Path) -> Vec<Value> {
     fs::read_to_string(run_root.join("events.jsonl"))
         .unwrap()
         .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|event| event["kind"] == "tool_completed")
-        .count()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn assert_tool_calls(run_root: &Path, expected: &[Value]) {
+    let state = node_state(run_root);
+    let mut completed = state["completed_calls"].as_array().unwrap().clone();
+    let mut expected_calls = expected.to_vec();
+    completed.sort_by_key(|entry| entry["call"]["id"].as_str().unwrap().to_owned());
+    expected_calls.sort_by_key(|entry| entry["call"]["id"].as_str().unwrap().to_owned());
+    assert_eq!(completed, expected_calls, "exact completed effect ledger");
+    let events = events(run_root);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "tool_completed")
+            .count(),
+        expected.len(),
+        "no extra or missing completion events"
+    );
+    let requested: Vec<_> = events
+        .iter()
+        .filter(|event| event["kind"] == "tool_requested")
+        .flat_map(|event| event["payload"]["structured_output"].as_array().unwrap())
+        .cloned()
+        .collect();
+    let expected_requests: Vec<_> = expected
+        .iter()
+        .map(|entry| {
+            json!({
+                "tool_call_id": entry["call"]["id"],
+                "tool_name": entry["call"]["name"],
+                "argument_fingerprint": entry["call"]["fingerprint"],
+            })
+        })
+        .collect();
+    assert_eq!(requested, expected_requests, "exact dispatch attribution");
+}
+
+// Fake profiles retain synthetic fixture arguments; events must still use fingerprints.
+// Never supply sensitive arguments to this offline fixture.
+fn completed_call(id: &str, name: &str, args: Value, response: Value, ordinal: u64) -> Value {
+    let fingerprint = workflow_runtime::argument_fingerprint(&args);
+    json!({"kind":"ordinary", "call": {
+        "id":id, "name":name, "args":args,
+        "fingerprint":fingerprint, "response":{
+            "status":"success", "payload":response,
+            "provenance":{"tool_id":name,"tool_version":"1"}
+        },
+        "model_iteration":1, "admission_ordinal":ordinal
+    }})
+}
+
+fn assert_finished(run_root: &Path, expected: Value) {
+    let state = node_state(run_root);
+    assert_eq!(state["finish_admitted"], true);
+    assert_eq!(
+        state["finished_output"], expected,
+        "retained terminal output"
+    );
+    assert_eq!(
+        state["finish_successor"], expected,
+        "resumed finish successor"
+    );
+    let manifest = read_json(run_root, "run-manifest.json");
+    let artifact = read_json(
+        &run_root.join("artifacts"),
+        manifest["artifact_id"].as_str().unwrap(),
+    );
+    assert_eq!(artifact["status"], "succeeded");
+    assert_eq!(artifact["terminal"], "done");
+    let checkpoint_manifest =
+        serde_json::from_value(read_json(run_root, "checkpoint-manifest.json")).unwrap();
+    let store = workflow_runtime::SqliteCheckpointStore::open(
+        run_root.join("checkpoint.sqlite"),
+        checkpoint_manifest,
+    )
+    .unwrap();
+    let run_id =
+        workflow_runtime::RunId::new(manifest["run_id"].as_str().unwrap().to_owned()).unwrap();
+    let checkpoint = store.load_latest(&run_id).unwrap().unwrap();
+    let restored: Value = serde_json::from_slice(checkpoint.state()).unwrap();
+    assert_eq!(
+        restored["node:work"], expected,
+        "checkpoint retains actual agent output"
+    );
+    assert_eq!(restored["terminal"], "done");
 }
 
 fn review(summary: &str) -> ReviewResult {
@@ -283,7 +375,18 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                     1000,
                     4,
                 );
-                assert_eq!(result.unwrap().status(), "succeeded", "{}", case.name);
+                let receipt = result.unwrap();
+                assert_eq!(receipt.status(), "succeeded", "{}", case.name);
+                assert_tool_calls(
+                    receipt.run_root(),
+                    &[completed_call(
+                        "single",
+                        "search_code",
+                        json!({"query":"one"}),
+                        json!({"found":true}),
+                        1,
+                    )],
+                );
             }
             CompatibilityDimension::ParallelToolCalls => {
                 let (_root, result) = run(
@@ -299,29 +402,58 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                     4,
                 );
                 let receipt = result.unwrap();
-                assert_eq!(completed_tools(receipt.run_root()), 2, "{}", case.name);
+                assert_eq!(receipt.status(), "succeeded", "{}", case.name);
+                assert_tool_calls(
+                    receipt.run_root(),
+                    &[
+                        completed_call(
+                            "parallel-a",
+                            "search_code",
+                            json!({"query":"one"}),
+                            json!({"found":true}),
+                            1,
+                        ),
+                        completed_call(
+                            "parallel-b",
+                            "read_source_range",
+                            json!({"path":"src/lib.rs","start":1}),
+                            json!({"source":"ok"}),
+                            2,
+                        ),
+                    ],
+                );
             }
             CompatibilityDimension::MalformedArguments => {
-                let (_root, result) = run(
-                    vec![
-                        json!({"calls": [{"id":"malformed","name":"search_code","args":{"query":1}}]}),
-                        finish(json!({"must_not":"succeed"})),
-                    ],
-                    0,
-                    1000,
-                    4,
-                );
-                let error = result.unwrap_err();
-                assert_eq!(
-                    completed_tools(error.receipt().unwrap().run_root()),
-                    0,
-                    "{}",
-                    case.name
-                );
+                // Shape rejection and schema rejection are different existing owners.
+                for (args, kind) in [
+                    (json!([]), ExecutionErrorKind::MalformedTool),
+                    (json!({"query":1}), ExecutionErrorKind::AuthorizationDenied),
+                ] {
+                    let (_root, result) = run(
+                        vec![
+                            json!({"calls": [{"id":"malformed","name":"search_code","args":args}]}),
+                            finish(json!({"must_not":"succeed"})),
+                        ],
+                        0,
+                        1000,
+                        4,
+                    );
+                    let error = result.unwrap_err();
+                    assert_eq!(error.kind(), kind, "{}", case.name);
+                    let run_root = error.receipt().unwrap().run_root();
+                    assert_eq!(node_state(run_root)["completed_calls"], json!([]));
+                    assert!(
+                        !events(run_root)
+                            .iter()
+                            .any(|event| event["kind"] == "tool_completed")
+                    );
+                }
             }
             CompatibilityDimension::StructuredFinish => {
                 let (_root, result) = run(vec![finish(json!({"answer":"structured"}))], 0, 1000, 2);
-                assert_eq!(result.unwrap().status(), "succeeded", "{}", case.name);
+                let receipt = result.unwrap();
+                assert_eq!(receipt.status(), "succeeded", "{}", case.name);
+                assert_finished(receipt.run_root(), json!({"answer":"structured"}));
             }
             CompatibilityDimension::TimeoutRetry => {
                 let (_root, result) = run(vec![finish(json!({"late":true}))], 50, 5, 2);
@@ -343,20 +475,35 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                     1000,
                     4,
                 );
+                let error = result.unwrap_err();
                 assert_eq!(
-                    result.unwrap_err().kind(),
+                    error.kind(),
                     ExecutionErrorKind::NonProgress,
                     "{}",
                     case.name
                 );
+                let run_root = error.receipt().unwrap().run_root();
+                assert_tool_calls(
+                    run_root,
+                    &[completed_call(
+                        "repeat-a",
+                        "search_code",
+                        json!({"query":"same"}),
+                        json!({"found":true}),
+                        1,
+                    )],
+                );
+                let state = node_state(run_root);
+                assert_eq!(
+                    state["total_tool_calls"], 1,
+                    "reject before admitting duplicate effect"
+                );
+                assert_eq!(
+                    state["model_iterations"], 1,
+                    "only first response was admitted"
+                );
             }
             CompatibilityDimension::Abstention => {
-                let binding = ModelProfileRegistry::new()
-                    .with_worker(fake_profile(vec![json!("abstain-ok")]))
-                    .unwrap()
-                    .bind_worker(&CredentialBroker::new())
-                    .unwrap();
-                assert_fake_profile_response(&binding, "abstain-ok");
                 let mut detector = NonProgressDetector::new(2);
                 let observation = review("no progress");
                 assert_eq!(
@@ -373,15 +520,59 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                 );
             }
             CompatibilityDimension::RunResumeSessionRetention => {
-                let (root, result) = run(vec![finish(json!({"answer":"retained"}))], 0, 1000, 2);
+                let (root, result) = run(
+                    vec![
+                        json!({"calls": [{"id":"retained-tool","name":"search_code","args":{"query":"retained-query"}}]}),
+                        finish(json!({"answer":"retained"})),
+                    ],
+                    0,
+                    1000,
+                    4,
+                );
                 let receipt = result.unwrap();
+                assert_eq!(receipt.status(), "succeeded");
+                let expected_calls = [completed_call(
+                    "retained-tool",
+                    "search_code",
+                    json!({"query":"retained-query"}),
+                    json!({"found":true}),
+                    1,
+                )];
+                assert_finished(receipt.run_root(), json!({"answer":"retained"}));
+                assert_tool_calls(receipt.run_root(), &expected_calls);
+                let before = node_state(receipt.run_root());
+                assert_eq!(before["model_iterations"], 2);
+                let before_manifest = read_json(receipt.run_root(), "run-manifest.json");
                 let resumed = ExecutionBackend::resume(&root.0, receipt.run_id()).unwrap();
                 assert_eq!(resumed.run_id(), receipt.run_id(), "{}", case.name);
                 assert_eq!(resumed.status(), "succeeded", "{}", case.name);
-                let manifest: Value = serde_json::from_slice(
-                    &fs::read(resumed.run_root().join("run-manifest.json")).unwrap(),
-                )
-                .unwrap();
+                assert_eq!(resumed.run_root(), receipt.run_root());
+                assert_eq!(resumed.resume_identity(), receipt.resume_identity());
+                assert_eq!(resumed.plan_hash(), receipt.plan_hash());
+                // Completed finish is restored, although the graph itself resumes.
+                assert_finished(resumed.run_root(), json!({"answer":"retained"}));
+                assert_tool_calls(resumed.run_root(), &expected_calls);
+                assert_eq!(
+                    node_state(resumed.run_root()),
+                    before,
+                    "no new model admission, tool effect, or conversation loss"
+                );
+                let manifest = read_json(resumed.run_root(), "run-manifest.json");
+                for key in [
+                    "workflow_id",
+                    "workdir_id",
+                    "profile_identity",
+                    "checkpoint_manifest",
+                ] {
+                    assert!(
+                        !before_manifest[key].is_null(),
+                        "identity field {key} must exist"
+                    );
+                    assert_eq!(
+                        manifest[key], before_manifest[key],
+                        "retained identity {key}"
+                    );
+                }
                 assert_eq!(manifest["resume_count"], 1, "{}", case.name);
             }
         }
