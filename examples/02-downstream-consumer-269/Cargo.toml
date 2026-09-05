@@ -10,3 +10,4 @@ sha2 = "0.10"
 workflow-adk = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "026b883a58bab6cc2d0c8610b44e3983e6017cb8" }
 workflow-compiler = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "026b883a58bab6cc2d0c8610b44e3983e6017cb8" }
 workflow-testkit = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "026b883a58bab6cc2d0c8610b44e3983e6017cb8" }
+workflow-runtime = { git = "https://github.com/RyderFreeman4Logos/adk-workflow-kit", rev = "026b883a58bab6cc2d0c8610b44e3983e6017cb8" }

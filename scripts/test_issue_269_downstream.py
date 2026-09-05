@@ -18,7 +18,7 @@ DOWNSTREAM = Path(
 )
 PINNED_REVISION = "026b883a58bab6cc2d0c8610b44e3983e6017cb8"
 EXPECTED_TARGET = f"/ssd/mirror-rootfs{DOWNSTREAM}/target"
-DIRECT_DEPENDENCIES = ("workflow-compiler", "workflow-adk", "workflow-testkit")
+DIRECT_DEPENDENCIES = ("workflow-compiler", "workflow-adk", "workflow-testkit", "workflow-runtime")
 TEMPLATE = ROOT / "examples/02-downstream-consumer-269"
 
 
@@ -96,7 +96,7 @@ def main() -> int:
     required = (
         "justfile",
         "src/main.rs",
-        "fixtures/workflow.toml",
+        "workflow.toml",
         "fixtures/profile.json",
         "fixtures/replay.json",
         "assets/prompt.txt",

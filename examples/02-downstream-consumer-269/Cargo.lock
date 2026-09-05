@@ -142,6 +142,7 @@ dependencies = [
  "sha2",
  "workflow-adk",
  "workflow-compiler",
+ "workflow-runtime",
  "workflow-testkit",
 ]
 

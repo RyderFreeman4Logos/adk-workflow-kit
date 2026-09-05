@@ -5,8 +5,8 @@
     "input_schema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object",
-      "properties": {"message": {"type": "string"}},
-      "required": ["message"],
+      "properties": {"message": {"type": "string"}, "resource": {"type": "string"}, "resource_sha256": {"type": "string"}},
+      "required": ["message", "resource", "resource_sha256"],
       "additionalProperties": false
     },
     "required_capabilities": [],
