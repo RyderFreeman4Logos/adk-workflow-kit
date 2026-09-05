@@ -29,6 +29,13 @@
     "model": "fake-reviewer",
     "responses": ["{\"status\":\"finished\",\"output\":\"pass\"}"]
   },
+  "skills": [
+    {
+      "id": "code-investigation",
+      "version": "1",
+      "root": "skills/code-investigation"
+    }
+  ],
   "tools": [
     {
       "name": "search_code",
@@ -45,5 +52,5 @@
       "required_scopes": []
     }
   ],
-  "sandbox": {"capabilities": ["filesystem.read"]}
+  "sandbox": {"capabilities": ["filesystem.read", "process.spawn"]}
 }

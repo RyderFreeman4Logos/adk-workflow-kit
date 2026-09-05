@@ -126,6 +126,61 @@ fn fake_profile_does_not_embed_tool_results() {
     }
 }
 
+#[test]
+fn canonical_example_composes_skill_runtime() {
+    let example = example_root();
+    let workflow = fs::read_to_string(example.join("workflow.toml")).expect("workflow");
+    let profile = load_profile();
+    let runtime = fs::read_to_string(example.join("skills/code-investigation/skill.runtime.toml"))
+        .expect("Skill runtime manifest");
+
+    assert!(workflow.contains("skills = [{ id = \"code-investigation\", version = \"1\" }]"));
+    assert_eq!(profile["skills"][0]["id"], "code-investigation");
+    assert_eq!(profile["skills"][0]["version"], "1");
+    assert_eq!(profile["skills"][0]["root"], "skills/code-investigation");
+    assert!(runtime.contains("id = \"code-investigation\""));
+    assert!(runtime.contains("path = \"scripts/digest.py\""));
+    assert!(runtime.contains("input_schema = \"references/investigation-input.json\""));
+    assert!(runtime.contains("output_schema = \"references/investigation-output.json\""));
+}
+
+#[test]
+fn canonical_example_executes_declared_skill_runtime() {
+    let mut profile = load_profile();
+    profile["model"]["responses"][1] = json!({
+        "calls": [
+            {"id": "activate-code-investigation", "name": "activate_skill", "args": {"skill_id": "code-investigation"}},
+            {"id": "read-grounding", "name": "read_skill_resource", "args": {"skill_id": "code-investigation", "resource_id": "references/grounding.md", "offset": 0, "limit": 4096}}
+        ]
+    });
+    profile["model"]["responses"]
+        .as_array_mut()
+        .expect("fake model responses")
+        .insert(2, json!("{\"status\":\"finished\",\"output\":\"planned\"}"));
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let profile_path = write_profile(&root.0, &profile);
+    let run = run_workflow(
+        &example_root().join("workflow.toml"),
+        &profile_path,
+        &workdir,
+    );
+    assert!(
+        run.status.success(),
+        "Skill runtime run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let receipt = json_receipt(&run);
+    let events = fs::read_to_string(
+        Path::new(receipt["run_root"].as_str().expect("run_root")).join("events.jsonl"),
+    )
+    .expect("runtime events");
+    assert!(events.contains("activate_skill"));
+    assert!(events.contains("read_skill_resource"));
+}
+
 fn assert_fail_closed(output: &Output) {
     assert_eq!(
         output.status.code(),
@@ -159,6 +214,8 @@ fn canonical_package_validates_graphs_and_locks() {
         "schemas/investigation-output.json",
         "skills/code-investigation/SKILL.md",
         "skills/code-investigation/references/grounding.md",
+        "skills/code-investigation/references/investigation-input.json",
+        "skills/code-investigation/references/investigation-output.json",
         "skills/code-investigation/scripts/digest.py",
         "repo/Cargo.toml",
         "repo/src/lib.rs",
@@ -434,7 +491,7 @@ fn fake_profile_fails_closed_on_malformed_model_output() {
 #[test]
 fn fake_profile_fails_closed_on_denied_tools() {
     let mut profile = load_profile();
-    profile["tools"][0]["required_capabilities"] = json!(["process.spawn"]);
+    profile["tools"][0]["required_capabilities"] = json!(["network"]);
 
     let root = temp_root();
     let workdir = root.0.join("runs");
