@@ -55,13 +55,23 @@ class PathTests(unittest.TestCase):
                 self.assertEqual(env["ISSUE_269_TMPDIR"], str(Path(explicit or home / "tmp").resolve()))
                 self.assertEqual(env.get("ISSUE_269_DOWNSTREAM"), str(consumer))
 
+    def test_just_with_long_home_and_short_explicit_base(self) -> None:
+        temporary = os.environ.get("ISSUE_269_TMPDIR", str(Path.home() / "tmp"))
+        with tempfile.TemporaryDirectory(prefix="269-long-synthetic-home-", dir=Path.home()) as base:
+            home = Path(base) / "long-home-without-toolchain-settings"
+            home.mkdir()
+            # Only parent-side path selection changes; real --prepare keeps HOME.
+            with patch.dict(os.environ, ISSUE_269_TMPDIR=temporary):
+                with patch.object(Path, "home", return_value=home):
+                    self.test_just_preserves_literal_path_arguments()
+
     def test_just_preserves_literal_path_arguments(self) -> None:
         with tempfile.TemporaryDirectory(prefix="269q-", dir=Path.home()) as base:
             base = Path(base)
             # Harmless expansion only: no executable side-effect payload.
             consumer = base / "literal$HOME'\"$(printf literal)"
             temporary = base / "$HOME'\""
-            env = dict(os.environ, ISSUE_269_DOWNSTREAM=str(consumer), ISSUE_269_TMPDIR=str(temporary))
+            env = dict(os.environ, ISSUE_269_DOWNSTREAM=str(consumer))
             result = subprocess.run(
                 ["python3", str(SCRIPTS / "test_issue_269_downstream.py"), "--prepare"],
                 env=env, capture_output=True, text=True,
@@ -71,6 +81,7 @@ class PathTests(unittest.TestCase):
             result = subprocess.run(["just", "_guard"], cwd=consumer, env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             # Execute the actual recipes/shell, recording argv instead of Cargo.
+            env["ISSUE_269_TMPDIR"] = str(temporary)
             recorder = base / "record.py"
             calls = base / "calls.jsonl"
             recorder.write_text(
