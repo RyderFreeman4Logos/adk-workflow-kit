@@ -156,6 +156,10 @@ m2-02-red:
 m2-02-green:
     python3 scripts/test_m2_02_recipes_consumer.py
 
+# Verify the standalone exact-Git downstream consumer for #269.
+issue-269-acceptance:
+    python3 scripts/test_issue_269_downstream.py
+
 # Validate the machine-readable ADK-Rust pattern catalog.
 pattern-catalog-test:
     python3 scripts/test_pattern_catalog.py

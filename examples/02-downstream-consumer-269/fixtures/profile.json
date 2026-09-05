@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "model": {
+    "provider": "fake",
+    "name": "consumer-fake",
+    "version": "1",
+    "model": "offline-consumer",
+    "responses": [
+      {"calls": [{"id": "echo-call", "name": "echo", "args": {"message": "downstream proof"}}]},
+      "{\"status\":\"finished\",\"output\":\"downstream proof complete\"}"
+    ]
+  },
+  "skills": [
+    {"id": "demo", "version": "1", "root": "assets/skills/demo"}
+  ],
+  "sandbox": {"capabilities": []}
+}

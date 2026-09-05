@@ -1,0 +1,19 @@
+set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+
+_io := "ionice -c 3"
+_target := "/ssd/mirror-rootfs/home/obj/project/downstream/adk-workflow-kit-269/target"
+
+_guard:
+    test -L target
+    test "$(readlink target)" = "{{_target}}"
+
+lock: _guard
+    {{_io}} cargo +1.98.0 generate-lockfile
+
+build: _guard
+    {{_io}} cargo +1.98.0 build --locked
+
+run: build
+    {{_io}} cargo +1.98.0 run --locked
+
+acceptance: lock run
