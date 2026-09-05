@@ -2,6 +2,7 @@
 
 mod bench;
 pub mod code_investigation;
+pub mod compatibility;
 pub mod conformance;
 mod eval;
 pub mod live_conformance;

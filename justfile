@@ -102,6 +102,10 @@ m3-07-live profile="":
 issue-267-test:
     {{_io}} cargo +1.98.0 test -p workflow-testkit --test issue_267_deterministic_nodes --locked -- --nocapture
 
+# Focused #268 offline fake-profile provider/model compatibility matrix.
+issue-268-test:
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --test issue_268_compatibility_matrix --locked -- --nocapture
+
 # Focused #224 reference-workflow package and runner contract tests.
 m3-08-reference:
     {{_io}} cargo +1.98.0 test -p workflowctl --test m3_08_reference_workflow --locked -- --nocapture
