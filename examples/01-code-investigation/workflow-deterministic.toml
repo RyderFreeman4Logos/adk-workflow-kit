@@ -1,0 +1,60 @@
+schema_version = 1
+
+[workflow]
+id = "code.investigation.deterministic"
+version = "1"
+entry = "start"
+
+[[nodes]]
+id = "start"
+kind = "action"
+idempotent = true
+
+[[nodes]]
+id = "validate_evidence"
+kind = "validator"
+
+[[nodes]]
+id = "request_approval"
+kind = "approval"
+timeout_ms = 60000
+
+[[nodes]]
+id = "write_effect"
+kind = "action"
+idempotent = true
+
+[[nodes]]
+id = "publish"
+kind = "terminal"
+
+[[nodes]]
+id = "denied"
+kind = "terminal"
+
+[[nodes]]
+id = "timeout"
+kind = "terminal"
+
+[[nodes]]
+id = "manual_recovery"
+kind = "terminal"
+
+[[edges]]
+from = "start"
+to = "validate_evidence"
+
+[[routes]]
+from = "validate_evidence"
+predicate = { id = "code.investigation.evidence@v1", version = "1.0.0" }
+cases = { valid = "request_approval", invalid = "manual_recovery" }
+
+[[routes]]
+from = "request_approval"
+predicate = { id = "approval.decision@v1", version = "1.0.0" }
+cases = { approve = "write_effect", deny = "denied", timeout = "timeout" }
+
+[[routes]]
+from = "write_effect"
+predicate = { id = "write.effect@v1", version = "1.0.0" }
+cases = { success = "publish", failure = "manual_recovery" }

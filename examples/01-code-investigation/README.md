@@ -85,6 +85,14 @@ bytes, so its validation also performs no network access.
 - fresh-process inspection and resume using the selected workdir; and
 - offline validation of the committed redacted replay bundle.
 
+## Deterministic node contract
+
+`workflow-deterministic.toml` is the model-free companion fixture for the
+canonical package. `just issue-267-test` compiles it with the exact Rust
+validator `code.investigation.evidence@v1` at `1.0.0`, gates approval and the
+idempotent `write_effect` before `publish`, and exercises approval, timeout,
+SIGKILL resume, duplicate-commit, and manual-recovery paths.
+
 Keep credentials and machine-specific paths out of every checked-in fixture.
 
 ## Opt-in live OpenAI-compatible conformance

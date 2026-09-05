@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "issue-267-effect-child"
+path = "src/bin/issue-267-effect-child.rs"
+
 [dependencies]
 adk-rust.workspace = true
 serde.workspace = true
@@ -18,3 +22,4 @@ workflow-runtime = { path = "../workflow-runtime" }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
+workflow-spec = { path = "../workflow-spec" }
