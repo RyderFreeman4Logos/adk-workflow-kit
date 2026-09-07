@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "model": {
+    "provider": "fake",
+    "name": "consumer-fake",
+    "version": "1",
+    "model": "offline-consumer",
+    "responses": [
+      {"calls": [{"id": "activate", "name": "activate_skill", "args": {"skill_id": "demo"}}]},
+      {"calls": [{"id": "read", "name": "read_skill_resource", "args": {"skill_id": "demo", "resource_id": {"$from_tool_response": {"name": "activate_skill", "pointer": "/payload/resources/0/id"}}, "offset": 0, "limit": 1024}}]},
+      {"calls": [{"id": "echo-call", "name": "echo", "args": {"message": "downstream proof", "resource": {"$from_tool_response": {"name": "read_skill_resource", "pointer": "/payload/content"}}, "resource_sha256": {"$from_tool_response": {"name": "read_skill_resource", "pointer": "/payload/result_ref"}}}}]},
+      "{\"status\":\"finished\",\"output\":\"downstream proof complete\"}"
+    ]
+  },
+  "skills": [
+    {"id": "demo", "version": "1", "root": "assets/skills/demo"}
+  ],
+  "sandbox": {"capabilities": ["filesystem.read"]}
+}

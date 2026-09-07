@@ -1,0 +1,9 @@
+schema_version = 1
+
+[skill]
+id = "demo"
+version = "1"
+
+[[resources]]
+id = "references/usage.md"
+sha256 = "sha256:25fd9b1dfaad22a6b42d99e49056b39eb4181bf7fcd85c4ef549d8fcfaf85bff"

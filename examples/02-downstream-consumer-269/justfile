@@ -1,0 +1,29 @@
+set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+
+_io := "ionice -c 3"
+_target := "/ssd/mirror-rootfs" + justfile_directory() + "/target"
+
+_guard:
+    test -L target
+    test "$(readlink target)" = {{quote(_target)}}
+
+lock: _guard
+    {{_io}} cargo +1.98.0 generate-lockfile
+
+build: _guard
+    {{_io}} cargo +1.98.0 build --locked
+
+run: build
+    {{_io}} cargo +1.98.0 run --locked -- {{quote(justfile_directory())}} {{quote(env_var('ISSUE_269_TMPDIR'))}}
+
+acceptance: run
+
+# Recheck retained artifacts/effects through the same public readers.
+verify run_id: build
+    {{_io}} cargo +1.98.0 run --locked -- {{quote(justfile_directory())}} {{quote(env_var('ISSUE_269_TMPDIR'))}} {{quote(run_id)}}
+
+fmt:
+    {{_io}} cargo +1.98.0 fmt -- --check
+
+lint: _guard
+    {{_io}} cargo +1.98.0 clippy --locked -- -D warnings
