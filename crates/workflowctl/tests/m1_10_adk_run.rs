@@ -719,31 +719,160 @@ fn diagnostics_after_cleanup(
     diagnostics
 }
 
-fn clean_up_child(mut child: Child) -> Vec<&'static str> {
-    let mut diagnostics = Vec::new();
-    if child.kill().is_err() {
-        diagnostics.push("oracle child kill failed");
+enum OwnedChildStat {
+    Ready { state: char, starttime: u64 },
+    Errno(i32),
+    Unavailable,
+}
+
+fn owned_child_stat(pid: u32) -> OwnedChildStat {
+    let contents = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(contents) => contents,
+        Err(error) => {
+            return error
+                .raw_os_error()
+                .map(OwnedChildStat::Errno)
+                .unwrap_or(OwnedChildStat::Unavailable);
+        }
+    };
+    let Some(fields) = contents.rsplit_once(") ").map(|(_, fields)| fields) else {
+        return OwnedChildStat::Unavailable;
+    };
+    let fields: Vec<&str> = fields.split_whitespace().collect();
+    let Some(state) = fields.first().and_then(|field| {
+        let mut chars = field.chars();
+        match (chars.next(), chars.next()) {
+            (Some(state), None) if state.is_ascii_alphabetic() => Some(state),
+            _ => None,
+        }
+    }) else {
+        return OwnedChildStat::Unavailable;
+    };
+    let Some(starttime) = fields.get(19).and_then(|field| field.parse().ok()) else {
+        return OwnedChildStat::Unavailable;
+    };
+    OwnedChildStat::Ready { state, starttime }
+}
+
+fn format_starttime(stat: &OwnedChildStat) -> String {
+    match stat {
+        OwnedChildStat::Ready { starttime, .. } => starttime.to_string(),
+        OwnedChildStat::Errno(errno) => format!("errno:{errno}"),
+        OwnedChildStat::Unavailable => "unavailable".to_string(),
     }
+}
+
+fn format_kill(error: Option<&std::io::Error>) -> String {
+    match error {
+        None => "ok".to_string(),
+        Some(error) => error
+            .raw_os_error()
+            .map(|errno| format!("errno:{errno}"))
+            .unwrap_or_else(|| "unavailable".to_string()),
+    }
+}
+
+fn format_wait_status(status: std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = status.code() {
+        format!("status:exit:{code}")
+    } else if let Some(signal) = status.signal() {
+        format!("status:signal:{signal}")
+    } else {
+        "status:unavailable".to_string()
+    }
+}
+
+fn format_wait_error(error: &std::io::Error) -> String {
+    error
+        .raw_os_error()
+        .map(|errno| format!("errno:{errno}"))
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn format_terminal(pid: u32) -> String {
+    match owned_child_stat(pid) {
+        OwnedChildStat::Ready { state, starttime } => {
+            format!("state:{state},starttime:{starttime}")
+        }
+        OwnedChildStat::Errno(errno) if errno == libc::ENOENT || errno == libc::ESRCH => {
+            "esrch".to_string()
+        }
+        OwnedChildStat::Errno(errno) => format!("errno:{errno}"),
+        OwnedChildStat::Unavailable => "unavailable".to_string(),
+    }
+}
+
+fn abort_unproven_reap(
+    operation: &'static str,
+    pid: u32,
+    starttime: &str,
+    kill: &str,
+    wait: &str,
+    terminal: &str,
+) -> ! {
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "oracle reap evidence operation={operation} pid={pid} starttime={starttime} kill={kill} wait={wait} terminal={terminal}"
+    );
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "oracle child terminal reap not proven; aborting"
+    );
+    std::process::abort();
+}
+
+fn clean_up_child(mut child: Child, operation: &'static str) -> Vec<&'static str> {
+    let pid = child.id();
+    let starttime = format_starttime(&owned_child_stat(pid));
+    let mut diagnostics = Vec::new();
+    let kill = match child.kill() {
+        Ok(()) => format_kill(None),
+        Err(error) => {
+            diagnostics.push("oracle child kill failed");
+            format_kill(Some(&error))
+        }
+    };
     if std::env::var_os(UNPROVEN_REAP_FIXTURE_ENV).is_some() {
-        abort_unproven_reap();
+        let wait = match child.try_wait() {
+            Ok(Some(status)) => format_wait_status(status),
+            Ok(None) => "still-alive".to_string(),
+            Err(error) => format_wait_error(&error),
+        };
+        abort_unproven_reap(
+            operation,
+            pid,
+            &starttime,
+            &kill,
+            &wait,
+            &format_terminal(pid),
+        );
     }
     let cleanup_deadline = Instant::now() + ORACLE_CLEANUP_TIMEOUT;
     loop {
-        match child.try_wait() {
+        let wait = match child.try_wait() {
             Ok(Some(_)) => {
                 diagnostics.push("oracle child reaped after kill");
                 return diagnostics;
             }
-            Ok(None) => {}
-            Err(_) => {
+            Ok(None) => "still-alive".to_string(),
+            Err(error) => {
                 if !diagnostics.contains(&"oracle child reap check failed") {
                     diagnostics.push("oracle child reap check failed");
                 }
+                format_wait_error(&error)
             }
-        }
+        };
         let now = Instant::now();
         if now >= cleanup_deadline {
-            abort_unproven_reap();
+            abort_unproven_reap(
+                operation,
+                pid,
+                &starttime,
+                &kill,
+                &wait,
+                &format_terminal(pid),
+            );
         }
         thread::sleep(
             cleanup_deadline
@@ -753,35 +882,34 @@ fn clean_up_child(mut child: Child) -> Vec<&'static str> {
     }
 }
 
-fn abort_unproven_reap() -> ! {
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "oracle child terminal reap not proven; aborting"
-    );
-    std::process::abort();
-}
-
 fn wait_bounded_child(
     mut child: Child,
     stdout_path: &Path,
     stderr_path: &Path,
     deadline: Instant,
+    operation: &'static str,
 ) -> Result<Output, String> {
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::yield_now(),
             Ok(None) => {
-                let diagnostics =
-                    diagnostics_after_cleanup(clean_up_child(child), stdout_path, stderr_path);
+                let diagnostics = diagnostics_after_cleanup(
+                    clean_up_child(child, operation),
+                    stdout_path,
+                    stderr_path,
+                );
                 return Err(format!(
                     "oracle child timed out; {}",
                     diagnostics.join("; ")
                 ));
             }
             Err(_) => {
-                let diagnostics =
-                    diagnostics_after_cleanup(clean_up_child(child), stdout_path, stderr_path);
+                let diagnostics = diagnostics_after_cleanup(
+                    clean_up_child(child, operation),
+                    stdout_path,
+                    stderr_path,
+                );
                 return Err(format!(
                     "oracle child wait failed; {}",
                     diagnostics.join("; ")
@@ -804,6 +932,7 @@ fn run_oracle_operation(
     args: &[&str],
     credential: (&str, Option<&str>),
     deadline: Instant,
+    operation: &'static str,
 ) -> Result<Output, String> {
     let stdout_path = root.join(format!("workflowctl-{label}.stdout"));
     let stderr_path = root.join(format!("workflowctl-{label}.stderr"));
@@ -823,7 +952,7 @@ fn run_oracle_operation(
         ))
         .spawn()
         .map_err(|_| "oracle child spawn failed")?;
-    wait_bounded_child(child, &stdout_path, &stderr_path, deadline)
+    wait_bounded_child(child, &stdout_path, &stderr_path, deadline, operation)
 }
 
 fn command_json(args: &[&str]) -> Output {
@@ -1711,7 +1840,13 @@ fn oracle_unproven_reap_abort_fixture() {
         ))
         .spawn()
         .expect("abort fixture owned child");
-    let _ = wait_bounded_child(child, &stdout_path, &stderr_path, Instant::now());
+    let _ = wait_bounded_child(
+        child,
+        &stdout_path,
+        &stderr_path,
+        Instant::now(),
+        "fixture-env",
+    );
 }
 
 #[test]
@@ -1736,9 +1871,85 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
     let _ = owned_tree::remove_dir_all(&fixture_root);
 
     assert!(!output.status.success(), "unproven reap must abort");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("oracle child terminal reap not proven; aborting"));
+    let evidence = stderr
+        .lines()
+        .find(|line| line.contains("oracle reap evidence"))
+        .expect("abort must emit one bounded reap evidence record");
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("oracle child terminal reap not proven; aborting")
+        evidence.contains("operation=fixture-env"),
+        "operation must be the static fixture-env label: {evidence}"
+    );
+    assert!(
+        evidence.split(' ').any(
+            |field| field.strip_prefix("pid=").is_some_and(
+                |value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+            )
+        ),
+        "pid must be numeric: {evidence}"
+    );
+    assert!(
+        evidence.split(' ').any(
+            |field| field.strip_prefix("starttime=").is_some_and(|value| {
+                (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+                    || value.strip_prefix("errno:").is_some_and(|errno| {
+                        !errno.is_empty() && errno.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                    || value == "unavailable"
+            })
+        ),
+        "starttime must be numeric, errno, or unavailable: {evidence}"
+    );
+    assert!(
+        evidence
+            .split(' ')
+            .any(|field| field.strip_prefix("kill=").is_some_and(|value| {
+                value == "ok"
+                    || value.strip_prefix("errno:").is_some_and(|errno| {
+                        !errno.is_empty() && errno.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                    || value == "unavailable"
+            })),
+        "kill must be ok, errno, or unavailable: {evidence}"
+    );
+    assert!(
+        evidence
+            .split(' ')
+            .any(|field| field.strip_prefix("wait=").is_some_and(|value| {
+                value == "still-alive"
+                    || value
+                        .strip_prefix("status:")
+                        .is_some_and(|status| !status.is_empty() && !status.contains('/'))
+                    || value.strip_prefix("errno:").is_some_and(|errno| {
+                        !errno.is_empty() && errno.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                    || value == "unavailable"
+            })),
+        "wait must be status, still-alive, errno, or unavailable: {evidence}"
+    );
+    assert!(
+        evidence.split(' ').any(|field| field.strip_prefix("terminal=").is_some_and(|value| {
+            value == "esrch"
+                || value
+                    .strip_prefix("state:")
+                    .is_some_and(|rest| {
+                        let mut parts = rest.split(',');
+                        matches!(parts.next(), Some(state) if state.len() == 1 && state.chars().next().is_some_and(|ch| ch.is_ascii_alphabetic()))
+                            && parts
+                                .next()
+                                .and_then(|part| part.strip_prefix("starttime:"))
+                                .is_some_and(|starttime| {
+                                    !starttime.is_empty() && starttime.bytes().all(|byte| byte.is_ascii_digit())
+                                })
+                            && parts.next().is_none()
+                    })
+                || value
+                    .strip_prefix("errno:")
+                    .is_some_and(|errno| !errno.is_empty() && errno.bytes().all(|byte| byte.is_ascii_digit()))
+                || value == "unavailable"
+        })),
+        "terminal must be esrch, state+starttime, errno, or unavailable: {evidence}"
     );
     assert!(sentinel_survived, "abort must not unwind root cleanup");
 }
@@ -1830,7 +2041,7 @@ fn oracle_child_timeout_is_primary_and_directly_reaped() {
             break;
         }
         if Instant::now() >= ready_deadline {
-            let diagnostics = clean_up_child(child);
+            let diagnostics = clean_up_child(child, "timeout-ready");
             panic!(
                 "fixture child output readiness timed out; {}",
                 diagnostics.join("; ")
@@ -1843,6 +2054,7 @@ fn oracle_child_timeout_is_primary_and_directly_reaped() {
         &stdout_path,
         &stderr_path,
         Instant::now() + Duration::from_millis(100),
+        "timeout-reap",
     )
     .expect_err("fixture child must time out");
     assert!(error.starts_with("oracle child timed out"));
@@ -2180,6 +2392,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         ],
         (HANDLE, Some(CANARY)),
         run_deadline,
+        "credential-run",
     );
     let _ = child_done_tx.send(());
     let server_result = server.join();
@@ -2262,6 +2475,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         ],
         (HANDLE, None),
         Instant::now() + ORACLE_TIMEOUT,
+        "credential-inspect",
     )
     .expect("bounded oracle inspect child");
     assert!(
@@ -2293,6 +2507,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         ],
         (HANDLE, None),
         Instant::now() + ORACLE_TIMEOUT,
+        "credential-resume-missing",
     )
     .expect("bounded missing-credential resume child");
     assert_eq!(missing_resume.status.code(), Some(2));
@@ -2323,6 +2538,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         ],
         (HANDLE, Some(CANARY)),
         Instant::now() + ORACLE_TIMEOUT,
+        "credential-resume",
     )
     .expect("bounded credential-backed resume child");
     assert!(
