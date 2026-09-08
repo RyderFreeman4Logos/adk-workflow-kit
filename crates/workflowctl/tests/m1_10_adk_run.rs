@@ -146,6 +146,47 @@ fn temp_root(label: &str) -> TempRoot {
     TempRoot::new(label)
 }
 
+fn bind_unix_listener(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    use std::io::ErrorKind;
+    use std::os::unix::net::UnixListener;
+
+    match UnixListener::bind(path) {
+        Ok(listener) => return Ok(listener),
+        Err(error) if error.kind() == ErrorKind::InvalidInput => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut staging_dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "socket fixture path"))?
+        .to_path_buf();
+    loop {
+        let staging = staging_dir.join(format!(
+            "s-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match UnixListener::bind(&staging) {
+            Ok(listener) => {
+                if let Err(error) = fs::rename(&staging, path) {
+                    let _ = fs::remove_file(&staging);
+                    return Err(error);
+                }
+                return Ok(listener);
+            }
+            Err(error)
+                if error.kind() == ErrorKind::AlreadyExists
+                    || error.kind() == ErrorKind::AddrInUse => {}
+            Err(error) if error.kind() == ErrorKind::InvalidInput => {
+                if !staging_dir.pop() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn write_fixture(root: &Path, profile: Value) -> (PathBuf, PathBuf, PathBuf) {
     let workflow = root.join("workflow.toml");
     let profile_path = root.join("profile.json");
@@ -2006,10 +2047,7 @@ fn oracle_run_root_scan_enforces_tiny_boundary_matrix() {
                     .expect("descendant symlink fixture");
             }
             Fixture::Special => {
-                socket = Some(
-                    std::os::unix::net::UnixListener::bind(root.join("socket"))
-                        .expect("socket fixture"),
-                );
+                socket = Some(bind_unix_listener(&root.join("socket")).expect("socket fixture"));
             }
             Fixture::Bytes(bytes) => fs::write(root.join("bytes"), bytes).expect("byte fixture"),
         }
@@ -2020,6 +2058,34 @@ fn oracle_run_root_scan_enforces_tiny_boundary_matrix() {
         );
         drop(socket);
     }
+
+    let long_holder = temp_root("long-socket");
+    let sun_path_len = std::mem::size_of::<libc::sockaddr_un>()
+        - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    let long_root = long_holder.join("x".repeat(sun_path_len));
+    fs::create_dir(&long_root).expect("long physical root");
+    assert_eq!(
+        scan_run_root_with_limits(&long_root, "safe", TINY),
+        Ok(()),
+        "long physical root"
+    );
+    let naive = long_root.join("socket");
+    assert!(
+        std::os::unix::ffi::OsStrExt::as_bytes(naive.as_os_str()).len() >= sun_path_len,
+        "long physical root socket path must exceed sockaddr_un.sun_path"
+    );
+    let socket = bind_unix_listener(&naive);
+    assert!(
+        socket.is_ok(),
+        "socket fixture must bind under long physical root: {:?}",
+        socket.as_ref().err()
+    );
+    assert_eq!(
+        scan_run_root_with_limits(&long_root, "safe", TINY),
+        Err("oracle run-root special file rejected"),
+        "long-physical-root socket"
+    );
+    drop(socket);
 
     let mut exact = usize::MAX - 1;
     assert!(!scan_bytes_exceeded(&mut exact, 1, usize::MAX));
