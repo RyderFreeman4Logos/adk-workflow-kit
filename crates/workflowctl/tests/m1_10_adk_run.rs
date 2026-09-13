@@ -691,6 +691,11 @@ fn serve_oracle_request_until_child_done(
     }
 }
 
+fn signal_oracle_child_done(child_done_tx: &mpsc::SyncSender<()>) {
+    // Server may already have returned (trailing bytes / count) and dropped rx.
+    let _ = child_done_tx.send(());
+}
+
 fn read_child_output(path: &Path) -> Result<Vec<u8>, &'static str> {
     let mut output = Vec::new();
     fs::File::open(path)
@@ -1725,7 +1730,7 @@ fn oracle_server_enforces_terminal_quiescence_and_cardinality_edges() {
     });
     let mut client = connect_and_read_response(address, CANARY);
     client.write_all(b"x").expect("delayed same-stream byte");
-    child_done_tx.send(()).expect("child completion signal");
+    signal_oracle_child_done(&child_done_tx);
     assert!(matches!(
         server.join().expect("oracle server thread"),
         Err("oracle request trailing bytes rejected")
@@ -1747,7 +1752,7 @@ fn oracle_server_enforces_terminal_quiescence_and_cardinality_edges() {
         )
     });
     let mut client = connect_and_read_response(address, CANARY);
-    child_done_tx.send(()).expect("child completion signal");
+    signal_oracle_child_done(&child_done_tx);
     let barrier_result = oracle_remaining_duration(
         deadline,
         Instant::now(),
@@ -2412,7 +2417,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         run_deadline,
         "credential-run",
     );
-    let _ = child_done_tx.send(());
+    signal_oracle_child_done(&child_done_tx);
     let server_result = server.join();
 
     let child = match child_result {
