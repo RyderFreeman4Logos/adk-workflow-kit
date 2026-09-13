@@ -122,6 +122,7 @@ pub struct NodeCacheError {
 }
 
 /// Filesystem-backed node-result cache. Atomic publish, fail-closed verify.
+#[derive(Clone)]
 pub struct NodeResultCache {
     root: PathBuf,
 }

@@ -265,6 +265,9 @@ impl AdkEventMapper {
                     Value::String(redacted_json_digest(&output)?),
                 );
             } else {
+                if let Some(disposition) = output.get("cache_disposition").cloned() {
+                    payload.insert("cache_disposition".to_owned(), disposition);
+                }
                 payload.insert("structured_output".to_owned(), output);
             }
         }

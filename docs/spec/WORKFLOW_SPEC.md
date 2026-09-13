@@ -13,3 +13,5 @@ Route operators are closed and represented by `RouteOperator`: `equals`, `not_eq
 `workflow-compiler` turns a parsed specification into validated `WorkflowIr`. It checks graph endpoints, canonical graph structure, state declarations, approval timeout rules, and exact predicate registry bindings. A workflow containing routes cannot compile without the required registry. Failures are categorized by `CompileError` (`Parse`, `Graph`, `State`, `PredicateRegistryRequired`, or `Registry`).
 
 Source input is bounded. Unknown fields, malformed values, unsupported schema versions, invalid identifiers, and invalid structural combinations fail closed. The spec parser does not execute nodes or invoke predicates.
+
+See [NODE_RESULT_CACHE.md](NODE_RESULT_CACHE.md) for the production node-result cache identity and replay dispositions.

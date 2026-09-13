@@ -35,8 +35,8 @@ use serde_json::{Value, json};
 use workflow_compiler::{CompiledPlan, ResolvedRuntimePlan};
 use workflow_ir::IrNodeKind;
 use workflow_runtime::{
-    PureTransformBackend, PureTransformRequest, RequestedCapabilities, SandboxCapability,
-    ToolBridgeErrorKind,
+    CacheDisposition, PureTransformBackend, PureTransformRequest, RequestedCapabilities,
+    SandboxCapability, ToolBridgeErrorKind,
 };
 
 const MAX_PATH_BYTES: usize = 256;
@@ -485,6 +485,7 @@ pub struct AdkGraph {
     fan_in_guard_nodes: BTreeMap<String, String>,
     agent_nodes: BTreeSet<String>,
     plan_binding: Option<PlanBinding>,
+    cache_dispositions: BTreeMap<String, CacheDisposition>,
 }
 
 impl AdkGraph {
@@ -602,11 +603,18 @@ impl AdkGraph {
                     step,
                     duration_ms,
                 } => {
+                    let payload = match self.cache_dispositions.get(&node) {
+                        Some(disposition) => json!({
+                            "step": step,
+                            "cache_disposition": disposition.as_str()
+                        }),
+                        None => json!({ "step": step }),
+                    };
                     mapper
                         .map_stream_observation(
                             Some(node),
                             events::AdkRuntimeObservationKindV1::NodeCompleted,
-                            Some(json!({ "step": step })),
+                            Some(payload),
                             Some(duration_ms),
                             artifacts,
                         )
@@ -643,6 +651,9 @@ impl AdkGraph {
                     }
                     if event.content().is_none() {
                         return Err(AdkGraphError::InvalidOutput { node });
+                    }
+                    if cache_hit_event(&event) {
+                        continue;
                     }
                     mapper
                         .map_adk_event(node, event, artifacts)
@@ -800,6 +811,14 @@ impl AdkGraph {
             Some(node) => Err(AdkGraphError::InvalidOutput { node: node.clone() }),
             None => Ok(state),
         }
+    }
+
+    pub(crate) fn with_cache_dispositions(
+        mut self,
+        cache_dispositions: BTreeMap<String, CacheDisposition>,
+    ) -> Self {
+        self.cache_dispositions = cache_dispositions;
+        self
     }
 }
 
@@ -1473,8 +1492,24 @@ impl AdkGraphTranslator {
             fan_in_guard_nodes,
             agent_nodes,
             plan_binding,
+            cache_dispositions: BTreeMap::new(),
         })
     }
+}
+
+fn cache_hit_event(event: &Event) -> bool {
+    event
+        .provider_metadata
+        .get("workflow.cache_hit")
+        .map(String::as_str)
+        == Some("1")
+        || event
+            .llm_response
+            .provider_metadata
+            .as_ref()
+            .and_then(|value| value.get("workflow.cache_hit"))
+            .and_then(Value::as_str)
+            == Some("1")
 }
 
 struct DeterministicAgent {

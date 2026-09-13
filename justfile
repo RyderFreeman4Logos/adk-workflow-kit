@@ -110,8 +110,12 @@ issue-268-test:
 issue-227-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_227_node_cache {{test_name}} --locked -- --nocapture
 
+issue-227-adk test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_227_node_cache {{test_name}} --locked -- --nocapture --test-threads=1
+
 issue-227-test:
     just issue-227-runtime
+    just issue-227-adk
 
 # Focused #224 reference-workflow package and runner contract tests.
 m3-08-reference:
