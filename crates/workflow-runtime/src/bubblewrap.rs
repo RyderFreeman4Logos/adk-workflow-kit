@@ -370,7 +370,8 @@ impl LinuxBubblewrapBackend {
         let stdout_pipe = match child.stdout.take() {
             Some(pipe) => pipe,
             None => {
-                terminate_and_reap(&mut child, process_group);
+                let _ =
+                    terminate_and_reap(&mut child, process_group, child_starttime(process_group));
                 return Err(BubblewrapError::Run {
                     source: io::Error::other("bubblewrap stdout pipe was not captured"),
                 });
@@ -379,7 +380,8 @@ impl LinuxBubblewrapBackend {
         let stderr_pipe = match child.stderr.take() {
             Some(pipe) => pipe,
             None => {
-                terminate_and_reap(&mut child, process_group);
+                let _ =
+                    terminate_and_reap(&mut child, process_group, child_starttime(process_group));
                 return Err(BubblewrapError::Run {
                     source: io::Error::other("bubblewrap stderr pipe was not captured"),
                 });
@@ -392,7 +394,11 @@ impl LinuxBubblewrapBackend {
             Some(bytes) => match child.stdin.take() {
                 Some(pipe) => Some(spawn_stdin_writer(pipe, bytes.clone())),
                 None => {
-                    terminate_and_reap(&mut child, process_group);
+                    let _ = terminate_and_reap(
+                        &mut child,
+                        process_group,
+                        child_starttime(process_group),
+                    );
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
                     return Err(BubblewrapError::Run {
@@ -403,38 +409,42 @@ impl LinuxBubblewrapBackend {
             None => None,
         };
         if let Err(source) = publish_host_pid_witness(request, process_group) {
-            terminate_and_reap(&mut child, process_group);
+            let _ = terminate_and_reap(&mut child, process_group, child_starttime(process_group));
             join_stdin_writer(stdin_writer);
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(BubblewrapError::Run { source });
         }
 
+        let recorded_starttime = child_starttime(process_group);
         let deadline = request.wall_time.map(|limit| Instant::now() + limit);
-        let status = loop {
+        let outcome = loop {
             match child.try_wait() {
-                Ok(Some(status)) => break status,
+                Ok(Some(status)) => break ReapOutcome::Reaped(status),
                 Ok(None)
                     if output_budget
                         .as_ref()
                         .is_some_and(|budget| budget.exceeded()) =>
                 {
-                    terminate_and_reap(&mut child, process_group);
-                    break timed_out_status();
+                    break terminate_and_reap(&mut child, process_group, recorded_starttime);
                 }
                 Ok(None) if deadline.is_some_and(|limit| Instant::now() >= limit) => {
-                    terminate_and_reap(&mut child, process_group);
-                    break timed_out_status();
+                    break terminate_and_reap(&mut child, process_group, recorded_starttime);
                 }
                 Ok(None) => thread::sleep(Duration::from_millis(10)),
                 Err(source) => {
-                    terminate_and_reap(&mut child, process_group);
+                    let _ = terminate_and_reap(&mut child, process_group, recorded_starttime);
                     join_stdin_writer(stdin_writer);
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
                     return Err(BubblewrapError::Run { source });
                 }
             }
+        };
+        let exit_code = receipt_exit_code(outcome);
+        let status = match outcome {
+            ReapOutcome::Reaped(status) => status,
+            ReapOutcome::Unreaped => timed_out_status(),
         };
 
         join_stdin_writer(stdin_writer);
@@ -447,6 +457,7 @@ impl LinuxBubblewrapBackend {
 
         Ok(BubblewrapReceipt {
             status,
+            exit_code,
             stdout,
             stderr,
             staged_output,
@@ -540,9 +551,105 @@ fn join_pipe_reader(reader: JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, 
     result.map_err(|source| BubblewrapError::Run { source })
 }
 
-fn terminate_and_reap(child: &mut std::process::Child, process_group: u32) {
+const D_STATE_REAP_TIMEOUT: Duration = Duration::from_secs(30);
+const CLEANUP_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReapOutcome {
+    Reaped(ExitStatus),
+    Unreaped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildStat {
+    Ready { state: char, starttime: u64 },
+    Other,
+}
+
+fn child_stat(pid: u32) -> ChildStat {
+    let Ok(contents) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return ChildStat::Other;
+    };
+    let Some(fields) = contents.rsplit_once(") ").map(|(_, fields)| fields) else {
+        return ChildStat::Other;
+    };
+    let mut fields = fields.split_whitespace();
+    let Some(state) = fields.next().and_then(|field| {
+        let mut chars = field.chars();
+        match (chars.next(), chars.next()) {
+            (Some(state), None) if state.is_ascii_alphabetic() => Some(state),
+            _ => None,
+        }
+    }) else {
+        return ChildStat::Other;
+    };
+    let Some(starttime) = fields.nth(18).and_then(|field| field.parse().ok()) else {
+        return ChildStat::Other;
+    };
+    ChildStat::Ready { state, starttime }
+}
+
+fn child_starttime(pid: u32) -> Option<u64> {
+    match child_stat(pid) {
+        ChildStat::Ready { starttime, .. } => Some(starttime),
+        ChildStat::Other => None,
+    }
+}
+
+fn matching_uninterruptible_io_stat(stat: ChildStat, recorded_starttime: Option<u64>) -> bool {
+    matches!(
+        (stat, recorded_starttime),
+        (ChildStat::Ready { state: 'D', starttime }, Some(recorded)) if starttime == recorded
+    )
+}
+
+fn matching_uninterruptible_io(pid: u32, recorded_starttime: Option<u64>) -> bool {
+    matching_uninterruptible_io_stat(child_stat(pid), recorded_starttime)
+}
+
+fn conventional_exit_code(status: ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+}
+
+fn receipt_exit_code(outcome: ReapOutcome) -> Option<i32> {
+    match outcome {
+        ReapOutcome::Reaped(status) => conventional_exit_code(status),
+        ReapOutcome::Unreaped => None,
+    }
+}
+
+fn terminate_and_reap(
+    child: &mut std::process::Child,
+    process_group: u32,
+    recorded_starttime: Option<u64>,
+) -> ReapOutcome {
     let _ = kill_process_group(process_group);
-    let _ = child.wait();
+    let cleanup_deadline = Instant::now() + CLEANUP_REAP_TIMEOUT;
+    let d_state_deadline = Instant::now() + D_STATE_REAP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return ReapOutcome::Reaped(status),
+            Ok(None) | Err(_) => {
+                let now = Instant::now();
+                let deadline = if matching_uninterruptible_io(process_group, recorded_starttime) {
+                    d_state_deadline
+                } else {
+                    cleanup_deadline
+                };
+                if now >= deadline {
+                    return ReapOutcome::Unreaped;
+                }
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_millis(10)),
+                );
+            }
+        }
+    }
 }
 
 fn kill_process_group(process_group: u32) -> io::Result<()> {
@@ -721,6 +828,7 @@ impl std::error::Error for BubblewrapError {
 #[derive(Debug)]
 pub struct BubblewrapReceipt {
     status: ExitStatus,
+    exit_code: Option<i32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     staged_output: Option<StagedOutput>,
@@ -734,7 +842,7 @@ impl BubblewrapReceipt {
 
     /// Returns the conventional process exit code, including `128 + signal` from bubblewrap.
     pub fn exit_code(&self) -> Option<i32> {
-        self.status.code()
+        self.exit_code
     }
 
     /// Returns the raw stdout captured from the sandboxed command.
@@ -753,5 +861,43 @@ impl BubblewrapReceipt {
             staged_output.commit()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn matching_d_state_after_sigkill_maps_to_exit_137() {
+        let starttime = 114_922_562;
+        assert!(matching_uninterruptible_io_stat(
+            ChildStat::Ready {
+                state: 'D',
+                starttime,
+            },
+            Some(starttime),
+        ));
+        assert_eq!(
+            receipt_exit_code(ReapOutcome::Reaped(ExitStatus::from_raw(9))),
+            Some(137)
+        );
+    }
+
+    #[test]
+    fn unreaped_child_after_hard_timeout_is_none() {
+        assert_eq!(receipt_exit_code(ReapOutcome::Unreaped), None);
+    }
+
+    #[test]
+    fn runnable_matching_pid_is_not_uninterruptible_io() {
+        assert!(!matching_uninterruptible_io_stat(
+            ChildStat::Ready {
+                state: 'R',
+                starttime: 1,
+            },
+            Some(1),
+        ));
     }
 }
