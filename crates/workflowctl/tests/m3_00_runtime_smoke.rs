@@ -716,6 +716,9 @@ fn single_run_directory(workdir: &Path) -> Result<PathBuf, &'static str> {
         if !metadata.file_type().is_dir() {
             return Err("run workdir contains a non-directory entry");
         }
+        if path.file_name() == Some(std::ffi::OsStr::new(".node-result-cache")) {
+            continue;
+        }
         directories.push(path);
         if directories.len() > 1 {
             return Err("run workdir contains more than one run directory");

@@ -76,7 +76,7 @@ const GRAPH_CONTINUATION_KEY: &str = "kit_graph_continuation_v1";
 const LOOP_LEDGER_FILE: &str = "loop-ledger.json";
 const SKILL_SNAPSHOT_FILE: &str = "sealed-skill-snapshot.json";
 const LOOP_LEDGER_DIGEST_KEY: &str = "kit_loop_ledger_digest_v1";
-const NODE_CACHE_SUFFIX: &str = ".node-result-cache";
+const NODE_CACHE_DIRNAME: &str = ".node-result-cache";
 static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
 static FAIL_CHECKPOINT_SAVES: AtomicBool = AtomicBool::new(false);
 #[cfg(debug_assertions)]
@@ -3620,20 +3620,13 @@ fn persist_agent_contracts(
     Ok(())
 }
 
-fn node_cache_dir(base: &Path) -> Option<PathBuf> {
-    let parent = base
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())?;
-    let mut name = base.file_name()?.to_os_string();
-    name.push(NODE_CACHE_SUFFIX);
-    Some(parent.join(name))
+fn node_cache_dir(base: &Path) -> PathBuf {
+    base.join(NODE_CACHE_DIRNAME)
 }
 
 fn node_cache_open(base: &Path) -> Result<NodeResultCache, ExecutionError> {
-    NodeResultCache::open(
-        node_cache_dir(base).ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Persistence))?,
-    )
-    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+    NodeResultCache::open(node_cache_dir(base))
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
 }
 
 fn cache_provenance(
@@ -3673,8 +3666,8 @@ fn cache_provenance(
 }
 
 fn node_cache_inventory(base: &Path) -> NodeCacheInventory {
-    node_cache_dir(base)
-        .and_then(|path| NodeResultCache::open(path).ok())
+    NodeResultCache::open(node_cache_dir(base))
+        .ok()
         .and_then(|cache| cache.inspect().ok())
         .map(|inspect| NodeCacheInventory {
             entry_count: inspect.entry_count() as u64,
@@ -6359,7 +6352,8 @@ fn find_run(base: &Path, run_id: &str) -> Result<(PathBuf, RunManifestV2), Execu
         let file_type = entry
             .file_type()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
-        if !file_type.is_dir() || file_type.is_symlink() {
+        if !file_type.is_dir() || file_type.is_symlink() || entry.file_name() == NODE_CACHE_DIRNAME
+        {
             continue;
         }
         let path = entry.path();

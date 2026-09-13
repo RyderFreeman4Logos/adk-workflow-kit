@@ -1,6 +1,6 @@
 # Node-result cache
 
-Production ADK execution (`FencedModel` / `build_profile_agent`) memoizes successful agent node outputs in a durable store at `<workdir>.node-result-cache/` (sibling of the run-root base, not a child of it). The store is fail-closed: hash or schema mismatch is a miss, never a silent hit.
+Production ADK execution (`FencedModel` / `build_profile_agent`) memoizes successful agent node outputs in a durable store at `<workdir>/.node-result-cache/` (reserved child of the run-root base, excluded from run-root cardinality). The store is fail-closed: hash or schema mismatch is a miss, never a silent hit.
 
 ## Identity
 

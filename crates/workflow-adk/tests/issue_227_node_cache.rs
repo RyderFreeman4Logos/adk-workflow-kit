@@ -185,9 +185,7 @@ fn resume_of_succeeded_run_does_not_reexecute_cached_node() {
 }
 
 fn cache_dir(base: &std::path::Path) -> std::path::PathBuf {
-    let mut name = base.file_name().expect("workdir name").to_os_string();
-    name.push(".node-result-cache");
-    base.parent().expect("workdir parent").join(name)
+    base.join(".node-result-cache")
 }
 
 fn tamper_success_payloads(base: &std::path::Path) {

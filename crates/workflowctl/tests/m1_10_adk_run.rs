@@ -319,7 +319,14 @@ fn json_stdout(output: &Output) -> Value {
 }
 
 fn sole_run_root(runs: &Path) -> Result<PathBuf, &'static str> {
-    let mut roots = fs::read_dir(runs).map_err(|_| "oracle run base read failed")?;
+    let mut roots = fs::read_dir(runs)
+        .map_err(|_| "oracle run base read failed")?
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .map(|entry| entry.file_name() != ".node-result-cache")
+                .unwrap_or(true)
+        });
     let root = roots
         .next()
         .transpose()
@@ -1174,7 +1181,12 @@ fn post_execution_artifact_failure_still_persists_the_returned_receipt() {
     let artifact_root = loop {
         let candidate = fs::read_dir(&runs)
             .expect("run base must be readable")
-            .next()
+            .find(|entry| {
+                entry
+                    .as_ref()
+                    .map(|entry| entry.file_name() != ".node-result-cache")
+                    .unwrap_or(true)
+            })
             .transpose()
             .expect("run entry must be readable")
             .map(|entry| entry.path().join("artifacts"));
@@ -2318,6 +2330,12 @@ fn oracle_run_root_admission_is_bounded_before_readback() {
     let only = runs.join("only");
     fs::create_dir(&only).expect("sole run root fixture");
     assert_eq!(sole_run_root(&runs).expect("sole run root"), only);
+
+    fs::create_dir(runs.join(".node-result-cache")).expect("reserved cache dirname fixture");
+    assert_eq!(
+        sole_run_root(&runs).expect("reserved cache dirname is not a run root"),
+        only
+    );
 
     fs::create_dir(runs.join("extra")).expect("extra run root fixture");
     assert!(matches!(
