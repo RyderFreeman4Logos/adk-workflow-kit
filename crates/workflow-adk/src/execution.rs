@@ -3475,8 +3475,7 @@ impl Agent for RestoredFinishAgent {
 struct FencedModel {
     binding: Arc<ModelBinding>,
     fence: Arc<EffectFence>,
-    cache: NodeResultCache,
-    cache_key: NodeCacheKey,
+    cache: Option<(NodeResultCache, NodeCacheKey)>,
 }
 
 #[async_trait]
@@ -3490,7 +3489,9 @@ impl Llm for FencedModel {
         request: LlmRequest,
         stream: bool,
     ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
-        if let Some(output) = cache_hit_or_disposition(&self.cache, &self.cache_key).0 {
+        if let Some((cache, key)) = &self.cache
+            && let Some(output) = cache_hit_or_disposition(cache, key).0
+        {
             return Ok(Box::pin(adk_rust::futures::stream::iter([Ok(
                 cached_finish_response(output),
             )])));
@@ -3627,6 +3628,28 @@ fn node_cache_dir(base: &Path) -> PathBuf {
 fn node_cache_open(base: &Path) -> Result<NodeResultCache, ExecutionError> {
     NodeResultCache::open(node_cache_dir(base))
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+}
+
+fn durable_node_cache_enabled(model: &ModelBinding) -> bool {
+    model.identity().provider() == "fake"
+}
+
+fn durable_node_cache(
+    cache: &NodeResultCache,
+    ir: &workflow_ir::WorkflowIr,
+    node: &workflow_ir::IrNode,
+    model: &ModelBinding,
+    contract: Option<&RuntimeAgentContract>,
+    input: &Value,
+    tool: &Option<BoundTool>,
+) -> Result<Option<(NodeResultCache, NodeCacheKey)>, ExecutionError> {
+    if !durable_node_cache_enabled(model) {
+        return Ok(None);
+    }
+    Ok(Some((
+        cache.clone(),
+        node_cache_key(ir, node, model, contract, input, tool)?,
+    )))
 }
 
 fn cache_provenance(
@@ -3778,6 +3801,9 @@ fn store_agent_outputs(
         let Some(model) = resolved_models.get(node.id().as_str()) else {
             continue;
         };
+        if !durable_node_cache_enabled(model) {
+            continue;
+        }
         let Ok(key) = node_cache_key(
             ir,
             node,
@@ -3802,7 +3828,7 @@ fn build_profile_agent(
     contract: Option<&RuntimeAgentContract>,
     limits: RunLimits,
     ledger: Arc<LoopLedgerStore>,
-    cache: (Arc<EffectFence>, NodeResultCache, NodeCacheKey),
+    cache: (Arc<EffectFence>, Option<(NodeResultCache, NodeCacheKey)>),
 ) -> Result<Arc<dyn Agent>, ExecutionError> {
     let (names, toolset) = match tool {
         Some((names, toolset)) => (names, Some(toolset)),
@@ -3810,7 +3836,7 @@ fn build_profile_agent(
     };
     let allowed = Arc::new(names.into_iter().collect::<BTreeSet<_>>());
     let output_schema = contract.map(|contract| contract.output_schema.clone());
-    let (effect_fence, cache_store, cache_key) = cache;
+    let (effect_fence, cache) = cache;
     let controller = Arc::new(LoopController::new(
         name,
         limits,
@@ -3826,8 +3852,7 @@ fn build_profile_agent(
     let model = Arc::new(FencedModel {
         binding: model,
         fence: Arc::clone(&effect_fence),
-        cache: cache_store,
-        cache_key,
+        cache,
     });
     let mut builder = LlmAgentBuilder::new(name)
         .description("workflow-kit profile-driven agent")
@@ -4591,7 +4616,8 @@ impl ExecutionBackend {
                             &run_root.join("artifacts"),
                         )?;
                         node_tools.insert(node.id().as_str().to_owned(), tool.clone());
-                        let key = node_cache_key(
+                        let cache = durable_node_cache(
+                            &node_cache,
                             compiled.ir(),
                             node,
                             &model,
@@ -4599,7 +4625,10 @@ impl ExecutionBackend {
                             &input,
                             &tool,
                         )?;
-                        let (cached, disposition) = cache_hit_or_disposition(&node_cache, &key);
+                        let (cached, disposition) = match &cache {
+                            Some((store, key)) => cache_hit_or_disposition(store, key),
+                            None => (None, CacheDisposition::Recorded),
+                        };
                         cache_dispositions.insert(node.id().as_str().to_owned(), disposition);
                         let agent = if let Some(output) = cached {
                             Arc::new(RestoredFinishAgent {
@@ -4614,7 +4643,7 @@ impl ExecutionBackend {
                                 agent_contracts.get(node.id().as_str()),
                                 profile.run_limits(),
                                 Arc::clone(&loop_ledger),
-                                (Arc::clone(&effect_fence), node_cache.clone(), key),
+                                (Arc::clone(&effect_fence), cache),
                             )?
                         };
                         Ok((node.id().as_str().to_owned(), agent))
@@ -5194,7 +5223,8 @@ impl ExecutionBackend {
                 let completed_turns = loop_ledger.model_iterations(name)?;
                 let model = profile.bind_resolved_model(&resolved_plan, name, completed_turns)?;
                 retry_models.push(Arc::clone(&model));
-                let key = node_cache_key(
+                let cache = durable_node_cache(
+                    &node_cache,
                     compiled.ir(),
                     node,
                     &model,
@@ -5202,7 +5232,10 @@ impl ExecutionBackend {
                     &input,
                     &toolsets.get(name).cloned().flatten(),
                 )?;
-                let (cached, cache_disposition) = cache_hit_or_disposition(&node_cache, &key);
+                let (cached, cache_disposition) = match &cache {
+                    Some((store, key)) => cache_hit_or_disposition(store, key),
+                    None => (None, CacheDisposition::Recorded),
+                };
                 let agent = if let Some(output) = loop_ledger.finish_successor(name)? {
                     cache_dispositions.insert(name.to_owned(), CacheDisposition::Reused);
                     Arc::new(RestoredFinishAgent {
@@ -5224,7 +5257,7 @@ impl ExecutionBackend {
                         agent_contracts.get(name),
                         profile.run_limits(),
                         Arc::clone(&loop_ledger),
-                        (Arc::clone(&effect_fence), node_cache.clone(), key),
+                        (Arc::clone(&effect_fence), cache),
                     )?
                 };
                 Ok((name.to_owned(), agent))
