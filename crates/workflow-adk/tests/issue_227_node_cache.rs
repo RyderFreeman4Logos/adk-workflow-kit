@@ -26,6 +26,7 @@ impl TestRoot {
 
 impl Drop for TestRoot {
     fn drop(&mut self) {
+        let _ = fs::remove_dir_all(cache_dir(&self.0));
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -184,7 +185,9 @@ fn resume_of_succeeded_run_does_not_reexecute_cached_node() {
 }
 
 fn cache_dir(base: &std::path::Path) -> std::path::PathBuf {
-    base.join("node-result-cache")
+    let mut name = base.file_name().expect("workdir name").to_os_string();
+    name.push(".node-result-cache");
+    base.parent().expect("workdir parent").join(name)
 }
 
 fn tamper_success_payloads(base: &std::path::Path) {
