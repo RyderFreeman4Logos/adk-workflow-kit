@@ -5,6 +5,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use workflow_adk::execution::{ExecutionBackend, ExecutionProfileV1};
 use workflow_runtime::{NodeCacheRetention, NodeResultCache};
 
@@ -126,7 +127,7 @@ fn production_cache_hit_skips_fenced_model_with_zero_calls() {
     assert_eq!(
         model_completed(second.run_root()),
         0,
-        "valid cache hit must skip FencedModel generate_content"
+        "valid cache hit must issue zero inner model calls"
     );
     assert_eq!(
         node_completed(second.run_root(), "start")["payload"]["cache_disposition"],
@@ -245,6 +246,251 @@ fn production_invalidation_reexecutes_fenced_model() {
     assert_eq!(
         node_completed(reexecuted.run_root(), "start")["payload"]["cache_disposition"],
         "reexecuted"
+    );
+    let restored =
+        ExecutionBackend::run(workflow(), profile(), json!({"request": "public"}), &root.0)
+            .expect("successful recompute must restore a reusable hit");
+    assert_eq!(restored.status(), "succeeded");
+    assert_eq!(
+        model_completed(restored.run_root()),
+        0,
+        "following run after invalidation recompute must be a durable hit"
+    );
+    assert_eq!(
+        node_completed(restored.run_root(), "start")["payload"]["cache_disposition"],
+        "reused"
+    );
+}
+
+fn digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn contracted_workflow(instruction_digest: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+[workflow]
+id = "issue-227-instruction"
+version = "1"
+entry = "worker"
+[[nodes]]
+id = "worker"
+kind = "agent"
+model = {{ role = "worker", id = "fake-model", version = "1" }}
+instruction = {{ path = "prompt.md", sha256 = "{instruction_digest}" }}
+input = {{ state_keys = ["request"] }}
+output = {{ state_key = "review", schema = "review.schema.json" }}
+session = "isolated"
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "worker"
+to = "done"
+[state]
+schema_id = "review-state"
+schema_version = "1"
+required_keys = ["request", "review"]
+[state.keys.request]
+schema_id = "text"
+schema_version = "1"
+[state.keys.review]
+schema_id = "review"
+schema_version = "1"
+"#
+    )
+}
+
+fn sequential_workflow() -> &'static str {
+    r#"
+schema_version = 1
+[workflow]
+id = "issue-227-sequential"
+version = "1"
+entry = "first"
+[[nodes]]
+id = "first"
+kind = "agent"
+model = { role = "worker", id = "fake-model", version = "1" }
+[[nodes]]
+id = "second"
+kind = "agent"
+model = { role = "worker", id = "fake-model", version = "1" }
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "first"
+to = "second"
+[[edges]]
+from = "second"
+to = "done"
+"#
+}
+
+fn profile_with(responses: &[&str]) -> ExecutionProfileV1 {
+    let profile = json!({
+        "schema_version": 1,
+        "model": {
+            "provider": "fake",
+            "name": "fake-model",
+            "version": "1",
+            "model": "fake",
+            "responses": responses
+        },
+        "sandbox": {"capabilities": []}
+    });
+    ExecutionProfileV1::parse(&serde_json::to_vec(&profile).expect("profile json"))
+        .expect("profile fixture should parse")
+}
+
+fn rewrite_valid_payload(base: &std::path::Path, from: &Value, to: Value) {
+    let entries = cache_dir(base).join("entries");
+    for entry in fs::read_dir(&entries).expect("cache entries") {
+        let path = entry.expect("entry").path();
+        if !path.is_file() {
+            continue;
+        }
+        let mut raw = serde_json::from_slice::<Value>(&fs::read(&path).expect("read cache"))
+            .expect("cache json");
+        if raw["payload"] != *from {
+            continue;
+        }
+        raw["payload"] = to.clone();
+        raw["payload_sha256"] = json!(digest(&serde_json::to_vec(&to).expect("payload bytes")));
+        fs::write(&path, serde_json::to_vec(&raw).expect("encode")).expect("rewrite cache");
+        return;
+    }
+    panic!("expected a cache entry with payload {from}");
+}
+
+#[test]
+fn instruction_bytes_are_bound_into_production_cache_key() {
+    let root = TestRoot::new();
+    let first_instruction = b"Review only the declared request.\n";
+    fs::write(root.0.join("prompt.md"), first_instruction).expect("instruction");
+    fs::write(
+        root.0.join("review.schema.json"),
+        br#"{"type":"object","properties":{"approved":{"type":"boolean"}},"required":["approved"],"additionalProperties":false}"#,
+    )
+    .expect("schema");
+    let workflow_path = root.0.join("workflow.toml");
+    fs::write(
+        &workflow_path,
+        contracted_workflow(&digest(first_instruction)),
+    )
+    .expect("workflow");
+    let finish = "{\"status\":\"finished\",\"output\":{\"approved\":true}}";
+    let first = ExecutionBackend::run(
+        &workflow_path,
+        profile_with(&[finish]),
+        json!({"request": "public"}),
+        &root.0,
+    )
+    .expect("seed instruction cache");
+    assert_eq!(first.status(), "succeeded");
+    assert_eq!(model_completed(first.run_root()), 1);
+
+    let mutated = b"Review a different declared request.\n";
+    fs::write(root.0.join("prompt.md"), mutated).expect("mutated instruction");
+    fs::write(&workflow_path, contracted_workflow(&digest(mutated))).expect("mutated workflow");
+    let missed = ExecutionBackend::run(
+        &workflow_path,
+        profile_with(&[finish]),
+        json!({"request": "public"}),
+        &root.0,
+    )
+    .expect("path-stable instruction-byte change must miss");
+    assert_eq!(missed.status(), "succeeded");
+    assert_eq!(
+        model_completed(missed.run_root()),
+        1,
+        "instruction bytes must be part of cache identity"
+    );
+    assert_eq!(
+        node_completed(missed.run_root(), "worker")["payload"]["cache_disposition"],
+        "recorded"
+    );
+}
+
+#[test]
+fn downstream_node_misses_when_upstream_result_changes() {
+    let root = TestRoot::new();
+    let workflow_path = root.0.join("workflow.toml");
+    fs::write(&workflow_path, sequential_workflow()).expect("workflow");
+    let first = ExecutionBackend::run(
+        &workflow_path,
+        profile_with(&[
+            "{\"status\":\"finished\",\"output\":\"upstream-a\"}",
+            "{\"status\":\"finished\",\"output\":\"downstream-from-a\"}",
+        ]),
+        json!({"request": "public"}),
+        &root.0,
+    )
+    .expect("seed sequential cache");
+    assert_eq!(first.status(), "succeeded");
+    assert_eq!(model_completed(first.run_root()), 2);
+    rewrite_valid_payload(&root.0, &json!("upstream-a"), json!("upstream-a2"));
+
+    let missed = ExecutionBackend::run(
+        &workflow_path,
+        profile_with(&[
+            "{\"status\":\"finished\",\"output\":\"upstream-a2\"}",
+            "{\"status\":\"finished\",\"output\":\"downstream-from-a2\"}",
+        ]),
+        json!({"request": "public"}),
+        &root.0,
+    )
+    .expect("changed upstream result must miss downstream");
+    assert_eq!(missed.status(), "succeeded");
+    assert_eq!(
+        model_completed(missed.run_root()),
+        1,
+        "downstream must not reuse a result computed from different upstream data"
+    );
+    assert_ne!(
+        node_completed(missed.run_root(), "second")["payload"]["cache_disposition"],
+        "reused"
+    );
+}
+
+#[test]
+fn non_fake_run_omits_recorded_disposition() {
+    let root = TestRoot::new();
+    let profile = ExecutionProfileV1::parse(
+        br#"{
+            "schema_version": 1,
+            "model": {
+                "provider": "openai-compatible",
+                "name": "fake-model",
+                "version": "1",
+                "model": "worker-model",
+                "base_url": "http://127.0.0.1:1/v1",
+                "credential_env": "ADK_WORKFLOW_KIT_ISSUE_227_NON_FAKE"
+            },
+            "sandbox": {"capabilities": []}
+        }"#,
+    )
+    .expect("non-fake profile must parse");
+    unsafe {
+        std::env::set_var("ADK_WORKFLOW_KIT_ISSUE_227_NON_FAKE", "test-key");
+    }
+    let result = ExecutionBackend::run(workflow(), profile, json!({"request": "public"}), &root.0);
+    let events = result
+        .as_ref()
+        .map(|receipt| events(receipt.run_root()))
+        .unwrap_or_else(|error| {
+            error
+                .receipt()
+                .map(|receipt| events(receipt.run_root()))
+                .unwrap_or_default()
+        });
+    assert!(
+        events
+            .iter()
+            .all(|event| { event["payload"].get("cache_disposition") != Some(&json!("recorded")) }),
+        "non-fake runs must not claim a confirmed cache store"
     );
 }
 

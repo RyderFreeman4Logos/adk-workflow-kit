@@ -1,11 +1,11 @@
 //! Durable, provenance-complete node-result memoization.
 
 use std::{
-    fs::{self, OpenOptions},
-    io::{self, Write},
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -13,8 +13,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub const NODE_CACHE_SCHEMA_VERSION: u16 = 1;
-
-static NEXT_TMP: AtomicU64 = AtomicU64::new(1);
 
 /// Identity fields bound into a node-result cache key.
 pub struct NodeCacheKeyMaterial<'a> {
@@ -290,8 +288,10 @@ impl NodeCacheError {
 impl NodeResultCache {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, NodeCacheError> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(root.join("entries"))
-            .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+        let entries = root.join("entries");
+        fs::create_dir_all(&entries).map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+        sync_dir(&entries)?;
+        sync_dir(&root)?;
         Ok(Self { root })
     }
 
@@ -299,44 +299,10 @@ impl NodeResultCache {
         let bytes = serde_json::to_vec(&entry)
             .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Corrupt))?;
         let final_path = self.path_for(&entry.key_digest);
-        let tmp = self.root.join(format!(
-            ".tmp-{}-{}",
-            file_stem(&entry.key_digest),
-            NEXT_TMP.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
-        if file
-            .write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .is_err()
-        {
-            let _ = fs::remove_file(&tmp);
-            return Err(NodeCacheError::new(NodeCacheErrorKind::Io));
-        }
-        match fs::hard_link(&tmp, &final_path) {
-            Ok(()) => {
-                let _ = fs::remove_file(&tmp);
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let existing = fs::read(&final_path)
-                    .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
-                if existing != bytes {
-                    let _ = fs::remove_file(&tmp);
-                    return Err(NodeCacheError::new(NodeCacheErrorKind::Corrupt));
-                }
-                let _ = fs::remove_file(&tmp);
-            }
-            Err(_) => {
-                let _ = fs::remove_file(&tmp);
-                return Err(NodeCacheError::new(NodeCacheErrorKind::Io));
-            }
-        }
-        Ok(())
+        let tmp = self.create_tmp(&entry.key_digest, &bytes)?;
+        let published = self.publish(&tmp, &final_path, &bytes);
+        let _ = fs::remove_file(&tmp);
+        published
     }
 
     pub fn lookup(&self, key: &NodeCacheKey) -> Result<NodeCacheLookup, NodeCacheError> {
@@ -386,7 +352,7 @@ impl NodeResultCache {
         _reason: NodeCacheInvalidationReason,
     ) -> Result<(), NodeCacheError> {
         match fs::remove_file(self.path_for(&key.digest)) {
-            Ok(()) => Ok(()),
+            Ok(()) => self.sync_entries(),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(NodeCacheError::new(NodeCacheErrorKind::Io)),
         }
@@ -436,12 +402,106 @@ impl NodeResultCache {
         for (_, path) in inspect.paths.into_iter().take(drop) {
             fs::remove_file(path).map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
         }
+        self.sync_entries()?;
         Ok(drop)
     }
 
     fn path_for(&self, digest: &str) -> PathBuf {
         self.root.join("entries").join(file_stem(digest))
     }
+
+    fn entries_dir(&self) -> PathBuf {
+        self.root.join("entries")
+    }
+
+    fn sync_entries(&self) -> Result<(), NodeCacheError> {
+        sync_dir(&self.entries_dir())
+    }
+
+    fn create_tmp(&self, digest: &str, bytes: &[u8]) -> Result<PathBuf, NodeCacheError> {
+        let stem = file_stem(digest);
+        for _ in 0..8 {
+            let tmp = self.root.join(format!(
+                ".tmp-{}-{}-{}",
+                stem,
+                std::process::id(),
+                tmp_token()
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+            {
+                Ok(mut file) => {
+                    if file
+                        .write_all(bytes)
+                        .and_then(|()| file.sync_all())
+                        .is_err()
+                    {
+                        let _ = fs::remove_file(&tmp);
+                        return Err(NodeCacheError::new(NodeCacheErrorKind::Io));
+                    }
+                    return Ok(tmp);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(NodeCacheError::new(NodeCacheErrorKind::Io)),
+            }
+        }
+        Err(NodeCacheError::new(NodeCacheErrorKind::Io))
+    }
+
+    fn publish(&self, tmp: &Path, final_path: &Path, bytes: &[u8]) -> Result<(), NodeCacheError> {
+        match fs::hard_link(tmp, final_path) {
+            Ok(()) => self.sync_entries(),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let existing = fs::read(final_path)
+                    .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+                if existing == bytes {
+                    return Ok(());
+                }
+                fs::remove_file(final_path)
+                    .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+                self.sync_entries()?;
+                match fs::hard_link(tmp, final_path) {
+                    Ok(()) => self.sync_entries(),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        let existing = fs::read(final_path)
+                            .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+                        (existing == bytes)
+                            .then_some(())
+                            .ok_or_else(|| NodeCacheError::new(NodeCacheErrorKind::Corrupt))
+                    }
+                    Err(_) => Err(NodeCacheError::new(NodeCacheErrorKind::Io)),
+                }
+            }
+            Err(_) => Err(NodeCacheError::new(NodeCacheErrorKind::Io)),
+        }
+    }
+}
+
+fn sync_dir(path: &Path) -> Result<(), NodeCacheError> {
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))
+}
+
+fn tmp_token() -> String {
+    let mut bytes = [0_u8; 8];
+    match File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut bytes)) {
+        Ok(()) => {}
+        Err(_) => {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or(0);
+            bytes = (u64::from(std::process::id()) ^ nanos).to_le_bytes();
+        }
+    }
+    bytes.iter().fold(String::new(), |mut token, byte| {
+        token.push_str(&format!("{byte:02x}"));
+        token
+    })
 }
 
 fn verify_entry(bytes: &[u8], expected_digest: Option<&str>) -> NodeCacheLookup {

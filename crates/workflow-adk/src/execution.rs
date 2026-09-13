@@ -20,7 +20,7 @@ use adk_rust::graph::prelude::{ExecutionConfig, State};
 use adk_rust::graph::{Checkpoint, Checkpointer, GraphError};
 use adk_rust::{
     Agent, Content, ErrorCategory, Llm, LlmRequest, LlmResponse, agent::LlmAgentBuilder,
-    async_trait,
+    async_trait, futures::StreamExt as _,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -37,14 +37,15 @@ use workflow_runtime::{
     ActivateSkillInput, ArtifactId, ArtifactStore, BackendCapabilities, CacheDisposition,
     CacheProvenance, CapabilityIntersection, CheckpointManifestV1, DurableCheckpointV1,
     EffectCommit, EffectJournal, EffectKey, FilesystemArtifactStore, Materialization,
-    NodeCacheEntry, NodeCacheKey, NodeCacheKeyMaterial, NodeCacheLookup, NodeCacheOutcome,
-    NodeResultCache, PageRequest, PolicyCapabilities, ProtectedArtifactReferenceV1,
-    PureTransformRequest, ReadSkillResourceInput, ReadSourceRangeTool, RequestedCapabilities,
-    RunContext, RunId, RunLimits, RunSandbox, RunSkillScriptInput, SandboxCapability,
-    SearchCodeTool, SqliteCheckpointStore, ToolBridge, ToolBridgeError, ToolBridgeErrorKind,
-    ToolCall, ToolCallContext, ToolEnvelope, ToolFlags, ToolHandler, ToolImplementationRegistry,
-    ToolProvenance, ToolRegistration, TrustDomain, WorkdirManager, WorkflowRuntimeEventKindV1,
-    contains_sensitive_key, intersect_policy_capabilities, redact_json_value, selection_identity,
+    NodeCacheEntry, NodeCacheInvalidationReason, NodeCacheKey, NodeCacheKeyMaterial,
+    NodeCacheLookup, NodeCacheOutcome, NodeResultCache, PageRequest, PolicyCapabilities,
+    ProtectedArtifactReferenceV1, PureTransformRequest, ReadSkillResourceInput,
+    ReadSourceRangeTool, RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox,
+    RunSkillScriptInput, SandboxCapability, SearchCodeTool, SqliteCheckpointStore, ToolBridge,
+    ToolBridgeError, ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolEnvelope, ToolFlags,
+    ToolHandler, ToolImplementationRegistry, ToolProvenance, ToolRegistration, TrustDomain,
+    WorkdirManager, WorkflowRuntimeEventKindV1, contains_sensitive_key,
+    intersect_policy_capabilities, redact_json_value, selection_identity,
     verify_sandbox_capabilities,
 };
 use workflow_spec::{
@@ -83,6 +84,11 @@ static FAIL_CHECKPOINT_SAVES: AtomicBool = AtomicBool::new(false);
 static CRASH_BARRIER_HITS: AtomicU64 = AtomicU64::new(0);
 static EFFECT_BARRIER_HITS: AtomicU64 = AtomicU64::new(0);
 type BoundTool = (Vec<String>, Arc<AdkToolBridge<FilesystemArtifactStore>>);
+type BoundCache = (
+    Arc<EffectFence>,
+    Option<(NodeResultCache, NodeCacheIdentity)>,
+    Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
+);
 type CompletedToolResponse = (String, String, String, String, Value);
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -3475,7 +3481,9 @@ impl Agent for RestoredFinishAgent {
 struct FencedModel {
     binding: Arc<ModelBinding>,
     fence: Arc<EffectFence>,
-    cache: Option<(NodeResultCache, NodeCacheKey)>,
+    cache: Option<(NodeResultCache, NodeCacheIdentity)>,
+    dispositions: Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
+    node_id: String,
 }
 
 #[async_trait]
@@ -3489,12 +3497,28 @@ impl Llm for FencedModel {
         request: LlmRequest,
         stream: bool,
     ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
-        if let Some((cache, key)) = &self.cache
-            && let Some(output) = cache_hit_or_disposition(cache, key).0
-        {
-            return Ok(Box::pin(adk_rust::futures::stream::iter([Ok(
-                cached_finish_response(output),
-            )])));
+        let key = self.cache.as_ref().and_then(|(cache, identity)| {
+            identity
+                .bind(&request_input_hashes(&request))
+                .ok()
+                .map(|key| (cache, key))
+        });
+        if let Some((cache, key)) = &key {
+            match cache.lookup(key) {
+                Ok(NodeCacheLookup::Hit(entry))
+                    if matches!(entry.outcome(), NodeCacheOutcome::Success) =>
+                {
+                    self.record_disposition(CacheDisposition::Reused);
+                    return Ok(Box::pin(adk_rust::futures::stream::iter([Ok(
+                        cached_finish_response(entry.payload().clone()),
+                    )])));
+                }
+                Ok(NodeCacheLookup::Hit(_) | NodeCacheLookup::Invalid { .. }) => {
+                    let _ = cache.invalidate(key, NodeCacheInvalidationReason::ExplicitInvalidate);
+                    self.record_disposition(CacheDisposition::Reexecuted);
+                }
+                _ => {}
+            }
         }
         let result = Llm::generate_content(&*self.binding, request, stream).await;
         if result
@@ -3504,7 +3528,34 @@ impl Llm for FencedModel {
             record_terminal(&self.fence.terminal, ExecutionErrorKind::Timeout);
             self.fence.cancellation.store(true, Ordering::Release);
         }
-        result
+        let Ok(response_stream) = result else {
+            return result;
+        };
+        let items = response_stream.collect::<Vec<_>>().await;
+        if let Some((cache, key)) = key
+            && let Some(Ok(response)) = items.first()
+            && let Some(content) = response.content.as_ref()
+            && let Ok(Some(output)) = admitted_finish(content)
+            && record_node_result(cache, key, output)
+            && !matches!(
+                self.dispositions
+                    .lock()
+                    .ok()
+                    .and_then(|dispositions| dispositions.get(&self.node_id).copied()),
+                Some(CacheDisposition::Reexecuted)
+            )
+        {
+            self.record_disposition(CacheDisposition::Recorded);
+        }
+        Ok(Box::pin(adk_rust::futures::stream::iter(items)))
+    }
+}
+
+impl FencedModel {
+    fn record_disposition(&self, disposition: CacheDisposition) {
+        if let Ok(mut dispositions) = self.dispositions.lock() {
+            dispositions.insert(self.node_id.clone(), disposition);
+        }
     }
 }
 
@@ -3640,15 +3691,14 @@ fn durable_node_cache(
     node: &workflow_ir::IrNode,
     model: &ModelBinding,
     contract: Option<&RuntimeAgentContract>,
-    input: &Value,
     scope: (&[SandboxCapability], &Option<BoundTool>),
-) -> Result<Option<(NodeResultCache, NodeCacheKey)>, ExecutionError> {
+) -> Result<Option<(NodeResultCache, NodeCacheIdentity)>, ExecutionError> {
     if !durable_node_cache_enabled(model) {
         return Ok(None);
     }
     Ok(Some((
         cache.clone(),
-        node_cache_key(ir, node, model, contract, input, scope)?,
+        node_cache_identity(ir, node, model, contract, scope)?,
     )))
 }
 
@@ -3722,31 +3772,81 @@ fn bound_tool_schema_digest(tool: &Option<BoundTool>) -> String {
     )
 }
 
-fn node_cache_key(
+struct NodeCacheIdentity {
+    workflow_id: String,
+    workflow_version: String,
+    node_id: String,
+    node_version: String,
+    invocation_identity: String,
+    policy_digest: String,
+}
+
+impl NodeCacheIdentity {
+    fn bind(&self, input_artifact_hashes: &[String]) -> Result<NodeCacheKey, ExecutionError> {
+        NodeCacheKey::bind(NodeCacheKeyMaterial {
+            workflow_id: &self.workflow_id,
+            workflow_version: &self.workflow_version,
+            node_id: &self.node_id,
+            node_version: &self.node_version,
+            invocation_identity: &self.invocation_identity,
+            input_artifact_hashes,
+            policy_digest: &self.policy_digest,
+        })
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))
+    }
+}
+
+fn request_input_hashes(request: &LlmRequest) -> Vec<String> {
+    request
+        .contents
+        .iter()
+        .filter_map(|content| {
+            let text = content
+                .parts
+                .iter()
+                .filter_map(|part| part.text())
+                .collect::<String>();
+            (!text.is_empty()).then(|| format!("sha256:{:x}", Sha256::digest(text.as_bytes())))
+        })
+        .collect()
+}
+
+fn node_cache_identity(
     ir: &workflow_ir::WorkflowIr,
     node: &workflow_ir::IrNode,
     model: &ModelBinding,
     contract: Option<&RuntimeAgentContract>,
-    input: &Value,
     scope: (&[SandboxCapability], &Option<BoundTool>),
-) -> Result<NodeCacheKey, ExecutionError> {
+) -> Result<NodeCacheIdentity, ExecutionError> {
     let (sandbox_capabilities, tool) = scope;
     let schema = agent_output_schema(contract);
+    let instruction = contract.map(|c| c.instruction.as_str()).unwrap_or("");
+    let instruction_digest = contract
+        .map(|c| format!("sha256:{:x}", Sha256::digest(c.instruction.as_bytes())))
+        .unwrap_or_default();
     let protocol = PromptProtocol::new(
-        "workflow-kit.node-result.v1",
+        if instruction.is_empty() {
+            "workflow-kit.node-result.v1"
+        } else {
+            instruction
+        },
         Vec::new(),
         schema.clone(),
-        input.clone(),
+        json!({
+            "instruction": instruction,
+            "instruction_digest": instruction_digest,
+        }),
         TrustDomain::TrustedGoal,
     )
     .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
     let output = StructuredOutputContract::new(schema, MAX_STATE_BYTES)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
+    let budget = inference_budget(model);
     let spec = ModelInvocationSpec::new(
         protocol,
         node.id().as_str(),
         ProviderRouteIdentity::from_binding(model),
-        InferenceBudget::medium(),
+        budget,
         output,
     )
     .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
@@ -3762,7 +3862,7 @@ fn node_cache_key(
         .join("\n");
     let tool_schema = bound_tool_schema_digest(tool);
     let policy = format!(
-        "tools:{tools};sandbox:{sandbox};instruction:{};schema:{};protocol:{};tokenizer:{};model:{};tool_schema:{};bound_tool_schema:{tool_schema};output_schema:{};route:{}/{};trust:{}",
+        "tools:{tools};sandbox:{sandbox};instruction:{};instruction_digest:{instruction_digest};schema:{};protocol:{};tokenizer:{};model:{};tool_schema:{};bound_tool_schema:{tool_schema};output_schema:{};route:{}/{};trust:{};budget:{}",
         contract.map(|c| c.instruction_path.as_str()).unwrap_or(""),
         contract.map(|c| c.schema_path.as_str()).unwrap_or(""),
         provenance.protocol_hash(),
@@ -3773,86 +3873,40 @@ fn node_cache_key(
         provenance.provider_route().provider(),
         provenance.provider_route().resolved_model(),
         provenance.cache_salt(),
+        provenance.invocation_identity(),
     );
     let node_version = node
         .model()
         .map(|model| format!("{}:{}", model.id(), model.version()))
         .unwrap_or_else(|| format!("{}:{}", node.id().as_str(), ir.workflow_version()));
-    let invocation_identity = provenance.invocation_identity().to_owned();
-    NodeCacheKey::bind(NodeCacheKeyMaterial {
-        workflow_id: ir.workflow_id().as_str(),
-        workflow_version: ir.workflow_version(),
-        node_id: node.id().as_str(),
-        node_version: &node_version,
-        invocation_identity: &invocation_identity,
-        input_artifact_hashes: &[],
-        policy_digest: &policy,
+    Ok(NodeCacheIdentity {
+        workflow_id: ir.workflow_id().as_str().to_owned(),
+        workflow_version: ir.workflow_version().to_owned(),
+        node_id: node.id().as_str().to_owned(),
+        node_version,
+        invocation_identity: spec.invocation_identity(),
+        policy_digest: format!("sha256:{:x}", Sha256::digest(policy.as_bytes())),
     })
-    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))
 }
 
-fn cache_hit_or_disposition(
-    cache: &NodeResultCache,
-    key: &NodeCacheKey,
-) -> (Option<Value>, CacheDisposition) {
-    match cache.lookup(key) {
-        Ok(NodeCacheLookup::Hit(entry)) if matches!(entry.outcome(), NodeCacheOutcome::Success) => {
-            (Some(entry.payload().clone()), CacheDisposition::Reused)
-        }
-        Ok(NodeCacheLookup::Hit(_) | NodeCacheLookup::Invalid { .. }) => {
-            (None, CacheDisposition::Reexecuted)
-        }
-        _ => (None, CacheDisposition::Recorded),
-    }
+fn inference_budget(model: &ModelBinding) -> InferenceBudget {
+    let tokens = model
+        .runtime()
+        .sampling()
+        .max_output_tokens
+        .and_then(|tokens| usize::try_from(tokens).ok())
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(4096);
+    InferenceBudget::new(crate::model_invocation::ReasoningEffort::Medium, tokens, 0)
+        .unwrap_or_else(|_| InferenceBudget::medium())
 }
 
-fn record_node_result(cache: &NodeResultCache, key: NodeCacheKey, payload: Value) {
+fn record_node_result(cache: &NodeResultCache, key: NodeCacheKey, payload: Value) -> bool {
     let provenance = CacheProvenance::from_key(&key);
     let Ok(entry) = NodeCacheEntry::success(key, payload, provenance) else {
-        return;
+        return false;
     };
-    let _ = cache.put(entry);
-}
-
-fn store_agent_outputs(
-    cache: &NodeResultCache,
-    ir: &workflow_ir::WorkflowIr,
-    resolved_models: &BTreeMap<String, Arc<ModelBinding>>,
-    agent_contracts: &BTreeMap<String, RuntimeAgentContract>,
-    input: &Value,
-    tools: (&BTreeMap<String, Option<BoundTool>>, &[SandboxCapability]),
-    state: &State,
-) {
-    let (tools, sandbox_capabilities) = tools;
-    for node in ir
-        .nodes()
-        .iter()
-        .filter(|node| node.kind() == workflow_ir::IrNodeKind::Agent)
-    {
-        let Some(model) = resolved_models.get(node.id().as_str()) else {
-            continue;
-        };
-        if !durable_node_cache_enabled(model) {
-            continue;
-        }
-        let Ok(key) = node_cache_key(
-            ir,
-            node,
-            model,
-            agent_contracts.get(node.id().as_str()),
-            input,
-            (
-                sandbox_capabilities,
-                tools.get(node.id().as_str()).unwrap_or(&None),
-            ),
-        ) else {
-            continue;
-        };
-        let Some(output) = state.get(&format!("node:{}", node.id().as_str())) else {
-            continue;
-        };
-        record_node_result(cache, key, output.clone());
-    }
+    cache.put(entry).is_ok()
 }
 
 fn build_profile_agent(
@@ -3862,7 +3916,7 @@ fn build_profile_agent(
     contract: Option<&RuntimeAgentContract>,
     limits: RunLimits,
     ledger: Arc<LoopLedgerStore>,
-    cache: (Arc<EffectFence>, Option<(NodeResultCache, NodeCacheKey)>),
+    cache: BoundCache,
 ) -> Result<Arc<dyn Agent>, ExecutionError> {
     let (names, toolset) = match tool {
         Some((names, toolset)) => (names, Some(toolset)),
@@ -3870,7 +3924,7 @@ fn build_profile_agent(
     };
     let allowed = Arc::new(names.into_iter().collect::<BTreeSet<_>>());
     let output_schema = contract.map(|contract| contract.output_schema.clone());
-    let (effect_fence, cache) = cache;
+    let (effect_fence, cache, dispositions) = cache;
     let controller = Arc::new(LoopController::new(
         name,
         limits,
@@ -3887,6 +3941,8 @@ fn build_profile_agent(
         binding: model,
         fence: Arc::clone(&effect_fence),
         cache,
+        dispositions,
+        node_id: name.to_owned(),
     });
     let mut builder = LlmAgentBuilder::new(name)
         .description("workflow-kit profile-driven agent")
@@ -4626,8 +4682,7 @@ impl ExecutionBackend {
                     Arc::clone(&effect_fence),
                 )?;
                 let node_cache = node_cache_open(workdir_base.as_ref())?;
-                let mut cache_dispositions = BTreeMap::new();
-                let mut node_tools = BTreeMap::new();
+                let cache_dispositions = Arc::new(Mutex::new(BTreeMap::new()));
                 let agents = compiled
                     .ir()
                     .nodes()
@@ -4649,37 +4704,27 @@ impl ExecutionBackend {
                             profile.run_limits().max_tool_output_bytes(),
                             &run_root.join("artifacts"),
                         )?;
-                        node_tools.insert(node.id().as_str().to_owned(), tool.clone());
                         let cache = durable_node_cache(
                             &node_cache,
                             compiled.ir(),
                             node,
                             &model,
                             agent_contracts.get(node.id().as_str()),
-                            &input,
                             (&effective_capabilities, &tool),
                         )?;
-                        let (cached, disposition) = match &cache {
-                            Some((store, key)) => cache_hit_or_disposition(store, key),
-                            None => (None, CacheDisposition::Recorded),
-                        };
-                        cache_dispositions.insert(node.id().as_str().to_owned(), disposition);
-                        let agent = if let Some(output) = cached {
-                            Arc::new(RestoredFinishAgent {
-                                name: node.id().as_str().to_owned(),
-                                output,
-                            }) as Arc<dyn Agent>
-                        } else {
-                            build_profile_agent(
-                                node.id().as_str(),
-                                model,
-                                tool,
-                                agent_contracts.get(node.id().as_str()),
-                                profile.run_limits(),
-                                Arc::clone(&loop_ledger),
-                                (Arc::clone(&effect_fence), cache),
-                            )?
-                        };
+                        let agent = build_profile_agent(
+                            node.id().as_str(),
+                            model,
+                            tool,
+                            agent_contracts.get(node.id().as_str()),
+                            profile.run_limits(),
+                            Arc::clone(&loop_ledger),
+                            (
+                                Arc::clone(&effect_fence),
+                                cache,
+                                Arc::clone(&cache_dispositions),
+                            ),
+                        )?;
                         Ok((node.id().as_str().to_owned(), agent))
                     })
                     .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -4694,11 +4739,18 @@ impl ExecutionBackend {
                         Some(continuation.clone()),
                     )
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?
-                    .with_cache_dispositions(cache_dispositions);
+                    .with_cache_dispositions(Arc::clone(&cache_dispositions));
                 let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
+                let mut start = State::new();
+                start.insert("input".to_owned(), input.clone());
+                if let Some(object) = input.as_object() {
+                    for (key, value) in object {
+                        start.insert(key.clone(), value.clone());
+                    }
+                }
                 let state = invoke_graph_with_deadline(
                     &runtime,
                     deadline,
@@ -4707,7 +4759,7 @@ impl ExecutionBackend {
                     &last_progress,
                     Duration::from_millis(profile.run_limits().max_idle_time_ms().get()),
                     graph.invoke_observed(
-                        State::new(),
+                        start,
                         ExecutionConfig::new(run_id.as_str()).with_recursion_limit(recursion_limit),
                         &mut mapper,
                         artifacts,
@@ -4727,19 +4779,6 @@ impl ExecutionBackend {
                     .contains_key("terminal")
                     .then_some(state)
                     .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Adk))
-                    .inspect(|state| {
-                        if let Ok(cache) = node_cache_open(workdir_base.as_ref()) {
-                            store_agent_outputs(
-                                &cache,
-                                compiled.ir(),
-                                &resolved_models,
-                                &agent_contracts,
-                                &input,
-                                (&node_tools, &effective_capabilities),
-                                state,
-                            );
-                        }
-                    })
             })()
         };
         let mut status = mapper
@@ -5246,7 +5285,7 @@ impl ExecutionBackend {
 
         let mut retry_models = Vec::new();
         let node_cache = node_cache_open(workdir_base.as_ref())?;
-        let mut cache_dispositions = BTreeMap::new();
+        let cache_dispositions = Arc::new(Mutex::new(BTreeMap::new()));
         let agents = compiled
             .ir()
             .nodes()
@@ -5263,30 +5302,17 @@ impl ExecutionBackend {
                     node,
                     &model,
                     agent_contracts.get(name),
-                    &input,
                     (
                         &effective_capabilities,
                         &toolsets.get(name).cloned().flatten(),
                     ),
                 )?;
-                let (cached, cache_disposition) = match &cache {
-                    Some((store, key)) => cache_hit_or_disposition(store, key),
-                    None => (None, CacheDisposition::Recorded),
-                };
                 let agent = if let Some(output) = loop_ledger.finish_successor(name)? {
-                    cache_dispositions.insert(name.to_owned(), CacheDisposition::Reused);
-                    Arc::new(RestoredFinishAgent {
-                        name: name.to_owned(),
-                        output,
-                    }) as Arc<dyn Agent>
-                } else if let Some(output) = cached {
-                    cache_dispositions.insert(name.to_owned(), cache_disposition);
                     Arc::new(RestoredFinishAgent {
                         name: name.to_owned(),
                         output,
                     }) as Arc<dyn Agent>
                 } else {
-                    cache_dispositions.insert(name.to_owned(), cache_disposition);
                     build_profile_agent(
                         name,
                         model,
@@ -5294,7 +5320,11 @@ impl ExecutionBackend {
                         agent_contracts.get(name),
                         profile.run_limits(),
                         Arc::clone(&loop_ledger),
-                        (Arc::clone(&effect_fence), cache),
+                        (
+                            Arc::clone(&effect_fence),
+                            cache,
+                            Arc::clone(&cache_dispositions),
+                        ),
                     )?
                 };
                 Ok((name.to_owned(), agent))
@@ -5328,7 +5358,7 @@ impl ExecutionBackend {
                 Some(continuation.clone()),
             )
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
-            .with_cache_dispositions(cache_dispositions);
+            .with_cache_dispositions(Arc::clone(&cache_dispositions));
         let recursion_limit = crate::graph_recursion_limit(compiled.ir()).max(50);
         let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
             .enable_all()

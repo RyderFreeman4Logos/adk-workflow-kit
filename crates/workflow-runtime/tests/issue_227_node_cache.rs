@@ -196,13 +196,53 @@ fn crash_during_write_does_not_return_partial_data() {
     let cache = NodeResultCache::open(&root).expect("open cache");
     let key = base_key();
     fs::write(
-        root.join(format!(".tmp-{}", key.digest().replace(':', "-"))),
+        root.join(format!(".tmp-{}-1", key.digest().replace(':', "-"))),
         b"{",
     )
     .expect("leftover temp");
     match cache.lookup(&key).expect("lookup") {
         NodeCacheLookup::Hit(_) => panic!("partial crash debris must not be a hit"),
         NodeCacheLookup::Miss | NodeCacheLookup::Invalid { .. } => {}
+    }
+    cache
+        .put(
+            NodeCacheEntry::success(
+                key.clone(),
+                json!({"answer": "after-crash"}),
+                provenance(&key),
+            )
+            .unwrap(),
+        )
+        .expect("stale numeric tmp suffix must not block a later process");
+    match cache.lookup(&key).expect("lookup after put") {
+        NodeCacheLookup::Hit(entry) => {
+            assert_eq!(entry.payload(), &json!({"answer": "after-crash"}))
+        }
+        other => panic!("expected hit after reclaiming crash debris, got {other:?}"),
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn put_replaces_divergent_existing_entry() {
+    let root = cache_root("replace");
+    let cache = NodeResultCache::open(&root).expect("open cache");
+    let key = base_key();
+    cache
+        .put(
+            NodeCacheEntry::success(key.clone(), json!({"answer": "old"}), provenance(&key))
+                .unwrap(),
+        )
+        .expect("seed");
+    cache
+        .put(
+            NodeCacheEntry::success(key.clone(), json!({"answer": "new"}), provenance(&key))
+                .unwrap(),
+        )
+        .expect("replace divergent bytes");
+    match cache.lookup(&key).expect("lookup") {
+        NodeCacheLookup::Hit(entry) => assert_eq!(entry.payload(), &json!({"answer": "new"})),
+        other => panic!("expected replaced hit, got {other:?}"),
     }
     let _ = fs::remove_dir_all(root);
 }
