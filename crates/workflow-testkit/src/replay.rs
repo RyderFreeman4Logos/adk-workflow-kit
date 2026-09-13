@@ -2,7 +2,7 @@ use std::{collections::HashSet, fmt};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use workflow_runtime::{RunStatus, SandboxCapability};
+use workflow_runtime::{CacheDisposition, RunStatus, SandboxCapability};
 
 /// A validated offline replay document that cannot dispatch work.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,7 +147,8 @@ impl ReplayEvent {
                 cache_disposition,
             } => Self::NodeCompleted {
                 node_id,
-                cache_disposition,
+                cache_disposition: cache_disposition
+                    .map(|disposition| disposition.as_str().to_owned()),
             },
             WireEvent::ModelExchange {
                 node_id,
@@ -346,7 +347,7 @@ enum WireEvent {
     NodeCompleted {
         node_id: String,
         #[serde(default)]
-        cache_disposition: Option<String>,
+        cache_disposition: Option<CacheDisposition>,
     },
     ModelExchange {
         node_id: String,
@@ -396,14 +397,8 @@ fn validate_required(bundle: &WireBundle) -> Result<(), ReplayError> {
             WireEvent::NodeStarted { node_id } => {
                 validate_identifier(node_id)?;
             }
-            WireEvent::NodeCompleted {
-                node_id,
-                cache_disposition,
-            } => {
+            WireEvent::NodeCompleted { node_id, .. } => {
                 validate_identifier(node_id)?;
-                if let Some(disposition) = cache_disposition {
-                    validate_identifier(disposition)?;
-                }
             }
             WireEvent::ModelExchange {
                 node_id,

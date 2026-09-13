@@ -6,7 +6,7 @@ use std::{
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use workflow_adk::execution::{ExecutionBackend, ExecutionProfileV1};
+use workflow_adk::execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1};
 use workflow_runtime::{NodeCacheRetention, NodeResultCache};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -582,5 +582,56 @@ fn inspect_gc_export_import_and_negative_cache_are_visible() {
             .expect("inspect after gc")
             .entry_count(),
         0
+    );
+}
+
+#[test]
+fn schema_invalid_finish_is_not_a_durable_success_hit() {
+    let root = TestRoot::new();
+    let instruction = b"Review only the declared request.\n";
+    fs::write(root.0.join("prompt.md"), instruction).expect("instruction");
+    fs::write(
+        root.0.join("review.schema.json"),
+        br#"{"type":"object","properties":{"approved":{"type":"boolean"}},"required":["approved"],"additionalProperties":false}"#,
+    )
+    .expect("schema");
+    let workflow_path = root.0.join("workflow.toml");
+    fs::write(&workflow_path, contracted_workflow(&digest(instruction))).expect("workflow");
+    let invalid = r#"{"status":"finished","output":"not-an-object"}"#;
+    let valid = r#"{"status":"finished","output":{"approved":true}}"#;
+    let first = ExecutionBackend::run(
+        &workflow_path,
+        profile_with(&[invalid]),
+        json!({"request": "public"}),
+        &root.0,
+    )
+    .expect_err("schema-invalid finish must fail closed");
+    assert_eq!(first.kind(), ExecutionErrorKind::InvalidOutput);
+    assert_eq!(
+        NodeResultCache::open(cache_dir(&root.0))
+            .expect("open after invalid finish")
+            .inspect()
+            .expect("inspect after invalid finish")
+            .entry_count(),
+        0,
+        "semantic-invalid finish must not become a Success hit"
+    );
+
+    let healed = ExecutionBackend::run(
+        &workflow_path,
+        profile_with(&[valid]),
+        json!({"request": "public"}),
+        &root.0,
+    )
+    .expect("following run must still reach the inner model");
+    assert_eq!(healed.status(), "succeeded");
+    assert_eq!(
+        model_completed(healed.run_root()),
+        1,
+        "schema-invalid poison must not be reused with zero inner calls"
+    );
+    assert_eq!(
+        node_completed(healed.run_root(), "worker")["payload"]["cache_disposition"],
+        "recorded"
     );
 }

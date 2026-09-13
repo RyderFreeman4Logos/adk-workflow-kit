@@ -187,3 +187,15 @@ fn replay_preserves_recorded_reused_and_reexecuted_without_live_models() {
         .collect::<Vec<_>>();
     assert_eq!(dispositions, ["recorded", "reused", "reexecuted"]);
 }
+
+#[test]
+fn forged_cache_disposition_fails_closed() {
+    let mut forged = bundle();
+    forged["events"] = json!([
+        { "type": "node_started", "node_id": "node-a" },
+        { "type": "node_completed", "node_id": "node-a", "cache_disposition": "forged" },
+        { "type": "terminal", "status": "completed", "outcome_sha256": DIGEST }
+    ]);
+    let error = parse(&forged).expect_err("forged cache disposition must fail closed");
+    assert_eq!(error.kind(), ReplayErrorKind::InvalidDocument);
+}

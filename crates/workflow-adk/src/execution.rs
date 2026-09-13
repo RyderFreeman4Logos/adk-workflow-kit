@@ -88,6 +88,7 @@ type BoundCache = (
     Arc<EffectFence>,
     Option<(NodeResultCache, NodeCacheIdentity)>,
     Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
+    Arc<Mutex<Option<(NodeCacheKey, Value)>>>,
 );
 type CompletedToolResponse = (String, String, String, String, Value);
 
@@ -3483,6 +3484,7 @@ struct FencedModel {
     fence: Arc<EffectFence>,
     cache: Option<(NodeResultCache, NodeCacheIdentity)>,
     dispositions: Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
+    pending: Arc<Mutex<Option<(NodeCacheKey, Value)>>>,
     node_id: String,
 }
 
@@ -3509,6 +3511,9 @@ impl Llm for FencedModel {
                     if matches!(entry.outcome(), NodeCacheOutcome::Success) =>
                 {
                     self.record_disposition(CacheDisposition::Reused);
+                    if let Ok(mut pending) = self.pending.lock() {
+                        *pending = None;
+                    }
                     return Ok(Box::pin(adk_rust::futures::stream::iter([Ok(
                         cached_finish_response(entry.payload().clone()),
                     )])));
@@ -3532,20 +3537,17 @@ impl Llm for FencedModel {
             return result;
         };
         let items = response_stream.collect::<Vec<_>>().await;
-        if let Some((cache, key)) = key
-            && let Some(Ok(response)) = items.first()
-            && let Some(content) = response.content.as_ref()
-            && let Ok(Some(output)) = admitted_finish(content)
-            && record_node_result(cache, key, output)
-            && !matches!(
-                self.dispositions
-                    .lock()
-                    .ok()
-                    .and_then(|dispositions| dispositions.get(&self.node_id).copied()),
-                Some(CacheDisposition::Reexecuted)
-            )
-        {
-            self.record_disposition(CacheDisposition::Recorded);
+        if let Ok(mut pending) = self.pending.lock() {
+            *pending = key.and_then(|(_, key)| {
+                items.iter().rev().find_map(|item| {
+                    let response = item.as_ref().ok()?;
+                    let content = response.content.as_ref()?;
+                    admitted_finish(content)
+                        .ok()
+                        .flatten()
+                        .map(|output| (key.clone(), output))
+                })
+            });
         }
         Ok(Box::pin(adk_rust::futures::stream::iter(items)))
     }
@@ -3772,6 +3774,7 @@ fn bound_tool_schema_digest(tool: &Option<BoundTool>) -> String {
     )
 }
 
+#[derive(Clone)]
 struct NodeCacheIdentity {
     workflow_id: String,
     workflow_version: String,
@@ -3909,6 +3912,42 @@ fn record_node_result(cache: &NodeResultCache, key: NodeCacheKey, payload: Value
     cache.put(entry).is_ok()
 }
 
+fn persist_accepted_node_result(
+    cache: &Option<(NodeResultCache, NodeCacheIdentity)>,
+    pending: &Mutex<Option<(NodeCacheKey, Value)>>,
+    dispositions: &Mutex<BTreeMap<String, CacheDisposition>>,
+    node_id: String,
+    response: &LlmResponse,
+) {
+    let Some((cache, _)) = cache.as_ref() else {
+        return;
+    };
+    let Ok(mut slot) = pending.lock() else {
+        return;
+    };
+    let Some((key, output)) = slot.take() else {
+        return;
+    };
+    let accepted = response
+        .content
+        .as_ref()
+        .and_then(|content| admitted_finish(content).ok().flatten());
+    if accepted.as_ref() != Some(&output) {
+        return;
+    }
+    let already_reexecuted = dispositions
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&node_id).copied())
+        == Some(CacheDisposition::Reexecuted);
+    if !record_node_result(cache, key, output) || already_reexecuted {
+        return;
+    }
+    if let Ok(mut map) = dispositions.lock() {
+        map.insert(node_id, CacheDisposition::Recorded);
+    }
+}
+
 fn build_profile_agent(
     name: &str,
     model: Arc<ModelBinding>,
@@ -3924,7 +3963,7 @@ fn build_profile_agent(
     };
     let allowed = Arc::new(names.into_iter().collect::<BTreeSet<_>>());
     let output_schema = contract.map(|contract| contract.output_schema.clone());
-    let (effect_fence, cache, dispositions) = cache;
+    let (effect_fence, cache, dispositions, pending) = cache;
     let controller = Arc::new(LoopController::new(
         name,
         limits,
@@ -3936,12 +3975,17 @@ fn build_profile_agent(
     let before_controller = Arc::clone(&controller);
     let tool_controller = Arc::clone(&controller);
     let tool_error_controller = Arc::clone(&controller);
+    let persist_cache = cache.clone();
+    let persist_dispositions = Arc::clone(&dispositions);
+    let persist_pending = Arc::clone(&pending);
+    let persist_node = name.to_owned();
     let tool_timeout = std::time::Duration::from_millis(controller.limits.max_tool_time_ms().get());
     let model = Arc::new(FencedModel {
         binding: model,
         fence: Arc::clone(&effect_fence),
         cache,
         dispositions,
+        pending,
         node_id: name.to_owned(),
     });
     let mut builder = LlmAgentBuilder::new(name)
@@ -3967,6 +4011,10 @@ fn build_profile_agent(
             let allowed = Arc::clone(&allowed);
             let controller = Arc::clone(&controller);
             let output_schema = output_schema.clone();
+            let persist_cache = persist_cache.clone();
+            let persist_dispositions = Arc::clone(&persist_dispositions);
+            let persist_pending = Arc::clone(&persist_pending);
+            let persist_node = persist_node.clone();
             Box::pin(async move {
                 if let Some(schema) = output_schema
                     && let Some(content) = response.content.as_ref()
@@ -3991,6 +4039,13 @@ fn build_profile_agent(
                     ));
                 }
                 controller.observe_model(&response, &allowed)?;
+                persist_accepted_node_result(
+                    &persist_cache,
+                    &persist_pending,
+                    &persist_dispositions,
+                    persist_node,
+                    &response,
+                );
                 Ok(None)
             })
         }))
@@ -4723,6 +4778,7 @@ impl ExecutionBackend {
                                 Arc::clone(&effect_fence),
                                 cache,
                                 Arc::clone(&cache_dispositions),
+                                Arc::new(Mutex::new(None)),
                             ),
                         )?;
                         Ok((node.id().as_str().to_owned(), agent))
@@ -5324,6 +5380,7 @@ impl ExecutionBackend {
                             Arc::clone(&effect_fence),
                             cache,
                             Arc::clone(&cache_dispositions),
+                            Arc::new(Mutex::new(None)),
                         ),
                     )?
                 };

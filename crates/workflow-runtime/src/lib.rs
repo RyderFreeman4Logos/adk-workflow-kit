@@ -66,7 +66,7 @@ pub use node_cache::{
     CacheDisposition, CacheProvenance, NODE_CACHE_SCHEMA_VERSION, NodeCacheEntry, NodeCacheError,
     NodeCacheErrorKind, NodeCacheInspect, NodeCacheInvalidationReason, NodeCacheKey,
     NodeCacheKeyError, NodeCacheKeyMaterial, NodeCacheLookup, NodeCacheOutcome, NodeCacheRetention,
-    NodeResultCache,
+    NodeResultCache, node_cache_dir_syncs, reset_node_cache_dir_syncs,
 };
 pub use observability::{
     CallLedgerRecord, EventCounts, ObservabilityError, OtelMapping, REDACTION_MARKER,

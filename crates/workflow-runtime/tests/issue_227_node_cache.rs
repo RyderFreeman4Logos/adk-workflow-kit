@@ -8,7 +8,8 @@ use serde_json::{Value, json};
 use workflow_runtime::{
     CacheDisposition, CacheProvenance, NODE_CACHE_SCHEMA_VERSION, NodeCacheEntry,
     NodeCacheInvalidationReason, NodeCacheKey, NodeCacheKeyMaterial, NodeCacheLookup,
-    NodeCacheOutcome, NodeCacheRetention, NodeResultCache,
+    NodeCacheOutcome, NodeCacheRetention, NodeResultCache, node_cache_dir_syncs,
+    reset_node_cache_dir_syncs,
 };
 
 fn bind_case(
@@ -366,4 +367,47 @@ fn replay_disposition_names_are_stable() {
     assert_eq!(CacheDisposition::Reused.as_str(), "reused");
     assert_eq!(CacheDisposition::Recorded.as_str(), "recorded");
     assert_eq!(CacheDisposition::Reexecuted.as_str(), "reexecuted");
+}
+
+#[test]
+fn open_fsyncs_parent_that_owns_the_cache_name() {
+    let parent = cache_root("open-parent");
+    let root = parent.join(".node-result-cache");
+    reset_node_cache_dir_syncs();
+    NodeResultCache::open(&root).expect("open cache");
+    assert!(
+        node_cache_dir_syncs() >= 3,
+        "first open must fsync entries, root, and the parent that owns the cache name"
+    );
+    let _ = fs::remove_dir_all(parent);
+}
+
+#[test]
+fn equal_existing_put_and_absent_invalidate_fsync_entries() {
+    let root = cache_root("idempotent-sync");
+    let cache = NodeResultCache::open(&root).expect("open cache");
+    let key = base_key();
+    let entry = NodeCacheEntry::success(key.clone(), json!({"answer": "shared"}), provenance(&key))
+        .unwrap();
+    cache.put(entry.clone()).expect("seed");
+
+    reset_node_cache_dir_syncs();
+    cache.put(entry).expect("equal existing bytes");
+    assert!(
+        node_cache_dir_syncs() >= 1,
+        "equal-existing put must fsync entries before returning success"
+    );
+
+    cache
+        .invalidate(&key, NodeCacheInvalidationReason::ExplicitInvalidate)
+        .expect("drop present entry");
+    reset_node_cache_dir_syncs();
+    cache
+        .invalidate(&key, NodeCacheInvalidationReason::ExplicitInvalidate)
+        .expect("already absent");
+    assert!(
+        node_cache_dir_syncs() >= 1,
+        "already-absent invalidate must fsync entries before returning success"
+    );
+    let _ = fs::remove_dir_all(root);
 }

@@ -5,6 +5,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -13,6 +14,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub const NODE_CACHE_SCHEMA_VERSION: u16 = 1;
+static DIR_SYNCS: AtomicU64 = AtomicU64::new(0);
 
 /// Identity fields bound into a node-result cache key.
 pub struct NodeCacheKeyMaterial<'a> {
@@ -89,7 +91,8 @@ pub enum NodeCacheLookup {
     Invalid { reason: NodeCacheInvalidationReason },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CacheDisposition {
     Reused,
     Recorded,
@@ -258,6 +261,16 @@ impl CacheDisposition {
     }
 }
 
+/// Test seam: successful directory fsyncs since the last reset.
+pub fn node_cache_dir_syncs() -> u64 {
+    DIR_SYNCS.load(Ordering::Relaxed)
+}
+
+/// Test seam: clear the directory-fsync counter.
+pub fn reset_node_cache_dir_syncs() {
+    DIR_SYNCS.store(0, Ordering::Relaxed);
+}
+
 impl NodeCacheInspect {
     pub const fn entry_count(&self) -> usize {
         self.entry_count
@@ -288,10 +301,12 @@ impl NodeCacheError {
 impl NodeResultCache {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, NodeCacheError> {
         let root = root.as_ref().to_path_buf();
+        let missing_root = !root.exists();
         let entries = root.join("entries");
         fs::create_dir_all(&entries).map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
         sync_dir(&entries)?;
         sync_dir(&root)?;
+        sync_created_parent(&root, missing_root)?;
         Ok(Self { root })
     }
 
@@ -353,7 +368,7 @@ impl NodeResultCache {
     ) -> Result<(), NodeCacheError> {
         match fs::remove_file(self.path_for(&key.digest)) {
             Ok(()) => self.sync_entries(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => self.sync_entries(),
             Err(_) => Err(NodeCacheError::new(NodeCacheErrorKind::Io)),
         }
     }
@@ -458,7 +473,7 @@ impl NodeResultCache {
                 let existing = fs::read(final_path)
                     .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
                 if existing == bytes {
-                    return Ok(());
+                    return self.sync_entries();
                 }
                 fs::remove_file(final_path)
                     .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
@@ -468,9 +483,11 @@ impl NodeResultCache {
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                         let existing = fs::read(final_path)
                             .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
-                        (existing == bytes)
-                            .then_some(())
-                            .ok_or_else(|| NodeCacheError::new(NodeCacheErrorKind::Corrupt))
+                        if existing == bytes {
+                            self.sync_entries()
+                        } else {
+                            Err(NodeCacheError::new(NodeCacheErrorKind::Corrupt))
+                        }
                     }
                     Err(_) => Err(NodeCacheError::new(NodeCacheErrorKind::Io)),
                 }
@@ -483,7 +500,16 @@ impl NodeResultCache {
 fn sync_dir(path: &Path) -> Result<(), NodeCacheError> {
     File::open(path)
         .and_then(|file| file.sync_all())
-        .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))
+        .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+    DIR_SYNCS.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+fn sync_created_parent(root: &Path, created: bool) -> Result<(), NodeCacheError> {
+    match (created, root.parent()) {
+        (true, Some(parent)) => sync_dir(parent),
+        _ => Ok(()),
+    }
 }
 
 fn tmp_token() -> String {
