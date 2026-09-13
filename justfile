@@ -110,6 +110,12 @@ issue-268-test:
 issue-227-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_227_node_cache {{test_name}} --locked -- --nocapture
 
+issue-227-wait test_name:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --lib {{test_name}} --locked -- --exact --nocapture
+
+issue-227-sandbox test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test sandbox_execution_contracts {{test_name}} --locked -- --nocapture
+
 issue-227-adk test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_227_node_cache {{test_name}} --locked -- --nocapture --test-threads=1
 
