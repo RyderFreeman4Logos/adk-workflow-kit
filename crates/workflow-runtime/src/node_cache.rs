@@ -106,6 +106,7 @@ pub struct NodeCacheRetention {
 #[derive(Clone, Debug)]
 pub struct NodeCacheInspect {
     entry_count: usize,
+    negative_entries: usize,
     paths: Vec<(String, PathBuf)>,
 }
 
@@ -264,6 +265,10 @@ impl NodeCacheInspect {
         self.entry_count
     }
 
+    pub const fn negative_entries(&self) -> usize {
+        self.negative_entries
+    }
+
     pub fn entry_path(&self, key: &NodeCacheKey) -> Option<PathBuf> {
         self.paths
             .iter()
@@ -348,6 +353,7 @@ impl NodeResultCache {
 
     pub fn inspect(&self) -> Result<NodeCacheInspect, NodeCacheError> {
         let mut paths = Vec::new();
+        let mut negative_entries = 0;
         let entries = fs::read_dir(self.root.join("entries"))
             .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
         for entry in entries {
@@ -360,12 +366,16 @@ impl NodeResultCache {
                 continue;
             };
             if let NodeCacheLookup::Hit(cached) = verify_entry(&bytes, None) {
+                if matches!(cached.outcome(), NodeCacheOutcome::Negative { .. }) {
+                    negative_entries += 1;
+                }
                 paths.push((cached.key_digest, path));
             }
         }
         paths.sort_by(|left, right| left.0.cmp(&right.0));
         Ok(NodeCacheInspect {
             entry_count: paths.len(),
+            negative_entries,
             paths,
         })
     }

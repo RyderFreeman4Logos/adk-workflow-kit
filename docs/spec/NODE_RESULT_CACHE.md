@@ -22,4 +22,4 @@ Run ids and timestamps are not part of the key.
 - `reused` — valid durable hit; `FencedModel` is skipped (zero fake-model calls)
 - `reexecuted` — prior entry was invalid or negative; the node ran again
 
-Resume of a completed cached node reuses the stored result. Inspect/GC/export/import operate on the same filesystem store. Fake/offline models only; live SuperQwen is not claimed.
+Resume of a succeeded run is a finish/no-op: it does not re-execute a completed cached node or issue another fake-model call. Inspect/GC/export/import operate on the same filesystem store. Fake/offline models only; live SuperQwen is not claimed.

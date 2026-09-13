@@ -3490,7 +3490,7 @@ impl Llm for FencedModel {
         request: LlmRequest,
         stream: bool,
     ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
-        if let Some(output) = cached_success(&self.cache, &self.cache_key) {
+        if let Some(output) = cache_hit_or_disposition(&self.cache, &self.cache_key).0 {
             return Ok(Box::pin(adk_rust::futures::stream::iter([Ok(
                 cached_finish_response(output),
             )])));
@@ -3625,6 +3625,52 @@ fn node_cache_open(base: &Path) -> Result<NodeResultCache, ExecutionError> {
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
 }
 
+fn cache_provenance(
+    events: &[workflow_runtime::WorkflowRuntimeEventV1],
+) -> (BTreeMap<String, String>, CacheEventCounts) {
+    let mut cache_dispositions = BTreeMap::new();
+    let mut event_counts = CacheEventCounts::default();
+    for event in events {
+        match event.kind() {
+            WorkflowRuntimeEventKindV1::ModelRequestCompleted => {
+                event_counts.model_turns = event_counts.model_turns.saturating_add(1);
+            }
+            WorkflowRuntimeEventKindV1::NodeCompleted => {
+                if let Some(disposition) = event
+                    .payload()
+                    .get("cache_disposition")
+                    .and_then(Value::as_str)
+                {
+                    if let Some(node) = event.node_id() {
+                        cache_dispositions.insert(node.to_owned(), disposition.to_owned());
+                    }
+                    match disposition {
+                        "reused" => {
+                            event_counts.cache_hits = event_counts.cache_hits.saturating_add(1)
+                        }
+                        "reexecuted" => {
+                            event_counts.reexecuted = event_counts.reexecuted.saturating_add(1)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (cache_dispositions, event_counts)
+}
+
+fn node_cache_inventory(base: &Path) -> NodeCacheInventory {
+    NodeResultCache::open(base.join(NODE_CACHE_DIR))
+        .and_then(|cache| cache.inspect())
+        .map(|inspect| NodeCacheInventory {
+            entry_count: inspect.entry_count() as u64,
+            negative_entries: inspect.negative_entries() as u64,
+        })
+        .unwrap_or_default()
+}
+
 fn node_cache_key(
     ir: &workflow_ir::WorkflowIr,
     node: &workflow_ir::IrNode,
@@ -3699,15 +3745,6 @@ fn cache_hit_or_disposition(
             (None, CacheDisposition::Reexecuted)
         }
         _ => (None, CacheDisposition::Recorded),
-    }
-}
-
-fn cached_success(cache: &NodeResultCache, key: &NodeCacheKey) -> Option<Value> {
-    match cache.lookup(key) {
-        Ok(NodeCacheLookup::Hit(entry)) if matches!(entry.outcome(), NodeCacheOutcome::Success) => {
-            Some(entry.payload().clone())
-        }
-        _ => None,
     }
 }
 
@@ -3893,6 +3930,12 @@ pub struct ExecutionReceipt {
     resume_count: u64,
     plan_hash: String,
     resume_identity: String,
+    #[serde(default)]
+    cache_dispositions: BTreeMap<String, String>,
+    #[serde(default)]
+    event_counts: CacheEventCounts,
+    #[serde(default)]
+    node_cache: NodeCacheInventory,
 }
 
 impl ExecutionReceipt {
@@ -3929,10 +3972,30 @@ struct RunManifestV2 {
     plan_hash: String,
     resume_identity: String,
     checkpoint_manifest: Option<CheckpointManifestV1>,
+    #[serde(default)]
+    cache_dispositions: BTreeMap<String, String>,
+    #[serde(default)]
+    event_counts: CacheEventCounts,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CacheEventCounts {
+    model_turns: u64,
+    cache_hits: u64,
+    reexecuted: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NodeCacheInventory {
+    entry_count: u64,
+    negative_entries: u64,
 }
 
 impl RunManifestV2 {
     fn receipt(&self, run_root: PathBuf) -> ExecutionReceipt {
+        let node_cache = node_cache_inventory(run_root.parent().unwrap_or(&run_root));
         ExecutionReceipt {
             run_id: self.run_id.clone(),
             workflow_id: self.workflow_id.clone(),
@@ -3942,6 +4005,9 @@ impl RunManifestV2 {
             resume_count: self.resume_count,
             plan_hash: self.plan_hash.clone(),
             resume_identity: self.resume_identity.clone(),
+            cache_dispositions: self.cache_dispositions.clone(),
+            event_counts: self.event_counts.clone(),
+            node_cache,
         }
     }
 }
@@ -4454,6 +4520,8 @@ impl ExecutionBackend {
                     plan_hash: resolved_plan.plan_hash().to_owned(),
                     resume_identity: resolved_plan.resume_identity().to_owned(),
                     checkpoint_manifest: Some(checkpoint_manifest.clone()),
+                    cache_dispositions: BTreeMap::new(),
+                    event_counts: CacheEventCounts::default(),
                 };
                 if write_json(&run_root.join("run-manifest.json"), &provisional).is_err() {
                     persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
@@ -4799,6 +4867,7 @@ impl ExecutionBackend {
             },
             None => "unavailable".to_owned(),
         };
+        let (cache_dispositions, event_counts) = cache_provenance(mapper.events());
         let manifest = RunManifestV2 {
             schema_version: 2,
             run_id: run_id.as_str().to_owned(),
@@ -4813,6 +4882,8 @@ impl ExecutionBackend {
             plan_hash: resolved_plan.plan_hash().to_owned(),
             resume_identity: resolved_plan.resume_identity().to_owned(),
             checkpoint_manifest: Some(checkpoint_manifest),
+            cache_dispositions,
+            event_counts,
         };
         if let Err(error) = write_json(&run_root.join("run-manifest.json"), &manifest) {
             persistence_error.get_or_insert(error);
@@ -5271,9 +5342,12 @@ impl ExecutionBackend {
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         crash_barrier("after-checkpoint");
         crash_barrier("after-result");
+        let (cache_dispositions, event_counts) = cache_provenance(mapper.events());
         manifest.status = "succeeded".to_owned();
         manifest.artifact_id = artifact_id;
         manifest.resume_count = next;
+        manifest.cache_dispositions = cache_dispositions;
+        manifest.event_counts = event_counts;
         write_json(&root.join("run-manifest.json"), &manifest)?;
         Ok(manifest.receipt(root))
     }

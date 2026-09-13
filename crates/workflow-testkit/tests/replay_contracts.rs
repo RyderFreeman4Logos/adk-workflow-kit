@@ -159,3 +159,31 @@ fn recorded_capability_expansion_is_rejected() {
     let error = parse(&expanded).expect_err("capability expansion must be rejected");
     assert_eq!(error.kind(), ReplayErrorKind::CapabilityExpansion);
 }
+
+#[test]
+fn replay_preserves_recorded_reused_and_reexecuted_without_live_models() {
+    let mut with_dispositions = bundle();
+    with_dispositions["events"] = json!([
+        { "type": "node_started", "node_id": "node-a" },
+        { "type": "node_completed", "node_id": "node-a", "cache_disposition": "recorded" },
+        { "type": "node_started", "node_id": "node-a" },
+        { "type": "node_completed", "node_id": "node-a", "cache_disposition": "reused" },
+        { "type": "node_started", "node_id": "node-a" },
+        { "type": "node_completed", "node_id": "node-a", "cache_disposition": "reexecuted" },
+        { "type": "terminal", "status": "completed", "outcome_sha256": DIGEST }
+    ]);
+    let trace = parse(&with_dispositions)
+        .expect("offline replay must keep recorded cache dispositions")
+        .replay();
+    let dispositions = trace
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            ReplayEvent::NodeCompleted {
+                cache_disposition, ..
+            } => cache_disposition.as_deref(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(dispositions, ["recorded", "reused", "reexecuted"]);
+}
