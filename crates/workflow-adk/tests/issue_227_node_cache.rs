@@ -154,6 +154,36 @@ fn identity_mutation_invalidates_production_cache() {
 }
 
 #[test]
+fn sandbox_capability_enlargement_misses_production_cache() {
+    let root = TestRoot::new();
+    let input = json!({"request": "public"});
+    let first = ExecutionBackend::run(workflow(), profile(), input.clone(), &root.0)
+        .expect("read-only sandbox records a node result");
+    assert_eq!(first.status(), "succeeded");
+    assert_eq!(
+        node_completed(first.run_root(), "start")["payload"]["cache_disposition"],
+        "recorded"
+    );
+
+    let mut widened = serde_json::to_value(profile()).expect("profile json");
+    widened["sandbox"]["capabilities"] = json!(["filesystem.write", "process.spawn"]);
+    let widened = ExecutionProfileV1::parse(&serde_json::to_vec(&widened).expect("encode"))
+        .expect("capability-enlarged profile must parse");
+    let missed = ExecutionBackend::run(workflow(), widened, input, &root.0)
+        .expect("capability-enlarged sibling must miss and re-execute");
+    assert_eq!(missed.status(), "succeeded");
+    assert_eq!(
+        model_completed(missed.run_root()),
+        1,
+        "sandbox/policy/capability difference must not reuse a read-only cache hit"
+    );
+    assert_eq!(
+        node_completed(missed.run_root(), "start")["payload"]["cache_disposition"],
+        "recorded"
+    );
+}
+
+#[test]
 fn resume_of_succeeded_run_does_not_reexecute_cached_node() {
     let root = TestRoot::new();
     let first = ExecutionBackend::run(workflow(), profile(), json!({"request": "public"}), &root.0)

@@ -3641,14 +3641,14 @@ fn durable_node_cache(
     model: &ModelBinding,
     contract: Option<&RuntimeAgentContract>,
     input: &Value,
-    tool: &Option<BoundTool>,
+    scope: (&[SandboxCapability], &Option<BoundTool>),
 ) -> Result<Option<(NodeResultCache, NodeCacheKey)>, ExecutionError> {
     if !durable_node_cache_enabled(model) {
         return Ok(None);
     }
     Ok(Some((
         cache.clone(),
-        node_cache_key(ir, node, model, contract, input, tool)?,
+        node_cache_key(ir, node, model, contract, input, scope)?,
     )))
 }
 
@@ -3699,14 +3699,38 @@ fn node_cache_inventory(base: &Path) -> NodeCacheInventory {
         .unwrap_or_default()
 }
 
+fn bound_tool_schema_digest(tool: &Option<BoundTool>) -> String {
+    let Some((_, bridge)) = tool else {
+        return String::new();
+    };
+    let mut tools = bridge
+        .registered_tools()
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name(),
+                "parameters": tool.parameters_schema(),
+                "response": tool.response_schema(),
+                "read_only": tool.is_read_only(),
+            })
+        })
+        .collect::<Vec<_>>();
+    tools.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&tools).unwrap_or_default())
+    )
+}
+
 fn node_cache_key(
     ir: &workflow_ir::WorkflowIr,
     node: &workflow_ir::IrNode,
     model: &ModelBinding,
     contract: Option<&RuntimeAgentContract>,
     input: &Value,
-    tool: &Option<BoundTool>,
+    scope: (&[SandboxCapability], &Option<BoundTool>),
 ) -> Result<NodeCacheKey, ExecutionError> {
+    let (sandbox_capabilities, tool) = scope;
     let schema = agent_output_schema(contract);
     let protocol = PromptProtocol::new(
         "workflow-kit.node-result.v1",
@@ -3731,8 +3755,14 @@ fn node_cache_key(
         .as_ref()
         .map(|(names, _)| names.join("\n"))
         .unwrap_or_default();
+    let sandbox = sandbox_capabilities
+        .iter()
+        .map(SandboxCapability::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tool_schema = bound_tool_schema_digest(tool);
     let policy = format!(
-        "tools:{tools};instruction:{};schema:{};protocol:{};tokenizer:{};model:{};tool_schema:{};output_schema:{};route:{}/{};trust:{}",
+        "tools:{tools};sandbox:{sandbox};instruction:{};schema:{};protocol:{};tokenizer:{};model:{};tool_schema:{};bound_tool_schema:{tool_schema};output_schema:{};route:{}/{};trust:{}",
         contract.map(|c| c.instruction_path.as_str()).unwrap_or(""),
         contract.map(|c| c.schema_path.as_str()).unwrap_or(""),
         provenance.protocol_hash(),
@@ -3790,9 +3820,10 @@ fn store_agent_outputs(
     resolved_models: &BTreeMap<String, Arc<ModelBinding>>,
     agent_contracts: &BTreeMap<String, RuntimeAgentContract>,
     input: &Value,
-    tools: &BTreeMap<String, Option<BoundTool>>,
+    tools: (&BTreeMap<String, Option<BoundTool>>, &[SandboxCapability]),
     state: &State,
 ) {
+    let (tools, sandbox_capabilities) = tools;
     for node in ir
         .nodes()
         .iter()
@@ -3810,7 +3841,10 @@ fn store_agent_outputs(
             model,
             agent_contracts.get(node.id().as_str()),
             input,
-            tools.get(node.id().as_str()).unwrap_or(&None),
+            (
+                sandbox_capabilities,
+                tools.get(node.id().as_str()).unwrap_or(&None),
+            ),
         ) else {
             continue;
         };
@@ -4623,7 +4657,7 @@ impl ExecutionBackend {
                             &model,
                             agent_contracts.get(node.id().as_str()),
                             &input,
-                            &tool,
+                            (&effective_capabilities, &tool),
                         )?;
                         let (cached, disposition) = match &cache {
                             Some((store, key)) => cache_hit_or_disposition(store, key),
@@ -4701,7 +4735,7 @@ impl ExecutionBackend {
                                 &resolved_models,
                                 &agent_contracts,
                                 &input,
-                                &node_tools,
+                                (&node_tools, &effective_capabilities),
                                 state,
                             );
                         }
@@ -5230,7 +5264,10 @@ impl ExecutionBackend {
                     &model,
                     agent_contracts.get(name),
                     &input,
-                    &toolsets.get(name).cloned().flatten(),
+                    (
+                        &effective_capabilities,
+                        &toolsets.get(name).cloned().flatten(),
+                    ),
                 )?;
                 let (cached, cache_disposition) = match &cache {
                     Some((store, key)) => cache_hit_or_disposition(store, key),
