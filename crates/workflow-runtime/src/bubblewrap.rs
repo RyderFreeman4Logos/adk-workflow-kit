@@ -418,7 +418,7 @@ impl LinuxBubblewrapBackend {
 
         let recorded_starttime = child_starttime(process_group);
         let wall_deadline = request.wall_time.map(|limit| Instant::now() + limit);
-        let d_state_deadline = Instant::now() + D_STATE_REAP_TIMEOUT;
+        let mut d_state_deadline = None;
         let outcome = loop {
             match child.try_wait() {
                 Ok(reaped) => match wait_progress(
@@ -426,7 +426,7 @@ impl LinuxBubblewrapBackend {
                     matching_group_uninterruptible_io(process_group, recorded_starttime),
                     Instant::now(),
                     wall_deadline,
-                    d_state_deadline,
+                    &mut d_state_deadline,
                     output_budget
                         .as_ref()
                         .is_some_and(|budget| budget.exceeded()),
@@ -708,16 +708,21 @@ fn wait_progress(
     matching_d: bool,
     now: Instant,
     wall_deadline: Option<Instant>,
-    d_state_deadline: Instant,
+    d_state_deadline: &mut Option<Instant>,
     output_exceeded: bool,
 ) -> WaitProgress {
     if let Some(status) = reaped {
         return WaitProgress::Reaped(status);
     }
-    if matching_d && now < d_state_deadline {
-        return WaitProgress::Poll;
+    let kill_requested = output_exceeded || wall_deadline.is_some_and(|limit| now >= limit);
+    if matching_d && kill_requested {
+        let deadline = *d_state_deadline.get_or_insert(now + D_STATE_REAP_TIMEOUT);
+        if now < deadline {
+            return WaitProgress::Poll;
+        }
+        return WaitProgress::Kill;
     }
-    if output_exceeded || wall_deadline.is_some_and(|limit| now >= limit) {
+    if kill_requested {
         return WaitProgress::Kill;
     }
     WaitProgress::Poll
@@ -1093,24 +1098,32 @@ mod tests {
     fn matching_d_state_does_not_timeout_kill_before_hard_bound() {
         let now = Instant::now();
         let wall_deadline = Some(now);
-        let d_state_deadline = now + D_STATE_REAP_TIMEOUT;
+        let mut d_state_deadline = Some(now + D_STATE_REAP_TIMEOUT);
         assert_eq!(
-            wait_progress(None, true, now, wall_deadline, d_state_deadline, false),
+            wait_progress(None, true, now, wall_deadline, &mut d_state_deadline, false),
             WaitProgress::Poll
         );
         assert_eq!(
             wait_progress(
                 None,
                 true,
-                d_state_deadline,
+                now + D_STATE_REAP_TIMEOUT,
                 wall_deadline,
-                d_state_deadline,
+                &mut d_state_deadline,
                 false
             ),
             WaitProgress::Kill
         );
+        let mut no_match_deadline = Some(now + D_STATE_REAP_TIMEOUT);
         assert_eq!(
-            wait_progress(None, false, now, wall_deadline, d_state_deadline, false),
+            wait_progress(
+                None,
+                false,
+                now,
+                wall_deadline,
+                &mut no_match_deadline,
+                false
+            ),
             WaitProgress::Kill
         );
     }
@@ -1118,17 +1131,25 @@ mod tests {
     #[test]
     fn matching_d_state_does_not_output_timeout_kill_before_hard_bound() {
         let now = Instant::now();
-        let d_state_deadline = now + D_STATE_REAP_TIMEOUT;
+        let mut d_state_deadline = Some(now + D_STATE_REAP_TIMEOUT);
         assert_eq!(
-            wait_progress(None, true, now, None, d_state_deadline, true),
+            wait_progress(None, true, now, None, &mut d_state_deadline, true),
             WaitProgress::Poll
         );
         assert_eq!(
-            wait_progress(None, true, d_state_deadline, None, d_state_deadline, true),
+            wait_progress(
+                None,
+                true,
+                now + D_STATE_REAP_TIMEOUT,
+                None,
+                &mut d_state_deadline,
+                true
+            ),
             WaitProgress::Kill
         );
+        let mut no_match_deadline = Some(now + D_STATE_REAP_TIMEOUT);
         assert_eq!(
-            wait_progress(None, false, now, None, d_state_deadline, true),
+            wait_progress(None, false, now, None, &mut no_match_deadline, true),
             WaitProgress::Kill
         );
     }
@@ -1137,16 +1158,146 @@ mod tests {
     fn matching_d_state_self_reap_is_not_killed() {
         let now = Instant::now();
         let status = ExitStatus::from_raw(9);
+        let mut d_state_deadline = Some(now + D_STATE_REAP_TIMEOUT);
         assert_eq!(
             wait_progress(
                 Some(status),
                 true,
                 now,
                 Some(now),
-                now + D_STATE_REAP_TIMEOUT,
+                &mut d_state_deadline,
                 true
             ),
             WaitProgress::Reaped(status)
+        );
+    }
+
+    #[test]
+    fn production_order_wall_after_30s_matching_d_does_not_kill_immediately() {
+        let wait_started = Instant::now();
+        let wall_deadline = Some(wait_started + Duration::from_secs(60));
+        let mut d_state_deadline = None;
+        let wall_now = wait_started + Duration::from_secs(60);
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                wall_now,
+                wall_deadline,
+                &mut d_state_deadline,
+                false
+            ),
+            WaitProgress::Poll
+        );
+        assert_eq!(d_state_deadline, Some(wall_now + D_STATE_REAP_TIMEOUT));
+        let later = wall_now + Duration::from_secs(10);
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                later,
+                wall_deadline,
+                &mut d_state_deadline,
+                false
+            ),
+            WaitProgress::Poll
+        );
+        assert_eq!(d_state_deadline, Some(wall_now + D_STATE_REAP_TIMEOUT));
+    }
+
+    #[test]
+    fn production_order_output_after_30s_matching_d_does_not_kill_immediately() {
+        let wait_started = Instant::now();
+        let mut d_state_deadline = None;
+        let output_now = wait_started + Duration::from_secs(45);
+        assert_eq!(
+            wait_progress(None, true, output_now, None, &mut d_state_deadline, true),
+            WaitProgress::Poll
+        );
+        assert_eq!(d_state_deadline, Some(output_now + D_STATE_REAP_TIMEOUT));
+        let later = output_now + Duration::from_secs(10);
+        assert_eq!(
+            wait_progress(None, true, later, None, &mut d_state_deadline, true),
+            WaitProgress::Poll
+        );
+        assert_eq!(d_state_deadline, Some(output_now + D_STATE_REAP_TIMEOUT));
+    }
+
+    #[test]
+    fn production_order_matching_d_self_reaps_before_grace() {
+        let wait_started = Instant::now();
+        let wall_deadline = Some(wait_started + Duration::from_secs(60));
+        let mut d_state_deadline = None;
+        let wall_now = wait_started + Duration::from_secs(60);
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                wall_now,
+                wall_deadline,
+                &mut d_state_deadline,
+                false
+            ),
+            WaitProgress::Poll
+        );
+        let status = ExitStatus::from_raw(0);
+        assert_eq!(
+            wait_progress(
+                Some(status),
+                true,
+                wall_now + Duration::from_secs(1),
+                wall_deadline,
+                &mut d_state_deadline,
+                false
+            ),
+            WaitProgress::Reaped(status)
+        );
+    }
+
+    #[test]
+    fn production_order_matching_d_kills_after_grace() {
+        let wait_started = Instant::now();
+        let wall_deadline = Some(wait_started + Duration::from_secs(60));
+        let mut d_state_deadline = None;
+        let wall_now = wait_started + Duration::from_secs(60);
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                wall_now,
+                wall_deadline,
+                &mut d_state_deadline,
+                false
+            ),
+            WaitProgress::Poll
+        );
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                wall_now + D_STATE_REAP_TIMEOUT,
+                wall_deadline,
+                &mut d_state_deadline,
+                false
+            ),
+            WaitProgress::Kill
+        );
+        let mut output_deadline = None;
+        let output_now = wait_started + Duration::from_secs(45);
+        assert_eq!(
+            wait_progress(None, true, output_now, None, &mut output_deadline, true),
+            WaitProgress::Poll
+        );
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                output_now + D_STATE_REAP_TIMEOUT,
+                None,
+                &mut output_deadline,
+                true
+            ),
+            WaitProgress::Kill
         );
     }
 }
