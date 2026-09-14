@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::encode_hex;
+use crate::{ArtifactId, ArtifactStore, PageRequest, encode_hex};
 
 /// The only admitted typed-output schema version.
 pub const TYPED_OUTPUT_SCHEMA_VERSION_V1: u32 = 1;
@@ -17,7 +17,7 @@ pub const TYPED_OUTPUT_SCHEMA_VERSION_V1: u32 = 1;
 const SHA256_PREFIX: &str = "sha256:";
 const SHA256_HEX_LEN: usize = 64;
 
-/// Baseline output-token budgets per node kind (whitespace-token estimate).
+/// Baseline output-token budgets per node kind (canonical JSON bytes / 4).
 pub const SENTINEL_OUTPUT_TOKEN_BUDGET: u32 = 128;
 pub const FIREWALL_OUTPUT_TOKEN_BUDGET: u32 = 96;
 pub const COMPACT_STATE_OUTPUT_TOKEN_BUDGET: u32 = 192;
@@ -38,6 +38,8 @@ pub enum TypedOutputError {
     RationaleNotEnabled,
     /// The document was malformed or failed a structural invariant.
     InvalidJson,
+    /// A complete envelope exceeded the node output budget.
+    OverBudget,
 }
 
 impl fmt::Display for TypedOutputError {
@@ -48,6 +50,7 @@ impl fmt::Display for TypedOutputError {
             Self::Truncated => "typed output is truncated",
             Self::RationaleNotEnabled => "free-form rationale is disabled",
             Self::InvalidJson => "typed output is invalid",
+            Self::OverBudget => "typed output exceeds the node budget",
         })
     }
 }
@@ -229,7 +232,7 @@ fn parse_state_op(code: &str) -> Result<&str, TypedOutputError> {
 #[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceSpan {
-    artifact_id: String,
+    artifact_id: ArtifactId,
     start: u64,
     end: u64,
 }
@@ -241,8 +244,9 @@ impl SourceSpan {
         start: u64,
         end: u64,
     ) -> Result<Self, TypedOutputError> {
-        let artifact_id = artifact_id.into();
-        if artifact_id.trim().is_empty() || end <= start {
+        let artifact_id =
+            ArtifactId::parse(artifact_id.into()).ok_or(TypedOutputError::InvalidJson)?;
+        if end <= start {
             return Err(TypedOutputError::InvalidJson);
         }
         Ok(Self {
@@ -253,7 +257,7 @@ impl SourceSpan {
     }
 
     pub fn artifact_id(&self) -> &str {
-        &self.artifact_id
+        self.artifact_id.as_str()
     }
 
     pub fn start(&self) -> u64 {
@@ -280,7 +284,7 @@ impl fmt::Debug for SourceSpan {
 #[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactRef {
-    artifact_id: String,
+    artifact_id: ArtifactId,
     sha256: String,
 }
 
@@ -290,9 +294,10 @@ impl ArtifactRef {
         artifact_id: impl Into<String>,
         sha256: impl Into<String>,
     ) -> Result<Self, TypedOutputError> {
-        let artifact_id = artifact_id.into();
+        let artifact_id =
+            ArtifactId::parse(artifact_id.into()).ok_or(TypedOutputError::InvalidJson)?;
         let sha256 = sha256.into();
-        if artifact_id.trim().is_empty() || !valid_sha256(&sha256) {
+        if !valid_sha256(&sha256) {
             return Err(TypedOutputError::InvalidJson);
         }
         Ok(Self {
@@ -302,7 +307,7 @@ impl ArtifactRef {
     }
 
     pub fn artifact_id(&self) -> &str {
-        &self.artifact_id
+        self.artifact_id.as_str()
     }
 
     pub fn sha256(&self) -> &str {
@@ -906,10 +911,14 @@ fn parse_artifacts(value: &Value) -> Result<Vec<ArtifactRef>, TypedOutputError> 
         .collect()
 }
 
-/// Rejects truncated or unknown envelopes before reducer or action use.
+/// Rejects truncated or over-budget envelopes before reducer or action use.
 pub fn admit_for_reducer(output: &TypedOutput) -> Result<&TypedPayload, TypedOutputError> {
     if output.completeness.is_truncated() {
         return Err(TypedOutputError::Truncated);
+    }
+    let json = output.to_json()?;
+    if estimate_output_tokens(&json) > node_output_token_budget(output.payload.kind()) as usize {
+        return Err(TypedOutputError::OverBudget);
     }
     Ok(&output.payload)
 }
@@ -956,15 +965,34 @@ fn push_spans(lines: &mut Vec<String>, spans: &[SourceSpan]) {
     for span in spans {
         lines.push(format!(
             "- span: {}#{}-{}",
-            span.artifact_id, span.start, span.end
+            escape_markdown(span.artifact_id()),
+            span.start,
+            span.end
         ));
     }
 }
 
 fn push_artifacts(lines: &mut Vec<String>, artifacts: &[ArtifactRef]) {
     for artifact in artifacts {
-        lines.push(format!("- artifact: {}", artifact.artifact_id));
+        lines.push(format!(
+            "- artifact: {}",
+            escape_markdown(artifact.artifact_id())
+        ));
     }
+}
+
+fn escape_markdown(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')' | '#' | '+' | '!' | '|' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// Deterministic JSON report: the operational envelope, nothing else.
@@ -984,9 +1012,9 @@ pub fn node_output_token_budget(kind: TypedNodeKind) -> u32 {
     }
 }
 
-/// Whitespace-token estimate used for budget comparisons. Not a model tokenizer.
+/// Canonical JSON byte budget used by this protocol. Four bytes ≈ one token.
 pub fn estimate_output_tokens(text: &str) -> usize {
-    text.split_whitespace().count()
+    text.len().div_ceil(4)
 }
 
 /// The four workflows that exchange this protocol without free-form prose.
@@ -999,10 +1027,63 @@ pub enum WorkflowExchange {
 }
 
 impl WorkflowExchange {
-    /// Admits a complete typed envelope for exchange between workflows.
-    pub fn exchange(self, _to: Self, output: &TypedOutput) -> Result<(), TypedOutputError> {
-        admit_for_reducer(output).map(|_| ())
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CodeInvestigation => "code.investigation",
+            Self::GroundedAnswer => "grounded.answer",
+            Self::MultiHop => "multi.hop",
+            Self::Review => "review",
+        }
     }
+
+    /// Publishes a complete typed envelope into the artifact store for `to`.
+    pub fn publish<S: ArtifactStore>(
+        self,
+        to: Self,
+        store: &mut S,
+        output: &TypedOutput,
+    ) -> Result<ArtifactId, TypedOutputError> {
+        admit_for_reducer(output)?;
+        let envelope = serde_json::json!({
+            "from": self.as_str(),
+            "to": to.as_str(),
+            "output": parse_typed_value_from_json(output)?,
+        });
+        let bytes = serde_json::to_vec(&envelope).map_err(|_| TypedOutputError::InvalidJson)?;
+        store.put(&bytes).map_err(|_| TypedOutputError::InvalidJson)
+    }
+
+    /// Admits a producer artifact for reducer/action use by `self`.
+    pub fn consume<S: ArtifactStore>(
+        self,
+        from: Self,
+        store: &S,
+        artifact_id: &ArtifactId,
+    ) -> Result<TypedPayload, TypedOutputError> {
+        let page = store
+            .read_page(
+                artifact_id,
+                PageRequest::new(
+                    0,
+                    std::num::NonZeroU64::new(65_536).ok_or(TypedOutputError::InvalidJson)?,
+                ),
+            )
+            .map_err(|_| TypedOutputError::InvalidJson)?;
+        let value: Value =
+            serde_json::from_slice(page.bytes()).map_err(|_| TypedOutputError::InvalidJson)?;
+        let object = value.as_object().ok_or(TypedOutputError::InvalidJson)?;
+        if object.get("from").and_then(Value::as_str) != Some(from.as_str())
+            || object.get("to").and_then(Value::as_str) != Some(self.as_str())
+        {
+            return Err(TypedOutputError::InvalidJson);
+        }
+        let output = parse_typed_value(object.get("output").ok_or(TypedOutputError::InvalidJson)?)?;
+        admit_for_reducer(&output).cloned()
+    }
+}
+
+fn parse_typed_value_from_json(output: &TypedOutput) -> Result<Value, TypedOutputError> {
+    output.to_value()
 }
 
 /// Opt-in research store for free-form rationale. Never part of the wire schema.

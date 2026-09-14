@@ -6,8 +6,8 @@ default and is stored only on an explicit research path.
 
 ## Baseline output-token budgets
 
-Whitespace-token estimates used as node output ceilings. Truncation is an
-explicit continuation record; truncated envelopes are rejected before reducer
+Canonical JSON byte estimates (`len / 4`) used as node output ceilings. Truncation is an
+explicit continuation record; truncated or over-budget envelopes are rejected before reducer
 or action use.
 
 | Node | Budget |
