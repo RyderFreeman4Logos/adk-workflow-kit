@@ -319,7 +319,14 @@ fn json_stdout(output: &Output) -> Value {
 }
 
 fn sole_run_root(runs: &Path) -> Result<PathBuf, &'static str> {
-    let mut roots = fs::read_dir(runs).map_err(|_| "oracle run base read failed")?;
+    let mut roots = fs::read_dir(runs)
+        .map_err(|_| "oracle run base read failed")?
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .map(|entry| entry.file_name() != ".node-result-cache")
+                .unwrap_or(true)
+        });
     let root = roots
         .next()
         .transpose()
@@ -352,6 +359,7 @@ struct RequestObservation {
 
 const ORACLE_TIMEOUT: Duration = Duration::from_secs(5);
 const ORACLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+const ORACLE_D_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 const ORACLE_SOCKET_TIMEOUT: Duration = Duration::from_millis(100);
 const ORACLE_TERMINAL_QUIET_WINDOW: Duration = Duration::from_millis(25);
 const ORACLE_MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -684,6 +692,11 @@ fn serve_oracle_request_until_child_done(
     }
 }
 
+fn signal_oracle_child_done(child_done_tx: &mpsc::SyncSender<()>) {
+    // Server may already have returned (trailing bytes / count) and dropped rx.
+    let _ = child_done_tx.send(());
+}
+
 fn read_child_output(path: &Path) -> Result<Vec<u8>, &'static str> {
     let mut output = Vec::new();
     fs::File::open(path)
@@ -723,6 +736,59 @@ enum OwnedChildStat {
     Ready { state: char, starttime: u64 },
     Errno(i32),
     Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OracleWait {
+    Reaped,
+    StillAlive,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OracleReapProgress {
+    Reaped,
+    Wait,
+    AbortUnproven,
+}
+
+fn matching_uninterruptible_io(
+    kill_ok: bool,
+    terminal: &OwnedChildStat,
+    recorded_starttime: Option<u64>,
+) -> bool {
+    matches!(
+        (kill_ok, terminal, recorded_starttime),
+        (true, OwnedChildStat::Ready { state: 'D', starttime }, Some(recorded))
+            if *starttime == recorded
+    )
+}
+
+fn oracle_reap_progress(
+    kill_ok: bool,
+    wait: OracleWait,
+    terminal: &OwnedChildStat,
+    recorded_starttime: Option<u64>,
+    now: Instant,
+    cleanup_deadline: Instant,
+    d_state_deadline: Instant,
+) -> OracleReapProgress {
+    match wait {
+        OracleWait::Reaped => OracleReapProgress::Reaped,
+        OracleWait::StillAlive
+            if matching_uninterruptible_io(kill_ok, terminal, recorded_starttime)
+                && now < d_state_deadline =>
+        {
+            OracleReapProgress::Wait
+        }
+        OracleWait::StillAlive | OracleWait::Error => {
+            if now < cleanup_deadline {
+                OracleReapProgress::Wait
+            } else {
+                OracleReapProgress::AbortUnproven
+            }
+        }
+    }
 }
 
 fn owned_child_stat(pid: u32) -> OwnedChildStat {
@@ -822,15 +888,24 @@ fn abort_unproven_reap(
     std::process::abort();
 }
 
+fn recorded_starttime(stat: &OwnedChildStat) -> Option<u64> {
+    match stat {
+        OwnedChildStat::Ready { starttime, .. } => Some(*starttime),
+        OwnedChildStat::Errno(_) | OwnedChildStat::Unavailable => None,
+    }
+}
+
 fn clean_up_child(mut child: Child, operation: &'static str) -> Vec<&'static str> {
     let pid = child.id();
-    let starttime = format_starttime(&owned_child_stat(pid));
+    let initial_stat = owned_child_stat(pid);
+    let recorded = recorded_starttime(&initial_stat);
+    let starttime = format_starttime(&initial_stat);
     let mut diagnostics = Vec::new();
-    let kill = match child.kill() {
-        Ok(()) => format_kill(None),
+    let (kill_ok, kill) = match child.kill() {
+        Ok(()) => (true, format_kill(None)),
         Err(error) => {
             diagnostics.push("oracle child kill failed");
-            format_kill(Some(&error))
+            (false, format_kill(Some(&error)))
         }
     };
     if std::env::var_os(UNPROVEN_REAP_FIXTURE_ENV).is_some() {
@@ -849,36 +924,57 @@ fn clean_up_child(mut child: Child, operation: &'static str) -> Vec<&'static str
         );
     }
     let cleanup_deadline = Instant::now() + ORACLE_CLEANUP_TIMEOUT;
+    let d_state_deadline = Instant::now() + ORACLE_D_STATE_TIMEOUT;
     loop {
-        let wait = match child.try_wait() {
+        let (wait_kind, wait) = match child.try_wait() {
             Ok(Some(_)) => {
                 diagnostics.push("oracle child reaped after kill");
                 return diagnostics;
             }
-            Ok(None) => "still-alive".to_string(),
+            Ok(None) => (OracleWait::StillAlive, "still-alive".to_string()),
             Err(error) => {
                 if !diagnostics.contains(&"oracle child reap check failed") {
                     diagnostics.push("oracle child reap check failed");
                 }
-                format_wait_error(&error)
+                (OracleWait::Error, format_wait_error(&error))
             }
         };
         let now = Instant::now();
-        if now >= cleanup_deadline {
-            abort_unproven_reap(
+        let terminal = owned_child_stat(pid);
+        match oracle_reap_progress(
+            kill_ok,
+            wait_kind,
+            &terminal,
+            recorded,
+            now,
+            cleanup_deadline,
+            d_state_deadline,
+        ) {
+            OracleReapProgress::Reaped => {
+                diagnostics.push("oracle child reaped after kill");
+                return diagnostics;
+            }
+            OracleReapProgress::Wait => {
+                let deadline = if matching_uninterruptible_io(kill_ok, &terminal, recorded) {
+                    d_state_deadline
+                } else {
+                    cleanup_deadline
+                };
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_millis(10)),
+                );
+            }
+            OracleReapProgress::AbortUnproven => abort_unproven_reap(
                 operation,
                 pid,
                 &starttime,
                 &kill,
                 &wait,
                 &format_terminal(pid),
-            );
+            ),
         }
-        thread::sleep(
-            cleanup_deadline
-                .saturating_duration_since(now)
-                .min(Duration::from_millis(10)),
-        );
     }
 }
 
@@ -1174,7 +1270,12 @@ fn post_execution_artifact_failure_still_persists_the_returned_receipt() {
     let artifact_root = loop {
         let candidate = fs::read_dir(&runs)
             .expect("run base must be readable")
-            .next()
+            .find(|entry| {
+                entry
+                    .as_ref()
+                    .map(|entry| entry.file_name() != ".node-result-cache")
+                    .unwrap_or(true)
+            })
             .transpose()
             .expect("run entry must be readable")
             .map(|entry| entry.path().join("artifacts"));
@@ -1713,7 +1814,7 @@ fn oracle_server_enforces_terminal_quiescence_and_cardinality_edges() {
     });
     let mut client = connect_and_read_response(address, CANARY);
     client.write_all(b"x").expect("delayed same-stream byte");
-    child_done_tx.send(()).expect("child completion signal");
+    signal_oracle_child_done(&child_done_tx);
     assert!(matches!(
         server.join().expect("oracle server thread"),
         Err("oracle request trailing bytes rejected")
@@ -1735,7 +1836,7 @@ fn oracle_server_enforces_terminal_quiescence_and_cardinality_edges() {
         )
     });
     let mut client = connect_and_read_response(address, CANARY);
-    child_done_tx.send(()).expect("child completion signal");
+    signal_oracle_child_done(&child_done_tx);
     let barrier_result = oracle_remaining_duration(
         deadline,
         Instant::now(),
@@ -2065,6 +2166,108 @@ fn oracle_child_timeout_is_primary_and_directly_reaped() {
 }
 
 #[test]
+fn oracle_kill_ok_matching_d_state_waits_instead_of_aborting_on_first_observation() {
+    let now = Instant::now();
+    let cleanup_deadline = now;
+    let d_state_deadline = now + ORACLE_D_STATE_TIMEOUT;
+    let starttime = 114922562;
+    let terminal = OwnedChildStat::Ready {
+        state: 'D',
+        starttime,
+    };
+    assert_eq!(
+        oracle_reap_progress(
+            true,
+            OracleWait::StillAlive,
+            &terminal,
+            Some(starttime),
+            now,
+            cleanup_deadline,
+            d_state_deadline,
+        ),
+        OracleReapProgress::Wait
+    );
+    assert_eq!(
+        oracle_reap_progress(
+            true,
+            OracleWait::StillAlive,
+            &terminal,
+            Some(starttime),
+            d_state_deadline,
+            cleanup_deadline,
+            d_state_deadline,
+        ),
+        OracleReapProgress::AbortUnproven
+    );
+    assert_eq!(
+        oracle_reap_progress(
+            true,
+            OracleWait::StillAlive,
+            &OwnedChildStat::Ready {
+                state: 'R',
+                starttime,
+            },
+            Some(starttime),
+            now,
+            cleanup_deadline,
+            d_state_deadline,
+        ),
+        OracleReapProgress::AbortUnproven
+    );
+    assert_eq!(
+        oracle_reap_progress(
+            true,
+            OracleWait::StillAlive,
+            &OwnedChildStat::Ready {
+                state: 'D',
+                starttime: starttime + 1,
+            },
+            Some(starttime),
+            now,
+            cleanup_deadline,
+            d_state_deadline,
+        ),
+        OracleReapProgress::AbortUnproven
+    );
+    assert_eq!(
+        oracle_reap_progress(
+            false,
+            OracleWait::StillAlive,
+            &terminal,
+            Some(starttime),
+            now,
+            cleanup_deadline,
+            d_state_deadline,
+        ),
+        OracleReapProgress::AbortUnproven
+    );
+    assert_eq!(
+        oracle_reap_progress(
+            true,
+            OracleWait::Reaped,
+            &terminal,
+            Some(starttime),
+            now,
+            cleanup_deadline,
+            d_state_deadline,
+        ),
+        OracleReapProgress::Reaped
+    );
+    assert_eq!(
+        oracle_reap_progress(
+            true,
+            OracleWait::Error,
+            &terminal,
+            Some(starttime),
+            now,
+            cleanup_deadline,
+            d_state_deadline,
+        ),
+        OracleReapProgress::AbortUnproven
+    );
+}
+
+#[test]
 fn oracle_output_diagnostics_require_proven_reap() {
     let root = temp_root("oracle-output-diagnostics");
     let stdout_path = root.join("stdout");
@@ -2319,6 +2522,12 @@ fn oracle_run_root_admission_is_bounded_before_readback() {
     fs::create_dir(&only).expect("sole run root fixture");
     assert_eq!(sole_run_root(&runs).expect("sole run root"), only);
 
+    fs::create_dir(runs.join(".node-result-cache")).expect("reserved cache dirname fixture");
+    assert_eq!(
+        sole_run_root(&runs).expect("reserved cache dirname is not a run root"),
+        only
+    );
+
     fs::create_dir(runs.join("extra")).expect("extra run root fixture");
     assert!(matches!(
         sole_run_root(&runs),
@@ -2394,7 +2603,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         run_deadline,
         "credential-run",
     );
-    let _ = child_done_tx.send(());
+    signal_oracle_child_done(&child_done_tx);
     let server_result = server.join();
 
     let child = match child_result {

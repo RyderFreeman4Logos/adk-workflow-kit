@@ -63,6 +63,8 @@ workflowctl skill test skill-dir
 
 Use `--profile` for ADK-backed execution. `--module` is the bounded pure-transform path. The sandbox is deny-by-default: profiles declare only needed capabilities, and an unauthorized capability fails before backend work. Checkpoints, events, and artifacts are stored beneath the selected workdir; replay validates a redacted replay bundle rather than contacting a provider.
 
+Durable node-result cache lives under `<workdir>/.node-result-cache/` (reserved child of the run-root base, excluded from run-root cardinality). Cache identity binds workflow/node version, `InvocationProvenance` (model, tokenizer, prompt protocol including instruction bytes, tool schema, output schema, inference, provider route, trust domain), executed node input hashes, and policy. Hits go through `FencedModel` with zero inner model calls. `node_completed.payload.cache_disposition` is `recorded`, `reused`, or `reexecuted`. Fake/offline profiles only.
+
 ## Maturity
 
 | Area | Status | Notes |

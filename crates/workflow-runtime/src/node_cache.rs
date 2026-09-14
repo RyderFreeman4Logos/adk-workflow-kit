@@ -1,0 +1,652 @@
+//! Durable, provenance-complete node-result memoization.
+
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+pub const NODE_CACHE_SCHEMA_VERSION: u16 = 1;
+static DIR_SYNCS: AtomicU64 = AtomicU64::new(0);
+
+/// Identity fields bound into a node-result cache key.
+pub struct NodeCacheKeyMaterial<'a> {
+    pub workflow_id: &'a str,
+    pub workflow_version: &'a str,
+    pub node_id: &'a str,
+    pub node_version: &'a str,
+    pub invocation_identity: &'a str,
+    pub input_artifact_hashes: &'a [String],
+    pub request_input_digest: &'a str,
+    pub policy_digest: &'a str,
+}
+
+/// Opaque content-addressed key. Run IDs and timestamps are not bound.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeCacheKey {
+    digest: String,
+    workflow_id: String,
+    workflow_version: String,
+    node_id: String,
+    node_version: String,
+    invocation_identity: String,
+    input_artifact_hashes: Vec<String>,
+    request_input_digest: String,
+    policy_digest: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeCacheKeyError {
+    EmptyIdentity,
+}
+
+/// Copies of the identities bound into a key.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CacheProvenance {
+    invocation_identity: String,
+    workflow_id: String,
+    workflow_version: String,
+    node_id: String,
+    node_version: String,
+    policy_digest: String,
+    input_artifact_hashes: Vec<String>,
+    request_input_digest: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeCacheInvalidationReason {
+    HashMismatch,
+    SchemaMismatch,
+    InvalidOutput,
+    ExplicitInvalidate,
+    Corrupt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeCacheOutcome {
+    Success,
+    Negative { reason: NodeCacheInvalidationReason },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NodeCacheEntry {
+    schema_version: u16,
+    key_digest: String,
+    payload: Value,
+    payload_sha256: String,
+    outcome: NodeCacheOutcome,
+    provenance: CacheProvenance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NodeCacheLookup {
+    Hit(Box<NodeCacheEntry>),
+    Miss,
+    Invalid { reason: NodeCacheInvalidationReason },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheDisposition {
+    Reused,
+    Recorded,
+    Reexecuted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeCacheRetention {
+    pub max_entries: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NodeCacheInspect {
+    entry_count: usize,
+    negative_entries: usize,
+    paths: Vec<(String, PathBuf)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeCacheErrorKind {
+    InvalidIdentity,
+    Io,
+    Corrupt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeCacheError {
+    kind: NodeCacheErrorKind,
+}
+
+/// Filesystem-backed node-result cache. Atomic publish, fail-closed verify.
+#[derive(Clone)]
+pub struct NodeResultCache {
+    root: PathBuf,
+}
+
+impl NodeCacheKey {
+    pub fn bind(material: NodeCacheKeyMaterial<'_>) -> Result<Self, NodeCacheKeyError> {
+        if [
+            material.workflow_id,
+            material.workflow_version,
+            material.node_id,
+            material.node_version,
+            material.invocation_identity,
+            material.request_input_digest,
+            material.policy_digest,
+        ]
+        .into_iter()
+        .any(str::is_empty)
+        {
+            return Err(NodeCacheKeyError::EmptyIdentity);
+        }
+        let mut hashes = material.input_artifact_hashes.to_vec();
+        hashes.sort();
+        let framed = [
+            frame("WORKFLOW_ID", material.workflow_id),
+            frame("WORKFLOW_VERSION", material.workflow_version),
+            frame("NODE_ID", material.node_id),
+            frame("NODE_VERSION", material.node_version),
+            frame("INVOCATION_IDENTITY", material.invocation_identity),
+            frame("INPUT_ARTIFACT_HASHES", &hashes.join("\n")),
+            frame("REQUEST_INPUT_DIGEST", material.request_input_digest),
+            frame("POLICY_DIGEST", material.policy_digest),
+        ]
+        .join("\n");
+        Ok(Self {
+            digest: digest_bytes(framed.as_bytes()),
+            workflow_id: material.workflow_id.to_owned(),
+            workflow_version: material.workflow_version.to_owned(),
+            node_id: material.node_id.to_owned(),
+            node_version: material.node_version.to_owned(),
+            invocation_identity: material.invocation_identity.to_owned(),
+            input_artifact_hashes: hashes,
+            request_input_digest: material.request_input_digest.to_owned(),
+            policy_digest: material.policy_digest.to_owned(),
+        })
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub fn invocation_identity(&self) -> &str {
+        &self.invocation_identity
+    }
+}
+
+impl CacheProvenance {
+    pub fn from_key(key: &NodeCacheKey) -> Self {
+        Self {
+            invocation_identity: key.invocation_identity.clone(),
+            workflow_id: key.workflow_id.clone(),
+            workflow_version: key.workflow_version.clone(),
+            node_id: key.node_id.clone(),
+            node_version: key.node_version.clone(),
+            policy_digest: key.policy_digest.clone(),
+            input_artifact_hashes: key.input_artifact_hashes.clone(),
+            request_input_digest: key.request_input_digest.clone(),
+        }
+    }
+
+    pub fn invocation_identity(&self) -> &str {
+        &self.invocation_identity
+    }
+}
+
+impl NodeCacheEntry {
+    pub fn success(
+        key: NodeCacheKey,
+        payload: Value,
+        provenance: CacheProvenance,
+    ) -> Result<Self, NodeCacheError> {
+        Self::new(key, payload, NodeCacheOutcome::Success, provenance)
+    }
+
+    pub fn negative(
+        key: NodeCacheKey,
+        reason: NodeCacheInvalidationReason,
+        provenance: CacheProvenance,
+    ) -> Result<Self, NodeCacheError> {
+        Self::new(
+            key,
+            Value::Null,
+            NodeCacheOutcome::Negative { reason },
+            provenance,
+        )
+    }
+
+    fn new(
+        key: NodeCacheKey,
+        payload: Value,
+        outcome: NodeCacheOutcome,
+        provenance: CacheProvenance,
+    ) -> Result<Self, NodeCacheError> {
+        let payload_sha256 = payload_digest(&payload)?;
+        Ok(Self {
+            schema_version: NODE_CACHE_SCHEMA_VERSION,
+            key_digest: key.digest,
+            payload,
+            payload_sha256,
+            outcome,
+            provenance,
+        })
+    }
+
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub fn payload(&self) -> &Value {
+        &self.payload
+    }
+
+    pub fn outcome(&self) -> &NodeCacheOutcome {
+        &self.outcome
+    }
+
+    pub fn provenance(&self) -> &CacheProvenance {
+        &self.provenance
+    }
+}
+
+impl CacheDisposition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reused => "reused",
+            Self::Recorded => "recorded",
+            Self::Reexecuted => "reexecuted",
+        }
+    }
+}
+
+/// Test seam: successful directory fsyncs since the last reset.
+pub fn node_cache_dir_syncs() -> u64 {
+    DIR_SYNCS.load(Ordering::Relaxed)
+}
+
+/// Test seam: clear the directory-fsync counter.
+pub fn reset_node_cache_dir_syncs() {
+    DIR_SYNCS.store(0, Ordering::Relaxed);
+}
+
+impl NodeCacheInspect {
+    pub const fn entry_count(&self) -> usize {
+        self.entry_count
+    }
+
+    pub const fn negative_entries(&self) -> usize {
+        self.negative_entries
+    }
+
+    pub fn entry_path(&self, key: &NodeCacheKey) -> Option<PathBuf> {
+        self.paths
+            .iter()
+            .find(|(digest, _)| digest == &key.digest)
+            .map(|(_, path)| path.clone())
+    }
+}
+
+impl NodeCacheError {
+    const fn new(kind: NodeCacheErrorKind) -> Self {
+        Self { kind }
+    }
+
+    pub const fn kind(self) -> NodeCacheErrorKind {
+        self.kind
+    }
+}
+
+impl NodeResultCache {
+    pub fn open(root: impl AsRef<Path>) -> Result<Self, NodeCacheError> {
+        let root = root.as_ref().to_path_buf();
+        let missing_root = !root.exists();
+        let entries = root.join("entries");
+        fs::create_dir_all(&entries).map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+        verified_entries_dir(&root)?;
+        sync_dir(&entries)?;
+        sync_dir(&root)?;
+        sync_created_parent(&root, missing_root)?;
+        Ok(Self { root })
+    }
+
+    pub fn put(&self, entry: NodeCacheEntry) -> Result<(), NodeCacheError> {
+        let bytes = serde_json::to_vec(&entry)
+            .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Corrupt))?;
+        let final_path = self.path_for(&entry.key_digest)?;
+        let tmp = self.create_tmp(&entry.key_digest, &bytes)?;
+        let published = self.publish(&tmp, &final_path, &bytes);
+        let _ = fs::remove_file(&tmp);
+        published
+    }
+
+    pub fn lookup(&self, key: &NodeCacheKey) -> Result<NodeCacheLookup, NodeCacheError> {
+        let path = self.path_for(&key.digest)?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(NodeCacheLookup::Miss);
+            }
+            Err(_) => return Err(NodeCacheError::new(NodeCacheErrorKind::Io)),
+        };
+        Ok(verify_entry(&bytes, Some(&key.digest)))
+    }
+
+    pub fn inspect(&self) -> Result<NodeCacheInspect, NodeCacheError> {
+        let mut paths = Vec::new();
+        let mut negative_entries = 0;
+        let entries = fs::read_dir(self.entries_dir()?)
+            .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+        for entry in entries {
+            let entry = entry.map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            if let NodeCacheLookup::Hit(cached) = verify_entry(&bytes, None) {
+                if matches!(cached.outcome(), NodeCacheOutcome::Negative { .. }) {
+                    negative_entries += 1;
+                }
+                paths.push((cached.key_digest, path));
+            }
+        }
+        paths.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(NodeCacheInspect {
+            entry_count: paths.len(),
+            negative_entries,
+            paths,
+        })
+    }
+
+    pub fn invalidate(
+        &self,
+        key: &NodeCacheKey,
+        _reason: NodeCacheInvalidationReason,
+    ) -> Result<(), NodeCacheError> {
+        match fs::remove_file(self.path_for(&key.digest)?) {
+            Ok(()) => self.sync_entries(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => self.sync_entries(),
+            Err(_) => Err(NodeCacheError::new(NodeCacheErrorKind::Io)),
+        }
+    }
+
+    pub fn export(&self) -> Result<Vec<u8>, NodeCacheError> {
+        let inspect = self.inspect()?;
+        let mut entries = Vec::new();
+        for (_, path) in inspect.paths {
+            let bytes = fs::read(&path).map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+            if let NodeCacheLookup::Hit(entry) = verify_entry(&bytes, None) {
+                entries.push(entry);
+            }
+        }
+        serde_json::to_vec(&entries).map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Corrupt))
+    }
+
+    pub fn import(&self, bytes: &[u8]) -> Result<usize, NodeCacheError> {
+        let entries: Vec<NodeCacheEntry> = serde_json::from_slice(bytes)
+            .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Corrupt))?;
+        let count = entries.len();
+        for entry in entries {
+            if !matches!(
+                verify_entry(
+                    &serde_json::to_vec(&entry)
+                        .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Corrupt))?,
+                    None
+                ),
+                NodeCacheLookup::Hit(_)
+            ) {
+                return Err(NodeCacheError::new(NodeCacheErrorKind::Corrupt));
+            }
+            self.put(entry)?;
+        }
+        Ok(count)
+    }
+
+    pub fn gc(&self, retention: NodeCacheRetention) -> Result<usize, NodeCacheError> {
+        let Some(max) = retention.max_entries else {
+            return Ok(0);
+        };
+        let inspect = self.inspect()?;
+        if inspect.entry_count <= max {
+            return Ok(0);
+        }
+        let drop = inspect.entry_count - max;
+        for (_, path) in inspect.paths.into_iter().take(drop) {
+            fs::remove_file(path).map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+        }
+        self.sync_entries()?;
+        Ok(drop)
+    }
+
+    fn path_for(&self, digest: &str) -> Result<PathBuf, NodeCacheError> {
+        let leaf = key_digest_leaf(digest)
+            .ok_or_else(|| NodeCacheError::new(NodeCacheErrorKind::InvalidIdentity))?;
+        Ok(self.entries_dir()?.join(leaf))
+    }
+
+    fn entries_dir(&self) -> Result<PathBuf, NodeCacheError> {
+        verified_entries_dir(&self.root)
+    }
+
+    fn sync_entries(&self) -> Result<(), NodeCacheError> {
+        sync_dir(&self.entries_dir()?)
+    }
+
+    fn create_tmp(&self, digest: &str, bytes: &[u8]) -> Result<PathBuf, NodeCacheError> {
+        let stem = key_digest_leaf(digest)
+            .ok_or_else(|| NodeCacheError::new(NodeCacheErrorKind::InvalidIdentity))?;
+        for _ in 0..8 {
+            let tmp = self.root.join(format!(
+                ".tmp-{}-{}-{}",
+                stem,
+                std::process::id(),
+                tmp_token()
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+            {
+                Ok(mut file) => {
+                    if file
+                        .write_all(bytes)
+                        .and_then(|()| file.sync_all())
+                        .is_err()
+                    {
+                        let _ = fs::remove_file(&tmp);
+                        return Err(NodeCacheError::new(NodeCacheErrorKind::Io));
+                    }
+                    return Ok(tmp);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(NodeCacheError::new(NodeCacheErrorKind::Io)),
+            }
+        }
+        Err(NodeCacheError::new(NodeCacheErrorKind::Io))
+    }
+
+    fn publish(&self, tmp: &Path, final_path: &Path, bytes: &[u8]) -> Result<(), NodeCacheError> {
+        match fs::hard_link(tmp, final_path) {
+            Ok(()) => self.sync_entries(),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let existing = fs::read(final_path)
+                    .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+                if existing == bytes {
+                    return self.sync_entries();
+                }
+                fs::remove_file(final_path)
+                    .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+                self.sync_entries()?;
+                match fs::hard_link(tmp, final_path) {
+                    Ok(()) => self.sync_entries(),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        let existing = fs::read(final_path)
+                            .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+                        if existing == bytes {
+                            self.sync_entries()
+                        } else {
+                            Err(NodeCacheError::new(NodeCacheErrorKind::Corrupt))
+                        }
+                    }
+                    Err(_) => Err(NodeCacheError::new(NodeCacheErrorKind::Io)),
+                }
+            }
+            Err(_) => Err(NodeCacheError::new(NodeCacheErrorKind::Io)),
+        }
+    }
+}
+
+fn sync_dir(path: &Path) -> Result<(), NodeCacheError> {
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+    DIR_SYNCS.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+fn sync_created_parent(root: &Path, created: bool) -> Result<(), NodeCacheError> {
+    match (created, root.parent()) {
+        (true, Some(parent)) => sync_dir(parent),
+        _ => Ok(()),
+    }
+}
+
+fn tmp_token() -> String {
+    let mut bytes = [0_u8; 8];
+    match File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut bytes)) {
+        Ok(()) => {}
+        Err(_) => {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or(0);
+            bytes = (u64::from(std::process::id()) ^ nanos).to_le_bytes();
+        }
+    }
+    bytes.iter().fold(String::new(), |mut token, byte| {
+        token.push_str(&format!("{byte:02x}"));
+        token
+    })
+}
+
+fn verify_entry(bytes: &[u8], expected_digest: Option<&str>) -> NodeCacheLookup {
+    let Ok(entry) = serde_json::from_slice::<NodeCacheEntry>(bytes) else {
+        return NodeCacheLookup::Invalid {
+            reason: NodeCacheInvalidationReason::Corrupt,
+        };
+    };
+    if entry.schema_version != NODE_CACHE_SCHEMA_VERSION {
+        return NodeCacheLookup::Invalid {
+            reason: NodeCacheInvalidationReason::SchemaMismatch,
+        };
+    }
+    let Ok(digest) = payload_digest(&entry.payload) else {
+        return NodeCacheLookup::Invalid {
+            reason: NodeCacheInvalidationReason::HashMismatch,
+        };
+    };
+    if digest != entry.payload_sha256 {
+        return NodeCacheLookup::Invalid {
+            reason: NodeCacheInvalidationReason::HashMismatch,
+        };
+    }
+    if key_digest_leaf(&entry.key_digest).is_none() {
+        return NodeCacheLookup::Invalid {
+            reason: NodeCacheInvalidationReason::HashMismatch,
+        };
+    }
+    let Ok(reconstructed) = key_from_provenance(&entry.provenance) else {
+        return NodeCacheLookup::Invalid {
+            reason: NodeCacheInvalidationReason::HashMismatch,
+        };
+    };
+    if reconstructed.digest() != entry.key_digest {
+        return NodeCacheLookup::Invalid {
+            reason: NodeCacheInvalidationReason::HashMismatch,
+        };
+    }
+    if expected_digest.is_some_and(|digest| digest != entry.key_digest) {
+        return NodeCacheLookup::Invalid {
+            reason: NodeCacheInvalidationReason::HashMismatch,
+        };
+    }
+    NodeCacheLookup::Hit(Box::new(entry))
+}
+
+fn key_from_provenance(provenance: &CacheProvenance) -> Result<NodeCacheKey, NodeCacheKeyError> {
+    NodeCacheKey::bind(NodeCacheKeyMaterial {
+        workflow_id: &provenance.workflow_id,
+        workflow_version: &provenance.workflow_version,
+        node_id: &provenance.node_id,
+        node_version: &provenance.node_version,
+        invocation_identity: &provenance.invocation_identity,
+        input_artifact_hashes: &provenance.input_artifact_hashes,
+        request_input_digest: &provenance.request_input_digest,
+        policy_digest: &provenance.policy_digest,
+    })
+}
+
+fn verified_entries_dir(root: &Path) -> Result<PathBuf, NodeCacheError> {
+    let entries = root.join("entries");
+    let metadata =
+        fs::symlink_metadata(&entries).map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(NodeCacheError::new(NodeCacheErrorKind::Io));
+    }
+    Ok(entries)
+}
+
+fn payload_digest(payload: &Value) -> Result<String, NodeCacheError> {
+    let encoded = serde_json::to_vec(payload)
+        .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Corrupt))?;
+    Ok(digest_bytes(&encoded))
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn frame(label: &str, value: &str) -> String {
+    format!("{label}_BYTES:{}\n{value}", value.len())
+}
+
+fn key_digest_leaf(digest: &str) -> Option<String> {
+    let hex = digest.strip_prefix("sha256:")?;
+    (hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+    .then(|| format!("sha256-{hex}"))
+}
+
+impl std::fmt::Display for NodeCacheKeyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("node cache key identity is empty")
+    }
+}
+
+impl std::error::Error for NodeCacheKeyError {}
+
+impl std::fmt::Display for NodeCacheError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self.kind {
+            NodeCacheErrorKind::InvalidIdentity => "node cache identity is invalid",
+            NodeCacheErrorKind::Io => "node cache storage failed",
+            NodeCacheErrorKind::Corrupt => "node cache entry is corrupt",
+        })
+    }
+}
+
+impl std::error::Error for NodeCacheError {}

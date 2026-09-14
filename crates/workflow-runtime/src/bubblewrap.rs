@@ -370,7 +370,12 @@ impl LinuxBubblewrapBackend {
         let stdout_pipe = match child.stdout.take() {
             Some(pipe) => pipe,
             None => {
-                terminate_and_reap(&mut child, process_group);
+                let _ = terminate_and_reap(
+                    &mut child,
+                    process_group,
+                    child_starttime(process_group),
+                    request.wall_time,
+                );
                 return Err(BubblewrapError::Run {
                     source: io::Error::other("bubblewrap stdout pipe was not captured"),
                 });
@@ -379,7 +384,12 @@ impl LinuxBubblewrapBackend {
         let stderr_pipe = match child.stderr.take() {
             Some(pipe) => pipe,
             None => {
-                terminate_and_reap(&mut child, process_group);
+                let _ = terminate_and_reap(
+                    &mut child,
+                    process_group,
+                    child_starttime(process_group),
+                    request.wall_time,
+                );
                 return Err(BubblewrapError::Run {
                     source: io::Error::other("bubblewrap stderr pipe was not captured"),
                 });
@@ -392,7 +402,12 @@ impl LinuxBubblewrapBackend {
             Some(bytes) => match child.stdin.take() {
                 Some(pipe) => Some(spawn_stdin_writer(pipe, bytes.clone())),
                 None => {
-                    terminate_and_reap(&mut child, process_group);
+                    let _ = terminate_and_reap(
+                        &mut child,
+                        process_group,
+                        child_starttime(process_group),
+                        request.wall_time,
+                    );
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
                     return Err(BubblewrapError::Run {
@@ -403,38 +418,63 @@ impl LinuxBubblewrapBackend {
             None => None,
         };
         if let Err(source) = publish_host_pid_witness(request, process_group) {
-            terminate_and_reap(&mut child, process_group);
+            let _ = terminate_and_reap(
+                &mut child,
+                process_group,
+                child_starttime(process_group),
+                request.wall_time,
+            );
             join_stdin_writer(stdin_writer);
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(BubblewrapError::Run { source });
         }
 
-        let deadline = request.wall_time.map(|limit| Instant::now() + limit);
-        let status = loop {
+        let recorded_starttime = child_starttime(process_group);
+        let wall_deadline = request.wall_time.map(|limit| Instant::now() + limit);
+        let mut d_state_deadline = None;
+        let outcome = loop {
             match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None)
-                    if output_budget
+                Ok(reaped) => match wait_progress(
+                    reaped,
+                    matching_group_uninterruptible_io(process_group, recorded_starttime),
+                    Instant::now(),
+                    wall_deadline,
+                    &mut d_state_deadline,
+                    output_budget
                         .as_ref()
-                        .is_some_and(|budget| budget.exceeded()) =>
-                {
-                    terminate_and_reap(&mut child, process_group);
-                    break timed_out_status();
-                }
-                Ok(None) if deadline.is_some_and(|limit| Instant::now() >= limit) => {
-                    terminate_and_reap(&mut child, process_group);
-                    break timed_out_status();
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                        .is_some_and(|budget| budget.exceeded()),
+                    request.wall_time,
+                ) {
+                    WaitProgress::Reaped(status) => break ReapOutcome::Reaped(status),
+                    WaitProgress::Poll => thread::sleep(Duration::from_millis(10)),
+                    WaitProgress::Kill => {
+                        break terminate_and_reap(
+                            &mut child,
+                            process_group,
+                            recorded_starttime,
+                            request.wall_time,
+                        );
+                    }
+                },
                 Err(source) => {
-                    terminate_and_reap(&mut child, process_group);
+                    let _ = terminate_and_reap(
+                        &mut child,
+                        process_group,
+                        recorded_starttime,
+                        request.wall_time,
+                    );
                     join_stdin_writer(stdin_writer);
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
                     return Err(BubblewrapError::Run { source });
                 }
             }
+        };
+        let exit_code = receipt_exit_code(outcome);
+        let status = match outcome {
+            ReapOutcome::Reaped(status) => status,
+            ReapOutcome::Unreaped => timed_out_status(),
         };
 
         join_stdin_writer(stdin_writer);
@@ -447,6 +487,7 @@ impl LinuxBubblewrapBackend {
 
         Ok(BubblewrapReceipt {
             status,
+            exit_code,
             stdout,
             stderr,
             staged_output,
@@ -540,9 +581,231 @@ fn join_pipe_reader(reader: JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, 
     result.map_err(|source| BubblewrapError::Run { source })
 }
 
-fn terminate_and_reap(child: &mut std::process::Child, process_group: u32) {
+const D_STATE_REAP_TIMEOUT: Duration = Duration::from_secs(30);
+const CLEANUP_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReapOutcome {
+    Reaped(ExitStatus),
+    Unreaped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitProgress {
+    Reaped(ExitStatus),
+    Poll,
+    Kill,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildStat {
+    Ready {
+        state: char,
+        ppid: u32,
+        pgid: u32,
+        starttime: u64,
+    },
+    Other,
+}
+
+fn child_stat(pid: u32) -> ChildStat {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .map_or(ChildStat::Other, |contents| parse_child_stat(&contents))
+}
+
+fn parse_child_stat(contents: &str) -> ChildStat {
+    let Some(fields) = contents.rsplit_once(") ").map(|(_, fields)| fields) else {
+        return ChildStat::Other;
+    };
+    let mut fields = fields.split_whitespace();
+    let Some(state) = fields.next().and_then(|field| {
+        let mut chars = field.chars();
+        match (chars.next(), chars.next()) {
+            (Some(state), None) if state.is_ascii_alphabetic() => Some(state),
+            _ => None,
+        }
+    }) else {
+        return ChildStat::Other;
+    };
+    let Some(ppid) = fields.next().and_then(|field| field.parse().ok()) else {
+        return ChildStat::Other;
+    };
+    let Some(pgid) = fields.next().and_then(|field| field.parse().ok()) else {
+        return ChildStat::Other;
+    };
+    let Some(starttime) = fields.nth(16).and_then(|field| field.parse().ok()) else {
+        return ChildStat::Other;
+    };
+    ChildStat::Ready {
+        state,
+        ppid,
+        pgid,
+        starttime,
+    }
+}
+
+fn child_starttime(pid: u32) -> Option<u64> {
+    match child_stat(pid) {
+        ChildStat::Ready { starttime, .. } => Some(starttime),
+        ChildStat::Other => None,
+    }
+}
+
+fn matching_uninterruptible_io_stat(stat: ChildStat, recorded_starttime: Option<u64>) -> bool {
+    matches!(
+        (stat, recorded_starttime),
+        (
+            ChildStat::Ready {
+                state: 'D',
+                starttime,
+                ..
+            },
+            Some(recorded)
+        ) if starttime == recorded
+    )
+}
+
+fn matching_uninterruptible_io(pid: u32, recorded_starttime: Option<u64>) -> bool {
+    matching_uninterruptible_io_stat(child_stat(pid), recorded_starttime)
+}
+
+fn matching_group_uninterruptible_io_stats(
+    process_group: u32,
+    recorded_starttime: Option<u64>,
+    stats: impl IntoIterator<Item = (u32, ChildStat)>,
+) -> bool {
+    let stats = stats.into_iter().collect::<Vec<_>>();
+    let ppid_by_pid = stats
+        .iter()
+        .filter_map(|(pid, stat)| match stat {
+            ChildStat::Ready { ppid, .. } => Some((*pid, *ppid)),
+            ChildStat::Other => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    stats.iter().any(|(pid, stat)| match stat {
+        ChildStat::Ready {
+            state: 'D',
+            pgid,
+            starttime,
+            ..
+        } if recorded_starttime.is_none_or(|recorded| *starttime >= recorded) => {
+            *pid == process_group
+                || *pgid == process_group
+                || owned_descendant(*pid, process_group, &ppid_by_pid)
+        }
+        _ => false,
+    })
+}
+
+fn owned_descendant(mut pid: u32, process_group: u32, ppid_by_pid: &BTreeMap<u32, u32>) -> bool {
+    for _ in 0..32 {
+        let Some(&ppid) = ppid_by_pid.get(&pid) else {
+            return false;
+        };
+        if ppid == process_group {
+            return true;
+        }
+        if ppid <= 1 || ppid == pid {
+            return false;
+        }
+        pid = ppid;
+    }
+    false
+}
+
+fn matching_group_uninterruptible_io(process_group: u32, recorded_starttime: Option<u64>) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return matching_uninterruptible_io(process_group, recorded_starttime);
+    };
+    matching_group_uninterruptible_io_stats(
+        process_group,
+        recorded_starttime,
+        entries.filter_map(|entry| {
+            let pid = entry.ok()?.file_name().to_str()?.parse().ok()?;
+            Some((pid, child_stat(pid)))
+        }),
+    )
+}
+
+fn d_state_grace(wall_time: Option<Duration>) -> Duration {
+    match wall_time {
+        Some(limit) if limit < D_STATE_REAP_TIMEOUT => limit.max(Duration::from_millis(10)),
+        _ => D_STATE_REAP_TIMEOUT,
+    }
+}
+
+fn wait_progress(
+    reaped: Option<ExitStatus>,
+    matching_d: bool,
+    now: Instant,
+    wall_deadline: Option<Instant>,
+    d_state_deadline: &mut Option<Instant>,
+    output_exceeded: bool,
+    wall_time: Option<Duration>,
+) -> WaitProgress {
+    if let Some(status) = reaped {
+        return WaitProgress::Reaped(status);
+    }
+    let kill_requested = output_exceeded || wall_deadline.is_some_and(|limit| now >= limit);
+    if matching_d && kill_requested {
+        let deadline = *d_state_deadline.get_or_insert(now + d_state_grace(wall_time));
+        if now < deadline {
+            return WaitProgress::Poll;
+        }
+        return WaitProgress::Kill;
+    }
+    if kill_requested {
+        return WaitProgress::Kill;
+    }
+    WaitProgress::Poll
+}
+
+fn conventional_exit_code(status: ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+}
+
+fn receipt_exit_code(outcome: ReapOutcome) -> Option<i32> {
+    match outcome {
+        ReapOutcome::Reaped(status) => conventional_exit_code(status),
+        ReapOutcome::Unreaped => None,
+    }
+}
+
+fn terminate_and_reap(
+    child: &mut std::process::Child,
+    process_group: u32,
+    recorded_starttime: Option<u64>,
+    wall_time: Option<Duration>,
+) -> ReapOutcome {
     let _ = kill_process_group(process_group);
-    let _ = child.wait();
+    let cleanup_deadline = Instant::now() + CLEANUP_REAP_TIMEOUT;
+    let d_state_deadline = Instant::now() + d_state_grace(wall_time);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return ReapOutcome::Reaped(status),
+            Ok(None) | Err(_) => {
+                let now = Instant::now();
+                let deadline =
+                    if matching_group_uninterruptible_io(process_group, recorded_starttime) {
+                        d_state_deadline
+                    } else {
+                        cleanup_deadline
+                    };
+                if now >= deadline {
+                    return ReapOutcome::Unreaped;
+                }
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_millis(10)),
+                );
+            }
+        }
+    }
 }
 
 fn kill_process_group(process_group: u32) -> io::Result<()> {
@@ -721,6 +984,7 @@ impl std::error::Error for BubblewrapError {
 #[derive(Debug)]
 pub struct BubblewrapReceipt {
     status: ExitStatus,
+    exit_code: Option<i32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     staged_output: Option<StagedOutput>,
@@ -734,7 +998,7 @@ impl BubblewrapReceipt {
 
     /// Returns the conventional process exit code, including `128 + signal` from bubblewrap.
     pub fn exit_code(&self) -> Option<i32> {
-        self.status.code()
+        self.exit_code
     }
 
     /// Returns the raw stdout captured from the sandboxed command.
@@ -753,5 +1017,395 @@ impl BubblewrapReceipt {
             staged_output.commit()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn matching_d_state_after_sigkill_maps_to_exit_137() {
+        let starttime = 114_922_562;
+        assert!(matching_uninterruptible_io_stat(
+            ChildStat::Ready {
+                state: 'D',
+                ppid: 1,
+                pgid: 7,
+                starttime,
+            },
+            Some(starttime),
+        ));
+        assert_eq!(
+            receipt_exit_code(ReapOutcome::Reaped(ExitStatus::from_raw(9))),
+            Some(137)
+        );
+    }
+
+    #[test]
+    fn unreaped_child_after_hard_timeout_is_none() {
+        assert_eq!(receipt_exit_code(ReapOutcome::Unreaped), None);
+    }
+
+    #[test]
+    fn runnable_matching_pid_is_not_uninterruptible_io() {
+        assert!(!matching_uninterruptible_io_stat(
+            ChildStat::Ready {
+                state: 'R',
+                ppid: 1,
+                pgid: 1,
+                starttime: 1,
+            },
+            Some(1),
+        ));
+    }
+
+    #[test]
+    fn parse_stat_reads_state_ppid_pgid_and_starttime() {
+        let stat = "42 (python3) D 7 42 42 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 114922565 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+        assert_eq!(
+            parse_child_stat(stat),
+            ChildStat::Ready {
+                state: 'D',
+                ppid: 7,
+                pgid: 42,
+                starttime: 114_922_565,
+            }
+        );
+    }
+
+    #[test]
+    fn matching_group_d_state_during_script_fsync_is_owned() {
+        let starttime = 114_922_562;
+        assert!(matching_group_uninterruptible_io_stats(
+            7,
+            Some(starttime),
+            [
+                (
+                    7,
+                    ChildStat::Ready {
+                        state: 'S',
+                        ppid: 1,
+                        pgid: 7,
+                        starttime,
+                    }
+                ),
+                (
+                    42,
+                    ChildStat::Ready {
+                        state: 'D',
+                        ppid: 7,
+                        pgid: 42,
+                        starttime: starttime + 3,
+                    }
+                ),
+            ],
+        ));
+        assert!(!matching_group_uninterruptible_io_stats(
+            7,
+            Some(starttime),
+            [
+                (
+                    7,
+                    ChildStat::Ready {
+                        state: 'S',
+                        ppid: 1,
+                        pgid: 7,
+                        starttime,
+                    }
+                ),
+                (
+                    99,
+                    ChildStat::Ready {
+                        state: 'D',
+                        ppid: 1,
+                        pgid: 99,
+                        starttime: starttime + 3,
+                    }
+                ),
+            ],
+        ));
+    }
+
+    #[test]
+    fn matching_d_state_does_not_timeout_kill_before_hard_bound() {
+        let now = Instant::now();
+        let wall_deadline = Some(now);
+        let mut d_state_deadline = Some(now + D_STATE_REAP_TIMEOUT);
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                now,
+                wall_deadline,
+                &mut d_state_deadline,
+                false,
+                None,
+            ),
+            WaitProgress::Poll
+        );
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                now + D_STATE_REAP_TIMEOUT,
+                wall_deadline,
+                &mut d_state_deadline,
+                false,
+                None,
+            ),
+            WaitProgress::Kill
+        );
+        let mut no_match_deadline = Some(now + D_STATE_REAP_TIMEOUT);
+        assert_eq!(
+            wait_progress(
+                None,
+                false,
+                now,
+                wall_deadline,
+                &mut no_match_deadline,
+                false,
+                None,
+            ),
+            WaitProgress::Kill
+        );
+    }
+
+    #[test]
+    fn matching_d_state_does_not_output_timeout_kill_before_hard_bound() {
+        let now = Instant::now();
+        let mut d_state_deadline = Some(now + D_STATE_REAP_TIMEOUT);
+        assert_eq!(
+            wait_progress(None, true, now, None, &mut d_state_deadline, true, None),
+            WaitProgress::Poll
+        );
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                now + D_STATE_REAP_TIMEOUT,
+                None,
+                &mut d_state_deadline,
+                true,
+                None,
+            ),
+            WaitProgress::Kill
+        );
+        let mut no_match_deadline = Some(now + D_STATE_REAP_TIMEOUT);
+        assert_eq!(
+            wait_progress(None, false, now, None, &mut no_match_deadline, true, None),
+            WaitProgress::Kill
+        );
+    }
+
+    #[test]
+    fn matching_d_state_self_reap_is_not_killed() {
+        let now = Instant::now();
+        let status = ExitStatus::from_raw(9);
+        let mut d_state_deadline = Some(now + D_STATE_REAP_TIMEOUT);
+        assert_eq!(
+            wait_progress(
+                Some(status),
+                true,
+                now,
+                Some(now),
+                &mut d_state_deadline,
+                true,
+                None,
+            ),
+            WaitProgress::Reaped(status)
+        );
+    }
+
+    #[test]
+    fn production_order_wall_after_30s_matching_d_does_not_kill_immediately() {
+        let wait_started = Instant::now();
+        let wall_deadline = Some(wait_started + Duration::from_secs(60));
+        let mut d_state_deadline = None;
+        let wall_now = wait_started + Duration::from_secs(60);
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                wall_now,
+                wall_deadline,
+                &mut d_state_deadline,
+                false,
+                Some(Duration::from_secs(60)),
+            ),
+            WaitProgress::Poll
+        );
+        assert_eq!(d_state_deadline, Some(wall_now + D_STATE_REAP_TIMEOUT));
+        let later = wall_now + Duration::from_secs(10);
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                later,
+                wall_deadline,
+                &mut d_state_deadline,
+                false,
+                Some(Duration::from_secs(60)),
+            ),
+            WaitProgress::Poll
+        );
+        assert_eq!(d_state_deadline, Some(wall_now + D_STATE_REAP_TIMEOUT));
+    }
+
+    #[test]
+    fn production_order_output_after_30s_matching_d_does_not_kill_immediately() {
+        let wait_started = Instant::now();
+        let mut d_state_deadline = None;
+        let output_now = wait_started + Duration::from_secs(45);
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                output_now,
+                None,
+                &mut d_state_deadline,
+                true,
+                None
+            ),
+            WaitProgress::Poll
+        );
+        assert_eq!(d_state_deadline, Some(output_now + D_STATE_REAP_TIMEOUT));
+        let later = output_now + Duration::from_secs(10);
+        assert_eq!(
+            wait_progress(None, true, later, None, &mut d_state_deadline, true, None),
+            WaitProgress::Poll
+        );
+        assert_eq!(d_state_deadline, Some(output_now + D_STATE_REAP_TIMEOUT));
+    }
+
+    #[test]
+    fn production_order_matching_d_self_reaps_before_grace() {
+        let wait_started = Instant::now();
+        let wall_deadline = Some(wait_started + Duration::from_secs(60));
+        let mut d_state_deadline = None;
+        let wall_now = wait_started + Duration::from_secs(60);
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                wall_now,
+                wall_deadline,
+                &mut d_state_deadline,
+                false,
+                Some(Duration::from_secs(60)),
+            ),
+            WaitProgress::Poll
+        );
+        let status = ExitStatus::from_raw(0);
+        assert_eq!(
+            wait_progress(
+                Some(status),
+                true,
+                wall_now + Duration::from_secs(1),
+                wall_deadline,
+                &mut d_state_deadline,
+                false,
+                Some(Duration::from_secs(60)),
+            ),
+            WaitProgress::Reaped(status)
+        );
+    }
+
+    #[test]
+    fn production_order_matching_d_kills_after_grace() {
+        let wait_started = Instant::now();
+        let wall_deadline = Some(wait_started + Duration::from_secs(60));
+        let mut d_state_deadline = None;
+        let wall_now = wait_started + Duration::from_secs(60);
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                wall_now,
+                wall_deadline,
+                &mut d_state_deadline,
+                false,
+                Some(Duration::from_secs(60)),
+            ),
+            WaitProgress::Poll
+        );
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                wall_now + D_STATE_REAP_TIMEOUT,
+                wall_deadline,
+                &mut d_state_deadline,
+                false,
+                Some(Duration::from_secs(60)),
+            ),
+            WaitProgress::Kill
+        );
+        let mut output_deadline = None;
+        let output_now = wait_started + Duration::from_secs(45);
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                output_now,
+                None,
+                &mut output_deadline,
+                true,
+                None
+            ),
+            WaitProgress::Poll
+        );
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                output_now + D_STATE_REAP_TIMEOUT,
+                None,
+                &mut output_deadline,
+                true,
+                None,
+            ),
+            WaitProgress::Kill
+        );
+    }
+
+    #[test]
+    fn short_expired_wall_matching_d_starts_grace_without_full_30s() {
+        let wait_started = Instant::now();
+        let wall_deadline = Some(wait_started + Duration::from_millis(500));
+        let mut d_state_deadline = None;
+        let wall_now = wait_started + Duration::from_millis(500);
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                wall_now,
+                wall_deadline,
+                &mut d_state_deadline,
+                false,
+                Some(Duration::from_millis(500)),
+            ),
+            WaitProgress::Poll
+        );
+        let deadline = d_state_deadline.expect("matching-D grace starts on first observation");
+        let grace = deadline.saturating_duration_since(wall_now);
+        assert!(
+            grace < Duration::from_secs(5),
+            "short wall must not stack a 30s D-state grace; grace={grace:?}"
+        );
+        assert!(grace > Duration::ZERO, "grace must be in the future");
+        assert_eq!(
+            wait_progress(
+                None,
+                true,
+                deadline,
+                wall_deadline,
+                &mut d_state_deadline,
+                false,
+                Some(Duration::from_millis(500)),
+            ),
+            WaitProgress::Kill
+        );
     }
 }

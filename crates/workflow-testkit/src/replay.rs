@@ -2,7 +2,7 @@ use std::{collections::HashSet, fmt};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use workflow_runtime::{RunStatus, SandboxCapability};
+use workflow_runtime::{CacheDisposition, RunStatus, SandboxCapability};
 
 /// A validated offline replay document that cannot dispatch work.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +80,8 @@ pub enum ReplayEvent {
     NodeCompleted {
         /// The stable node identifier.
         node_id: String,
+        /// Recorded cache reuse, first write, or recompute. Absent on older traces.
+        cache_disposition: Option<String>,
     },
     /// A model request and response identified by declared fixture digests.
     ModelExchange {
@@ -140,7 +142,14 @@ impl ReplayEvent {
     fn from_wire(event: WireEvent) -> Result<Self, ReplayError> {
         Ok(match event {
             WireEvent::NodeStarted { node_id } => Self::NodeStarted { node_id },
-            WireEvent::NodeCompleted { node_id } => Self::NodeCompleted { node_id },
+            WireEvent::NodeCompleted {
+                node_id,
+                cache_disposition,
+            } => Self::NodeCompleted {
+                node_id,
+                cache_disposition: cache_disposition
+                    .map(|disposition| disposition.as_str().to_owned()),
+            },
             WireEvent::ModelExchange {
                 node_id,
                 model_id,
@@ -337,6 +346,8 @@ enum WireEvent {
     },
     NodeCompleted {
         node_id: String,
+        #[serde(default)]
+        cache_disposition: Option<CacheDisposition>,
     },
     ModelExchange {
         node_id: String,
@@ -383,7 +394,10 @@ fn validate_required(bundle: &WireBundle) -> Result<(), ReplayError> {
     }
     for event in &bundle.events {
         match event {
-            WireEvent::NodeStarted { node_id } | WireEvent::NodeCompleted { node_id } => {
+            WireEvent::NodeStarted { node_id } => {
+                validate_identifier(node_id)?;
+            }
+            WireEvent::NodeCompleted { node_id, .. } => {
                 validate_identifier(node_id)?;
             }
             WireEvent::ModelExchange {

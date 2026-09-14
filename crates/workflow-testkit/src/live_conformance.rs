@@ -4,8 +4,9 @@
 //! without touching a profile, network, or credential handle.
 
 use std::fs;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -216,6 +217,14 @@ fn fail_closed(
     finish(workdir, ConformanceDisposition::Fail, metrics)
 }
 
+fn run_wait_succeeded(status: &ExitStatus, receipt: &Value) -> bool {
+    receipt["status"] == "succeeded" && (status.success() || sigkill_reap_wait(status))
+}
+
+fn sigkill_reap_wait(status: &ExitStatus) -> bool {
+    status.signal() == Some(9) || status.code() == Some(137)
+}
+
 fn classify(
     output: std::io::Result<std::process::Output>,
     workdir: &Path,
@@ -230,7 +239,7 @@ fn classify(
         .get("run_root")
         .and_then(Value::as_str)
         .map(PathBuf::from);
-    if !output.status.success() || receipt["status"] != "succeeded" {
+    if !run_wait_succeeded(&output.status, &receipt) {
         return fail_closed(
             workdir,
             started,
@@ -378,9 +387,59 @@ fn event_node_ids(run_root: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Output;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture(PathBuf);
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_root(prefix: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).expect("temp root");
+        path
+    }
+
+    fn classify_wait(
+        status: ExitStatus,
+        receipt_status: &str,
+        nodes: &[&str],
+    ) -> (ConformanceReport, Fixture) {
+        let workdir = unique_root("m3-07-classify");
+        let run_root = workdir.join("run");
+        fs::create_dir(&run_root).expect("run root");
+        let events = nodes
+            .iter()
+            .map(|node| format!(r#"{{"kind":"node_completed","node_id":"{node}"}}"#))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(run_root.join("events.jsonl"), events).expect("events");
+        let stdout = serde_json::to_vec(&serde_json::json!({
+            "status": receipt_status,
+            "run_root": run_root,
+        }))
+        .expect("receipt");
+        let report = classify(
+            Ok(Output {
+                status,
+                stdout,
+                stderr: Vec::new(),
+            }),
+            &workdir,
+            Instant::now(),
+        );
+        (report, Fixture(workdir))
+    }
 
     fn review_revisions_for(events: &str) -> u64 {
         let root = std::env::temp_dir().join(format!(
@@ -432,5 +491,29 @@ mod tests {
         assert_eq!(review_revisions_for(none), 0);
         assert_eq!(review_revisions_for(one), 1);
         assert_eq!(review_revisions_for(repeated), 2);
+    }
+
+    #[test]
+    fn authored_impossible_stays_abstain_after_sigkill_reap_mapping() {
+        let nodes = ["coverage_decision", "abstain"];
+        for status in [
+            ExitStatus::from_raw(9),
+            ExitStatus::from_raw(137 << 8),
+            ExitStatus::from_raw(0),
+        ] {
+            let (report, _root) = classify_wait(status, "succeeded", &nodes);
+            assert_eq!(report.disposition(), ConformanceDisposition::Abstain);
+            assert_ne!(report.disposition(), ConformanceDisposition::Fail);
+            assert_ne!(report.disposition(), ConformanceDisposition::Pass);
+        }
+    }
+
+    #[test]
+    fn failed_receipt_stays_fail_after_sigkill_reap_mapping() {
+        for status in [ExitStatus::from_raw(9), ExitStatus::from_raw(137 << 8)] {
+            let (report, _root) = classify_wait(status, "failed", &["search_code"]);
+            assert_eq!(report.disposition(), ConformanceDisposition::Fail);
+            assert_ne!(report.disposition(), ConformanceDisposition::Abstain);
+        }
     }
 }

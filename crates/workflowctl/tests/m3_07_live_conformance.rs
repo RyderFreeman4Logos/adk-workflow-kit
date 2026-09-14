@@ -22,8 +22,14 @@ const HANDLE: &str = "ADK_WORKFLOW_KIT_M3_07_TEST_KEY";
 const CANARY: &str = "synthetic-m3-07-canary-not-a-secret";
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
-// ponytail: one lock serializes loopback fixtures; use per-fixture isolation if M3-07 grows.
+// ponytail: one lock serializes live workflowctl children; recover poison so one panic does not cascade.
 static LIVE_RUN: Mutex<()> = Mutex::new(());
+
+fn live_run() -> MutexGuard<'static, ()> {
+    LIVE_RUN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 struct TempRoot(PathBuf);
 
@@ -260,7 +266,7 @@ fn serve_provider(
     stall_body: bool,
     rate_limit_delay: Duration,
 ) -> ScriptedServer {
-    let run_guard = LIVE_RUN.lock().expect("live conformance run lock");
+    let run_guard = live_run();
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("addr");
@@ -470,6 +476,7 @@ fn checked_in_template_is_credential_free() {
 
 #[test]
 fn missing_credential_fails_closed() {
+    let _guard = live_run();
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
@@ -479,6 +486,7 @@ fn missing_credential_fails_closed() {
 
 #[test]
 fn unreachable_endpoint_fails_closed() {
+    let _guard = live_run();
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
@@ -706,6 +714,7 @@ fn authored_revise_max_visits_allows_a_second_revision() {
 
 #[test]
 fn capability_denial_fails_closed() {
+    let _guard = live_run();
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
@@ -981,6 +990,7 @@ fn metrics_write_failure_is_fail_not_pass() {
 
 #[test]
 fn checkpoint_persistence_failure_fails_closed() {
+    let _guard = live_run();
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
@@ -1000,6 +1010,7 @@ fn checkpoint_persistence_failure_fails_closed() {
 
 #[test]
 fn unavailable_profile_is_never_pass() {
+    let _guard = live_run();
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");

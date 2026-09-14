@@ -150,7 +150,9 @@ fn run_args(profile: &Path, workdir: &Path) -> Command {
 fn run_root(workdir: &Path) -> PathBuf {
     let roots = fs::read_dir(workdir)
         .expect("workdir")
-        .map(|entry| entry.expect("run entry").path())
+        .map(|entry| entry.expect("run entry"))
+        .filter(|entry| entry.file_name() != ".node-result-cache")
+        .map(|entry| entry.path())
         .filter(|path| path.is_dir())
         .collect::<Vec<_>>();
     assert_eq!(roots.len(), 1, "one independent run root is required");

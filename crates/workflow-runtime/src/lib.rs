@@ -10,6 +10,7 @@ mod effect_journal;
 mod event;
 mod execution;
 mod hot_reload;
+mod node_cache;
 mod observability;
 mod podman;
 mod policy;
@@ -61,6 +62,12 @@ pub use execution::{
     PureTransformBinding, PureTransformExecutionError, PureTransformPlanError, PureTransformPlanV1,
 };
 pub use hot_reload::{DevelopmentHotReload, HotReloadError, HotReloadErrorKind};
+pub use node_cache::{
+    CacheDisposition, CacheProvenance, NODE_CACHE_SCHEMA_VERSION, NodeCacheEntry, NodeCacheError,
+    NodeCacheErrorKind, NodeCacheInspect, NodeCacheInvalidationReason, NodeCacheKey,
+    NodeCacheKeyError, NodeCacheKeyMaterial, NodeCacheLookup, NodeCacheOutcome, NodeCacheRetention,
+    NodeResultCache, node_cache_dir_syncs, reset_node_cache_dir_syncs,
+};
 pub use observability::{
     CallLedgerRecord, EventCounts, ObservabilityError, OtelMapping, REDACTION_MARKER,
     RedactedEvent, SensitiveSnapshot, SensitiveSnapshotKind,

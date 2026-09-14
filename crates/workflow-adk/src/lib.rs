@@ -17,7 +17,7 @@ use crate::execution::{ExecutionError, ExecutionErrorKind};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -35,8 +35,8 @@ use serde_json::{Value, json};
 use workflow_compiler::{CompiledPlan, ResolvedRuntimePlan};
 use workflow_ir::IrNodeKind;
 use workflow_runtime::{
-    PureTransformBackend, PureTransformRequest, RequestedCapabilities, SandboxCapability,
-    ToolBridgeErrorKind,
+    CacheDisposition, PureTransformBackend, PureTransformRequest, RequestedCapabilities,
+    SandboxCapability, ToolBridgeErrorKind,
 };
 
 const MAX_PATH_BYTES: usize = 256;
@@ -485,6 +485,7 @@ pub struct AdkGraph {
     fan_in_guard_nodes: BTreeMap<String, String>,
     agent_nodes: BTreeSet<String>,
     plan_binding: Option<PlanBinding>,
+    cache_dispositions: Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
 }
 
 impl AdkGraph {
@@ -602,11 +603,23 @@ impl AdkGraph {
                     step,
                     duration_ms,
                 } => {
+                    let payload = match self
+                        .cache_dispositions
+                        .lock()
+                        .ok()
+                        .and_then(|dispositions| dispositions.get(&node).copied())
+                    {
+                        Some(disposition) => json!({
+                            "step": step,
+                            "cache_disposition": disposition.as_str()
+                        }),
+                        None => json!({ "step": step }),
+                    };
                     mapper
                         .map_stream_observation(
                             Some(node),
                             events::AdkRuntimeObservationKindV1::NodeCompleted,
-                            Some(json!({ "step": step })),
+                            Some(payload),
                             Some(duration_ms),
                             artifacts,
                         )
@@ -643,6 +656,9 @@ impl AdkGraph {
                     }
                     if event.content().is_none() {
                         return Err(AdkGraphError::InvalidOutput { node });
+                    }
+                    if cache_hit_event(&event) {
+                        continue;
                     }
                     mapper
                         .map_adk_event(node, event, artifacts)
@@ -800,6 +816,14 @@ impl AdkGraph {
             Some(node) => Err(AdkGraphError::InvalidOutput { node: node.clone() }),
             None => Ok(state),
         }
+    }
+
+    pub(crate) fn with_cache_dispositions(
+        mut self,
+        cache_dispositions: Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
+    ) -> Self {
+        self.cache_dispositions = cache_dispositions;
+        self
     }
 }
 
@@ -1054,6 +1078,7 @@ impl AdkGraphTranslator {
             }
             false
         };
+        let predecessors = incoming.clone();
         let fan_in = incoming
             .into_iter()
             .filter_map(|(target, sources)| {
@@ -1213,38 +1238,52 @@ impl AdkGraphTranslator {
                     .agent_contract()
                     .map(|contract| contract.output().state_key().to_owned())
                     .unwrap_or_else(|| format!("node:{id}"));
-                builder = builder.node(AgentNode::new(agent).with_output_mapper(move |events| {
-                    let value = events
-                        .iter()
-                        .rev()
-                        .find_map(|event| {
-                            event
-                                .content()
-                                .and_then(|content| content.parts.first()?.text())
+                let input_keys = node
+                    .agent_contract()
+                    .map(|contract| contract.input().state_keys().to_vec())
+                    .unwrap_or_default();
+                let preds = predecessors.get(&id).cloned().unwrap_or_default();
+                builder = builder.node(
+                    AgentNode::new(agent)
+                        .with_input_mapper(move |state| {
+                            agent_node_input(state, &preds, &input_keys)
                         })
-                        .map_or_else(
-                            || json!({ "__workflow_invalid_output": true }),
-                            |text| serde_json::from_str(text).unwrap_or_else(|_| json!(text)),
-                        );
-                    let mut output = std::collections::HashMap::new();
-                    let node_value = value
-                        .get("output")
-                        .cloned()
-                        .unwrap_or_else(|| value.clone());
-                    if let Some(state) = value.get("state").and_then(serde_json::Value::as_object) {
-                        if fan_in_targets.is_empty() {
-                            output.extend(
-                                state
-                                    .iter()
-                                    .map(|(key, value)| (key.clone(), value.clone())),
-                            );
-                        } else {
-                            for (target, source) in &fan_in_targets {
-                                let generation = fan_in_generations
-                                    .get(&(target.clone(), source.clone()))
-                                    .expect("fan-in generation exists for each target")
-                                    .fetch_add(1, Ordering::Relaxed);
-                                output.extend(state.iter().map(|(key, value)| {
+                        .with_output_mapper(move |events| {
+                            let value = events
+                                .iter()
+                                .rev()
+                                .find_map(|event| {
+                                    event
+                                        .content()
+                                        .and_then(|content| content.parts.first()?.text())
+                                })
+                                .map_or_else(
+                                    || json!({ "__workflow_invalid_output": true }),
+                                    |text| {
+                                        serde_json::from_str(text).unwrap_or_else(|_| json!(text))
+                                    },
+                                );
+                            let mut output = std::collections::HashMap::new();
+                            let node_value = value
+                                .get("output")
+                                .cloned()
+                                .unwrap_or_else(|| value.clone());
+                            if let Some(state) =
+                                value.get("state").and_then(serde_json::Value::as_object)
+                            {
+                                if fan_in_targets.is_empty() {
+                                    output.extend(
+                                        state
+                                            .iter()
+                                            .map(|(key, value)| (key.clone(), value.clone())),
+                                    );
+                                } else {
+                                    for (target, source) in &fan_in_targets {
+                                        let generation = fan_in_generations
+                                            .get(&(target.clone(), source.clone()))
+                                            .expect("fan-in generation exists for each target")
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        output.extend(state.iter().map(|(key, value)| {
                                     (
                                         format!(
                                             "__workflow_fanin:{target}:{source}:{generation}:{key}"
@@ -1252,12 +1291,13 @@ impl AdkGraphTranslator {
                                         value.clone(),
                                     )
                                 }));
+                                    }
+                                }
                             }
-                        }
-                    }
-                    output.insert(output_key.clone(), node_value);
-                    output
-                }));
+                            output.insert(output_key.clone(), node_value);
+                            output
+                        }),
+                );
             } else {
                 let terminal = node.kind() == IrNodeKind::Terminal;
                 if terminal {
@@ -1473,8 +1513,57 @@ impl AdkGraphTranslator {
             fan_in_guard_nodes,
             agent_nodes,
             plan_binding,
+            cache_dispositions: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
+}
+
+fn agent_node_input(
+    state: &State,
+    predecessors: &BTreeSet<String>,
+    input_keys: &[String],
+) -> Content {
+    let mut payload = serde_json::Map::new();
+    if !input_keys.is_empty() {
+        for key in input_keys {
+            if let Some(value) = state.get(key) {
+                payload.insert(key.clone(), value.clone());
+            }
+        }
+    } else {
+        let mut upstream = serde_json::Map::new();
+        for predecessor in predecessors {
+            if let Some(value) = state
+                .get(&format!("node:{predecessor}"))
+                .or_else(|| state.get(predecessor))
+            {
+                upstream.insert(predecessor.clone(), value.clone());
+            }
+        }
+        if !upstream.is_empty() {
+            payload.insert("upstream".to_owned(), Value::Object(upstream));
+        } else if let Some(input) = state.get("input") {
+            payload.insert("input".to_owned(), input.clone());
+        }
+    }
+    Content::new("user").with_text(
+        serde_json::to_string(&Value::Object(payload)).unwrap_or_else(|_| "{}".to_owned()),
+    )
+}
+
+fn cache_hit_event(event: &Event) -> bool {
+    event
+        .provider_metadata
+        .get("workflow.cache_hit")
+        .map(String::as_str)
+        == Some("1")
+        || event
+            .llm_response
+            .provider_metadata
+            .as_ref()
+            .and_then(|value| value.get("workflow.cache_hit"))
+            .and_then(Value::as_str)
+            == Some("1")
 }
 
 struct DeterministicAgent {

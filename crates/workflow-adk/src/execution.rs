@@ -18,7 +18,10 @@ use std::{
 
 use adk_rust::graph::prelude::{ExecutionConfig, State};
 use adk_rust::graph::{Checkpoint, Checkpointer, GraphError};
-use adk_rust::{Agent, ErrorCategory, Llm, LlmRequest, agent::LlmAgentBuilder, async_trait};
+use adk_rust::{
+    Agent, Content, ErrorCategory, Llm, LlmRequest, LlmResponse, agent::LlmAgentBuilder,
+    async_trait, futures::StreamExt as _,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -31,16 +34,19 @@ use workflow_compiler::{
 };
 use workflow_ir::IrModelRole;
 use workflow_runtime::{
-    ActivateSkillInput, ArtifactId, ArtifactStore, BackendCapabilities, CapabilityIntersection,
-    CheckpointManifestV1, DurableCheckpointV1, EffectCommit, EffectJournal, EffectKey,
-    FilesystemArtifactStore, Materialization, PageRequest, PolicyCapabilities,
+    ActivateSkillInput, ArtifactId, ArtifactStore, BackendCapabilities, CacheDisposition,
+    CacheProvenance, CapabilityIntersection, CheckpointManifestV1, DurableCheckpointV1,
+    EffectCommit, EffectJournal, EffectKey, FilesystemArtifactStore, Materialization,
+    NodeCacheEntry, NodeCacheInvalidationReason, NodeCacheKey, NodeCacheKeyMaterial,
+    NodeCacheLookup, NodeCacheOutcome, NodeResultCache, PageRequest, PolicyCapabilities,
     ProtectedArtifactReferenceV1, PureTransformRequest, ReadSkillResourceInput,
     ReadSourceRangeTool, RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox,
     RunSkillScriptInput, SandboxCapability, SearchCodeTool, SqliteCheckpointStore, ToolBridge,
     ToolBridgeError, ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolEnvelope, ToolFlags,
-    ToolHandler, ToolImplementationRegistry, ToolProvenance, ToolRegistration, WorkdirManager,
-    WorkflowRuntimeEventKindV1, contains_sensitive_key, intersect_policy_capabilities,
-    redact_json_value, selection_identity, verify_sandbox_capabilities,
+    ToolHandler, ToolImplementationRegistry, ToolProvenance, ToolRegistration, TrustDomain,
+    WorkdirManager, WorkflowRuntimeEventKindV1, contains_sensitive_key,
+    intersect_policy_capabilities, redact_json_value, selection_identity,
+    verify_sandbox_capabilities,
 };
 use workflow_spec::{
     RESERVED_SKILL_TOOL_NAMES, SourcePath, is_reserved_skill_tool_name, read_bounded_regular_file,
@@ -49,6 +55,10 @@ use workflow_spec::{
 use crate::{
     AdkGraphError, AdkGraphTranslator,
     events::{AdkEventMapper, AdkRuntimeObservationKindV1, AdkRuntimeObservationV1},
+    model_invocation::{
+        InferenceBudget, ModelInvocationSpec, PromptProtocol, ProviderRouteIdentity,
+        StructuredOutputContract,
+    },
     model_profiles::{
         CredentialBroker, CredentialHandle, FakeModelProfile, ModelBinding, ModelProfileErrorKind,
         ModelProfileRegistry, ModelRuntimeConfig, OpenAiCompatibleProfile, QueuedFakeLlm,
@@ -67,12 +77,19 @@ const GRAPH_CONTINUATION_KEY: &str = "kit_graph_continuation_v1";
 const LOOP_LEDGER_FILE: &str = "loop-ledger.json";
 const SKILL_SNAPSHOT_FILE: &str = "sealed-skill-snapshot.json";
 const LOOP_LEDGER_DIGEST_KEY: &str = "kit_loop_ledger_digest_v1";
+const NODE_CACHE_DIRNAME: &str = ".node-result-cache";
 static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
 static FAIL_CHECKPOINT_SAVES: AtomicBool = AtomicBool::new(false);
 #[cfg(debug_assertions)]
 static CRASH_BARRIER_HITS: AtomicU64 = AtomicU64::new(0);
 static EFFECT_BARRIER_HITS: AtomicU64 = AtomicU64::new(0);
 type BoundTool = (Vec<String>, Arc<AdkToolBridge<FilesystemArtifactStore>>);
+type BoundCache = (
+    Arc<EffectFence>,
+    Option<(NodeResultCache, NodeCacheIdentity)>,
+    Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
+    Arc<Mutex<Option<(NodeCacheKey, Value)>>>,
+);
 type CompletedToolResponse = (String, String, String, String, Value);
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -3454,7 +3471,10 @@ impl Agent for RestoredFinishAgent {
         }))
         .map_err(|_| adk_rust::AdkError::agent("restored finish unavailable"))?;
         let mut event = adk_rust::Event::new(&self.name);
-        event.set_content(adk_rust::Content::new("assistant").with_text(text));
+        event.set_content(Content::new("assistant").with_text(text));
+        event
+            .provider_metadata
+            .insert("workflow.cache_hit".to_owned(), "1".to_owned());
         Ok(Box::pin(adk_rust::futures::stream::iter([Ok(event)])))
     }
 }
@@ -3462,6 +3482,10 @@ impl Agent for RestoredFinishAgent {
 struct FencedModel {
     binding: Arc<ModelBinding>,
     fence: Arc<EffectFence>,
+    cache: Option<(NodeResultCache, NodeCacheIdentity)>,
+    dispositions: Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
+    pending: Arc<Mutex<Option<(NodeCacheKey, Value)>>>,
+    node_id: String,
 }
 
 #[async_trait]
@@ -3475,6 +3499,30 @@ impl Llm for FencedModel {
         request: LlmRequest,
         stream: bool,
     ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+        let key = self
+            .cache
+            .as_ref()
+            .and_then(|(cache, identity)| identity.bind(&request).ok().map(|key| (cache, key)));
+        if let Some((cache, key)) = &key {
+            match cache.lookup(key) {
+                Ok(NodeCacheLookup::Hit(entry))
+                    if matches!(entry.outcome(), NodeCacheOutcome::Success) =>
+                {
+                    self.record_disposition(CacheDisposition::Reused);
+                    if let Ok(mut pending) = self.pending.lock() {
+                        *pending = None;
+                    }
+                    return Ok(Box::pin(adk_rust::futures::stream::iter([Ok(
+                        cached_finish_response(entry.payload().clone()),
+                    )])));
+                }
+                Ok(NodeCacheLookup::Hit(_) | NodeCacheLookup::Invalid { .. }) => {
+                    let _ = cache.invalidate(key, NodeCacheInvalidationReason::ExplicitInvalidate);
+                    self.record_disposition(CacheDisposition::Reexecuted);
+                }
+                _ => {}
+            }
+        }
         let result = Llm::generate_content(&*self.binding, request, stream).await;
         if result
             .as_ref()
@@ -3483,8 +3531,43 @@ impl Llm for FencedModel {
             record_terminal(&self.fence.terminal, ExecutionErrorKind::Timeout);
             self.fence.cancellation.store(true, Ordering::Release);
         }
-        result
+        let Ok(response_stream) = result else {
+            return result;
+        };
+        let items = response_stream.collect::<Vec<_>>().await;
+        if let Ok(mut pending) = self.pending.lock() {
+            *pending = key.and_then(|(_, key)| {
+                items.iter().rev().find_map(|item| {
+                    let response = item.as_ref().ok()?;
+                    let content = response.content.as_ref()?;
+                    admitted_finish(content)
+                        .ok()
+                        .flatten()
+                        .map(|output| (key.clone(), output))
+                })
+            });
+        }
+        Ok(Box::pin(adk_rust::futures::stream::iter(items)))
     }
+}
+
+impl FencedModel {
+    fn record_disposition(&self, disposition: CacheDisposition) {
+        if let Ok(mut dispositions) = self.dispositions.lock() {
+            dispositions.insert(self.node_id.clone(), disposition);
+        }
+    }
+}
+
+fn cached_finish_response(output: Value) -> LlmResponse {
+    let text = serde_json::to_string(&json!({
+        "status": "finished",
+        "output": output,
+    }))
+    .unwrap_or_else(|_| "{\"status\":\"finished\",\"output\":null}".to_owned());
+    let mut response = LlmResponse::new(Content::new("assistant").with_text(text));
+    response.provider_metadata = Some(json!({ "workflow.cache_hit": "1" }));
+    response
 }
 
 #[derive(Clone)]
@@ -3589,6 +3672,450 @@ fn persist_agent_contracts(
     Ok(())
 }
 
+fn node_cache_dir(base: &Path) -> PathBuf {
+    base.join(NODE_CACHE_DIRNAME)
+}
+
+fn node_cache_open(base: &Path) -> Result<NodeResultCache, ExecutionError> {
+    NodeResultCache::open(node_cache_dir(base))
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+}
+
+fn durable_node_cache_enabled(model: &ModelBinding) -> bool {
+    model.identity().provider() == "fake"
+}
+
+fn durable_node_cache(
+    cache: &NodeResultCache,
+    ir: &workflow_ir::WorkflowIr,
+    node: &workflow_ir::IrNode,
+    model: &ModelBinding,
+    contract: Option<&RuntimeAgentContract>,
+    scope: (&[SandboxCapability], &Option<BoundTool>),
+) -> Result<Option<(NodeResultCache, NodeCacheIdentity)>, ExecutionError> {
+    if !durable_node_cache_enabled(model) {
+        return Ok(None);
+    }
+    Ok(Some((
+        cache.clone(),
+        node_cache_identity(ir, node, model, contract, scope)?,
+    )))
+}
+
+fn cache_provenance(
+    events: &[workflow_runtime::WorkflowRuntimeEventV1],
+) -> (BTreeMap<String, String>, CacheEventCounts) {
+    let mut cache_dispositions = BTreeMap::new();
+    let mut event_counts = CacheEventCounts::default();
+    for event in events {
+        match event.kind() {
+            WorkflowRuntimeEventKindV1::ModelRequestCompleted => {
+                event_counts.model_turns = event_counts.model_turns.saturating_add(1);
+            }
+            WorkflowRuntimeEventKindV1::NodeCompleted => {
+                if let Some(disposition) = event
+                    .payload()
+                    .get("cache_disposition")
+                    .and_then(Value::as_str)
+                {
+                    if let Some(node) = event.node_id() {
+                        cache_dispositions.insert(node.to_owned(), disposition.to_owned());
+                    }
+                    match disposition {
+                        "reused" => {
+                            event_counts.cache_hits = event_counts.cache_hits.saturating_add(1)
+                        }
+                        "reexecuted" => {
+                            event_counts.reexecuted = event_counts.reexecuted.saturating_add(1)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (cache_dispositions, event_counts)
+}
+
+fn node_cache_inventory(base: &Path) -> NodeCacheInventory {
+    NodeResultCache::open(node_cache_dir(base))
+        .ok()
+        .and_then(|cache| cache.inspect().ok())
+        .map(|inspect| NodeCacheInventory {
+            entry_count: inspect.entry_count() as u64,
+            negative_entries: inspect.negative_entries() as u64,
+        })
+        .unwrap_or_default()
+}
+
+fn bound_tool_schema_digest(tool: &Option<BoundTool>) -> String {
+    let Some((_, bridge)) = tool else {
+        return String::new();
+    };
+    let mut tools = bridge
+        .registered_tools()
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name(),
+                "parameters": tool.parameters_schema(),
+                "response": tool.response_schema(),
+                "read_only": tool.is_read_only(),
+            })
+        })
+        .collect::<Vec<_>>();
+    tools.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&tools).unwrap_or_default())
+    )
+}
+
+#[derive(Clone)]
+struct NodeCacheIdentity {
+    workflow_id: String,
+    workflow_version: String,
+    node_id: String,
+    node_version: String,
+    invocation_identity: String,
+    policy_digest: String,
+}
+
+impl NodeCacheIdentity {
+    fn bind(&self, request: &LlmRequest) -> Result<NodeCacheKey, ExecutionError> {
+        NodeCacheKey::bind(NodeCacheKeyMaterial {
+            workflow_id: &self.workflow_id,
+            workflow_version: &self.workflow_version,
+            node_id: &self.node_id,
+            node_version: &self.node_version,
+            invocation_identity: &self.invocation_identity,
+            input_artifact_hashes: &[],
+            request_input_digest: &request_input_digest(request),
+            policy_digest: &self.policy_digest,
+        })
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))
+    }
+}
+
+/// Length-framed digest of the complete ordered request conversation.
+pub fn request_input_digest(request: &LlmRequest) -> String {
+    let mut framed = frame_field("CONTENTS", &request.contents.len().to_string());
+    for content in &request.contents {
+        framed.push('\n');
+        framed.push_str(&frame_field("ROLE", &content.role));
+        framed.push('\n');
+        framed.push_str(&frame_field("PARTS", &content.parts.len().to_string()));
+        for part in &content.parts {
+            framed.push('\n');
+            framed.push_str(&frame_part(part));
+        }
+    }
+    format!("sha256:{:x}", Sha256::digest(framed.as_bytes()))
+}
+
+fn frame_field(label: &str, value: &str) -> String {
+    format!("{label}_BYTES:{}\n{value}", value.len())
+}
+
+fn frame_opt(label: &str, value: Option<&str>) -> String {
+    match value {
+        Some(value) => frame_field(label, value),
+        None => frame_field(&format!("{label}_ABSENT"), ""),
+    }
+}
+
+fn frame_json(label: &str, value: &Value) -> String {
+    frame_field(
+        label,
+        &serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()),
+    )
+}
+
+fn frame_bytes(label: &str, bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    frame_field(label, &hex)
+}
+
+fn frame_json_opt(label: &str, value: Option<&Value>) -> String {
+    frame_opt(
+        label,
+        value
+            .and_then(|value| serde_json::to_string(value).ok())
+            .as_deref(),
+    )
+}
+
+fn frame_nested_inline_data(part: &adk_rust::InlineDataPart) -> String {
+    [
+        frame_field("INLINE_MIME", &part.mime_type),
+        frame_bytes("INLINE_DATA", &part.data),
+        frame_opt("INLINE_URI", part.uri.as_deref()),
+        frame_json_opt("INLINE_ANNOTATIONS", part.annotations.as_ref()),
+    ]
+    .join("\n")
+}
+
+fn frame_nested_file_data(part: &adk_rust::FileDataPart) -> String {
+    [
+        frame_field("FILE_MIME", &part.mime_type),
+        frame_field("FILE_URI", &part.file_uri),
+        frame_json_opt("FILE_ANNOTATIONS", part.annotations.as_ref()),
+    ]
+    .join("\n")
+}
+
+fn frame_part(part: &adk_rust::Part) -> String {
+    match part {
+        adk_rust::Part::Text { text } => {
+            [frame_field("TAG", "text"), frame_field("TEXT", text)].join("\n")
+        }
+        adk_rust::Part::Thinking {
+            thinking,
+            signature,
+        } => [
+            frame_field("TAG", "thinking"),
+            frame_field("THINKING", thinking),
+            frame_opt("SIGNATURE", signature.as_deref()),
+        ]
+        .join("\n"),
+        adk_rust::Part::InlineData {
+            mime_type,
+            data,
+            uri,
+            annotations,
+        } => [
+            frame_field("TAG", "inline_data"),
+            frame_field("MIME", mime_type),
+            frame_bytes("DATA", data),
+            frame_opt("URI", uri.as_deref()),
+            frame_json_opt("ANNOTATIONS", annotations.as_ref()),
+        ]
+        .join("\n"),
+        adk_rust::Part::FileData {
+            mime_type,
+            file_uri,
+            annotations,
+        } => [
+            frame_field("TAG", "file_data"),
+            frame_field("MIME", mime_type),
+            frame_field("FILE_URI", file_uri),
+            frame_json_opt("ANNOTATIONS", annotations.as_ref()),
+        ]
+        .join("\n"),
+        adk_rust::Part::FunctionCall {
+            name,
+            args,
+            id,
+            thought_signature,
+        } => [
+            frame_field("TAG", "function_call"),
+            frame_field("NAME", name),
+            frame_json("ARGS", args),
+            frame_opt("ID", id.as_deref()),
+            frame_opt("THOUGHT_SIGNATURE", thought_signature.as_deref()),
+        ]
+        .join("\n"),
+        adk_rust::Part::FunctionResponse {
+            function_response,
+            id,
+            annotations,
+        } => {
+            let mut framed = [
+                frame_field("TAG", "function_response"),
+                frame_field("NAME", &function_response.name),
+                frame_json("RESPONSE", &function_response.response),
+                frame_opt("ID", id.as_deref()),
+                frame_json_opt("ANNOTATIONS", annotations.as_ref()),
+                frame_field(
+                    "INLINE_DATA_COUNT",
+                    &function_response.inline_data.len().to_string(),
+                ),
+            ]
+            .join("\n");
+            for part in &function_response.inline_data {
+                framed.push('\n');
+                framed.push_str(&frame_nested_inline_data(part));
+            }
+            framed.push('\n');
+            framed.push_str(&frame_field(
+                "FILE_DATA_COUNT",
+                &function_response.file_data.len().to_string(),
+            ));
+            for part in &function_response.file_data {
+                framed.push('\n');
+                framed.push_str(&frame_nested_file_data(part));
+            }
+            framed
+        }
+        adk_rust::Part::ServerToolCall { server_tool_call } => [
+            frame_field("TAG", "server_tool_call"),
+            frame_json("PAYLOAD", server_tool_call),
+        ]
+        .join("\n"),
+        adk_rust::Part::ServerToolResponse {
+            server_tool_response,
+        } => [
+            frame_field("TAG", "server_tool_response"),
+            frame_json("PAYLOAD", server_tool_response),
+        ]
+        .join("\n"),
+        adk_rust::Part::EmbeddedResource { resource } => match resource {
+            adk_rust::EmbeddedResource::Text(text) => [
+                frame_field("TAG", "embedded_text"),
+                frame_field("URI", &text.uri),
+                frame_opt("MIME", text.mime_type.as_deref()),
+                frame_field("TEXT", &text.text),
+            ]
+            .join("\n"),
+            adk_rust::EmbeddedResource::Blob(blob) => [
+                frame_field("TAG", "embedded_blob"),
+                frame_field("URI", &blob.uri),
+                frame_opt("MIME", blob.mime_type.as_deref()),
+                frame_bytes("DATA", &blob.data),
+            ]
+            .join("\n"),
+        },
+    }
+}
+
+fn node_cache_identity(
+    ir: &workflow_ir::WorkflowIr,
+    node: &workflow_ir::IrNode,
+    model: &ModelBinding,
+    contract: Option<&RuntimeAgentContract>,
+    scope: (&[SandboxCapability], &Option<BoundTool>),
+) -> Result<NodeCacheIdentity, ExecutionError> {
+    let (sandbox_capabilities, tool) = scope;
+    let schema = agent_output_schema(contract);
+    let instruction = contract.map(|c| c.instruction.as_str()).unwrap_or("");
+    let instruction_digest = contract
+        .map(|c| format!("sha256:{:x}", Sha256::digest(c.instruction.as_bytes())))
+        .unwrap_or_default();
+    let protocol = PromptProtocol::new(
+        if instruction.is_empty() {
+            "workflow-kit.node-result.v1"
+        } else {
+            instruction
+        },
+        Vec::new(),
+        schema.clone(),
+        json!({
+            "instruction": instruction,
+            "instruction_digest": instruction_digest,
+        }),
+        TrustDomain::TrustedGoal,
+    )
+    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
+    let output = StructuredOutputContract::new(schema, MAX_STATE_BYTES)
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
+    let budget = inference_budget(model);
+    let spec = ModelInvocationSpec::new(
+        protocol,
+        node.id().as_str(),
+        ProviderRouteIdentity::from_binding(model),
+        budget,
+        output,
+    )
+    .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
+    let provenance = spec.provenance();
+    let tools = tool
+        .as_ref()
+        .map(|(names, _)| names.join("\n"))
+        .unwrap_or_default();
+    let sandbox = sandbox_capabilities
+        .iter()
+        .map(SandboxCapability::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tool_schema = bound_tool_schema_digest(tool);
+    let policy = format!(
+        "tools:{tools};sandbox:{sandbox};instruction:{};instruction_digest:{instruction_digest};schema:{};protocol:{};tokenizer:{};model:{};tool_schema:{};bound_tool_schema:{tool_schema};output_schema:{};route:{}/{};trust:{};budget:{}",
+        contract.map(|c| c.instruction_path.as_str()).unwrap_or(""),
+        contract.map(|c| c.schema_path.as_str()).unwrap_or(""),
+        provenance.protocol_hash(),
+        provenance.tokenizer_identity(),
+        provenance.model_identity(),
+        provenance.tool_schema_hash(),
+        provenance.output_schema_hash(),
+        provenance.provider_route().provider(),
+        provenance.provider_route().resolved_model(),
+        provenance.cache_salt(),
+        provenance.invocation_identity(),
+    );
+    let node_version = node
+        .model()
+        .map(|model| format!("{}:{}", model.id(), model.version()))
+        .unwrap_or_else(|| format!("{}:{}", node.id().as_str(), ir.workflow_version()));
+    Ok(NodeCacheIdentity {
+        workflow_id: ir.workflow_id().as_str().to_owned(),
+        workflow_version: ir.workflow_version().to_owned(),
+        node_id: node.id().as_str().to_owned(),
+        node_version,
+        invocation_identity: spec.invocation_identity(),
+        policy_digest: format!("sha256:{:x}", Sha256::digest(policy.as_bytes())),
+    })
+}
+
+fn inference_budget(model: &ModelBinding) -> InferenceBudget {
+    let tokens = model
+        .runtime()
+        .sampling()
+        .max_output_tokens
+        .and_then(|tokens| usize::try_from(tokens).ok())
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(4096);
+    InferenceBudget::new(crate::model_invocation::ReasoningEffort::Medium, tokens, 0)
+        .unwrap_or_else(|_| InferenceBudget::medium())
+}
+
+fn record_node_result(cache: &NodeResultCache, key: NodeCacheKey, payload: Value) -> bool {
+    let provenance = CacheProvenance::from_key(&key);
+    let Ok(entry) = NodeCacheEntry::success(key, payload, provenance) else {
+        return false;
+    };
+    cache.put(entry).is_ok()
+}
+
+fn persist_accepted_node_result(
+    cache: &Option<(NodeResultCache, NodeCacheIdentity)>,
+    pending: &Mutex<Option<(NodeCacheKey, Value)>>,
+    dispositions: &Mutex<BTreeMap<String, CacheDisposition>>,
+    node_id: String,
+    response: &LlmResponse,
+) {
+    let Some((cache, _)) = cache.as_ref() else {
+        return;
+    };
+    let Ok(mut slot) = pending.lock() else {
+        return;
+    };
+    let Some((key, output)) = slot.take() else {
+        return;
+    };
+    let accepted = response
+        .content
+        .as_ref()
+        .and_then(|content| admitted_finish(content).ok().flatten());
+    if accepted.as_ref() != Some(&output) {
+        return;
+    }
+    let already_reexecuted = dispositions
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&node_id).copied())
+        == Some(CacheDisposition::Reexecuted);
+    if !record_node_result(cache, key, output) || already_reexecuted {
+        return;
+    }
+    if let Ok(mut map) = dispositions.lock() {
+        map.insert(node_id, CacheDisposition::Recorded);
+    }
+}
+
 fn build_profile_agent(
     name: &str,
     model: Arc<ModelBinding>,
@@ -3596,7 +4123,7 @@ fn build_profile_agent(
     contract: Option<&RuntimeAgentContract>,
     limits: RunLimits,
     ledger: Arc<LoopLedgerStore>,
-    effect_fence: Arc<EffectFence>,
+    cache: BoundCache,
 ) -> Result<Arc<dyn Agent>, ExecutionError> {
     let (names, toolset) = match tool {
         Some((names, toolset)) => (names, Some(toolset)),
@@ -3604,6 +4131,7 @@ fn build_profile_agent(
     };
     let allowed = Arc::new(names.into_iter().collect::<BTreeSet<_>>());
     let output_schema = contract.map(|contract| contract.output_schema.clone());
+    let (effect_fence, cache, dispositions, pending) = cache;
     let controller = Arc::new(LoopController::new(
         name,
         limits,
@@ -3615,10 +4143,18 @@ fn build_profile_agent(
     let before_controller = Arc::clone(&controller);
     let tool_controller = Arc::clone(&controller);
     let tool_error_controller = Arc::clone(&controller);
+    let persist_cache = cache.clone();
+    let persist_dispositions = Arc::clone(&dispositions);
+    let persist_pending = Arc::clone(&pending);
+    let persist_node = name.to_owned();
     let tool_timeout = std::time::Duration::from_millis(controller.limits.max_tool_time_ms().get());
     let model = Arc::new(FencedModel {
         binding: model,
         fence: Arc::clone(&effect_fence),
+        cache,
+        dispositions,
+        pending,
+        node_id: name.to_owned(),
     });
     let mut builder = LlmAgentBuilder::new(name)
         .description("workflow-kit profile-driven agent")
@@ -3643,6 +4179,10 @@ fn build_profile_agent(
             let allowed = Arc::clone(&allowed);
             let controller = Arc::clone(&controller);
             let output_schema = output_schema.clone();
+            let persist_cache = persist_cache.clone();
+            let persist_dispositions = Arc::clone(&persist_dispositions);
+            let persist_pending = Arc::clone(&persist_pending);
+            let persist_node = persist_node.clone();
             Box::pin(async move {
                 if let Some(schema) = output_schema
                     && let Some(content) = response.content.as_ref()
@@ -3667,6 +4207,13 @@ fn build_profile_agent(
                     ));
                 }
                 controller.observe_model(&response, &allowed)?;
+                persist_accepted_node_result(
+                    &persist_cache,
+                    &persist_pending,
+                    &persist_dispositions,
+                    persist_node,
+                    &response,
+                );
                 Ok(None)
             })
         }))
@@ -3726,6 +4273,12 @@ pub struct ExecutionReceipt {
     resume_count: u64,
     plan_hash: String,
     resume_identity: String,
+    #[serde(default)]
+    cache_dispositions: BTreeMap<String, String>,
+    #[serde(default)]
+    event_counts: CacheEventCounts,
+    #[serde(default)]
+    node_cache: NodeCacheInventory,
 }
 
 impl ExecutionReceipt {
@@ -3762,10 +4315,30 @@ struct RunManifestV2 {
     plan_hash: String,
     resume_identity: String,
     checkpoint_manifest: Option<CheckpointManifestV1>,
+    #[serde(default)]
+    cache_dispositions: BTreeMap<String, String>,
+    #[serde(default)]
+    event_counts: CacheEventCounts,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CacheEventCounts {
+    model_turns: u64,
+    cache_hits: u64,
+    reexecuted: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NodeCacheInventory {
+    entry_count: u64,
+    negative_entries: u64,
 }
 
 impl RunManifestV2 {
     fn receipt(&self, run_root: PathBuf) -> ExecutionReceipt {
+        let node_cache = node_cache_inventory(run_root.parent().unwrap_or(&run_root));
         ExecutionReceipt {
             run_id: self.run_id.clone(),
             workflow_id: self.workflow_id.clone(),
@@ -3775,6 +4348,9 @@ impl RunManifestV2 {
             resume_count: self.resume_count,
             plan_hash: self.plan_hash.clone(),
             resume_identity: self.resume_identity.clone(),
+            cache_dispositions: self.cache_dispositions.clone(),
+            event_counts: self.event_counts.clone(),
+            node_cache,
         }
     }
 }
@@ -4134,7 +4710,7 @@ impl ExecutionBackend {
         let effective_capabilities = sandbox_capabilities;
         let transform_module = profile.transform_module()?;
         let recursion_limit = crate::graph_recursion_limit(compiled.ir()).max(50);
-        let manager = WorkdirManager::new(workdir_base)
+        let manager = WorkdirManager::new(workdir_base.as_ref())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let run_id = fresh_run_id()?;
         let checkpoint_manifest = build_checkpoint_manifest(
@@ -4287,6 +4863,8 @@ impl ExecutionBackend {
                     plan_hash: resolved_plan.plan_hash().to_owned(),
                     resume_identity: resolved_plan.resume_identity().to_owned(),
                     checkpoint_manifest: Some(checkpoint_manifest.clone()),
+                    cache_dispositions: BTreeMap::new(),
+                    event_counts: CacheEventCounts::default(),
                 };
                 if write_json(&run_root.join("run-manifest.json"), &provisional).is_err() {
                     persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
@@ -4326,6 +4904,8 @@ impl ExecutionBackend {
                     effect_journal.clone(),
                     Arc::clone(&effect_fence),
                 )?;
+                let node_cache = node_cache_open(workdir_base.as_ref())?;
+                let cache_dispositions = Arc::new(Mutex::new(BTreeMap::new()));
                 let agents = compiled
                     .ir()
                     .nodes()
@@ -4338,22 +4918,36 @@ impl ExecutionBackend {
                             .ok_or_else(|| {
                                 ExecutionError::new(ExecutionErrorKind::ImplementationBinding)
                             })?;
+                        let tool = build_toolset(
+                            &tool_registry,
+                            node.id().as_str(),
+                            resolved_plan.node_tools(node.id().as_str()),
+                            resolved_plan.node_skills(node.id().as_str()),
+                            &effective_capabilities,
+                            profile.run_limits().max_tool_output_bytes(),
+                            &run_root.join("artifacts"),
+                        )?;
+                        let cache = durable_node_cache(
+                            &node_cache,
+                            compiled.ir(),
+                            node,
+                            &model,
+                            agent_contracts.get(node.id().as_str()),
+                            (&effective_capabilities, &tool),
+                        )?;
                         let agent = build_profile_agent(
                             node.id().as_str(),
                             model,
-                            build_toolset(
-                                &tool_registry,
-                                node.id().as_str(),
-                                resolved_plan.node_tools(node.id().as_str()),
-                                resolved_plan.node_skills(node.id().as_str()),
-                                &effective_capabilities,
-                                profile.run_limits().max_tool_output_bytes(),
-                                &run_root.join("artifacts"),
-                            )?,
+                            tool,
                             agent_contracts.get(node.id().as_str()),
                             profile.run_limits(),
                             Arc::clone(&loop_ledger),
-                            Arc::clone(&effect_fence),
+                            (
+                                Arc::clone(&effect_fence),
+                                cache,
+                                Arc::clone(&cache_dispositions),
+                                Arc::new(Mutex::new(None)),
+                            ),
                         )?;
                         Ok((node.id().as_str().to_owned(), agent))
                     })
@@ -4368,11 +4962,19 @@ impl ExecutionBackend {
                         &input,
                         Some(continuation.clone()),
                     )
-                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?
+                    .with_cache_dispositions(Arc::clone(&cache_dispositions));
                 let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
+                let mut start = State::new();
+                start.insert("input".to_owned(), input.clone());
+                if let Some(object) = input.as_object() {
+                    for (key, value) in object {
+                        start.insert(key.clone(), value.clone());
+                    }
+                }
                 let state = invoke_graph_with_deadline(
                     &runtime,
                     deadline,
@@ -4381,7 +4983,7 @@ impl ExecutionBackend {
                     &last_progress,
                     Duration::from_millis(profile.run_limits().max_idle_time_ms().get()),
                     graph.invoke_observed(
-                        State::new(),
+                        start,
                         ExecutionConfig::new(run_id.as_str()).with_recursion_limit(recursion_limit),
                         &mut mapper,
                         artifacts,
@@ -4596,6 +5198,7 @@ impl ExecutionBackend {
             },
             None => "unavailable".to_owned(),
         };
+        let (cache_dispositions, event_counts) = cache_provenance(mapper.events());
         let manifest = RunManifestV2 {
             schema_version: 2,
             run_id: run_id.as_str().to_owned(),
@@ -4610,6 +5213,8 @@ impl ExecutionBackend {
             plan_hash: resolved_plan.plan_hash().to_owned(),
             resume_identity: resolved_plan.resume_identity().to_owned(),
             checkpoint_manifest: Some(checkpoint_manifest),
+            cache_dispositions,
+            event_counts,
         };
         if let Err(error) = write_json(&run_root.join("run-manifest.json"), &manifest) {
             persistence_error.get_or_insert(error);
@@ -4903,6 +5508,8 @@ impl ExecutionBackend {
         restore_tool_events(&loop_ledger, &tool_event_counts, &mut mapper)?;
 
         let mut retry_models = Vec::new();
+        let node_cache = node_cache_open(workdir_base.as_ref())?;
+        let cache_dispositions = Arc::new(Mutex::new(BTreeMap::new()));
         let agents = compiled
             .ir()
             .nodes()
@@ -4913,6 +5520,17 @@ impl ExecutionBackend {
                 let completed_turns = loop_ledger.model_iterations(name)?;
                 let model = profile.bind_resolved_model(&resolved_plan, name, completed_turns)?;
                 retry_models.push(Arc::clone(&model));
+                let cache = durable_node_cache(
+                    &node_cache,
+                    compiled.ir(),
+                    node,
+                    &model,
+                    agent_contracts.get(name),
+                    (
+                        &effective_capabilities,
+                        &toolsets.get(name).cloned().flatten(),
+                    ),
+                )?;
                 let agent = if let Some(output) = loop_ledger.finish_successor(name)? {
                     Arc::new(RestoredFinishAgent {
                         name: name.to_owned(),
@@ -4926,7 +5544,12 @@ impl ExecutionBackend {
                         agent_contracts.get(name),
                         profile.run_limits(),
                         Arc::clone(&loop_ledger),
-                        Arc::clone(&effect_fence),
+                        (
+                            Arc::clone(&effect_fence),
+                            cache,
+                            Arc::clone(&cache_dispositions),
+                            Arc::new(Mutex::new(None)),
+                        ),
                     )?
                 };
                 Ok((name.to_owned(), agent))
@@ -4959,7 +5582,8 @@ impl ExecutionBackend {
                 &input,
                 Some(continuation.clone()),
             )
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
+            .with_cache_dispositions(Arc::clone(&cache_dispositions));
         let recursion_limit = crate::graph_recursion_limit(compiled.ir()).max(50);
         let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5048,9 +5672,12 @@ impl ExecutionBackend {
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         crash_barrier("after-checkpoint");
         crash_barrier("after-result");
+        let (cache_dispositions, event_counts) = cache_provenance(mapper.events());
         manifest.status = "succeeded".to_owned();
         manifest.artifact_id = artifact_id;
         manifest.resume_count = next;
+        manifest.cache_dispositions = cache_dispositions;
+        manifest.event_counts = event_counts;
         write_json(&root.join("run-manifest.json"), &manifest)?;
         Ok(manifest.receipt(root))
     }
@@ -6050,7 +6677,8 @@ fn find_run(base: &Path, run_id: &str) -> Result<(PathBuf, RunManifestV2), Execu
         let file_type = entry
             .file_type()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
-        if !file_type.is_dir() || file_type.is_symlink() {
+        if !file_type.is_dir() || file_type.is_symlink() || entry.file_name() == NODE_CACHE_DIRNAME
+        {
             continue;
         }
         let path = entry.path();
