@@ -24,6 +24,7 @@ pub struct NodeCacheKeyMaterial<'a> {
     pub node_version: &'a str,
     pub invocation_identity: &'a str,
     pub input_artifact_hashes: &'a [String],
+    pub request_input_digest: &'a str,
     pub policy_digest: &'a str,
 }
 
@@ -37,6 +38,7 @@ pub struct NodeCacheKey {
     node_version: String,
     invocation_identity: String,
     input_artifact_hashes: Vec<String>,
+    request_input_digest: String,
     policy_digest: String,
 }
 
@@ -55,6 +57,7 @@ pub struct CacheProvenance {
     node_version: String,
     policy_digest: String,
     input_artifact_hashes: Vec<String>,
+    request_input_digest: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -137,6 +140,7 @@ impl NodeCacheKey {
             material.node_id,
             material.node_version,
             material.invocation_identity,
+            material.request_input_digest,
             material.policy_digest,
         ]
         .into_iter()
@@ -153,6 +157,7 @@ impl NodeCacheKey {
             frame("NODE_VERSION", material.node_version),
             frame("INVOCATION_IDENTITY", material.invocation_identity),
             frame("INPUT_ARTIFACT_HASHES", &hashes.join("\n")),
+            frame("REQUEST_INPUT_DIGEST", material.request_input_digest),
             frame("POLICY_DIGEST", material.policy_digest),
         ]
         .join("\n");
@@ -164,6 +169,7 @@ impl NodeCacheKey {
             node_version: material.node_version.to_owned(),
             invocation_identity: material.invocation_identity.to_owned(),
             input_artifact_hashes: hashes,
+            request_input_digest: material.request_input_digest.to_owned(),
             policy_digest: material.policy_digest.to_owned(),
         })
     }
@@ -187,6 +193,7 @@ impl CacheProvenance {
             node_version: key.node_version.clone(),
             policy_digest: key.policy_digest.clone(),
             input_artifact_hashes: key.input_artifact_hashes.clone(),
+            request_input_digest: key.request_input_digest.clone(),
         }
     }
 
@@ -304,6 +311,7 @@ impl NodeResultCache {
         let missing_root = !root.exists();
         let entries = root.join("entries");
         fs::create_dir_all(&entries).map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+        verified_entries_dir(&root)?;
         sync_dir(&entries)?;
         sync_dir(&root)?;
         sync_created_parent(&root, missing_root)?;
@@ -313,7 +321,7 @@ impl NodeResultCache {
     pub fn put(&self, entry: NodeCacheEntry) -> Result<(), NodeCacheError> {
         let bytes = serde_json::to_vec(&entry)
             .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Corrupt))?;
-        let final_path = self.path_for(&entry.key_digest);
+        let final_path = self.path_for(&entry.key_digest)?;
         let tmp = self.create_tmp(&entry.key_digest, &bytes)?;
         let published = self.publish(&tmp, &final_path, &bytes);
         let _ = fs::remove_file(&tmp);
@@ -321,7 +329,7 @@ impl NodeResultCache {
     }
 
     pub fn lookup(&self, key: &NodeCacheKey) -> Result<NodeCacheLookup, NodeCacheError> {
-        let path = self.path_for(&key.digest);
+        let path = self.path_for(&key.digest)?;
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -335,7 +343,7 @@ impl NodeResultCache {
     pub fn inspect(&self) -> Result<NodeCacheInspect, NodeCacheError> {
         let mut paths = Vec::new();
         let mut negative_entries = 0;
-        let entries = fs::read_dir(self.root.join("entries"))
+        let entries = fs::read_dir(self.entries_dir()?)
             .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
         for entry in entries {
             let entry = entry.map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
@@ -366,7 +374,7 @@ impl NodeResultCache {
         key: &NodeCacheKey,
         _reason: NodeCacheInvalidationReason,
     ) -> Result<(), NodeCacheError> {
-        match fs::remove_file(self.path_for(&key.digest)) {
+        match fs::remove_file(self.path_for(&key.digest)?) {
             Ok(()) => self.sync_entries(),
             Err(error) if error.kind() == io::ErrorKind::NotFound => self.sync_entries(),
             Err(_) => Err(NodeCacheError::new(NodeCacheErrorKind::Io)),
@@ -421,20 +429,23 @@ impl NodeResultCache {
         Ok(drop)
     }
 
-    fn path_for(&self, digest: &str) -> PathBuf {
-        self.root.join("entries").join(file_stem(digest))
+    fn path_for(&self, digest: &str) -> Result<PathBuf, NodeCacheError> {
+        let leaf = key_digest_leaf(digest)
+            .ok_or_else(|| NodeCacheError::new(NodeCacheErrorKind::InvalidIdentity))?;
+        Ok(self.entries_dir()?.join(leaf))
     }
 
-    fn entries_dir(&self) -> PathBuf {
-        self.root.join("entries")
+    fn entries_dir(&self) -> Result<PathBuf, NodeCacheError> {
+        verified_entries_dir(&self.root)
     }
 
     fn sync_entries(&self) -> Result<(), NodeCacheError> {
-        sync_dir(&self.entries_dir())
+        sync_dir(&self.entries_dir()?)
     }
 
     fn create_tmp(&self, digest: &str, bytes: &[u8]) -> Result<PathBuf, NodeCacheError> {
-        let stem = file_stem(digest);
+        let stem = key_digest_leaf(digest)
+            .ok_or_else(|| NodeCacheError::new(NodeCacheErrorKind::InvalidIdentity))?;
         for _ in 0..8 {
             let tmp = self.root.join(format!(
                 ".tmp-{}-{}-{}",
@@ -551,12 +562,50 @@ fn verify_entry(bytes: &[u8], expected_digest: Option<&str>) -> NodeCacheLookup 
             reason: NodeCacheInvalidationReason::HashMismatch,
         };
     }
+    if key_digest_leaf(&entry.key_digest).is_none() {
+        return NodeCacheLookup::Invalid {
+            reason: NodeCacheInvalidationReason::HashMismatch,
+        };
+    }
+    let Ok(reconstructed) = key_from_provenance(&entry.provenance) else {
+        return NodeCacheLookup::Invalid {
+            reason: NodeCacheInvalidationReason::HashMismatch,
+        };
+    };
+    if reconstructed.digest() != entry.key_digest {
+        return NodeCacheLookup::Invalid {
+            reason: NodeCacheInvalidationReason::HashMismatch,
+        };
+    }
     if expected_digest.is_some_and(|digest| digest != entry.key_digest) {
         return NodeCacheLookup::Invalid {
             reason: NodeCacheInvalidationReason::HashMismatch,
         };
     }
     NodeCacheLookup::Hit(Box::new(entry))
+}
+
+fn key_from_provenance(provenance: &CacheProvenance) -> Result<NodeCacheKey, NodeCacheKeyError> {
+    NodeCacheKey::bind(NodeCacheKeyMaterial {
+        workflow_id: &provenance.workflow_id,
+        workflow_version: &provenance.workflow_version,
+        node_id: &provenance.node_id,
+        node_version: &provenance.node_version,
+        invocation_identity: &provenance.invocation_identity,
+        input_artifact_hashes: &provenance.input_artifact_hashes,
+        request_input_digest: &provenance.request_input_digest,
+        policy_digest: &provenance.policy_digest,
+    })
+}
+
+fn verified_entries_dir(root: &Path) -> Result<PathBuf, NodeCacheError> {
+    let entries = root.join("entries");
+    let metadata =
+        fs::symlink_metadata(&entries).map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(NodeCacheError::new(NodeCacheErrorKind::Io));
+    }
+    Ok(entries)
 }
 
 fn payload_digest(payload: &Value) -> Result<String, NodeCacheError> {
@@ -573,8 +622,13 @@ fn frame(label: &str, value: &str) -> String {
     format!("{label}_BYTES:{}\n{value}", value.len())
 }
 
-fn file_stem(digest: &str) -> String {
-    digest.replace(':', "-")
+fn key_digest_leaf(digest: &str) -> Option<String> {
+    let hex = digest.strip_prefix("sha256:")?;
+    (hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+    .then(|| format!("sha256-{hex}"))
 }
 
 impl std::fmt::Display for NodeCacheKeyError {

@@ -3499,12 +3499,10 @@ impl Llm for FencedModel {
         request: LlmRequest,
         stream: bool,
     ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
-        let key = self.cache.as_ref().and_then(|(cache, identity)| {
-            identity
-                .bind(&request_input_hashes(&request))
-                .ok()
-                .map(|key| (cache, key))
-        });
+        let key = self
+            .cache
+            .as_ref()
+            .and_then(|(cache, identity)| identity.bind(&request).ok().map(|key| (cache, key)));
         if let Some((cache, key)) = &key {
             match cache.lookup(key) {
                 Ok(NodeCacheLookup::Hit(entry))
@@ -3785,33 +3783,199 @@ struct NodeCacheIdentity {
 }
 
 impl NodeCacheIdentity {
-    fn bind(&self, input_artifact_hashes: &[String]) -> Result<NodeCacheKey, ExecutionError> {
+    fn bind(&self, request: &LlmRequest) -> Result<NodeCacheKey, ExecutionError> {
         NodeCacheKey::bind(NodeCacheKeyMaterial {
             workflow_id: &self.workflow_id,
             workflow_version: &self.workflow_version,
             node_id: &self.node_id,
             node_version: &self.node_version,
             invocation_identity: &self.invocation_identity,
-            input_artifact_hashes,
+            input_artifact_hashes: &[],
+            request_input_digest: &request_input_digest(request),
             policy_digest: &self.policy_digest,
         })
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))
     }
 }
 
-fn request_input_hashes(request: &LlmRequest) -> Vec<String> {
-    request
-        .contents
-        .iter()
-        .filter_map(|content| {
-            let text = content
-                .parts
-                .iter()
-                .filter_map(|part| part.text())
-                .collect::<String>();
-            (!text.is_empty()).then(|| format!("sha256:{:x}", Sha256::digest(text.as_bytes())))
-        })
-        .collect()
+/// Length-framed digest of the complete ordered request conversation.
+pub fn request_input_digest(request: &LlmRequest) -> String {
+    let mut framed = frame_field("CONTENTS", &request.contents.len().to_string());
+    for content in &request.contents {
+        framed.push('\n');
+        framed.push_str(&frame_field("ROLE", &content.role));
+        framed.push('\n');
+        framed.push_str(&frame_field("PARTS", &content.parts.len().to_string()));
+        for part in &content.parts {
+            framed.push('\n');
+            framed.push_str(&frame_part(part));
+        }
+    }
+    format!("sha256:{:x}", Sha256::digest(framed.as_bytes()))
+}
+
+fn frame_field(label: &str, value: &str) -> String {
+    format!("{label}_BYTES:{}\n{value}", value.len())
+}
+
+fn frame_opt(label: &str, value: Option<&str>) -> String {
+    match value {
+        Some(value) => frame_field(label, value),
+        None => frame_field(&format!("{label}_ABSENT"), ""),
+    }
+}
+
+fn frame_json(label: &str, value: &Value) -> String {
+    frame_field(
+        label,
+        &serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()),
+    )
+}
+
+fn frame_bytes(label: &str, bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    frame_field(label, &hex)
+}
+
+fn frame_part(part: &adk_rust::Part) -> String {
+    match part {
+        adk_rust::Part::Text { text } => {
+            [frame_field("TAG", "text"), frame_field("TEXT", text)].join("\n")
+        }
+        adk_rust::Part::Thinking {
+            thinking,
+            signature,
+        } => [
+            frame_field("TAG", "thinking"),
+            frame_field("THINKING", thinking),
+            frame_opt("SIGNATURE", signature.as_deref()),
+        ]
+        .join("\n"),
+        adk_rust::Part::InlineData {
+            mime_type,
+            data,
+            uri,
+            annotations,
+        } => [
+            frame_field("TAG", "inline_data"),
+            frame_field("MIME", mime_type),
+            frame_bytes("DATA", data),
+            frame_opt("URI", uri.as_deref()),
+            frame_opt(
+                "ANNOTATIONS",
+                annotations
+                    .as_ref()
+                    .and_then(|value| serde_json::to_string(value).ok())
+                    .as_deref(),
+            ),
+        ]
+        .join("\n"),
+        adk_rust::Part::FileData {
+            mime_type,
+            file_uri,
+            annotations,
+        } => [
+            frame_field("TAG", "file_data"),
+            frame_field("MIME", mime_type),
+            frame_field("FILE_URI", file_uri),
+            frame_opt(
+                "ANNOTATIONS",
+                annotations
+                    .as_ref()
+                    .and_then(|value| serde_json::to_string(value).ok())
+                    .as_deref(),
+            ),
+        ]
+        .join("\n"),
+        adk_rust::Part::FunctionCall {
+            name,
+            args,
+            id,
+            thought_signature,
+        } => [
+            frame_field("TAG", "function_call"),
+            frame_field("NAME", name),
+            frame_json("ARGS", args),
+            frame_opt("ID", id.as_deref()),
+            frame_opt("THOUGHT_SIGNATURE", thought_signature.as_deref()),
+        ]
+        .join("\n"),
+        adk_rust::Part::FunctionResponse {
+            function_response,
+            id,
+            annotations,
+        } => {
+            let mut framed = [
+                frame_field("TAG", "function_response"),
+                frame_field("NAME", &function_response.name),
+                frame_json("RESPONSE", &function_response.response),
+                frame_opt("ID", id.as_deref()),
+                frame_opt(
+                    "ANNOTATIONS",
+                    annotations
+                        .as_ref()
+                        .and_then(|value| serde_json::to_string(value).ok())
+                        .as_deref(),
+                ),
+                frame_field(
+                    "INLINE_DATA_COUNT",
+                    &function_response.inline_data.len().to_string(),
+                ),
+            ]
+            .join("\n");
+            for part in &function_response.inline_data {
+                framed.push('\n');
+                framed.push_str(&frame_field("INLINE_MIME", &part.mime_type));
+                framed.push('\n');
+                framed.push_str(&frame_bytes("INLINE_DATA", &part.data));
+                framed.push('\n');
+                framed.push_str(&frame_opt("INLINE_URI", part.uri.as_deref()));
+            }
+            framed.push('\n');
+            framed.push_str(&frame_field(
+                "FILE_DATA_COUNT",
+                &function_response.file_data.len().to_string(),
+            ));
+            for part in &function_response.file_data {
+                framed.push('\n');
+                framed.push_str(&frame_field("FILE_MIME", &part.mime_type));
+                framed.push('\n');
+                framed.push_str(&frame_field("FILE_URI", &part.file_uri));
+            }
+            framed
+        }
+        adk_rust::Part::ServerToolCall { server_tool_call } => [
+            frame_field("TAG", "server_tool_call"),
+            frame_json("PAYLOAD", server_tool_call),
+        ]
+        .join("\n"),
+        adk_rust::Part::ServerToolResponse {
+            server_tool_response,
+        } => [
+            frame_field("TAG", "server_tool_response"),
+            frame_json("PAYLOAD", server_tool_response),
+        ]
+        .join("\n"),
+        adk_rust::Part::EmbeddedResource { resource } => match resource {
+            adk_rust::EmbeddedResource::Text(text) => [
+                frame_field("TAG", "embedded_text"),
+                frame_field("URI", &text.uri),
+                frame_opt("MIME", text.mime_type.as_deref()),
+                frame_field("TEXT", &text.text),
+            ]
+            .join("\n"),
+            adk_rust::EmbeddedResource::Blob(blob) => [
+                frame_field("TAG", "embedded_blob"),
+                frame_field("URI", &blob.uri),
+                frame_opt("MIME", blob.mime_type.as_deref()),
+                frame_bytes("DATA", &blob.data),
+            ]
+            .join("\n"),
+        },
+    }
 }
 
 fn node_cache_identity(

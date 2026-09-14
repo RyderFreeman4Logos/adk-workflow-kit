@@ -4,10 +4,29 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use adk_rust::{Content, FunctionResponseData, LlmRequest, Part};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use workflow_adk::execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1};
-use workflow_runtime::{NodeCacheRetention, NodeResultCache};
+use workflow_adk::execution::{
+    ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1, request_input_digest,
+};
+use workflow_runtime::{NodeCacheKey, NodeCacheKeyMaterial, NodeCacheRetention, NodeResultCache};
+
+fn request_key(request: &LlmRequest) -> String {
+    NodeCacheKey::bind(NodeCacheKeyMaterial {
+        workflow_id: "wf-cache",
+        workflow_version: "1",
+        node_id: "work",
+        node_version: "work:1",
+        invocation_identity: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        input_artifact_hashes: &[],
+        request_input_digest: &request_input_digest(request),
+        policy_digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    })
+    .expect("valid cache key")
+    .digest()
+    .to_owned()
+}
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -137,6 +156,81 @@ fn production_cache_hit_skips_fenced_model_with_zero_calls() {
         terminal_output(second.run_root())["terminal"],
         recorded["terminal"]
     );
+}
+
+#[test]
+fn request_input_identity_misses_role_order_boundary_and_tool_collisions() {
+    let text = |role: &str, parts: Vec<&str>| Content {
+        role: role.to_owned(),
+        parts: parts
+            .into_iter()
+            .map(|text| Part::Text {
+                text: text.to_owned(),
+            })
+            .collect(),
+    };
+    let baseline = LlmRequest::new(
+        "fake",
+        vec![text("user", vec!["ab"]), text("assistant", vec!["c"])],
+    );
+    let role_swap = LlmRequest::new(
+        "fake",
+        vec![text("assistant", vec!["ab"]), text("user", vec!["c"])],
+    );
+    let reordered = LlmRequest::new(
+        "fake",
+        vec![text("assistant", vec!["c"]), text("user", vec!["ab"])],
+    );
+    let boundary = LlmRequest::new(
+        "fake",
+        vec![text("user", vec!["a", "b"]), text("assistant", vec!["c"])],
+    );
+    let with_tool = LlmRequest::new(
+        "fake",
+        vec![
+            text("user", vec!["ab"]),
+            Content {
+                role: "assistant".to_owned(),
+                parts: vec![
+                    Part::Text {
+                        text: "c".to_owned(),
+                    },
+                    Part::FunctionCall {
+                        name: "lookup".to_owned(),
+                        args: json!({"q": "ab"}),
+                        id: None,
+                        thought_signature: None,
+                    },
+                ],
+            },
+        ],
+    );
+    let with_tool_response = LlmRequest::new(
+        "fake",
+        vec![
+            text("user", vec!["ab"]),
+            text("assistant", vec!["c"]),
+            Content {
+                role: "function".to_owned(),
+                parts: vec![Part::FunctionResponse {
+                    function_response: FunctionResponseData::new("lookup", json!({"q": "ab"})),
+                    id: None,
+                    annotations: None,
+                }],
+            },
+        ],
+    );
+    let same_again = LlmRequest::new(
+        "fake",
+        vec![text("user", vec!["ab"]), text("assistant", vec!["c"])],
+    );
+    let baseline_key = request_key(&baseline);
+    assert_eq!(baseline_key, request_key(&same_again));
+    assert_ne!(baseline_key, request_key(&role_swap));
+    assert_ne!(baseline_key, request_key(&reordered));
+    assert_ne!(baseline_key, request_key(&boundary));
+    assert_ne!(baseline_key, request_key(&with_tool));
+    assert_ne!(baseline_key, request_key(&with_tool_response));
 }
 
 #[test]

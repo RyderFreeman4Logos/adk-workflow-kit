@@ -12,12 +12,33 @@ use workflow_runtime::{
     reset_node_cache_dir_syncs,
 };
 
+const FIXTURE_REQUEST_DIGEST: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
 fn bind_case(
     workflow_version: &str,
     node_version: &str,
     invocation_identity: &str,
     input_hashes: &[&str],
     policy_digest: &str,
+) -> NodeCacheKey {
+    bind_case_with_request(
+        workflow_version,
+        node_version,
+        invocation_identity,
+        input_hashes,
+        policy_digest,
+        FIXTURE_REQUEST_DIGEST,
+    )
+}
+
+fn bind_case_with_request(
+    workflow_version: &str,
+    node_version: &str,
+    invocation_identity: &str,
+    input_hashes: &[&str],
+    policy_digest: &str,
+    request_input_digest: &str,
 ) -> NodeCacheKey {
     let hashes = input_hashes
         .iter()
@@ -30,6 +51,7 @@ fn bind_case(
         node_version,
         invocation_identity,
         input_artifact_hashes: &hashes,
+        request_input_digest,
         policy_digest,
     })
     .expect("valid cache key")
@@ -125,6 +147,7 @@ fn key_mutation_matrix_covers_every_identity_field() {
         input_artifact_hashes: &[
             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
         ],
+        request_input_digest: FIXTURE_REQUEST_DIGEST,
         policy_digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     })
     .expect("valid cache key");
@@ -132,6 +155,44 @@ fn key_mutation_matrix_covers_every_identity_field() {
         baseline.digest(),
         with_run_metadata.digest(),
         "run IDs and timestamps must not be part of the key material"
+    );
+    let reordered_artifacts = bind_case(
+        "1",
+        "work:1",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        &[
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ],
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    );
+    let ordered_artifacts = bind_case(
+        "1",
+        "work:1",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        &[
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        ],
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    );
+    assert_eq!(
+        reordered_artifacts.digest(),
+        ordered_artifacts.digest(),
+        "unordered artifact sets must still hit regardless of presentation order"
+    );
+    let swapped_request = bind_case_with_request(
+        "1",
+        "work:1",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        &["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    );
+    assert_ne!(
+        baseline.digest(),
+        swapped_request.digest(),
+        "ordered request input identity must not collapse into the artifact set"
     );
 }
 
@@ -379,6 +440,76 @@ fn open_fsyncs_parent_that_owns_the_cache_name() {
         node_cache_dir_syncs() >= 3,
         "first open must fsync entries, root, and the parent that owns the cache name"
     );
+    let _ = fs::remove_dir_all(parent);
+}
+
+#[test]
+fn import_rejects_path_traversal_key_digest_without_escaping_cache_root() {
+    let parent = cache_root("import-escape");
+    let root = parent.join("cache");
+    let victim = parent.join("victim");
+    fs::write(&victim, b"keep-me").expect("seed victim");
+    let cache = NodeResultCache::open(&root).expect("open cache");
+    let key = base_key();
+    let mut entry = serde_json::to_value(
+        NodeCacheEntry::success(key, json!({"answer": "evil"}), provenance(&base_key())).unwrap(),
+    )
+    .expect("entry json");
+    entry["key_digest"] = json!("../../victim");
+    let bytes = serde_json::to_vec(&vec![entry]).expect("import payload");
+    assert!(
+        cache.import(&bytes).is_err(),
+        "imported key_digest must not be used as a pathname"
+    );
+    assert_eq!(
+        fs::read(&victim).expect("victim survives"),
+        b"keep-me",
+        "traversal import must not create or replace files outside the cache root"
+    );
+    assert!(
+        !root.join("entries").join("../../victim").exists()
+            || fs::read(&victim).expect("reread") == b"keep-me"
+    );
+    let _ = fs::remove_dir_all(parent);
+}
+
+#[test]
+fn import_heals_divergent_validated_leaf_without_escaping() {
+    let parent = cache_root("import-heal");
+    let root = parent.join("cache");
+    let victim = parent.join("victim");
+    fs::write(&victim, b"keep-me").expect("seed victim");
+    let cache = NodeResultCache::open(&root).expect("open cache");
+    let key = base_key();
+    cache
+        .put(
+            NodeCacheEntry::success(key.clone(), json!({"answer": "old"}), provenance(&key))
+                .unwrap(),
+        )
+        .expect("seed");
+    let path = cache
+        .inspect()
+        .expect("inspect")
+        .entry_path(&key)
+        .expect("validated leaf");
+    assert!(path.starts_with(root.join("entries")));
+    fs::write(&path, b"stale-divergent").expect("diverge leaf");
+    let imported =
+        NodeCacheEntry::success(key.clone(), json!({"answer": "healed"}), provenance(&key))
+            .unwrap();
+    assert_eq!(
+        cache
+            .import(&serde_json::to_vec(&vec![imported]).expect("encode"))
+            .expect("valid reconstructed digest still imports"),
+        1
+    );
+    match cache.lookup(&key).expect("lookup") {
+        NodeCacheLookup::Hit(entry) => {
+            assert_eq!(entry.payload(), &json!({"answer": "healed"}))
+        }
+        other => panic!("validated leaf must heal in place, got {other:?}"),
+    }
+    assert_eq!(fs::read(&victim).expect("victim survives"), b"keep-me");
     let _ = fs::remove_dir_all(parent);
 }
 
