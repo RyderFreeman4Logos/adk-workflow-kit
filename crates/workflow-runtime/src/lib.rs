@@ -21,6 +21,7 @@ mod security;
 mod session;
 mod tool;
 mod tool_registry;
+mod typed_protocol;
 mod workdir;
 
 pub use approval::{
@@ -106,6 +107,16 @@ pub use tool_registry::{
     ReadSourceRangeTool, SearchCodeTool, ToolImplementationRegistry,
     ToolImplementationRegistryError,
 };
+pub use typed_protocol::{
+    ArtifactRef, COMPACT_STATE_OUTPUT_TOKEN_BUDGET, CompactStateDelta, Completeness, Continuation,
+    DEPENDENCY_OUTPUT_TOKEN_BUDGET, DependencyJudgment, DependencyRecord,
+    ESCALATION_OUTPUT_TOKEN_BUDGET, EscalationRecord, EscalationTarget,
+    FIREWALL_OUTPUT_TOKEN_BUDGET, FirewallDecision, FirewallRecord, ISSUE_CARD_OUTPUT_TOKEN_BUDGET,
+    IssueCard, ResearchRationale, SENTINEL_OUTPUT_TOKEN_BUDGET, SentinelEvidence, SentinelVerdict,
+    SourceSpan, TYPED_OUTPUT_SCHEMA_VERSION_V1, TypedNodeKind, TypedOutput, TypedOutputError,
+    TypedPayload, WorkflowExchange, admit_for_reducer, estimate_output_tokens,
+    node_output_token_budget, parse_typed_output, render_json, render_markdown,
+};
 pub use workdir::{
     CleanupOutcome, Materialization, RunWorkdir, WorkdirError, WorkdirErrorKind, WorkdirId,
     WorkdirManager,
@@ -115,7 +126,7 @@ use std::{collections::HashSet, fmt, num::NonZeroU64};
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
-fn encode_hex(bytes: &[u8]) -> String {
+pub(crate) fn encode_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
 
     let mut encoded = String::with_capacity(bytes.len() * 2);

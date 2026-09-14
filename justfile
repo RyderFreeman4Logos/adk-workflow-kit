@@ -123,6 +123,13 @@ issue-227-test:
     just issue-227-runtime
     just issue-227-adk
 
+# Focused #228 compact typed-output protocol tests.
+issue-228-runtime test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_228_typed_outputs {{test_name}} --locked -- --nocapture
+
+issue-228-test:
+    just issue-228-runtime
+
 # Focused #224 reference-workflow package and runner contract tests.
 m3-08-reference:
     {{_io}} cargo +1.98.0 test -p workflowctl --test m3_08_reference_workflow --locked -- --nocapture
