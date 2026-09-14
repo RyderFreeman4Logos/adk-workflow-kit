@@ -67,6 +67,8 @@ Durable node-result cache lives under `<workdir>/.node-result-cache/` (reserved 
 
 Compact typed outputs (Sentinel, Firewall, CompactState, IssueCard, dependency, escalation) are versioned v1 envelopes with reason-code registries and deterministic Markdown/JSON renderers. Free-form rationale is off by default. Budgets: [`docs/architecture/typed-output-protocol.md`](docs/architecture/typed-output-protocol.md).
 
+Pinned eval datasets are declared in [`config/datasets.toml`](config/datasets.toml). Fetch is resumable, checksum-gated, and license-gated; see [`docs/spec/DATASET_REGISTRY.md`](docs/spec/DATASET_REGISTRY.md). Large third-party dumps are not vendored.
+
 ## Maturity
 
 | Area | Status | Notes |

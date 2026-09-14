@@ -130,6 +130,13 @@ issue-228-runtime test_name="":
 issue-228-test:
     just issue-228-runtime
 
+# Focused #229 pinned dataset registry tests.
+issue-229-runtime test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_229_dataset_registry {{test_name}} --locked -- --nocapture
+
+issue-229-test:
+    just issue-229-runtime
+
 # Focused #224 reference-workflow package and runner contract tests.
 m3-08-reference:
     {{_io}} cargo +1.98.0 test -p workflowctl --test m3_08_reference_workflow --locked -- --nocapture

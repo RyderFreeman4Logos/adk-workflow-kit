@@ -3248,7 +3248,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workflow-adk"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "adk-rust",
  "jsonschema 0.45.1",
@@ -3266,7 +3266,7 @@ dependencies = [
 
 [[package]]
 name = "workflow-compiler"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "jsonschema 0.45.1",
  "serde",
@@ -3281,7 +3281,7 @@ dependencies = [
 
 [[package]]
 name = "workflow-ir"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "sha2",
  "workflow-spec",
@@ -3289,7 +3289,7 @@ dependencies = [
 
 [[package]]
 name = "workflow-review"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "schemars",
  "serde",
@@ -3301,7 +3301,7 @@ dependencies = [
 
 [[package]]
 name = "workflow-runtime"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "jsonschema 0.45.1",
  "rusqlite",
@@ -3309,12 +3309,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "toml",
  "wasmi",
 ]
 
 [[package]]
 name = "workflow-spec"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "serde",
  "serde_path_to_error",
@@ -3324,7 +3325,7 @@ dependencies = [
 
 [[package]]
 name = "workflow-testkit"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "adk-rust",
  "serde",
@@ -3341,7 +3342,7 @@ dependencies = [
 
 [[package]]
 name = "workflowctl"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "clap",
  "libc",

@@ -1,0 +1,17 @@
+schema_version = 1
+
+# Tiny synthetic smoke/regression subset. Do not vendor third-party dumps.
+
+[[datasets]]
+id = "smoke-fixture"
+family = "synthetic"
+language = "en"
+revision = "1.0.0"
+url = "memory://smoke-fixture"
+sha256 = "sha256:e543862e31a042f932ef3d2f34daa869537e5da06ad9ded1cbbd10885bd46959"
+license = "Apache-2.0"
+license_acceptance_required = false
+distribution = "fetch"
+adapter_version = "1"
+derivation = "identity"
+suites = ["smoke", "regression"]
