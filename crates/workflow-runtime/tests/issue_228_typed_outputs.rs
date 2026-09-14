@@ -602,6 +602,42 @@ fn source_identifiers_reject_control_and_markdown_injection() {
     assert!(!markdown.contains('\u{0007}'));
 }
 
+fn compact_state_at_exact_budget() -> TypedOutput {
+    let budget = node_output_token_budget(TypedNodeKind::CompactState) as usize;
+    let output = TypedOutput::new(
+        TypedPayload::CompactState(CompactStateDelta::new("k".repeat(629), "add", Vec::new())),
+        Completeness::Complete,
+    )
+    .expect("valid compact state");
+    let json = output.to_json().expect("json");
+    assert_eq!(json.len(), 768, "inner JSON must be exactly 768 bytes");
+    assert_eq!(estimate_output_tokens(&json), budget);
+    output
+}
+
+#[test]
+fn exact_compact_state_budget_round_trips_longest_endpoint_pair() {
+    let output = compact_state_at_exact_budget();
+    let mut store = artifact_store();
+    let longest = WorkflowExchange::CodeInvestigation;
+    let artifact_id = longest
+        .publish(longest, &mut store, &output)
+        .expect("publish must admit exact 192-token compact state");
+    let payload = longest
+        .consume(longest, &store, &artifact_id)
+        .expect("consume must admit the longest closed-schema envelope");
+    assert_eq!(payload, output.payload().clone());
+}
+
+#[test]
+fn artifact_ref_rejects_uppercase_digest_hex() {
+    let digest = format!("sha256:{}", "A".repeat(64));
+    assert!(
+        ArtifactRef::new(ARTIFACT_ID, digest).is_err(),
+        "uppercase digest hex must fail closed"
+    );
+}
+
 #[test]
 fn debug_redacts_source_ids() {
     let rendered = format!("{:?}", sentinel());

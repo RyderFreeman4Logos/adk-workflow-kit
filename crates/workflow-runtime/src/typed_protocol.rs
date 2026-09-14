@@ -15,7 +15,6 @@ use crate::{ArtifactId, ArtifactStore, PageRequest, encode_hex};
 pub const TYPED_OUTPUT_SCHEMA_VERSION_V1: u32 = 1;
 
 const SHA256_PREFIX: &str = "sha256:";
-const SHA256_HEX_LEN: usize = 64;
 
 /// Baseline output-token budgets per node kind (canonical JSON bytes / 4).
 pub const SENTINEL_OUTPUT_TOKEN_BUDGET: u32 = 128;
@@ -326,10 +325,9 @@ impl fmt::Debug for ArtifactRef {
 }
 
 fn valid_sha256(value: &str) -> bool {
-    let Some(hex) = value.strip_prefix(SHA256_PREFIX) else {
-        return false;
-    };
-    hex.len() == SHA256_HEX_LEN && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value
+        .strip_prefix(SHA256_PREFIX)
+        .is_some_and(|hex| ArtifactId::parse(hex).is_some())
 }
 
 /// Continuation token for a truncated node output.
@@ -1073,7 +1071,12 @@ impl WorkflowExchange {
         envelope.insert("from".to_owned(), Value::String(self.as_str().to_owned()));
         envelope.insert("to".to_owned(), Value::String(to.as_str().to_owned()));
         envelope.insert("output".to_owned(), output.to_value()?);
-        serde_json::to_vec(&Value::Object(envelope)).map_err(|_| TypedOutputError::InvalidJson)
+        let bytes = serde_json::to_vec(&Value::Object(envelope))
+            .map_err(|_| TypedOutputError::InvalidJson)?;
+        if bytes.len() > MAX_EXCHANGE_ENVELOPE_BYTES {
+            return Err(TypedOutputError::InvalidJson);
+        }
+        Ok(bytes)
     }
 
     /// Publishes a complete typed envelope into the artifact store for `to`.
@@ -1113,7 +1116,10 @@ impl WorkflowExchange {
     }
 }
 
-const MAX_EXCHANGE_ENVELOPE_BYTES: usize = (COMPACT_STATE_OUTPUT_TOKEN_BUDGET as usize) * 4 + 64;
+const MAX_EXCHANGE_WRAPPER_BYTES: usize =
+    br#"{"from":"code.investigation","to":"code.investigation","output":}"#.len();
+const MAX_EXCHANGE_ENVELOPE_BYTES: usize =
+    (COMPACT_STATE_OUTPUT_TOKEN_BUDGET as usize) * 4 + MAX_EXCHANGE_WRAPPER_BYTES;
 
 fn read_exchange_bytes<S: ArtifactStore>(
     store: &S,
