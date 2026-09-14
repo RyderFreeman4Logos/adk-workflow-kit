@@ -1036,6 +1036,46 @@ impl WorkflowExchange {
         }
     }
 
+    fn parse(id: &str) -> Option<Self> {
+        match id {
+            "code.investigation" => Some(Self::CodeInvestigation),
+            "grounded.answer" => Some(Self::GroundedAnswer),
+            "multi.hop" => Some(Self::MultiHop),
+            "review" => Some(Self::Review),
+            _ => None,
+        }
+    }
+
+    fn successor(self) -> Self {
+        match self {
+            Self::CodeInvestigation => Self::GroundedAnswer,
+            Self::GroundedAnswer => Self::MultiHop,
+            Self::MultiHop => Self::Review,
+            Self::Review => Self::CodeInvestigation,
+        }
+    }
+
+    /// Wraps a named workflow's execute output before the existing stage/commit path.
+    pub(crate) fn encode_named_output(
+        workflow_id: &str,
+        json_bytes: &[u8],
+    ) -> Result<Option<Vec<u8>>, TypedOutputError> {
+        let Some(from) = Self::parse(workflow_id) else {
+            return Ok(None);
+        };
+        let output = parse_typed_output(json_bytes)?;
+        Ok(Some(from.envelope_bytes(from.successor(), &output)?))
+    }
+
+    fn envelope_bytes(self, to: Self, output: &TypedOutput) -> Result<Vec<u8>, TypedOutputError> {
+        admit_for_reducer(output)?;
+        let mut envelope = Map::new();
+        envelope.insert("from".to_owned(), Value::String(self.as_str().to_owned()));
+        envelope.insert("to".to_owned(), Value::String(to.as_str().to_owned()));
+        envelope.insert("output".to_owned(), output.to_value()?);
+        serde_json::to_vec(&Value::Object(envelope)).map_err(|_| TypedOutputError::InvalidJson)
+    }
+
     /// Publishes a complete typed envelope into the artifact store for `to`.
     pub fn publish<S: ArtifactStore>(
         self,
@@ -1043,14 +1083,9 @@ impl WorkflowExchange {
         store: &mut S,
         output: &TypedOutput,
     ) -> Result<ArtifactId, TypedOutputError> {
-        admit_for_reducer(output)?;
-        let envelope = serde_json::json!({
-            "from": self.as_str(),
-            "to": to.as_str(),
-            "output": parse_typed_value_from_json(output)?,
-        });
-        let bytes = serde_json::to_vec(&envelope).map_err(|_| TypedOutputError::InvalidJson)?;
-        store.put(&bytes).map_err(|_| TypedOutputError::InvalidJson)
+        store
+            .put(&self.envelope_bytes(to, output)?)
+            .map_err(|_| TypedOutputError::InvalidJson)
     }
 
     /// Admits a producer artifact for reducer/action use by `self`.
@@ -1060,20 +1095,16 @@ impl WorkflowExchange {
         store: &S,
         artifact_id: &ArtifactId,
     ) -> Result<TypedPayload, TypedOutputError> {
-        let page = store
-            .read_page(
-                artifact_id,
-                PageRequest::new(
-                    0,
-                    std::num::NonZeroU64::new(65_536).ok_or(TypedOutputError::InvalidJson)?,
-                ),
-            )
-            .map_err(|_| TypedOutputError::InvalidJson)?;
+        let bytes = read_exchange_bytes(store, artifact_id)?;
         let value: Value =
-            serde_json::from_slice(page.bytes()).map_err(|_| TypedOutputError::InvalidJson)?;
+            serde_json::from_slice(&bytes).map_err(|_| TypedOutputError::InvalidJson)?;
         let object = value.as_object().ok_or(TypedOutputError::InvalidJson)?;
-        if object.get("from").and_then(Value::as_str) != Some(from.as_str())
-            || object.get("to").and_then(Value::as_str) != Some(self.as_str())
+        if object.contains_key("rationale") {
+            return Err(TypedOutputError::RationaleNotEnabled);
+        }
+        require_keys(object, &["from", "to", "output"])?;
+        if string_field(object, "from")? != from.as_str()
+            || string_field(object, "to")? != self.as_str()
         {
             return Err(TypedOutputError::InvalidJson);
         }
@@ -1082,8 +1113,29 @@ impl WorkflowExchange {
     }
 }
 
-fn parse_typed_value_from_json(output: &TypedOutput) -> Result<Value, TypedOutputError> {
-    output.to_value()
+const MAX_EXCHANGE_ENVELOPE_BYTES: usize = (COMPACT_STATE_OUTPUT_TOKEN_BUDGET as usize) * 4 + 64;
+
+fn read_exchange_bytes<S: ArtifactStore>(
+    store: &S,
+    artifact_id: &ArtifactId,
+) -> Result<Vec<u8>, TypedOutputError> {
+    let page_limit = std::num::NonZeroU64::new(65_536).ok_or(TypedOutputError::InvalidJson)?;
+    let mut bytes = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = store
+            .read_page(artifact_id, PageRequest::new(offset, page_limit))
+            .map_err(|_| TypedOutputError::InvalidJson)?;
+        bytes.extend_from_slice(page.bytes());
+        if bytes.len() > MAX_EXCHANGE_ENVELOPE_BYTES {
+            return Err(TypedOutputError::InvalidJson);
+        }
+        match page.next_offset() {
+            Some(next) if next > offset => offset = next,
+            Some(_) => return Err(TypedOutputError::InvalidJson),
+            None => return Ok(bytes),
+        }
+    }
 }
 
 /// Opt-in research store for free-form rationale. Never part of the wire schema.

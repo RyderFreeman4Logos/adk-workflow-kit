@@ -1,19 +1,109 @@
-use std::num::NonZeroU64;
+use std::{
+    fs,
+    num::NonZeroU64,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
+use serde_json::{Value, json};
 use workflow_runtime::{
-    ArtifactRef, CompactStateDelta, Completeness, Continuation, DependencyJudgment,
-    DependencyRecord, EscalationRecord, EscalationTarget, FirewallDecision, FirewallRecord,
-    InMemoryArtifactStore, IssueCard, ResearchRationale, SentinelEvidence, SentinelVerdict,
-    SourceSpan, TypedNodeKind, TypedOutput, TypedOutputError, TypedPayload, WorkflowExchange,
+    ArtifactId, ArtifactRef, ArtifactStore, CompactStateDelta, Completeness, Continuation,
+    DependencyJudgment, DependencyRecord, EscalationRecord, EscalationTarget, FirewallDecision,
+    FirewallRecord, InMemoryArtifactStore, IssueCard, PureTransformBinding, PureTransformPlanV1,
+    RequestedCapabilities, ResearchRationale, RunContext, RunController, RunId, RunLimits,
+    RunOutcome, SandboxCapability, SentinelEvidence, SentinelVerdict, SourceSpan, TypedNodeKind,
+    TypedOutput, TypedOutputError, TypedPayload, WorkdirManager, WorkflowExchange,
     admit_for_reducer, estimate_output_tokens, node_output_token_budget, parse_typed_output,
     render_json, render_markdown,
 };
+
+const IDENTITY_WASM: &[u8] = include_bytes!("fixtures/pure_transform_identity.wasm");
+const IDENTITY_DIGEST: &str =
+    "sha256:caee0e61e31b90ed712002a93afeebfc192c8d627b0d66666daafcf26b283f7c";
+static NEXT_WORKDIR: AtomicU64 = AtomicU64::new(0);
 
 fn artifact_store() -> InMemoryArtifactStore {
     InMemoryArtifactStore::new(
         NonZeroU64::new(1 << 16).expect("content limit"),
         NonZeroU64::new(1 << 16).expect("page limit"),
     )
+}
+
+fn small_page_store() -> InMemoryArtifactStore {
+    InMemoryArtifactStore::new(
+        NonZeroU64::new(1 << 16).expect("content limit"),
+        NonZeroU64::new(16).expect("small page limit"),
+    )
+}
+
+struct TestWorkdir(PathBuf);
+
+impl TestWorkdir {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "issue-228-typed-outputs-{}-{}",
+            std::process::id(),
+            NEXT_WORKDIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("workdir root");
+        Self(root)
+    }
+}
+
+impl Drop for TestWorkdir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn run_context() -> RunContext {
+    let one = NonZeroU64::new(1).expect("positive");
+    RunContext::new(
+        RunId::new(String::from("issue-228")).expect("run id"),
+        RunLimits::new(
+            one,
+            one,
+            one,
+            NonZeroU64::new(1_000).expect("wall"),
+            NonZeroU64::new(1_000).expect("idle"),
+            NonZeroU64::new(1_000).expect("tool"),
+            NonZeroU64::new(64 * 1024).expect("output"),
+        ),
+    )
+}
+
+fn execute_typed_output<S: ArtifactStore>(
+    workflow_id: &str,
+    output: &TypedOutput,
+    artifacts: &mut S,
+) -> ArtifactId {
+    let input: Value = serde_json::from_str(&output.to_json().expect("json")).expect("value");
+    let plan = PureTransformPlanV1::new(
+        PureTransformBinding::new(workflow_id, "1", IDENTITY_DIGEST, IDENTITY_WASM)
+            .expect("binding"),
+        input,
+        RequestedCapabilities::new(std::iter::empty::<SandboxCapability>()),
+    )
+    .expect("plan");
+    let root = TestWorkdir::new();
+    let workdirs = root.0.join("workdirs");
+    fs::create_dir(&workdirs).expect("workdirs");
+    let manager = WorkdirManager::new(&workdirs).expect("manager");
+    let run = run_context();
+    let mut workdir = manager.allocate(run.run_id()).expect("allocate");
+    let result = plan.execute(
+        &run,
+        RunController::new(&run),
+        || Duration::ZERO,
+        &workdir,
+        artifacts,
+    );
+    workdir.cleanup().expect("cleanup");
+    match result.outcome() {
+        RunOutcome::Completed { output } => output.clone(),
+        other => panic!("typed output must publish through execute, got {other:?}"),
+    }
 }
 
 const ARTIFACT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -199,6 +289,25 @@ fn measured_tokens(output: &TypedOutput) -> usize {
     estimate_output_tokens(&json)
 }
 
+fn sentinel_at_exact_budget() -> TypedOutput {
+    let budget = node_output_token_budget(TypedNodeKind::Sentinel) as usize;
+    let spans = vec![
+        SourceSpan::new(ARTIFACT_ID, 12, 40_000_000).expect("exact-budget span"),
+        span(),
+    ];
+    let output = TypedOutput::new(
+        TypedPayload::Sentinel(SentinelEvidence::new(
+            SentinelVerdict::Clean,
+            spans,
+            vec![artifact()],
+        )),
+        Completeness::Complete,
+    )
+    .expect("valid sentinel");
+    assert_eq!(measured_tokens(&output), budget);
+    output
+}
+
 #[test]
 fn node_budgets_and_token_continuation_are_explicit() {
     assert_eq!(node_output_token_budget(TypedNodeKind::Sentinel), 128);
@@ -232,31 +341,21 @@ fn admit_for_reducer_enforces_below_at_and_above_node_budgets() {
     assert!(below_tokens < budget, "below-limit fixture {below_tokens}");
     admit_for_reducer(&below).expect("below-limit complete output is admissible");
 
-    let mut at = below.clone();
+    let at = sentinel_at_exact_budget();
+    let at_tokens = measured_tokens(&at);
+    assert_eq!(
+        at_tokens, budget,
+        "at-limit fixture must be exactly {budget}"
+    );
+    admit_for_reducer(&at).expect("at-limit complete output is admissible");
+
     let mut above = below.clone();
-    let mut found_at = false;
     for count in 2..64 {
         let candidate = sentinel_with_span_count(count);
-        let tokens = measured_tokens(&candidate);
-        if tokens == budget {
-            at = candidate;
-            found_at = true;
-        } else if tokens > budget {
+        if measured_tokens(&candidate) > budget {
             above = candidate;
-            if !found_at {
-                at = sentinel_with_span_count(count - 1);
-            }
             break;
-        } else {
-            at = candidate;
         }
-    }
-    let at_tokens = measured_tokens(&at);
-    assert!(at_tokens <= budget, "at-limit fixture {at_tokens}");
-    if at_tokens == budget {
-        admit_for_reducer(&at).expect("at-limit complete output is admissible");
-    } else {
-        admit_for_reducer(&at).expect("largest below-limit complete output is admissible");
     }
 
     let above_tokens = measured_tokens(&above);
@@ -291,6 +390,15 @@ fn four_workflow_classes() -> [WorkflowExchange; 4] {
         WorkflowExchange::MultiHop,
         WorkflowExchange::Review,
     ]
+}
+
+fn workflow_id(class: WorkflowExchange) -> &'static str {
+    match class {
+        WorkflowExchange::CodeInvestigation => "code.investigation",
+        WorkflowExchange::GroundedAnswer => "grounded.answer",
+        WorkflowExchange::MultiHop => "multi.hop",
+        WorkflowExchange::Review => "review",
+    }
 }
 
 #[test]
@@ -360,6 +468,99 @@ fn four_workflows_handoff_typed_outputs_through_artifact_store() {
         .publish(WorkflowExchange::Review, &mut store, &over_budget)
         .expect_err("over-budget output must not be published for downstream use");
     assert!(matches!(error, TypedOutputError::OverBudget));
+}
+
+#[test]
+fn four_named_workflows_handoff_through_production_execute_then_consume() {
+    let pairs = [
+        (
+            WorkflowExchange::CodeInvestigation,
+            WorkflowExchange::GroundedAnswer,
+            sentinel(),
+        ),
+        (
+            WorkflowExchange::GroundedAnswer,
+            WorkflowExchange::MultiHop,
+            issue_card(),
+        ),
+        (
+            WorkflowExchange::MultiHop,
+            WorkflowExchange::Review,
+            dependency(),
+        ),
+        (
+            WorkflowExchange::Review,
+            WorkflowExchange::CodeInvestigation,
+            firewall(),
+        ),
+    ];
+    for (from, to, output) in pairs {
+        let mut store = artifact_store();
+        let artifact_id = execute_typed_output(workflow_id(from), &output, &mut store);
+        let payload = to
+            .consume(from, &store, &artifact_id)
+            .expect("consumer must admit the producer artifact from execute");
+        assert_eq!(payload, output.payload().clone());
+
+        let truncated = TypedOutput::new(
+            output.payload().clone(),
+            Completeness::Truncated {
+                continuation: Continuation::new(1, "next-1").expect("token"),
+            },
+        )
+        .expect("valid truncated envelope");
+        let error = from
+            .publish(to, &mut store, &truncated)
+            .expect_err("truncated output must not be published for downstream use");
+        assert!(matches!(error, TypedOutputError::Truncated));
+    }
+}
+
+#[test]
+fn consume_follows_next_offset_when_page_limit_is_small() {
+    let mut store = small_page_store();
+    let output = sentinel();
+    let artifact_id = WorkflowExchange::CodeInvestigation
+        .publish(WorkflowExchange::GroundedAnswer, &mut store, &output)
+        .expect("publish");
+    let payload = WorkflowExchange::GroundedAnswer
+        .consume(WorkflowExchange::CodeInvestigation, &store, &artifact_id)
+        .expect("consume must reassemble pages");
+    assert_eq!(payload, output.payload().clone());
+}
+
+#[test]
+fn outer_exchange_wrapper_rejects_rationale_and_unknown_fields() {
+    let mut store = artifact_store();
+    let output = sentinel();
+    let envelope = json!({
+        "from": "code.investigation",
+        "to": "grounded.answer",
+        "output": serde_json::from_str::<Value>(&output.to_json().expect("json")).expect("value"),
+        "rationale": "free form",
+    });
+    let bytes = serde_json::to_vec(&envelope).expect("bytes");
+    let artifact_id = store.put(&bytes).expect("store");
+    let error = WorkflowExchange::GroundedAnswer
+        .consume(WorkflowExchange::CodeInvestigation, &store, &artifact_id)
+        .expect_err("outer rationale must fail closed");
+    assert!(matches!(
+        error,
+        TypedOutputError::RationaleNotEnabled | TypedOutputError::InvalidJson
+    ));
+
+    let unknown = json!({
+        "from": "code.investigation",
+        "to": "grounded.answer",
+        "output": serde_json::from_str::<Value>(&output.to_json().expect("json")).expect("value"),
+        "extra": true,
+    });
+    let bytes = serde_json::to_vec(&unknown).expect("bytes");
+    let artifact_id = store.put(&bytes).expect("store");
+    let error = WorkflowExchange::GroundedAnswer
+        .consume(WorkflowExchange::CodeInvestigation, &store, &artifact_id)
+        .expect_err("unknown outer field must fail closed");
+    assert!(matches!(error, TypedOutputError::InvalidJson));
 }
 
 #[test]
