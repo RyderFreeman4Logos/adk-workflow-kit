@@ -3840,6 +3840,34 @@ fn frame_bytes(label: &str, bytes: &[u8]) -> String {
     frame_field(label, &hex)
 }
 
+fn frame_json_opt(label: &str, value: Option<&Value>) -> String {
+    frame_opt(
+        label,
+        value
+            .and_then(|value| serde_json::to_string(value).ok())
+            .as_deref(),
+    )
+}
+
+fn frame_nested_inline_data(part: &adk_rust::InlineDataPart) -> String {
+    [
+        frame_field("INLINE_MIME", &part.mime_type),
+        frame_bytes("INLINE_DATA", &part.data),
+        frame_opt("INLINE_URI", part.uri.as_deref()),
+        frame_json_opt("INLINE_ANNOTATIONS", part.annotations.as_ref()),
+    ]
+    .join("\n")
+}
+
+fn frame_nested_file_data(part: &adk_rust::FileDataPart) -> String {
+    [
+        frame_field("FILE_MIME", &part.mime_type),
+        frame_field("FILE_URI", &part.file_uri),
+        frame_json_opt("FILE_ANNOTATIONS", part.annotations.as_ref()),
+    ]
+    .join("\n")
+}
+
 fn frame_part(part: &adk_rust::Part) -> String {
     match part {
         adk_rust::Part::Text { text } => {
@@ -3864,13 +3892,7 @@ fn frame_part(part: &adk_rust::Part) -> String {
             frame_field("MIME", mime_type),
             frame_bytes("DATA", data),
             frame_opt("URI", uri.as_deref()),
-            frame_opt(
-                "ANNOTATIONS",
-                annotations
-                    .as_ref()
-                    .and_then(|value| serde_json::to_string(value).ok())
-                    .as_deref(),
-            ),
+            frame_json_opt("ANNOTATIONS", annotations.as_ref()),
         ]
         .join("\n"),
         adk_rust::Part::FileData {
@@ -3881,13 +3903,7 @@ fn frame_part(part: &adk_rust::Part) -> String {
             frame_field("TAG", "file_data"),
             frame_field("MIME", mime_type),
             frame_field("FILE_URI", file_uri),
-            frame_opt(
-                "ANNOTATIONS",
-                annotations
-                    .as_ref()
-                    .and_then(|value| serde_json::to_string(value).ok())
-                    .as_deref(),
-            ),
+            frame_json_opt("ANNOTATIONS", annotations.as_ref()),
         ]
         .join("\n"),
         adk_rust::Part::FunctionCall {
@@ -3913,13 +3929,7 @@ fn frame_part(part: &adk_rust::Part) -> String {
                 frame_field("NAME", &function_response.name),
                 frame_json("RESPONSE", &function_response.response),
                 frame_opt("ID", id.as_deref()),
-                frame_opt(
-                    "ANNOTATIONS",
-                    annotations
-                        .as_ref()
-                        .and_then(|value| serde_json::to_string(value).ok())
-                        .as_deref(),
-                ),
+                frame_json_opt("ANNOTATIONS", annotations.as_ref()),
                 frame_field(
                     "INLINE_DATA_COUNT",
                     &function_response.inline_data.len().to_string(),
@@ -3928,11 +3938,7 @@ fn frame_part(part: &adk_rust::Part) -> String {
             .join("\n");
             for part in &function_response.inline_data {
                 framed.push('\n');
-                framed.push_str(&frame_field("INLINE_MIME", &part.mime_type));
-                framed.push('\n');
-                framed.push_str(&frame_bytes("INLINE_DATA", &part.data));
-                framed.push('\n');
-                framed.push_str(&frame_opt("INLINE_URI", part.uri.as_deref()));
+                framed.push_str(&frame_nested_inline_data(part));
             }
             framed.push('\n');
             framed.push_str(&frame_field(
@@ -3941,9 +3947,7 @@ fn frame_part(part: &adk_rust::Part) -> String {
             ));
             for part in &function_response.file_data {
                 framed.push('\n');
-                framed.push_str(&frame_field("FILE_MIME", &part.mime_type));
-                framed.push('\n');
-                framed.push_str(&frame_field("FILE_URI", &part.file_uri));
+                framed.push_str(&frame_nested_file_data(part));
             }
             framed
         }

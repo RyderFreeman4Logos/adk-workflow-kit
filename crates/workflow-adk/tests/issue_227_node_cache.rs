@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use adk_rust::{Content, FunctionResponseData, LlmRequest, Part};
+use adk_rust::{Content, FileDataPart, FunctionResponseData, InlineDataPart, LlmRequest, Part};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use workflow_adk::execution::{
@@ -231,6 +231,55 @@ fn request_input_identity_misses_role_order_boundary_and_tool_collisions() {
     assert_ne!(baseline_key, request_key(&boundary));
     assert_ne!(baseline_key, request_key(&with_tool));
     assert_ne!(baseline_key, request_key(&with_tool_response));
+}
+
+fn function_response_request(function_response: FunctionResponseData) -> LlmRequest {
+    LlmRequest::new(
+        "fake",
+        vec![Content {
+            role: "function".to_owned(),
+            parts: vec![Part::FunctionResponse {
+                function_response,
+                id: None,
+                annotations: None,
+            }],
+        }],
+    )
+}
+
+#[test]
+fn request_input_identity_misses_nested_function_response_inline_annotations() {
+    let mut absent = FunctionResponseData::new("lookup", json!({"q": "ab"}));
+    absent.inline_data = vec![InlineDataPart {
+        mime_type: "image/png".to_owned(),
+        data: vec![0x89, 0x50, 0x4E, 0x47],
+        uri: None,
+        annotations: None,
+    }];
+    let mut present = absent.clone();
+    present.inline_data[0].annotations = Some(json!({"caption": "chart"}));
+    assert_ne!(
+        request_key(&function_response_request(absent)),
+        request_key(&function_response_request(present)),
+        "nested FunctionResponse inline_data annotations must enter request identity"
+    );
+}
+
+#[test]
+fn request_input_identity_misses_nested_function_response_file_annotations() {
+    let mut absent = FunctionResponseData::new("lookup", json!({"q": "ab"}));
+    absent.file_data = vec![FileDataPart {
+        mime_type: "application/pdf".to_owned(),
+        file_uri: "gs://bucket/report.pdf".to_owned(),
+        annotations: None,
+    }];
+    let mut present = absent.clone();
+    present.file_data[0].annotations = Some(json!({"source": "tool"}));
+    assert_ne!(
+        request_key(&function_response_request(absent)),
+        request_key(&function_response_request(present)),
+        "nested FunctionResponse file_data annotations must enter request identity"
+    );
 }
 
 #[test]
