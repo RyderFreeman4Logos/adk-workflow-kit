@@ -598,6 +598,14 @@ enum WaitProgress {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReapProgress {
+    Reaped(ExitStatus),
+    Poll,
+    Kill,
+    Unreaped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChildStat {
     Ready {
         state: char,
@@ -748,17 +756,49 @@ fn wait_progress(
         return WaitProgress::Reaped(status);
     }
     let kill_requested = output_exceeded || wall_deadline.is_some_and(|limit| now >= limit);
-    if matching_d && kill_requested {
+    if !kill_requested {
+        return WaitProgress::Poll;
+    }
+    if matching_d || d_state_deadline.is_some() {
         let deadline = *d_state_deadline.get_or_insert(now + d_state_grace(wall_time));
         if now < deadline {
             return WaitProgress::Poll;
         }
         return WaitProgress::Kill;
     }
-    if kill_requested {
-        return WaitProgress::Kill;
+    WaitProgress::Kill
+}
+
+fn reap_progress(
+    reaped: Option<ExitStatus>,
+    matching_d: bool,
+    now: Instant,
+    cleanup_deadline: Instant,
+    d_state_deadline: &mut Option<Instant>,
+    kill_sent: bool,
+    wall_time: Option<Duration>,
+) -> ReapProgress {
+    if let Some(status) = reaped {
+        return ReapProgress::Reaped(status);
     }
-    WaitProgress::Poll
+    if matching_d || d_state_deadline.is_some() {
+        let deadline = *d_state_deadline.get_or_insert(now + d_state_grace(wall_time));
+        if now < deadline {
+            return ReapProgress::Poll;
+        }
+        if !kill_sent {
+            return ReapProgress::Kill;
+        }
+        return ReapProgress::Unreaped;
+    }
+    if !kill_sent {
+        return ReapProgress::Kill;
+    }
+    if now >= cleanup_deadline {
+        ReapProgress::Unreaped
+    } else {
+        ReapProgress::Poll
+    }
 }
 
 fn conventional_exit_code(status: ExitStatus) -> Option<i32> {
@@ -781,29 +821,28 @@ fn terminate_and_reap(
     recorded_starttime: Option<u64>,
     wall_time: Option<Duration>,
 ) -> ReapOutcome {
-    let _ = kill_process_group(process_group);
     let cleanup_deadline = Instant::now() + CLEANUP_REAP_TIMEOUT;
-    let d_state_deadline = Instant::now() + d_state_grace(wall_time);
+    let mut d_state_deadline = None;
+    let mut kill_sent = false;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return ReapOutcome::Reaped(status),
-            Ok(None) | Err(_) => {
-                let now = Instant::now();
-                let deadline =
-                    if matching_group_uninterruptible_io(process_group, recorded_starttime) {
-                        d_state_deadline
-                    } else {
-                        cleanup_deadline
-                    };
-                if now >= deadline {
-                    return ReapOutcome::Unreaped;
-                }
-                thread::sleep(
-                    deadline
-                        .saturating_duration_since(now)
-                        .min(Duration::from_millis(10)),
-                );
+        let reaped = child.try_wait().unwrap_or_default();
+        let matching_d = matching_group_uninterruptible_io(process_group, recorded_starttime);
+        match reap_progress(
+            reaped,
+            matching_d,
+            Instant::now(),
+            cleanup_deadline,
+            &mut d_state_deadline,
+            kill_sent,
+            wall_time,
+        ) {
+            ReapProgress::Reaped(status) => return ReapOutcome::Reaped(status),
+            ReapProgress::Unreaped => return ReapOutcome::Unreaped,
+            ReapProgress::Kill => {
+                let _ = kill_process_group(process_group);
+                kill_sent = true;
             }
+            ReapProgress::Poll => thread::sleep(Duration::from_millis(10)),
         }
     }
 }
@@ -1168,6 +1207,23 @@ mod tests {
                 false,
                 None,
             ),
+            WaitProgress::Poll
+        );
+        assert_eq!(
+            wait_progress(
+                None,
+                false,
+                now + D_STATE_REAP_TIMEOUT,
+                wall_deadline,
+                &mut no_match_deadline,
+                false,
+                None,
+            ),
+            WaitProgress::Kill
+        );
+        let mut never_d = None;
+        assert_eq!(
+            wait_progress(None, false, now, wall_deadline, &mut never_d, false, None,),
             WaitProgress::Kill
         );
     }
@@ -1195,6 +1251,23 @@ mod tests {
         let mut no_match_deadline = Some(now + D_STATE_REAP_TIMEOUT);
         assert_eq!(
             wait_progress(None, false, now, None, &mut no_match_deadline, true, None),
+            WaitProgress::Poll
+        );
+        assert_eq!(
+            wait_progress(
+                None,
+                false,
+                now + D_STATE_REAP_TIMEOUT,
+                None,
+                &mut no_match_deadline,
+                true,
+                None,
+            ),
+            WaitProgress::Kill
+        );
+        let mut never_d = None;
+        assert_eq!(
+            wait_progress(None, false, now, None, &mut never_d, true, None),
             WaitProgress::Kill
         );
     }
@@ -1406,6 +1479,124 @@ mod tests {
                 Some(Duration::from_millis(500)),
             ),
             WaitProgress::Kill
+        );
+    }
+
+    #[test]
+    fn terminate_and_reap_matching_d_does_not_sigkill_before_grace() {
+        let now = Instant::now();
+        let cleanup_deadline = now + CLEANUP_REAP_TIMEOUT;
+        let mut d_state_deadline = None;
+        assert_eq!(
+            reap_progress(
+                None,
+                true,
+                now,
+                cleanup_deadline,
+                &mut d_state_deadline,
+                false,
+                None,
+            ),
+            ReapProgress::Poll
+        );
+        assert_eq!(d_state_deadline, Some(now + D_STATE_REAP_TIMEOUT));
+        assert_eq!(
+            reap_progress(
+                None,
+                false,
+                now + Duration::from_secs(1),
+                cleanup_deadline,
+                &mut d_state_deadline,
+                false,
+                None,
+            ),
+            ReapProgress::Poll
+        );
+        assert_eq!(d_state_deadline, Some(now + D_STATE_REAP_TIMEOUT));
+    }
+
+    #[test]
+    fn terminate_and_reap_matching_d_sigkills_only_after_observed_grace() {
+        let now = Instant::now();
+        let cleanup_deadline = now + CLEANUP_REAP_TIMEOUT;
+        let mut d_state_deadline = None;
+        assert_eq!(
+            reap_progress(
+                None,
+                true,
+                now,
+                cleanup_deadline,
+                &mut d_state_deadline,
+                false,
+                None,
+            ),
+            ReapProgress::Poll
+        );
+        let deadline = d_state_deadline.expect("matching-D grace starts on first observation");
+        assert_eq!(
+            reap_progress(
+                None,
+                true,
+                deadline,
+                cleanup_deadline,
+                &mut d_state_deadline,
+                false,
+                None,
+            ),
+            ReapProgress::Kill
+        );
+        let mut short = None;
+        let short_now = Instant::now();
+        assert_eq!(
+            reap_progress(
+                None,
+                true,
+                short_now,
+                short_now + CLEANUP_REAP_TIMEOUT,
+                &mut short,
+                false,
+                Some(Duration::from_millis(500)),
+            ),
+            ReapProgress::Poll
+        );
+        let short_deadline = short.expect("short wall grace starts on first observation");
+        let grace = short_deadline.saturating_duration_since(short_now);
+        assert!(
+            grace < Duration::from_secs(5),
+            "short wall must not stack a 30s D-state grace; grace={grace:?}"
+        );
+    }
+
+    #[test]
+    fn terminate_and_reap_runnable_child_still_sigkills_immediately() {
+        let now = Instant::now();
+        let cleanup_deadline = now + CLEANUP_REAP_TIMEOUT;
+        let mut d_state_deadline = None;
+        assert_eq!(
+            reap_progress(
+                None,
+                false,
+                now,
+                cleanup_deadline,
+                &mut d_state_deadline,
+                false,
+                None,
+            ),
+            ReapProgress::Kill
+        );
+        assert_eq!(d_state_deadline, None);
+        let status = ExitStatus::from_raw(9);
+        assert_eq!(
+            reap_progress(
+                Some(status),
+                true,
+                now,
+                cleanup_deadline,
+                &mut d_state_deadline,
+                false,
+                None,
+            ),
+            ReapProgress::Reaped(status)
         );
     }
 }
