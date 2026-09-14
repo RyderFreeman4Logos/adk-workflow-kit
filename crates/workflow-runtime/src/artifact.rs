@@ -10,6 +10,7 @@ use std::{
     time::SystemTime,
 };
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::encode_hex;
@@ -22,7 +23,8 @@ fn next_capability() -> NonZeroU64 {
 }
 
 /// An opaque content identifier derived from stored bytes.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct ArtifactId(String);
 
 impl ArtifactId {

@@ -65,6 +65,8 @@ Use `--profile` for ADK-backed execution. `--module` is the bounded pure-transfo
 
 Durable node-result cache lives under `<workdir>/.node-result-cache/` (reserved child of the run-root base, excluded from run-root cardinality). Cache identity binds workflow/node version, `InvocationProvenance` (model, tokenizer, prompt protocol including instruction bytes, tool schema, output schema, inference, provider route, trust domain), executed node input hashes, and policy. Hits go through `FencedModel` with zero inner model calls. `node_completed.payload.cache_disposition` is `recorded`, `reused`, or `reexecuted`. Fake/offline profiles only.
 
+Compact typed outputs (Sentinel, Firewall, CompactState, IssueCard, dependency, escalation) are versioned v1 envelopes with reason-code registries and deterministic Markdown/JSON renderers. Free-form rationale is off by default. Budgets: [`docs/architecture/typed-output-protocol.md`](docs/architecture/typed-output-protocol.md).
+
 ## Maturity
 
 | Area | Status | Notes |

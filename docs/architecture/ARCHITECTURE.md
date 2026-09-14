@@ -7,7 +7,7 @@ This repository is a headless Rust workflow platform. The workspace is split int
 1. `workflow-spec` parses version 1 TOML with source-aware locations, closed enums, and strict unknown-field handling.
 2. `workflow-ir` represents the normalized workflow graph without performing IO.
 3. `workflow-compiler` validates graph, state, approval, and predicate-registry requirements, then exposes a `CompiledPlan` and deterministic Mermaid rendering.
-4. `workflow-runtime` applies capability and contextual policy before execution. A policy denial is typed and privacy-safe.
+4. `workflow-runtime` applies capability and contextual policy before execution. A policy denial is typed and privacy-safe. Compact typed-output envelopes, reason-code registries, and deterministic renderers live here.
 5. `workflow-review` serializes typed verdicts, defects, grounded-answer and multi-hop outcomes; it is a wire model, not an execution engine.
 6. `workflow-adk` accepts only a bounded opaque `VerbatimRequest`. It rejects invalid shape/size and foreign ADK type markers before dispatch.
 

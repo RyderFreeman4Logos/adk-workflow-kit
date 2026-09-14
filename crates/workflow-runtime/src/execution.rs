@@ -211,6 +211,14 @@ impl PureTransformPlanV1 {
             Ok(_) => return failed(context, PureTransformExecutionError::EmptyOutput),
             Err(_) => return failed(context, PureTransformExecutionError::OutputSerialization),
         };
+        let output = match crate::typed_protocol::WorkflowExchange::encode_named_output(
+            self.binding.workflow_id(),
+            &output,
+        ) {
+            Ok(Some(wrapped)) => wrapped,
+            Ok(None) => output,
+            Err(_) => return failed(context, PureTransformExecutionError::OutputSerialization),
+        };
         let staged = match artifacts.stage(&output) {
             Ok(staged) => staged,
             Err(error) => return failed(context, PureTransformExecutionError::Artifact(error)),
