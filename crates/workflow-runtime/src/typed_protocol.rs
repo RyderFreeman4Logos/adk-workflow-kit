@@ -5,7 +5,7 @@
 
 use std::{error::Error, fmt};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -331,8 +331,7 @@ fn valid_sha256(value: &str) -> bool {
 }
 
 /// Continuation token for a truncated node output.
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct Continuation {
     seq: u32,
     token: String,

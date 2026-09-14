@@ -644,3 +644,57 @@ fn debug_redacts_source_ids() {
     assert!(!rendered.contains(ARTIFACT_ID));
     assert!(!rendered.contains("aaaaaaaaaaaaaaaa"));
 }
+
+struct DeserializeProbe<T>(std::marker::PhantomData<T>);
+
+trait ImplementsDeserialize {
+    fn implements_deserialize(&self) -> bool {
+        true
+    }
+}
+
+impl<T: serde::de::DeserializeOwned> ImplementsDeserialize for DeserializeProbe<T> {}
+
+trait DoesNotImplementDeserialize {
+    fn implements_deserialize(&self) -> bool {
+        false
+    }
+}
+
+impl<T> DoesNotImplementDeserialize for &DeserializeProbe<T> {}
+
+#[test]
+fn continuation_does_not_impl_deserialize() {
+    assert!(
+        DeserializeProbe::<String>(std::marker::PhantomData).implements_deserialize(),
+        "probe must detect Deserialize on types that implement it"
+    );
+    assert!(
+        !(&DeserializeProbe::<Continuation>(std::marker::PhantomData)).implements_deserialize(),
+        "public Continuation must not implement Deserialize"
+    );
+}
+
+#[test]
+fn continuation_direct_serde_rejects_zero_seq() {
+    assert!(
+        Continuation::new(0, "next").is_err(),
+        "seq=0 must not bypass Continuation::new"
+    );
+}
+
+#[test]
+fn continuation_direct_serde_rejects_empty_token() {
+    assert!(
+        Continuation::new(1, "").is_err(),
+        "empty token must not bypass Continuation::new"
+    );
+}
+
+#[test]
+fn continuation_direct_serde_rejects_whitespace_token() {
+    assert!(
+        Continuation::new(1, " \t").is_err(),
+        "whitespace token must not bypass Continuation::new"
+    );
+}
