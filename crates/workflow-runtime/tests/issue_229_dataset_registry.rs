@@ -408,6 +408,29 @@ fn offline_miss_fails_closed_without_network() {
 }
 
 #[test]
+fn formal_suite_rejects_committed_smoke_fixture() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/datasets.toml");
+    let text = fs::read_to_string(&path).expect("committed datasets.toml");
+    let manifest = DatasetManifest::parse_str(&text).expect("parse committed manifest");
+    let root = TestRoot::new("formal-smoke");
+    let source = ScriptedSource::new(SMOKE_BYTES, 64);
+    let error = prepare(
+        &manifest,
+        &root.0,
+        &source,
+        Call {
+            id: "smoke-fixture",
+            suite: EvalSuite::Formal,
+            offline: false,
+            license_accepted: false,
+            manual_path: None,
+        },
+    )
+    .expect_err("formal must not admit smoke-fixture");
+    assert_eq!(error.kind(), DatasetErrorKind::SuiteNotAdmitted);
+}
+
+#[test]
 fn debug_redacts_paths_and_checksums() {
     let manifest = DatasetManifest::parse_str(&smoke_toml()).expect("manifest");
     let debug = format!("{manifest:?}");

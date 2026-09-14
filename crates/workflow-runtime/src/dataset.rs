@@ -25,6 +25,8 @@ pub enum DatasetErrorKind {
     UnknownDataset,
     /// Formal suites reject moving branches such as `main`.
     UnpinnedRevision,
+    /// Requested eval suite is absent from the dataset's admitted suites.
+    SuiteNotAdmitted,
     /// License-gated datasets require explicit acceptance.
     LicenseRequired,
     /// Non-distributable sources must be supplied on a local path.
@@ -77,6 +79,7 @@ impl fmt::Debug for DatasetErrorKind {
             Self::InvalidManifest => "InvalidManifest",
             Self::UnknownDataset => "UnknownDataset",
             Self::UnpinnedRevision => "UnpinnedRevision",
+            Self::SuiteNotAdmitted => "SuiteNotAdmitted",
             Self::LicenseRequired => "LicenseRequired",
             Self::ManualPathRequired => "ManualPathRequired",
             Self::ChecksumMismatch => "ChecksumMismatch",
@@ -93,6 +96,7 @@ impl fmt::Display for DatasetError {
             DatasetErrorKind::InvalidManifest => "dataset manifest is invalid",
             DatasetErrorKind::UnknownDataset => "dataset is unknown",
             DatasetErrorKind::UnpinnedRevision => "dataset revision is unpinned",
+            DatasetErrorKind::SuiteNotAdmitted => "dataset is not admitted to the requested suite",
             DatasetErrorKind::LicenseRequired => "dataset license acceptance is required",
             DatasetErrorKind::ManualPathRequired => "dataset requires a manual path",
             DatasetErrorKind::ChecksumMismatch => "dataset checksum mismatch",
@@ -129,6 +133,14 @@ pub enum EvalSuite {
 impl EvalSuite {
     const fn requires_pin(self) -> bool {
         matches!(self, Self::Regression | Self::Formal)
+    }
+
+    const fn manifest_name(self) -> &'static str {
+        match self {
+            Self::Smoke => "smoke",
+            Self::Regression => "regression",
+            Self::Formal => "final",
+        }
     }
 }
 
@@ -380,6 +392,13 @@ pub fn prepare_dataset(
     let entry = manifest
         .dataset(id)
         .ok_or(DatasetError::new(DatasetErrorKind::UnknownDataset))?;
+    if !entry
+        .suites
+        .iter()
+        .any(|suite| suite == request.suite.manifest_name())
+    {
+        return Err(DatasetError::new(DatasetErrorKind::SuiteNotAdmitted));
+    }
     if request.suite.requires_pin() && !is_pinned_revision(&entry.revision) {
         return Err(DatasetError::new(DatasetErrorKind::UnpinnedRevision));
     }
