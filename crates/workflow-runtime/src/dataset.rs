@@ -162,11 +162,14 @@ impl EvalSuite {
     }
 }
 
+use dataset_cache_security::validate_cache_entry_ancestors;
 pub use dataset_identity::{
     DatasetProvenance, DatasetReport, DatasetSourceIdentity, LocalFileSource, PreparedDataset,
 };
 use dataset_identity::{expected_identity, is_pinned_entry, is_sha256, valid_source_identity};
 
+#[path = "dataset_cache_security.rs"]
+mod dataset_cache_security;
 #[path = "dataset_identity.rs"]
 mod dataset_identity;
 
@@ -342,6 +345,7 @@ pub fn prepare_dataset(
     validate_cache_root(request.cache_dir)?;
     let expected_identity = expected_identity(entry);
     let dest = artifact_path(request.cache_dir, entry)?;
+    validate_cache_entry_ancestors(request.cache_dir, &dest)?;
     if let Some(prepared) = load_verified(entry, &dest, request.cache_dir, &expected_identity)? {
         return Ok(prepared);
     }
@@ -658,6 +662,7 @@ fn ensure_parent(dest: &Path, cache_dir: &Path) -> Result<(), DatasetError> {
         .create(parent)
         .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
     reject_symlink_components(dest, Some(cache_dir))?;
+    validate_cache_entry_ancestors(cache_dir, dest)?;
     let canonical_parent =
         fs::canonicalize(parent).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
     validate_directory_ancestry(&canonical_parent)

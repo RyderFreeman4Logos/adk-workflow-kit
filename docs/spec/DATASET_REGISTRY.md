@@ -23,7 +23,10 @@ call a live model.
   `artifact.partial`; sibling identity metadata binds provenance kind, origin,
   and revision/content digest. Entries without matching metadata are cache
   misses and cannot be promoted into source provenance. Offline hits reuse only
-  the same verified identity and keep the same adapter/derivation hash.
+  the same verified identity and keep the same adapter/derivation hash. Warm
+  reuse and writes also require current-user-owned, non-group-writable
+  id/revision directories; world-writable directories are allowed only when
+  sticky. The configured cache-root symlink remains supported.
 - Reports list the resolved source identity, checksum, adapter version, and
   derivation hash.
 - Case IDs are `{id}/{family}/{language}/0000`.

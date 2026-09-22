@@ -12,6 +12,8 @@ use workflow_runtime::{
 
 #[path = "issue_229_dataset_registry/identity.rs"]
 mod identity;
+#[path = "issue_229_dataset_registry/security.rs"]
+mod security;
 #[path = "issue_229_dataset_registry/support.rs"]
 mod support;
 use support::{NEXT_ROOT, SMOKE_BYTES, SMOKE_SHA256, ScriptedSource, TestRoot};
@@ -156,6 +158,20 @@ fn configured_cache_root_directory_symlink_preserves_storage_layout() {
         fs::read(target.join("smoke-fixture/1.0.0/artifact")).expect("stored artifact"),
         SMOKE_BYTES
     );
+    let cached = prepare(
+        &manifest,
+        &configured,
+        &source,
+        Call {
+            id: "smoke-fixture",
+            suite: EvalSuite::Smoke,
+            offline: true,
+            license_accepted: false,
+            manual_path: None,
+        },
+    )
+    .expect("warm configured root symlink must remain supported");
+    assert!(cached.from_cache());
 }
 
 #[test]
