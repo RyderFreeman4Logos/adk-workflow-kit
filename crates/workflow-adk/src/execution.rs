@@ -6596,7 +6596,10 @@ fn crash_barrier(name: &str) {
         .and_then(|value| value.rsplit_once('#'))
         .and_then(|(value, hit)| hit.parse::<u64>().ok().map(|hit| (value, hit)))
         .unwrap_or((configured.as_deref().unwrap_or_default(), 1));
-    if configured != name || CRASH_BARRIER_HITS.fetch_add(1, Ordering::Relaxed) + 1 != hit {
+    if configured != name {
+        return;
+    }
+    if CRASH_BARRIER_HITS.fetch_add(1, Ordering::Relaxed) + 1 != hit {
         return;
     }
     #[cfg(unix)]
