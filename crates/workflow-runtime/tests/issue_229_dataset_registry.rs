@@ -1,6 +1,6 @@
 use std::{
     fs,
-    os::unix::fs::symlink,
+    os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -46,6 +46,7 @@ struct ScriptedSource {
     bytes: Vec<u8>,
     max_bytes: usize,
     interrupt_after: Option<u64>,
+    zero_after: Option<u64>,
     served: Mutex<Vec<u64>>,
 }
 
@@ -55,6 +56,7 @@ impl ScriptedSource {
             bytes: bytes.to_vec(),
             max_bytes,
             interrupt_after: None,
+            zero_after: None,
             served: Mutex::new(Vec::new()),
         }
     }
@@ -64,6 +66,17 @@ impl ScriptedSource {
             bytes: bytes.to_vec(),
             max_bytes,
             interrupt_after: Some(offset),
+            zero_after: None,
+            served: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn short_eof_after(bytes: &[u8], max_bytes: usize, offset: u64) -> Self {
+        Self {
+            bytes: bytes.to_vec(),
+            max_bytes,
+            interrupt_after: None,
+            zero_after: Some(offset),
             served: Mutex::new(Vec::new()),
         }
     }
@@ -73,6 +86,9 @@ impl ByteSource for ScriptedSource {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, DatasetError> {
         if self.interrupt_after.is_some_and(|limit| offset >= limit) {
             return Err(DatasetError::from(DatasetErrorKind::Interrupted));
+        }
+        if self.zero_after.is_some_and(|limit| offset >= limit) {
+            return Ok(0);
         }
         let start = usize::try_from(offset).expect("fixture offset");
         if start >= self.bytes.len() {
@@ -233,6 +249,54 @@ fn configured_cache_root_directory_symlink_preserves_storage_layout() {
 }
 
 #[test]
+fn unsafe_existing_cache_descendants_fail_closed_without_witness_change() {
+    for (label, unsafe_component, unsafe_mode) in [
+        ("id-group", "id", 0o770),
+        ("revision-world", "revision", 0o707),
+    ] {
+        let root = TestRoot::new(label);
+        let cache = root.0.join("cache");
+        fs::create_dir(&cache).expect("cache root");
+        let id = cache.join("smoke-fixture");
+        fs::create_dir(&id).expect("dataset directory");
+        let revision = id.join("1.0.0");
+        fs::create_dir(&revision).expect("revision directory");
+        let unsafe_path = if unsafe_component == "id" {
+            &id
+        } else {
+            &revision
+        };
+        fs::set_permissions(unsafe_path, fs::Permissions::from_mode(unsafe_mode))
+            .expect("unsafe directory mode");
+        let witness = root.0.join("external-witness");
+        fs::write(&witness, b"witness-before").expect("external witness");
+
+        let manifest = DatasetManifest::parse_str(&smoke_toml()).expect("manifest");
+        let source = ScriptedSource::new(SMOKE_BYTES, 64);
+        let error = prepare(
+            &manifest,
+            &cache,
+            &source,
+            Call {
+                id: "smoke-fixture",
+                suite: EvalSuite::Smoke,
+                offline: false,
+                license_accepted: false,
+                manual_path: None,
+            },
+        )
+        .expect_err("unsafe existing descendants must fail closed");
+        assert_eq!(error.kind(), DatasetErrorKind::Io);
+        assert!(!revision.join("artifact").exists());
+        assert!(source.served.lock().expect("served").is_empty());
+        assert_eq!(
+            fs::read(&witness).expect("external witness"),
+            b"witness-before"
+        );
+    }
+}
+
+#[test]
 fn symlinked_cache_paths_and_existing_temps_fail_closed() {
     let manifest = DatasetManifest::parse_str(&smoke_toml()).expect("manifest");
     let source = ScriptedSource::new(SMOKE_BYTES, 64);
@@ -384,6 +448,49 @@ fn committed_manifest_round_trips_and_pins_smoke_subset() {
     assert_eq!(smoke.sha256(), SMOKE_SHA256);
     assert_eq!(smoke.adapter_version(), "1");
     assert!(!smoke.license_acceptance_required());
+}
+
+#[test]
+fn early_zero_read_preserves_partial_cache_for_resumption() {
+    let root = TestRoot::new("early-eof");
+    let manifest = DatasetManifest::parse_str(&smoke_toml()).expect("manifest");
+    let source = ScriptedSource::short_eof_after(SMOKE_BYTES, 8, 8);
+    let first = prepare(
+        &manifest,
+        &root.0,
+        &source,
+        Call {
+            id: "smoke-fixture",
+            suite: EvalSuite::Smoke,
+            offline: false,
+            license_accepted: false,
+            manual_path: None,
+        },
+    )
+    .expect_err("short source EOF must remain resumable");
+    assert_eq!(first.kind(), DatasetErrorKind::Interrupted);
+    let partial = root.0.join("smoke-fixture/1.0.0/artifact.partial");
+    assert_eq!(
+        fs::read(&partial).expect("retained partial"),
+        &SMOKE_BYTES[..8]
+    );
+
+    let corrected = ScriptedSource::new(SMOKE_BYTES, SMOKE_BYTES.len());
+    let prepared = prepare(
+        &manifest,
+        &root.0,
+        &corrected,
+        Call {
+            id: "smoke-fixture",
+            suite: EvalSuite::Smoke,
+            offline: false,
+            license_accepted: false,
+            manual_path: None,
+        },
+    )
+    .expect("corrected retry must resume the retained prefix");
+    assert_eq!(corrected.served.lock().expect("served")[0], 8);
+    assert_eq!(prepared.checksum(), SMOKE_SHA256);
 }
 
 #[test]

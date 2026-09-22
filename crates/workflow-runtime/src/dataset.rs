@@ -6,7 +6,7 @@ use std::{
     fs::{self, OpenOptions},
     hash::BuildHasher,
     io::{Seek, SeekFrom, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -718,8 +718,15 @@ fn ensure_parent(dest: &Path, cache_dir: &Path) -> Result<(), DatasetError> {
     let parent = dest
         .parent()
         .ok_or(DatasetError::new(DatasetErrorKind::Io))?;
-    fs::create_dir_all(parent).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
-    reject_symlink_components(dest, Some(cache_dir))
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder
+        .create(parent)
+        .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+    reject_symlink_components(dest, Some(cache_dir))?;
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+    validate_directory_ancestry(&canonical_parent)
 }
 
 fn publish(dest: &Path, bytes: &[u8], cache_dir: &Path) -> Result<(), DatasetError> {
@@ -803,7 +810,9 @@ fn fetch_resumable(
     while offset < expected {
         let read = source.read_at(offset, &mut buf)?;
         if read == 0 {
-            break;
+            file.flush()
+                .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+            return Err(DatasetError::new(DatasetErrorKind::Interrupted));
         }
         file.write_all(&buf[..read])
             .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
