@@ -4975,6 +4975,9 @@ impl ExecutionBackend {
                         start.insert(key.clone(), value.clone());
                     }
                 }
+                *last_progress
+                    .lock()
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))? = Instant::now();
                 let state = invoke_graph_with_deadline(
                     &runtime,
                     deadline,
