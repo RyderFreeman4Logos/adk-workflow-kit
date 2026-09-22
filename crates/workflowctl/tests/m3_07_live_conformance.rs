@@ -281,7 +281,7 @@ fn serve_provider(
     let released = Arc::clone(&first_response_released);
     let captured = Arc::clone(&bodies);
     let handle = thread::spawn(move || {
-        let accept = |timeout: Duration| {
+        let accept = |timeout: Option<Duration>| {
             let started = Instant::now();
             loop {
                 if finished.load(Ordering::Acquire) {
@@ -290,7 +290,7 @@ fn serve_provider(
                 match listener.accept() {
                     Ok((socket, _)) => return Some(socket),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if started.elapsed() > timeout {
+                        if timeout.is_some_and(|limit| started.elapsed() > limit) {
                             return None;
                         }
                         thread::sleep(Duration::from_millis(20));
@@ -301,7 +301,7 @@ fn serve_provider(
         };
         let drain_extra = || {
             while !finished.load(Ordering::Acquire) {
-                if let Some(socket) = accept(Duration::from_millis(50)) {
+                if let Some(socket) = accept(Some(Duration::from_millis(50))) {
                     extra_count.fetch_add(1, Ordering::Relaxed);
                     request_count.fetch_add(1, Ordering::Relaxed);
                     drop(socket);
@@ -309,7 +309,7 @@ fn serve_provider(
             }
         };
         if stall {
-            let Some(mut socket) = accept(Duration::from_secs(2)) else {
+            let Some(mut socket) = accept(Some(Duration::from_secs(2))) else {
                 return;
             };
             request_count.fetch_add(1, Ordering::Relaxed);
@@ -324,7 +324,7 @@ fn serve_provider(
             .chain(responses.into_iter().map(Some))
             .enumerate()
         {
-            let Some(mut socket) = accept(Duration::from_secs(2)) else {
+            let Some(mut socket) = accept(None) else {
                 return;
             };
             request_count.fetch_add(1, Ordering::Relaxed);
