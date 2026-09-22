@@ -620,12 +620,7 @@ fn serve_oracle_request_until_child_done(
                 {
                     child_observed_at = Some(Instant::now());
                 }
-                match oracle_accept_progress(
-                    false,
-                    child_observed_at,
-                    Instant::now(),
-                    child_identity.as_ref().map_or(Some(deadline), |_| None),
-                ) {
+                match oracle_accept_progress(false, child_observed_at, Instant::now(), deadline) {
                     OracleAcceptProgress::TimedOut => {
                         return Err("oracle listener accept timed out");
                     }
@@ -846,7 +841,7 @@ fn oracle_accept_progress(
     accepted: bool,
     child_observed_at: Option<Instant>,
     now: Instant,
-    unobserved_deadline: Option<Instant>,
+    unobserved_deadline: Instant,
 ) -> OracleAcceptProgress {
     if accepted {
         return OracleAcceptProgress::Accepted;
@@ -862,10 +857,13 @@ fn oracle_accept_progress(
                 OracleAcceptProgress::Wait
             }
         }
-        None => match unobserved_deadline {
-            Some(deadline) if now >= deadline => OracleAcceptProgress::TimedOut,
-            Some(_) | None => OracleAcceptProgress::Wait,
-        },
+        None => {
+            if now >= unobserved_deadline {
+                OracleAcceptProgress::TimedOut
+            } else {
+                OracleAcceptProgress::Wait
+            }
+        }
     }
 }
 
@@ -2358,6 +2356,23 @@ fn oracle_kill_ok_matching_d_state_waits_instead_of_aborting_on_first_observatio
 }
 
 #[test]
+fn oracle_accept_silent_identity_receiver_respects_absolute_fallback() {
+    let now = Instant::now();
+    let deadline = now;
+    let (_identity_tx, identity_rx) = mpsc::sync_channel::<OracleChildIdentity>(1);
+    assert!(matches!(
+        identity_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    let child_identity = Some(identity_rx);
+    assert!(child_identity.is_some());
+    assert_eq!(
+        oracle_accept_progress(false, None, now, deadline),
+        OracleAcceptProgress::TimedOut
+    );
+}
+
+#[test]
 fn oracle_accept_wait_starts_on_child_observation_instead_of_pre_armed_deadline() {
     let started_at = Instant::now();
     let unobserved_deadline = started_at + Duration::from_secs(4);
@@ -2391,7 +2406,7 @@ fn oracle_accept_wait_starts_on_child_observation_instead_of_pre_armed_deadline(
         },
     ));
     assert_eq!(
-        oracle_accept_progress(true, None, unobserved_deadline, Some(unobserved_deadline)),
+        oracle_accept_progress(true, None, unobserved_deadline, unobserved_deadline),
         OracleAcceptProgress::Accepted
     );
     assert_eq!(
@@ -2399,25 +2414,25 @@ fn oracle_accept_wait_starts_on_child_observation_instead_of_pre_armed_deadline(
             false,
             None,
             started_at + Duration::from_secs(4) - Duration::from_millis(1),
-            Some(unobserved_deadline),
+            unobserved_deadline,
         ),
         OracleAcceptProgress::Wait
     );
     assert_eq!(
-        oracle_accept_progress(false, None, unobserved_deadline, Some(unobserved_deadline),),
+        oracle_accept_progress(false, None, unobserved_deadline, unobserved_deadline),
         OracleAcceptProgress::TimedOut
-    );
-    assert_eq!(
-        oracle_accept_progress(false, None, started_at + ORACLE_TIMEOUT, None),
-        OracleAcceptProgress::Wait
     );
     assert_eq!(
         oracle_accept_progress(
             false,
-            Some(observed_at),
-            observed_at,
-            Some(unobserved_deadline),
+            None,
+            started_at + ORACLE_TIMEOUT,
+            unobserved_deadline
         ),
+        OracleAcceptProgress::TimedOut
+    );
+    assert_eq!(
+        oracle_accept_progress(false, Some(observed_at), observed_at, unobserved_deadline,),
         OracleAcceptProgress::Wait
     );
     assert_eq!(
@@ -2425,7 +2440,7 @@ fn oracle_accept_wait_starts_on_child_observation_instead_of_pre_armed_deadline(
             false,
             Some(observed_at),
             observed_at + Duration::from_secs(4),
-            Some(unobserved_deadline),
+            unobserved_deadline,
         ),
         OracleAcceptProgress::Wait
     );
@@ -2434,7 +2449,7 @@ fn oracle_accept_wait_starts_on_child_observation_instead_of_pre_armed_deadline(
             false,
             Some(observed_at),
             observed_at + ORACLE_TIMEOUT,
-            Some(unobserved_deadline),
+            unobserved_deadline,
         ),
         OracleAcceptProgress::TimedOut
     );
