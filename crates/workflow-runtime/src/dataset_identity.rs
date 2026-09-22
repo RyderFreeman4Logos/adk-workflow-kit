@@ -287,8 +287,10 @@ fn is_local_fixture(entry: &DatasetEntry) -> bool {
     entry.url.starts_with("memory://")
 }
 
-pub(super) fn is_pinned_entry(entry: &DatasetEntry) -> bool {
-    if entry.distribution == DatasetDistribution::Manual {
+pub(super) fn is_pinned_entry(entry: &DatasetEntry, suite: EvalSuite) -> bool {
+    if entry.distribution == DatasetDistribution::Manual
+        || (suite == EvalSuite::Regression && is_local_fixture(entry))
+    {
         is_sha256(&entry.sha256)
     } else {
         is_immutable_object_id(&entry.revision)

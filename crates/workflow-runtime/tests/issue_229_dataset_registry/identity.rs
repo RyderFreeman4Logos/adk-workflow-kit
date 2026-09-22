@@ -4,6 +4,7 @@ use super::support::{SMOKE_BYTES, SMOKE_SHA256, ScriptedSource, TestRoot};
 use super::{Call, prepare};
 use workflow_runtime::{
     ByteSource, DatasetError, DatasetErrorKind, DatasetManifest, DatasetSourceIdentity, EvalSuite,
+    PrepareRequest, prepare_dataset,
 };
 
 const UPSTREAM_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -174,4 +175,57 @@ fn cache_and_partial_metadata_cannot_cross_source_identities() {
     .expect_err("identity B must not resume identity A's partial");
     assert_eq!(error.kind(), DatasetErrorKind::SourceIdentityMismatch);
     assert!(source_b.served.lock().expect("served").is_empty());
+}
+
+#[test]
+fn literal_committed_smoke_fixture_is_pinned_for_regression_and_offline_reuse() {
+    let manifest = DatasetManifest::parse_str(include_str!("../../../../config/datasets.toml"))
+        .expect("literal committed manifest");
+    let cache = TestRoot::new("literal-regression");
+    let source = ScriptedSource::new(SMOKE_BYTES, 64);
+    let online = prepare_dataset(
+        &manifest,
+        "smoke-fixture",
+        &PrepareRequest {
+            cache_dir: &cache.0,
+            source: &source,
+            suite: EvalSuite::Regression,
+            offline: false,
+            license_accepted: false,
+            manual_path: None,
+        },
+    )
+    .expect("content-addressed local fixture is pinned for Regression");
+    assert_eq!(online.checksum(), SMOKE_SHA256);
+    assert_eq!(
+        online.source_identity(),
+        &DatasetSourceIdentity::local_fixture("memory://smoke-fixture", SMOKE_SHA256)
+    );
+    let served = source.served.lock().expect("served").len();
+
+    let offline = prepare_dataset(
+        &manifest,
+        "smoke-fixture",
+        &PrepareRequest {
+            cache_dir: &cache.0,
+            source: &source,
+            suite: EvalSuite::Regression,
+            offline: true,
+            license_accepted: false,
+            manual_path: None,
+        },
+    )
+    .expect("literal fixture must reuse its verified offline cache");
+    assert!(offline.from_cache());
+    assert_eq!(offline.checksum(), online.checksum());
+    assert_eq!(offline.source_identity(), online.source_identity());
+    assert_eq!(
+        offline.report().adapter_version(),
+        online.report().adapter_version()
+    );
+    assert_eq!(
+        offline.report().derivation_hash(),
+        online.report().derivation_hash()
+    );
+    assert_eq!(source.served.lock().expect("served").len(), served);
 }

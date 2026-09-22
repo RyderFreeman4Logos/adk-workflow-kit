@@ -26,7 +26,10 @@ call a live model.
   the same verified identity and keep the same adapter/derivation hash. Warm
   reuse and writes also require current-user-owned, non-group-writable
   id/revision directories; world-writable directories are allowed only when
-  sticky. The configured cache-root symlink remains supported.
+  sticky. The configured cache-root symlink remains supported. The committed
+  `memory://` fixture is pinned by its SHA-256 and `LocalFixture` identity for
+  Regression; its semantic revision label is not treated as an upstream
+  immutable object ID. Moving upstream revisions remain ineligible.
 - Reports list the resolved source identity, checksum, adapter version, and
   derivation hash.
 - Case IDs are `{id}/{family}/{language}/0000`.

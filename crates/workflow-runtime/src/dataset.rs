@@ -339,7 +339,7 @@ pub fn prepare_dataset(
     if entry.license_acceptance_required && !request.license_accepted {
         return Err(DatasetError::new(DatasetErrorKind::LicenseRequired));
     }
-    if request.suite.requires_pin() && !is_pinned_entry(entry) {
+    if request.suite.requires_pin() && !is_pinned_entry(entry, request.suite) {
         return Err(DatasetError::new(DatasetErrorKind::UnpinnedRevision));
     }
     validate_cache_root(request.cache_dir)?;
