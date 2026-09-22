@@ -1,110 +1,20 @@
 use std::{
     fs,
     os::unix::fs::{PermissionsExt, symlink},
-    path::{Path, PathBuf},
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    path::Path,
+    sync::atomic::Ordering,
 };
 
 use workflow_runtime::{
-    ByteSource, DatasetError, DatasetErrorKind, DatasetManifest, EvalSuite, PrepareRequest,
-    prepare_dataset,
+    ByteSource, DatasetError, DatasetErrorKind, DatasetManifest, DatasetProvenance,
+    DatasetSourceIdentity, EvalSuite, LocalFileSource, PrepareRequest, prepare_dataset,
 };
 
-const SMOKE_BYTES: &[u8] = b"issue-229-smoke-fixture\n";
-const SMOKE_SHA256: &str =
-    "sha256:e543862e31a042f932ef3d2f34daa869537e5da06ad9ded1cbbd10885bd46959";
-static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
-
-struct TestRoot(PathBuf);
-
-impl TestRoot {
-    fn new(label: &str) -> Self {
-        let temp_root =
-            fs::canonicalize(Path::new(&std::env::var_os("HOME").expect("HOME")).join("tmp"))
-                .expect("resolved HOME/tmp");
-        let root = temp_root.join(format!(
-            "issue-229-{}-{}-{}",
-            label,
-            std::process::id(),
-            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).expect("cache root");
-        Self(root)
-    }
-}
-
-impl Drop for TestRoot {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-struct ScriptedSource {
-    bytes: Vec<u8>,
-    max_bytes: usize,
-    interrupt_after: Option<u64>,
-    zero_after: Option<u64>,
-    served: Mutex<Vec<u64>>,
-}
-
-impl ScriptedSource {
-    fn new(bytes: &[u8], max_bytes: usize) -> Self {
-        Self {
-            bytes: bytes.to_vec(),
-            max_bytes,
-            interrupt_after: None,
-            zero_after: None,
-            served: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn interrupt_after(bytes: &[u8], max_bytes: usize, offset: u64) -> Self {
-        Self {
-            bytes: bytes.to_vec(),
-            max_bytes,
-            interrupt_after: Some(offset),
-            zero_after: None,
-            served: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn short_eof_after(bytes: &[u8], max_bytes: usize, offset: u64) -> Self {
-        Self {
-            bytes: bytes.to_vec(),
-            max_bytes,
-            interrupt_after: None,
-            zero_after: Some(offset),
-            served: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-impl ByteSource for ScriptedSource {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, DatasetError> {
-        if self.interrupt_after.is_some_and(|limit| offset >= limit) {
-            return Err(DatasetError::from(DatasetErrorKind::Interrupted));
-        }
-        if self.zero_after.is_some_and(|limit| offset >= limit) {
-            return Ok(0);
-        }
-        let start = usize::try_from(offset).expect("fixture offset");
-        if start >= self.bytes.len() {
-            return Ok(0);
-        }
-        let available = self.bytes.len() - start;
-        let take = available.min(buf.len()).min(self.max_bytes);
-        buf[..take].copy_from_slice(&self.bytes[start..start + take]);
-        self.served.lock().expect("served").push(offset);
-        Ok(take)
-    }
-
-    fn len(&self) -> Result<u64, DatasetError> {
-        Ok(u64::try_from(self.bytes.len()).expect("fixture len"))
-    }
-}
+#[path = "issue_229_dataset_registry/identity.rs"]
+mod identity;
+#[path = "issue_229_dataset_registry/support.rs"]
+mod support;
+use support::{NEXT_ROOT, SMOKE_BYTES, SMOKE_SHA256, ScriptedSource, TestRoot};
 
 fn smoke_toml() -> String {
     format!(
@@ -147,7 +57,7 @@ id = "gated"
 family = "agentdojo"
 language = "en"
 revision = "{revision}"
-url = "memory://gated"
+url = "memory://smoke-fixture"
 sha256 = "{SMOKE_SHA256}"
 license = "research-only"
 license_acceptance_required = {license_required}
@@ -622,6 +532,81 @@ fn unpinned_revision_is_rejected_for_formal_suites() {
 }
 
 #[test]
+fn stable_revision_is_rejected_for_regression_before_source_reads() {
+    let root = TestRoot::new("stable-red");
+    let manifest = DatasetManifest::parse_str(
+        &manifest_with_tokens("smoke-fixture", "stable")
+            .replace("memory://smoke-fixture", "https://example.invalid/smoke"),
+    )
+    .expect("manifest");
+    let source = ScriptedSource::new(SMOKE_BYTES, 64).with_identity(
+        DatasetSourceIdentity::upstream("https://example.invalid/smoke", "stable"),
+    );
+    let error = prepare(
+        &manifest,
+        &root.0,
+        &source,
+        Call {
+            id: "smoke-fixture",
+            suite: EvalSuite::Regression,
+            offline: false,
+            license_accepted: false,
+            manual_path: None,
+        },
+    )
+    .expect_err("moving stable revision must fail before source reads");
+    assert_eq!(error.kind(), DatasetErrorKind::UnpinnedRevision);
+    assert!(source.served.lock().expect("served").is_empty());
+}
+
+#[test]
+fn local_file_source_preserves_typed_content_identity_in_report_and_cache() {
+    let root = TestRoot::new("local-file-identity");
+    let manifest = DatasetManifest::parse_str(&smoke_toml()).expect("manifest");
+    let source_path = root.0.join("source.jsonl");
+    fs::write(&source_path, SMOKE_BYTES).expect("source");
+    let source = LocalFileSource::new(&source_path, "memory://smoke-fixture").expect("source");
+    let prepared = prepare(
+        &manifest,
+        &root.0,
+        &source,
+        Call {
+            id: "smoke-fixture",
+            suite: EvalSuite::Smoke,
+            offline: false,
+            license_accepted: false,
+            manual_path: None,
+        },
+    )
+    .expect("local source");
+    assert_eq!(
+        prepared.source_identity().provenance(),
+        DatasetProvenance::LocalFixture
+    );
+    assert_eq!(prepared.source_revision(), SMOKE_SHA256);
+    assert_eq!(
+        prepared.report().source_identity(),
+        prepared.source_identity()
+    );
+
+    let cached = prepare(
+        &manifest,
+        &root.0,
+        &ScriptedSource::new(&[], 64),
+        Call {
+            id: "smoke-fixture",
+            suite: EvalSuite::Smoke,
+            offline: true,
+            license_accepted: false,
+            manual_path: None,
+        },
+    )
+    .expect("identity-preserving cache hit");
+    assert!(cached.from_cache());
+    assert_eq!(cached.source_identity(), prepared.source_identity());
+}
+
+#[test]
 fn offline_cache_hit_reuses_identical_adapter_hash() {
     let root = TestRoot::new("offline");
     let manifest = DatasetManifest::parse_str(&smoke_toml()).expect("manifest");
@@ -641,7 +626,7 @@ fn offline_cache_hit_reuses_identical_adapter_hash() {
     .expect("warm cache");
     let online_hash = first.derivation_hash().to_owned();
     let report = first.report();
-    assert_eq!(report.source_revision(), "1.0.0");
+    assert_eq!(report.source_revision(), SMOKE_SHA256);
     assert_eq!(report.checksum(), SMOKE_SHA256);
     assert_eq!(report.adapter_version(), "1");
     assert_eq!(report.derivation_hash(), online_hash);
@@ -669,8 +654,12 @@ fn offline_cache_hit_reuses_identical_adapter_hash() {
 #[test]
 fn license_gated_dataset_cannot_be_fetched_silently() {
     let root = TestRoot::new("license");
-    let manifest =
-        DatasetManifest::parse_str(&gated_toml("fetch", "1.0.0", true)).expect("manifest");
+    let manifest = DatasetManifest::parse_str(&gated_toml(
+        "fetch",
+        "0123456789abcdef0123456789abcdef01234567",
+        true,
+    ))
+    .expect("manifest");
     let source = ScriptedSource::new(SMOKE_BYTES, 64);
     let silent = prepare(
         &manifest,
@@ -740,7 +729,11 @@ fn manual_path_is_required_for_non_distributable_sources() {
     )
     .expect("manual path");
     assert_eq!(prepared.checksum(), SMOKE_SHA256);
-    assert_eq!(prepared.source_revision(), "9f3c1aa");
+    assert_eq!(prepared.source_revision(), SMOKE_SHA256);
+    assert_eq!(
+        prepared.source_identity().provenance(),
+        DatasetProvenance::Manual,
+    );
 }
 
 #[test]

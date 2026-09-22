@@ -43,6 +43,12 @@ pub enum DatasetErrorKind {
     OfflineMiss,
     /// The source stopped before the artifact was complete.
     Interrupted,
+    /// The source could not provide an immutable identity.
+    SourceIdentityRequired,
+    /// The requested and resolved source identities differ.
+    SourceIdentityMismatch,
+    /// Cache metadata does not describe the stored artifact.
+    InvalidCacheIdentity,
     /// Cache or source IO failed.
     Io,
 }
@@ -91,6 +97,9 @@ impl fmt::Debug for DatasetErrorKind {
             Self::ChecksumMismatch => "ChecksumMismatch",
             Self::OfflineMiss => "OfflineMiss",
             Self::Interrupted => "Interrupted",
+            Self::SourceIdentityRequired => "SourceIdentityRequired",
+            Self::SourceIdentityMismatch => "SourceIdentityMismatch",
+            Self::InvalidCacheIdentity => "InvalidCacheIdentity",
             Self::Io => "Io",
         })
     }
@@ -108,6 +117,9 @@ impl fmt::Display for DatasetError {
             DatasetErrorKind::ChecksumMismatch => "dataset checksum mismatch",
             DatasetErrorKind::OfflineMiss => "dataset cache miss in offline mode",
             DatasetErrorKind::Interrupted => "dataset fetch interrupted",
+            DatasetErrorKind::SourceIdentityRequired => "dataset source identity is required",
+            DatasetErrorKind::SourceIdentityMismatch => "dataset source identity mismatch",
+            DatasetErrorKind::InvalidCacheIdentity => "dataset cache identity is invalid",
             DatasetErrorKind::Io => "dataset storage failed",
         })
     }
@@ -150,8 +162,20 @@ impl EvalSuite {
     }
 }
 
-/// Byte source used by fetch. Tests inject fixtures; no live model is involved.
+pub use dataset_identity::{
+    DatasetProvenance, DatasetReport, DatasetSourceIdentity, LocalFileSource, PreparedDataset,
+};
+use dataset_identity::{expected_identity, is_pinned_entry, is_sha256, valid_source_identity};
+
+#[path = "dataset_identity.rs"]
+mod dataset_identity;
+
+/// Byte source used by fetch. Implementations must attest the selected source identity.
 pub trait ByteSource {
+    /// Returns the identity resolved by this source/provider.
+    fn identity(&self) -> Result<DatasetSourceIdentity, DatasetError> {
+        Err(DatasetError::new(DatasetErrorKind::SourceIdentityRequired))
+    }
     /// Reads up to `buf.len()` bytes starting at `offset`.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, DatasetError>;
     /// Returns the total source length in bytes.
@@ -293,107 +317,6 @@ impl fmt::Debug for DatasetManifest {
     }
 }
 
-/// Provenance listed in evaluation reports.
-#[derive(Clone, Eq, PartialEq)]
-pub struct DatasetReport {
-    source_revision: String,
-    checksum: String,
-    adapter_version: String,
-    derivation_hash: String,
-}
-
-impl DatasetReport {
-    /// Pinned source revision.
-    pub fn source_revision(&self) -> &str {
-        &self.source_revision
-    }
-
-    /// Artifact SHA-256.
-    pub fn checksum(&self) -> &str {
-        &self.checksum
-    }
-
-    /// Adapter version from the manifest.
-    pub fn adapter_version(&self) -> &str {
-        &self.adapter_version
-    }
-
-    /// Hash of adapter version, derivation recipe, and artifact checksum.
-    pub fn derivation_hash(&self) -> &str {
-        &self.derivation_hash
-    }
-}
-
-impl fmt::Debug for DatasetReport {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("DatasetReport")
-            .field("adapter_version", &self.adapter_version)
-            .field("checksum", &"<redacted>")
-            .field("derivation_hash", &"<redacted>")
-            .finish()
-    }
-}
-
-/// Verified local dataset ready for an eval suite.
-#[derive(Clone, Eq, PartialEq)]
-pub struct PreparedDataset {
-    checksum: String,
-    source_revision: String,
-    adapter_version: String,
-    derivation_hash: String,
-    from_cache: bool,
-    case_ids: Vec<String>,
-}
-
-impl PreparedDataset {
-    /// Artifact SHA-256.
-    pub fn checksum(&self) -> &str {
-        &self.checksum
-    }
-
-    /// Pinned source revision.
-    pub fn source_revision(&self) -> &str {
-        &self.source_revision
-    }
-
-    /// Hash of the adapter recipe and artifact.
-    pub fn derivation_hash(&self) -> &str {
-        &self.derivation_hash
-    }
-
-    /// Whether the artifact was reused from a verified cache entry.
-    pub fn from_cache(&self) -> bool {
-        self.from_cache
-    }
-
-    /// Deterministic case identities for split discipline.
-    pub fn case_ids(&self) -> &[String] {
-        &self.case_ids
-    }
-
-    /// Report fields: revision, checksum, adapter version, derivation hash.
-    pub fn report(&self) -> DatasetReport {
-        DatasetReport {
-            source_revision: self.source_revision.clone(),
-            checksum: self.checksum.clone(),
-            adapter_version: self.adapter_version.clone(),
-            derivation_hash: self.derivation_hash.clone(),
-        }
-    }
-}
-
-impl fmt::Debug for PreparedDataset {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PreparedDataset")
-            .field("from_cache", &self.from_cache)
-            .field("case_count", &self.case_ids.len())
-            .field("checksum", &"<redacted>")
-            .finish()
-    }
-}
-
 /// Fetches or reuses a pinned dataset. Independent of live model execution.
 pub fn prepare_dataset(
     manifest: &DatasetManifest,
@@ -410,15 +333,16 @@ pub fn prepare_dataset(
     {
         return Err(DatasetError::new(DatasetErrorKind::SuiteNotAdmitted));
     }
-    if request.suite.requires_pin() && !is_pinned_revision(&entry.revision) {
-        return Err(DatasetError::new(DatasetErrorKind::UnpinnedRevision));
-    }
     if entry.license_acceptance_required && !request.license_accepted {
         return Err(DatasetError::new(DatasetErrorKind::LicenseRequired));
     }
+    if request.suite.requires_pin() && !is_pinned_entry(entry) {
+        return Err(DatasetError::new(DatasetErrorKind::UnpinnedRevision));
+    }
     validate_cache_root(request.cache_dir)?;
+    let expected_identity = expected_identity(entry);
     let dest = artifact_path(request.cache_dir, entry)?;
-    if let Some(prepared) = load_verified(entry, &dest, request.cache_dir)? {
+    if let Some(prepared) = load_verified(entry, &dest, request.cache_dir, &expected_identity)? {
         return Ok(prepared);
     }
     match entry.distribution {
@@ -426,13 +350,20 @@ pub fn prepare_dataset(
             let path = request
                 .manual_path
                 .ok_or(DatasetError::new(DatasetErrorKind::ManualPathRequired))?;
-            copy_manual(entry, path, &dest, request.cache_dir)
+            copy_manual(entry, path, &dest, request.cache_dir, &expected_identity)
         }
         DatasetDistribution::Fetch => {
             if request.offline {
                 return Err(DatasetError::new(DatasetErrorKind::OfflineMiss));
             }
-            fetch_resumable(entry, request.source, &dest, request.cache_dir)
+            fetch_resumable(
+                entry,
+                request.source,
+                &dest,
+                request.cache_dir,
+                &expected_identity,
+                request.suite,
+            )
         }
     }
 }
@@ -523,24 +454,6 @@ fn is_safe_token(value: &str) -> bool {
         )
 }
 
-fn is_sha256(value: &str) -> bool {
-    let Some(hex) = value.strip_prefix(SHA256_PREFIX) else {
-        return false;
-    };
-    hex.len() == 64
-        && hex
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-fn is_pinned_revision(revision: &str) -> bool {
-    let lowered = revision.to_ascii_lowercase();
-    !matches!(
-        lowered.as_str(),
-        "main" | "master" | "head" | "latest" | "trunk" | "develop" | "dev"
-    ) && !lowered.starts_with("origin/")
-}
-
 fn digest_bytes(bytes: &[u8]) -> String {
     format!("{SHA256_PREFIX}{}", encode_hex(&Sha256::digest(bytes)))
 }
@@ -565,10 +478,14 @@ fn case_id(entry: &DatasetEntry) -> String {
     format!("{}/{}/{}/0000", entry.id, entry.family, entry.language)
 }
 
-fn prepared(entry: &DatasetEntry, from_cache: bool) -> PreparedDataset {
+fn prepared(
+    entry: &DatasetEntry,
+    source_identity: &DatasetSourceIdentity,
+    from_cache: bool,
+) -> PreparedDataset {
     PreparedDataset {
         checksum: entry.sha256.clone(),
-        source_revision: entry.revision.clone(),
+        source_identity: source_identity.clone(),
         adapter_version: entry.adapter_version.clone(),
         derivation_hash: derivation_hash(entry),
         from_cache,
@@ -694,19 +611,36 @@ fn partial_path(dest: &Path) -> Result<PathBuf, DatasetError> {
     Ok(dest.with_file_name(leaf))
 }
 
+fn identity_path(dest: &Path) -> PathBuf {
+    dest.with_file_name(format!(
+        "{}.identity",
+        dest.file_name().unwrap_or_default().to_string_lossy()
+    ))
+}
+
 fn load_verified(
     entry: &DatasetEntry,
     dest: &Path,
     cache_dir: &Path,
+    expected_identity: &DatasetSourceIdentity,
 ) -> Result<Option<PreparedDataset>, DatasetError> {
     reject_symlink_components(dest, Some(cache_dir))?;
+    let identity = identity_path(dest);
+    reject_symlink_components(&identity, Some(cache_dir))?;
     match fs::read(dest) {
         Ok(bytes) => {
-            if digest_bytes(&bytes) == entry.sha256 {
-                Ok(Some(prepared(entry, true)))
-            } else {
-                Err(DatasetError::new(DatasetErrorKind::ChecksumMismatch))
+            if digest_bytes(&bytes) != entry.sha256 {
+                return Err(DatasetError::new(DatasetErrorKind::ChecksumMismatch));
             }
+            let stored = match fs::read(&identity) {
+                Ok(stored) => stored,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(DatasetError::new(DatasetErrorKind::Io)),
+            };
+            if stored != expected_identity.cache_bytes().into_bytes() {
+                return Ok(None);
+            }
+            Ok(Some(prepared(entry, expected_identity, true)))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(DatasetError::new(DatasetErrorKind::Io)),
@@ -775,14 +709,23 @@ fn copy_manual(
     path: &Path,
     dest: &Path,
     cache_dir: &Path,
+    expected_identity: &DatasetSourceIdentity,
 ) -> Result<PreparedDataset, DatasetError> {
     reject_symlink_components(path, None)?;
     let bytes = fs::read(path).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
     if digest_bytes(&bytes) != entry.sha256 {
         return Err(DatasetError::new(DatasetErrorKind::ChecksumMismatch));
     }
+    if !valid_source_identity(expected_identity, EvalSuite::Smoke) {
+        return Err(DatasetError::new(DatasetErrorKind::SourceIdentityMismatch));
+    }
     publish(dest, &bytes, cache_dir)?;
-    Ok(prepared(entry, false))
+    publish(
+        &identity_path(dest),
+        expected_identity.cache_bytes().as_bytes(),
+        cache_dir,
+    )?;
+    Ok(prepared(entry, expected_identity, false))
 }
 
 fn fetch_resumable(
@@ -790,10 +733,32 @@ fn fetch_resumable(
     source: &dyn ByteSource,
     dest: &Path,
     cache_dir: &Path,
+    expected_identity: &DatasetSourceIdentity,
+    suite: EvalSuite,
 ) -> Result<PreparedDataset, DatasetError> {
+    let actual_identity = source.identity()?;
+    if &actual_identity != expected_identity || !valid_source_identity(&actual_identity, suite) {
+        return Err(DatasetError::new(DatasetErrorKind::SourceIdentityMismatch));
+    }
     ensure_parent(dest, cache_dir)?;
     let partial = partial_path(dest)?;
+    let partial_identity = identity_path(&partial);
     reject_symlink_components(&partial, Some(cache_dir))?;
+    reject_symlink_components(&partial_identity, Some(cache_dir))?;
+    let identity_bytes = expected_identity.cache_bytes().into_bytes();
+    match fs::read(&partial_identity) {
+        Ok(stored) if stored != identity_bytes => {
+            return Err(DatasetError::new(DatasetErrorKind::SourceIdentityMismatch));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if fs::symlink_metadata(&partial).is_ok() {
+                return Err(DatasetError::new(DatasetErrorKind::SourceIdentityMismatch));
+            }
+            publish(&partial_identity, &identity_bytes, cache_dir)?;
+        }
+        Err(_) => return Err(DatasetError::new(DatasetErrorKind::Io)),
+    }
     let expected = source.len()?;
     let mut file = OpenOptions::new()
         .create(true)
@@ -825,9 +790,12 @@ fn fetch_resumable(
     let bytes = fs::read(&partial).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
     if digest_bytes(&bytes) != entry.sha256 {
         fs::remove_file(&partial).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+        let _ = fs::remove_file(&partial_identity);
         return Err(DatasetError::new(DatasetErrorKind::ChecksumMismatch));
     }
     reject_symlink_components(dest, Some(cache_dir))?;
     fs::rename(&partial, dest).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
-    Ok(prepared(entry, false))
+    publish(&identity_path(dest), &identity_bytes, cache_dir)?;
+    let _ = fs::remove_file(&partial_identity);
+    Ok(prepared(entry, expected_identity, false))
 }
