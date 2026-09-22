@@ -1,5 +1,6 @@
 use std::{
     fs,
+    os::unix::fs::symlink,
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -21,7 +22,10 @@ struct TestRoot(PathBuf);
 
 impl TestRoot {
     fn new(label: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
+        let temp_root =
+            fs::canonicalize(Path::new(&std::env::var_os("HOME").expect("HOME")).join("tmp"))
+                .expect("resolved HOME/tmp");
+        let root = temp_root.join(format!(
             "issue-229-{}-{}-{}",
             label,
             std::process::id(),
@@ -108,6 +112,15 @@ suites = ["smoke", "regression"]
     )
 }
 
+fn manifest_with_tokens(id: &str, revision: &str) -> String {
+    smoke_toml()
+        .replace("id = \"smoke-fixture\"", &format!("id = \"{id}\""))
+        .replace(
+            "revision = \"1.0.0\"",
+            &format!("revision = \"{revision}\""),
+        )
+}
+
 fn gated_toml(distribution: &str, revision: &str, license_required: bool) -> String {
     format!(
         r#"
@@ -156,6 +169,204 @@ fn prepare(
             manual_path: call.manual_path,
         },
     )
+}
+
+#[test]
+fn manifest_rejects_dot_and_dotdot_path_tokens_without_cache_io() {
+    for (id, revision) in [
+        (".", "1.0.0"),
+        ("..", "1.0.0"),
+        ("smoke-fixture", "."),
+        ("smoke-fixture", ".."),
+    ] {
+        let root = TestRoot::new("traversal");
+        let outside = root.0.parent().expect("test root parent").join(format!(
+            "issue-229-outside-{}-{}",
+            id.replace('.', "dot"),
+            revision.replace('.', "dot")
+        ));
+        assert!(!outside.exists(), "external witness must start absent");
+        let error = DatasetManifest::parse_str(&manifest_with_tokens(id, revision))
+            .expect_err("path traversal tokens must be rejected during parsing");
+        assert_eq!(error.kind(), DatasetErrorKind::InvalidManifest);
+        assert!(
+            !outside.exists(),
+            "invalid tokens must not touch the cache boundary"
+        );
+    }
+}
+
+#[test]
+fn configured_cache_root_directory_symlink_preserves_storage_layout() {
+    let manifest = DatasetManifest::parse_str(&smoke_toml()).expect("manifest");
+    let source = ScriptedSource::new(SMOKE_BYTES, 64);
+    let root = TestRoot::new("root-symlink");
+    let target = root.0.join("cache-target");
+    fs::create_dir(&target).expect("cache target");
+    let configured = root.0.join("cache-link");
+    symlink(&target, &configured).expect("configured cache root symlink");
+
+    let prepared = prepare(
+        &manifest,
+        &configured,
+        &source,
+        Call {
+            id: "smoke-fixture",
+            suite: EvalSuite::Smoke,
+            offline: false,
+            license_accepted: false,
+            manual_path: None,
+        },
+    )
+    .expect("verified configured root symlink must be supported");
+    assert_eq!(prepared.checksum(), SMOKE_SHA256);
+    assert!(
+        fs::symlink_metadata(&configured)
+            .expect("configured root")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read(target.join("smoke-fixture/1.0.0/artifact")).expect("stored artifact"),
+        SMOKE_BYTES
+    );
+}
+
+#[test]
+fn symlinked_cache_paths_and_existing_temps_fail_closed() {
+    let manifest = DatasetManifest::parse_str(&smoke_toml()).expect("manifest");
+    let source = ScriptedSource::new(SMOKE_BYTES, 64);
+    let root = TestRoot::new("symlinks");
+
+    let external_parent = root.0.join(format!(
+        "issue-229-external-parent-{}",
+        NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&external_parent).expect("external parent");
+    let parent_cache = root.0.join("parent-cache");
+    fs::create_dir_all(&parent_cache).expect("parent cache");
+    symlink(&external_parent, parent_cache.join("smoke-fixture")).expect("cache parent symlink");
+    let error = prepare(
+        &manifest,
+        &parent_cache,
+        &source,
+        Call {
+            id: "smoke-fixture",
+            suite: EvalSuite::Smoke,
+            offline: false,
+            license_accepted: false,
+            manual_path: None,
+        },
+    )
+    .expect_err("symlinked cache parents must be rejected");
+    assert_eq!(error.kind(), DatasetErrorKind::Io);
+    assert!(!external_parent.join("1.0.0/artifact").exists());
+    fs::remove_dir_all(&external_parent).expect("remove external parent");
+
+    let external_artifact = root.0.join(format!(
+        "issue-229-external-artifact-{}",
+        NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&external_artifact, b"outside-artifact").expect("external artifact");
+    let artifact_cache = root.0.join("artifact-cache/smoke-fixture/1.0.0");
+    fs::create_dir_all(&artifact_cache).expect("artifact cache");
+    symlink(&external_artifact, artifact_cache.join("artifact")).expect("artifact symlink");
+    let error = prepare(
+        &manifest,
+        &root.0.join("artifact-cache"),
+        &source,
+        Call {
+            id: "smoke-fixture",
+            suite: EvalSuite::Smoke,
+            offline: false,
+            license_accepted: false,
+            manual_path: None,
+        },
+    )
+    .expect_err("symlinked artifacts must be rejected");
+    assert_eq!(error.kind(), DatasetErrorKind::Io);
+    assert_eq!(
+        fs::read(&external_artifact).expect("external artifact"),
+        b"outside-artifact"
+    );
+    fs::remove_file(&external_artifact).expect("remove external artifact");
+
+    let external_partial = root.0.join(format!(
+        "issue-229-external-partial-{}",
+        NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&external_partial, b"outside-partial").expect("external partial");
+    let partial_cache = root.0.join("partial-cache/smoke-fixture/1.0.0");
+    fs::create_dir_all(&partial_cache).expect("partial cache");
+    symlink(&external_partial, partial_cache.join("artifact.partial")).expect("partial symlink");
+    let error = prepare(
+        &manifest,
+        &root.0.join("partial-cache"),
+        &source,
+        Call {
+            id: "smoke-fixture",
+            suite: EvalSuite::Smoke,
+            offline: false,
+            license_accepted: false,
+            manual_path: None,
+        },
+    )
+    .expect_err("symlinked partials must be rejected");
+    assert_eq!(error.kind(), DatasetErrorKind::Io);
+    assert_eq!(
+        fs::read(&external_partial).expect("external partial"),
+        b"outside-partial"
+    );
+    fs::remove_file(&external_partial).expect("remove external partial");
+
+    let external_temp = root.0.join(format!(
+        "issue-229-external-temp-{}",
+        NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&external_temp, b"outside-temp").expect("external temp");
+    let temp_cache = root.0.join("temp-cache/gated/9f3c1aa");
+    fs::create_dir_all(&temp_cache).expect("temp cache");
+    symlink(&external_temp, temp_cache.join(".tmp-artifact-collision"))
+        .expect("existing temp collision");
+    let manual = root.0.join("manual.txt");
+    fs::write(&manual, SMOKE_BYTES).expect("manual artifact");
+    let manual_manifest = DatasetManifest::parse_str(&gated_toml("manual", "9f3c1aa", true))
+        .expect("manual manifest");
+    let error = prepare(
+        &manual_manifest,
+        &root.0.join("temp-cache"),
+        &source,
+        Call {
+            id: "gated",
+            suite: EvalSuite::Formal,
+            offline: false,
+            license_accepted: true,
+            manual_path: Some(&manual),
+        },
+    )
+    .expect_err("existing temp collisions must be rejected");
+    assert_eq!(error.kind(), DatasetErrorKind::Io);
+    assert_eq!(
+        fs::read(&external_temp).expect("external temp"),
+        b"outside-temp"
+    );
+    fs::remove_file(&external_temp).expect("remove external temp");
+}
+
+#[test]
+fn manifest_rejects_duplicate_dataset_ids_deterministically() {
+    let duplicate = format!(
+        "{}\n[[datasets]]\nid = \"smoke-fixture\"\nfamily = \"synthetic\"\nlanguage = \"en\"\nrevision = \"1.0.0\"\nurl = \"https://example.invalid/smoke\"\nsha256 = \"{}\"\nlicense = \"CC-BY-4.0\"\nlicense_acceptance_required = false\ndistribution = \"fetch\"\nadapter_version = \"adapter-1\"\nderivation = \"fixture-v1\"\nsuites = [\"smoke\"]\n",
+        smoke_toml(),
+        SMOKE_SHA256
+    );
+    let first =
+        DatasetManifest::parse_str(&duplicate).expect_err("duplicate dataset IDs must be invalid");
+    let second = DatasetManifest::parse_str(&duplicate)
+        .expect_err("duplicate dataset IDs must stay invalid");
+    assert_eq!(first.kind(), DatasetErrorKind::InvalidManifest);
+    assert_eq!(second.kind(), DatasetErrorKind::InvalidManifest);
+    assert_eq!(format!("{first:?}"), format!("{second:?}"));
 }
 
 #[test]
@@ -221,7 +432,7 @@ fn interrupted_download_resumes_from_partial_cache() {
 fn checksum_mismatch_rejects_changed_upstream_bytes() {
     let root = TestRoot::new("checksum");
     let manifest = DatasetManifest::parse_str(&smoke_toml()).expect("manifest");
-    let source = ScriptedSource::new(b"changed-upstream-bytes\n", 64);
+    let source = ScriptedSource::new(b"changed-upstream-byte!!\n", 64);
     let error = prepare(
         &manifest,
         &root.0,
@@ -237,8 +448,48 @@ fn checksum_mismatch_rejects_changed_upstream_bytes() {
     .expect_err("checksum must fail closed");
     assert_eq!(error.kind(), DatasetErrorKind::ChecksumMismatch);
     let debug = format!("{error:?}");
-    assert!(!debug.contains("changed-upstream-bytes"));
+    assert!(!debug.contains("changed-upstream-byte!!"));
     assert!(!debug.contains(SMOKE_SHA256));
+}
+
+#[test]
+fn checksum_mismatch_discards_partial_before_retry() {
+    let root = TestRoot::new("checksum-retry");
+    let manifest = DatasetManifest::parse_str(&smoke_toml()).expect("manifest");
+    let changed = ScriptedSource::new(b"changed-upstream-byte!!\n", 64);
+    assert_eq!(changed.bytes.len(), SMOKE_BYTES.len());
+    let error = prepare(
+        &manifest,
+        &root.0,
+        &changed,
+        Call {
+            id: "smoke-fixture",
+            suite: EvalSuite::Smoke,
+            offline: false,
+            license_accepted: false,
+            manual_path: None,
+        },
+    )
+    .expect_err("checksum must fail closed");
+    assert_eq!(error.kind(), DatasetErrorKind::ChecksumMismatch);
+    let partial = root.0.join("smoke-fixture/1.0.0/artifact.partial");
+    assert!(!partial.exists(), "bad partial must be discarded");
+
+    let corrected = ScriptedSource::new(SMOKE_BYTES, 64);
+    prepare(
+        &manifest,
+        &root.0,
+        &corrected,
+        Call {
+            id: "smoke-fixture",
+            suite: EvalSuite::Smoke,
+            offline: false,
+            license_accepted: false,
+            manual_path: None,
+        },
+    )
+    .expect("corrected retry must start clean");
+    assert_eq!(corrected.served.lock().expect("served")[0], 0);
 }
 
 #[test]

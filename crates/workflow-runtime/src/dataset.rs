@@ -1,10 +1,14 @@
 //! Pinned dataset registry, resumable fetch, checksums, and license gates.
 
 use std::{
+    collections::{HashSet, hash_map::RandomState},
     fmt,
     fs::{self, OpenOptions},
+    hash::BuildHasher,
     io::{Seek, SeekFrom, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +19,8 @@ use crate::encode_hex;
 const SCHEMA_VERSION: u32 = 1;
 const SHA256_PREFIX: &str = "sha256:";
 const ARTIFACT_NAME: &str = "artifact";
+const O_NOFOLLOW: i32 = 0o400000;
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// Fail-closed dataset registry and fetch errors.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -248,8 +254,13 @@ impl DatasetManifest {
             return Err(DatasetError::new(DatasetErrorKind::InvalidManifest));
         }
         let mut datasets = Vec::with_capacity(raw.datasets.len());
+        let mut ids = HashSet::with_capacity(raw.datasets.len());
         for item in raw.datasets {
-            datasets.push(DatasetEntry::from_raw(item)?);
+            let entry = DatasetEntry::from_raw(item)?;
+            if !ids.insert(entry.id.clone()) {
+                return Err(DatasetError::new(DatasetErrorKind::InvalidManifest));
+            }
+            datasets.push(entry);
         }
         Ok(Self {
             schema_version: SCHEMA_VERSION,
@@ -405,8 +416,9 @@ pub fn prepare_dataset(
     if entry.license_acceptance_required && !request.license_accepted {
         return Err(DatasetError::new(DatasetErrorKind::LicenseRequired));
     }
+    validate_cache_root(request.cache_dir)?;
     let dest = artifact_path(request.cache_dir, entry)?;
-    if let Some(prepared) = load_verified(entry, &dest)? {
+    if let Some(prepared) = load_verified(entry, &dest, request.cache_dir)? {
         return Ok(prepared);
     }
     match entry.distribution {
@@ -414,13 +426,13 @@ pub fn prepare_dataset(
             let path = request
                 .manual_path
                 .ok_or(DatasetError::new(DatasetErrorKind::ManualPathRequired))?;
-            copy_manual(entry, path, &dest)
+            copy_manual(entry, path, &dest, request.cache_dir)
         }
         DatasetDistribution::Fetch => {
             if request.offline {
                 return Err(DatasetError::new(DatasetErrorKind::OfflineMiss));
             }
-            fetch_resumable(entry, request.source, &dest)
+            fetch_resumable(entry, request.source, &dest, request.cache_dir)
         }
     }
 }
@@ -504,7 +516,8 @@ impl DatasetEntry {
 }
 
 fn is_safe_token(value: &str) -> bool {
-    !value.is_empty()
+    !matches!(value, "." | "..")
+        && !value.is_empty()
         && value.bytes().all(
             |byte| matches!(byte, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'.' | b'_' | b'-'),
         )
@@ -564,10 +577,112 @@ fn prepared(entry: &DatasetEntry, from_cache: bool) -> PreparedDataset {
 }
 
 fn artifact_path(cache_dir: &Path, entry: &DatasetEntry) -> Result<PathBuf, DatasetError> {
-    Ok(cache_dir
-        .join(&entry.id)
+    if !is_safe_token(&entry.id) || !is_safe_token(&entry.revision) {
+        return Err(DatasetError::new(DatasetErrorKind::InvalidManifest));
+    }
+    let relative = Path::new(&entry.id)
         .join(&entry.revision)
-        .join(ARTIFACT_NAME))
+        .join(ARTIFACT_NAME);
+    let dest = cache_dir.join(&relative);
+    if dest.strip_prefix(cache_dir) != Ok(relative.as_path()) {
+        return Err(DatasetError::new(DatasetErrorKind::Io));
+    }
+    Ok(dest)
+}
+
+fn safe_directory_metadata(metadata: &fs::Metadata) -> bool {
+    let mode = metadata.mode();
+    metadata.is_dir() && mode & 0o020 == 0 && (mode & 0o002 == 0 || mode & 0o1000 != 0)
+}
+
+fn same_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+fn validate_directory_ancestry(path: &Path) -> Result<(), DatasetError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let metadata =
+            fs::symlink_metadata(&current).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+        if metadata.file_type().is_symlink() || !safe_directory_metadata(&metadata) {
+            return Err(DatasetError::new(DatasetErrorKind::Io));
+        }
+    }
+    Ok(())
+}
+
+fn validate_cache_root(cache_dir: &Path) -> Result<(), DatasetError> {
+    let metadata = match fs::symlink_metadata(cache_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return reject_symlink_components(cache_dir, None);
+        }
+        Err(_) => return Err(DatasetError::new(DatasetErrorKind::Io)),
+    };
+    if metadata.file_type().is_symlink() {
+        let link_target =
+            fs::read_link(cache_dir).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+        let canonical_target =
+            fs::canonicalize(cache_dir).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+        let before =
+            fs::metadata(cache_dir).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+        validate_directory_ancestry(&canonical_target)?;
+        let canonical_again =
+            fs::canonicalize(cache_dir).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+        let after = fs::metadata(cache_dir).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+        let link_target_again =
+            fs::read_link(cache_dir).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+        if canonical_target != canonical_again
+            || link_target != link_target_again
+            || !same_identity(&before, &after)
+        {
+            return Err(DatasetError::new(DatasetErrorKind::Io));
+        }
+        return Ok(());
+    }
+    let canonical_root =
+        fs::canonicalize(cache_dir).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+    validate_directory_ancestry(&canonical_root)?;
+    let after = fs::metadata(cache_dir).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+    if !same_identity(&metadata, &after) {
+        return Err(DatasetError::new(DatasetErrorKind::Io));
+    }
+    Ok(())
+}
+
+fn reject_symlink_components(path: &Path, allowed_root: Option<&Path>) -> Result<(), DatasetError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink() && allowed_root != Some(current.as_path()) =>
+            {
+                return Err(DatasetError::new(DatasetErrorKind::Io));
+            }
+            Ok(metadata)
+                if current != path
+                    && !metadata.is_dir()
+                    && allowed_root != Some(current.as_path()) =>
+            {
+                return Err(DatasetError::new(DatasetErrorKind::Io));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => return Err(DatasetError::new(DatasetErrorKind::Io)),
+        }
+    }
+    Ok(())
+}
+
+fn temp_prefix(dest: &Path) -> Result<String, DatasetError> {
+    Ok(format!(
+        ".tmp-{}-",
+        dest.file_name()
+            .ok_or(DatasetError::new(DatasetErrorKind::Io))?
+            .to_string_lossy()
+    ))
 }
 
 fn partial_path(dest: &Path) -> Result<PathBuf, DatasetError> {
@@ -582,7 +697,9 @@ fn partial_path(dest: &Path) -> Result<PathBuf, DatasetError> {
 fn load_verified(
     entry: &DatasetEntry,
     dest: &Path,
+    cache_dir: &Path,
 ) -> Result<Option<PreparedDataset>, DatasetError> {
+    reject_symlink_components(dest, Some(cache_dir))?;
     match fs::read(dest) {
         Ok(bytes) => {
             if digest_bytes(&bytes) == entry.sha256 {
@@ -596,23 +713,50 @@ fn load_verified(
     }
 }
 
-fn ensure_parent(dest: &Path) -> Result<(), DatasetError> {
+fn ensure_parent(dest: &Path, cache_dir: &Path) -> Result<(), DatasetError> {
+    reject_symlink_components(dest, Some(cache_dir))?;
     let parent = dest
         .parent()
         .ok_or(DatasetError::new(DatasetErrorKind::Io))?;
-    fs::create_dir_all(parent).map_err(|_| DatasetError::new(DatasetErrorKind::Io))
+    fs::create_dir_all(parent).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+    reject_symlink_components(dest, Some(cache_dir))
 }
 
-fn publish(dest: &Path, bytes: &[u8]) -> Result<(), DatasetError> {
-    ensure_parent(dest)?;
-    let tmp = dest.with_file_name(format!(
-        ".tmp-{}-{}",
-        dest.file_name()
-            .ok_or(DatasetError::new(DatasetErrorKind::Io))?
-            .to_string_lossy(),
-        std::process::id()
+fn publish(dest: &Path, bytes: &[u8], cache_dir: &Path) -> Result<(), DatasetError> {
+    ensure_parent(dest, cache_dir)?;
+    let parent = dest
+        .parent()
+        .ok_or(DatasetError::new(DatasetErrorKind::Io))?;
+    let prefix = temp_prefix(dest)?;
+    for entry in fs::read_dir(parent).map_err(|_| DatasetError::new(DatasetErrorKind::Io))? {
+        let entry = entry.map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            return Err(DatasetError::new(DatasetErrorKind::Io));
+        }
+    }
+    let nonce = RandomState::new().hash_one((
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed),
     ));
-    fs::write(&tmp, bytes).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+    let tmp = parent.join(format!("{prefix}{nonce:016x}"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW)
+        .open(&tmp)
+        .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+    if file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .is_err()
+    {
+        let _ = fs::remove_file(&tmp);
+        return Err(DatasetError::new(DatasetErrorKind::Io));
+    }
+    drop(file);
+    reject_symlink_components(&tmp, Some(cache_dir))?;
+    reject_symlink_components(dest, Some(cache_dir))?;
     fs::rename(&tmp, dest).map_err(|_| {
         let _ = fs::remove_file(&tmp);
         DatasetError::new(DatasetErrorKind::Io)
@@ -623,12 +767,14 @@ fn copy_manual(
     entry: &DatasetEntry,
     path: &Path,
     dest: &Path,
+    cache_dir: &Path,
 ) -> Result<PreparedDataset, DatasetError> {
+    reject_symlink_components(path, None)?;
     let bytes = fs::read(path).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
     if digest_bytes(&bytes) != entry.sha256 {
         return Err(DatasetError::new(DatasetErrorKind::ChecksumMismatch));
     }
-    publish(dest, &bytes)?;
+    publish(dest, &bytes, cache_dir)?;
     Ok(prepared(entry, false))
 }
 
@@ -636,15 +782,18 @@ fn fetch_resumable(
     entry: &DatasetEntry,
     source: &dyn ByteSource,
     dest: &Path,
+    cache_dir: &Path,
 ) -> Result<PreparedDataset, DatasetError> {
-    ensure_parent(dest)?;
+    ensure_parent(dest, cache_dir)?;
     let partial = partial_path(dest)?;
+    reject_symlink_components(&partial, Some(cache_dir))?;
     let expected = source.len()?;
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
+        .custom_flags(O_NOFOLLOW)
         .open(&partial)
         .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
     let mut offset = file
@@ -663,10 +812,13 @@ fn fetch_resumable(
     file.flush()
         .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
     drop(file);
+    reject_symlink_components(&partial, Some(cache_dir))?;
     let bytes = fs::read(&partial).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
     if digest_bytes(&bytes) != entry.sha256 {
+        fs::remove_file(&partial).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
         return Err(DatasetError::new(DatasetErrorKind::ChecksumMismatch));
     }
+    reject_symlink_components(dest, Some(cache_dir))?;
     fs::rename(&partial, dest).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
     Ok(prepared(entry, false))
 }
