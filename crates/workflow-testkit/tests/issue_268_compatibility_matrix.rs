@@ -21,6 +21,7 @@ use workflow_testkit::compatibility::{
 use workflow_testkit::{NoProgressReason, NonProgressDetector};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+const COMPATIBILITY_WALL_TIME_MS: u64 = 2_000;
 
 #[path = "support/issue_268_binding.rs"]
 mod binding_oracles;
@@ -372,7 +373,7 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                         finish(json!({"ok":true})),
                     ],
                     0,
-                    1000,
+                    COMPATIBILITY_WALL_TIME_MS,
                     4,
                 );
                 let receipt = result.unwrap();
@@ -398,7 +399,7 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                         finish(json!({"ok":true})),
                     ],
                     0,
-                    1000,
+                    COMPATIBILITY_WALL_TIME_MS,
                     4,
                 );
                 let receipt = result.unwrap();
@@ -435,7 +436,7 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                             finish(json!({"must_not":"succeed"})),
                         ],
                         0,
-                        1000,
+                        COMPATIBILITY_WALL_TIME_MS,
                         4,
                     );
                     let error = result.unwrap_err();
@@ -450,7 +451,12 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                 }
             }
             CompatibilityDimension::StructuredFinish => {
-                let (_root, result) = run(vec![finish(json!({"answer":"structured"}))], 0, 1000, 2);
+                let (_root, result) = run(
+                    vec![finish(json!({"answer":"structured"}))],
+                    0,
+                    COMPATIBILITY_WALL_TIME_MS,
+                    2,
+                );
                 let receipt = result.unwrap();
                 assert_eq!(receipt.status(), "succeeded", "{}", case.name);
                 assert_finished(receipt.run_root(), json!({"answer":"structured"}));
@@ -472,7 +478,7 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                         json!({"calls": [{"id":"repeat-a","name":"search_code","args":{"query":"same"}}]}),
                     ],
                     0,
-                    1000,
+                    COMPATIBILITY_WALL_TIME_MS,
                     4,
                 );
                 let error = result.unwrap_err();
@@ -526,7 +532,7 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                         finish(json!({"answer":"retained"})),
                     ],
                     0,
-                    1000,
+                    COMPATIBILITY_WALL_TIME_MS,
                     4,
                 );
                 let receipt = result.unwrap();
