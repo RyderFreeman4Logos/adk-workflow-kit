@@ -60,6 +60,9 @@ pub fn run_dataset_product(
     {
         return Err("dataset license or split metadata mismatch".into());
     }
+    if !license_accepted {
+        return Err("dataset license acceptance is required".into());
+    }
     let cache = validated_dataset_cache_root(cache).map_err(|error| error.to_string())?;
     let prepared = prepare_dataset(
         manifest,

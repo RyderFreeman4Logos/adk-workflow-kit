@@ -114,6 +114,12 @@ suites = ["regression"]
         .unwrap()
         .join(format!("issue-229-product-test-{}", std::process::id()));
     fs::create_dir(&cache).unwrap();
+    let broken = cache.join("broken-root-link");
+    std::os::unix::fs::symlink(cache.join("absent"), &broken).unwrap();
+    assert_eq!(
+        run_dataset_product(&manifest, "ether0", &source, &broken, false, false, 3).unwrap_err(),
+        "dataset license acceptance is required"
+    );
     assert!(run_dataset_product(&manifest, "ether0", &source, &cache, false, false, 3).is_err());
     assert!(!cache.join("ether0-report.json").exists());
     let wrong_revision = Source {
