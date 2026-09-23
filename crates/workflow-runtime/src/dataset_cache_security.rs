@@ -16,13 +16,11 @@ pub(super) fn validate_cache_entry_ancestors(
         }
         Err(_) => return Err(DatasetError::new(DatasetErrorKind::Io)),
     };
-    if root.file_type().is_symlink() {
-        if root.uid() != uid {
-            return Err(DatasetError::new(DatasetErrorKind::Io));
-        }
-        if let Some(parent) = cache_dir.parent() {
-            validate_sticky_ancestry(parent, uid)?;
-        }
+    if let Some(parent) = cache_dir.parent() {
+        validate_sticky_ancestry(parent, uid)?;
+    }
+    if root.file_type().is_symlink() && root.uid() != uid {
+        return Err(DatasetError::new(DatasetErrorKind::Io));
     }
     let canonical_root =
         fs::canonicalize(cache_dir).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
@@ -85,7 +83,7 @@ fn validate_creation_ancestry(path: &Path, uid: u32) -> Result<(), DatasetError>
     Ok(())
 }
 
-// Sticky shared parents cannot replace entries owned by another user.
+// Only our UID or root may control a pathname ancestor; retain sticky-child checks.
 fn validate_sticky_ancestry(path: &Path, uid: u32) -> Result<(), DatasetError> {
     let mut child = path.to_owned();
     while let Some(parent) = child.parent() {
@@ -94,10 +92,48 @@ fn validate_sticky_ancestry(path: &Path, uid: u32) -> Result<(), DatasetError> {
         let parent_metadata =
             fs::metadata(parent).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
         let parent_mode = parent_metadata.mode();
-        if parent_mode & 0o1002 == 0o1002 && child_metadata.uid() != uid {
+        if ![uid, 0].contains(&child_metadata.uid())
+            || ![uid, 0].contains(&parent_metadata.uid())
+            || (parent_mode & 0o1002 == 0o1002 && child_metadata.uid() != uid)
+        {
             return Err(DatasetError::new(DatasetErrorKind::Io));
         }
         child = parent.to_owned();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_foreign_owned_ancestor_cannot_control_cache_namespace() {
+        let current_uid = fs::metadata("/proc/self").expect("current uid").uid();
+        let root =
+            fs::canonicalize(Path::new(&std::env::var_os("HOME").expect("HOME")).join("tmp"))
+                .expect("SSD test root");
+        assert_eq!(fs::metadata(&root).expect("root").uid(), current_uid);
+        let sticky = Path::new("/run/lock");
+        assert_eq!(
+            fs::metadata(sticky)
+                .expect("root-owned sticky directory")
+                .uid(),
+            0
+        );
+        assert_eq!(
+            fs::metadata(sticky).expect("sticky directory").mode() & 0o1002,
+            0o1002
+        );
+        validate_sticky_ancestry(sticky, current_uid).expect("root-owned sticky ancestor");
+        assert_eq!(fs::metadata(&root).expect("root").mode() & 0o777, 0o700);
+        validate_sticky_ancestry(&root, current_uid).expect("own and root-owned ancestors");
+        let foreign_uid = current_uid.checked_add(1).expect("non-root fixture uid");
+        assert_eq!(
+            validate_sticky_ancestry(&root, foreign_uid)
+                .expect_err("foreign-owned ordinary ancestor must be rejected")
+                .kind(),
+            DatasetErrorKind::Io
+        );
+    }
 }
