@@ -6,6 +6,7 @@ mod bridge;
 mod bubblewrap;
 mod checkpoint;
 mod controller;
+mod dataset;
 mod effect_journal;
 mod event;
 mod execution;
@@ -49,6 +50,13 @@ pub use checkpoint::{
 pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
 };
+pub use dataset::{
+    ByteSource, DatasetDistribution, DatasetEntry, DatasetError, DatasetErrorKind, DatasetManifest,
+    DatasetProvenance, DatasetReport, DatasetSourceIdentity, EvalSuite, HttpByteSource,
+    LocalFileSource, PrepareRequest, PreparedDataset, prepare_dataset,
+    validated_dataset_cache_root,
+};
+pub use dataset::{DatasetCase, ParquetCaseError, decode_parquet_cases};
 pub use effect_journal::{
     EffectCommit, EffectJournal, EffectJournalError, EffectJournalErrorKind, EffectKey,
 };

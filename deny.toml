@@ -17,6 +17,9 @@ allow = [
     "Unicode-3.0",
     "Zlib",
 ]
+exceptions = [
+    { name = "tiny-keccak", version = "=2.0.2", allow = ["CC0-1.0"] },
+]
 
 [bans]
 deny = []

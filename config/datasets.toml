@@ -1,0 +1,34 @@
+schema_version = 1
+
+# Tiny synthetic smoke/regression subset. Do not vendor third-party dumps.
+
+[[datasets]]
+id = "smoke-fixture"
+family = "synthetic"
+language = "en"
+revision = "1.0.0"
+url = "memory://smoke-fixture"
+sha256 = "sha256:e543862e31a042f932ef3d2f34daa869537e5da06ad9ded1cbbd10885bd46959"
+license = "Apache-2.0"
+license_acceptance_required = false
+distribution = "fetch"
+adapter_version = "1"
+derivation = "identity"
+suites = ["smoke", "regression"]
+
+# FutureHouse ©2025 ether0-benchmark, CC BY 4.0.
+# https://creativecommons.org/licenses/by/4.0/
+# This project's first-row adapter modifies the original Parquet presentation.
+[[datasets]]
+id = "ether0"
+family = "futurehouse"
+language = "en"
+revision = "c7d5e59960087f360bc32a5006bb994324b38c35"
+url = "https://huggingface.co/datasets/futurehouse/ether0-benchmark/resolve/c7d5e59960087f360bc32a5006bb994324b38c35/data/test-00000-of-00001.parquet"
+sha256 = "sha256:c53213a37ef319aa7f733751b93748db960cce33355c1d44124108e7f15c5bbc"
+license = "CC-BY-4.0"
+license_acceptance_required = true
+distribution = "fetch"
+adapter_version = "ether0-first-rows-v1"
+derivation = "first-physical-parquet-rows; trajectory-fixture-acknowledgement-only"
+suites = ["smoke", "regression"]

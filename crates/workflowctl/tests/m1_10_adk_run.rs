@@ -593,22 +593,47 @@ fn serve_oracle_request_until_child_done(
     child_done: mpsc::Receiver<()>,
     terminal_probe: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     deadline: Instant,
+    child_identity: Option<mpsc::Receiver<OracleChildIdentity>>,
 ) -> Result<RequestObservation, &'static str> {
     listener
         .set_nonblocking(true)
         .map_err(|_| "oracle listener setup failed")?;
+    let mut expected_identity = None;
+    let mut child_observed_at = None;
     let (mut socket, _) = loop {
         match listener.accept() {
             Ok(connection) => break connection,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err("oracle listener accept timed out");
+                if expected_identity.is_none() {
+                    match child_identity.as_ref().map(|rx| rx.try_recv()) {
+                        Some(Ok(identity)) => expected_identity = Some(identity),
+                        Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                            return Err("oracle listener accept timed out");
+                        }
+                        Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+                    }
                 }
-                thread::yield_now();
+                if child_observed_at.is_none()
+                    && expected_identity.is_some_and(|identity| {
+                        matching_oracle_child_identity(identity, &owned_child_stat(identity.pid))
+                    })
+                {
+                    child_observed_at = Some(Instant::now());
+                }
+                match oracle_accept_progress(false, child_observed_at, Instant::now(), deadline) {
+                    OracleAcceptProgress::TimedOut => {
+                        return Err("oracle listener accept timed out");
+                    }
+                    OracleAcceptProgress::Wait => thread::yield_now(),
+                    OracleAcceptProgress::Accepted => unreachable!(),
+                }
             }
             Err(_) => return Err("oracle listener accept failed"),
         }
     };
+    let deadline = child_observed_at
+        .map(|observed| observed + ORACLE_TIMEOUT)
+        .unwrap_or(deadline);
     let observation = read_model_request(&mut socket, deadline, canary)?;
     let body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"status\":\"finished\",\"output\":\"oracle-ok\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
     let response = format!(
@@ -752,6 +777,27 @@ enum OracleReapProgress {
     AbortUnproven,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OracleAcceptProgress {
+    Accepted,
+    Wait,
+    TimedOut,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OracleChildIdentity {
+    pid: u32,
+    starttime: u64,
+}
+
+fn matching_oracle_child_identity(identity: OracleChildIdentity, stat: &OwnedChildStat) -> bool {
+    identity.starttime != 0
+        && matches!(
+            stat,
+            OwnedChildStat::Ready { starttime, .. } if *starttime == identity.starttime
+        )
+}
+
 fn matching_uninterruptible_io(
     kill_ok: bool,
     terminal: &OwnedChildStat,
@@ -786,6 +832,36 @@ fn oracle_reap_progress(
                 OracleReapProgress::Wait
             } else {
                 OracleReapProgress::AbortUnproven
+            }
+        }
+    }
+}
+
+fn oracle_accept_progress(
+    accepted: bool,
+    child_observed_at: Option<Instant>,
+    now: Instant,
+    unobserved_deadline: Instant,
+) -> OracleAcceptProgress {
+    if accepted {
+        return OracleAcceptProgress::Accepted;
+    }
+    match child_observed_at {
+        Some(observed) => {
+            if now
+                .checked_duration_since(observed)
+                .is_some_and(|elapsed| elapsed >= ORACLE_TIMEOUT)
+            {
+                OracleAcceptProgress::TimedOut
+            } else {
+                OracleAcceptProgress::Wait
+            }
+        }
+        None => {
+            if now >= unobserved_deadline {
+                OracleAcceptProgress::TimedOut
+            } else {
+                OracleAcceptProgress::Wait
             }
         }
     }
@@ -1027,7 +1103,7 @@ fn run_oracle_operation(
     label: &str,
     args: &[&str],
     credential: (&str, Option<&str>),
-    deadline: Instant,
+    spawned: Option<&mpsc::SyncSender<OracleChildIdentity>>,
     operation: &'static str,
 ) -> Result<Output, String> {
     let stdout_path = root.join(format!("workflowctl-{label}.stdout"));
@@ -1048,7 +1124,17 @@ fn run_oracle_operation(
         ))
         .spawn()
         .map_err(|_| "oracle child spawn failed")?;
-    wait_bounded_child(child, &stdout_path, &stderr_path, deadline, operation)
+    if let Some(tx) = spawned {
+        let pid = child.id();
+        match owned_child_stat(pid) {
+            OwnedChildStat::Ready { starttime, .. } if starttime != 0 => {
+                let _ = tx.send(OracleChildIdentity { pid, starttime });
+            }
+            _ => {}
+        }
+    }
+    let wait_deadline = Instant::now() + ORACLE_TIMEOUT;
+    wait_bounded_child(child, &stdout_path, &stderr_path, wait_deadline, operation)
 }
 
 fn command_json(args: &[&str]) -> Output {
@@ -1761,6 +1847,7 @@ fn oracle_server_rejects_second_physical_request() {
             child_done_rx,
             None,
             Instant::now() + ORACLE_TIMEOUT,
+            None,
         ),
         Err("oracle request count rejected")
     ));
@@ -1810,7 +1897,7 @@ fn oracle_server_enforces_terminal_quiescence_and_cardinality_edges() {
     let (child_done_tx, child_done_rx) = mpsc::sync_channel(1);
     let deadline = Instant::now() + ORACLE_TIMEOUT;
     let server = thread::spawn(move || {
-        serve_oracle_request_until_child_done(listener, CANARY, child_done_rx, None, deadline)
+        serve_oracle_request_until_child_done(listener, CANARY, child_done_rx, None, deadline, None)
     });
     let mut client = connect_and_read_response(address, CANARY);
     client.write_all(b"x").expect("delayed same-stream byte");
@@ -1833,6 +1920,7 @@ fn oracle_server_enforces_terminal_quiescence_and_cardinality_edges() {
             child_done_rx,
             Some((observed_tx, release_rx)),
             deadline,
+            None,
         )
     });
     let mut client = connect_and_read_response(address, CANARY);
@@ -2268,6 +2356,106 @@ fn oracle_kill_ok_matching_d_state_waits_instead_of_aborting_on_first_observatio
 }
 
 #[test]
+fn oracle_accept_silent_identity_receiver_respects_absolute_fallback() {
+    let now = Instant::now();
+    let deadline = now;
+    let (_identity_tx, identity_rx) = mpsc::sync_channel::<OracleChildIdentity>(1);
+    assert!(matches!(
+        identity_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    let child_identity = Some(identity_rx);
+    assert!(child_identity.is_some());
+    assert_eq!(
+        oracle_accept_progress(false, None, now, deadline),
+        OracleAcceptProgress::TimedOut
+    );
+}
+
+#[test]
+fn oracle_accept_wait_starts_on_child_observation_instead_of_pre_armed_deadline() {
+    let started_at = Instant::now();
+    let unobserved_deadline = started_at + Duration::from_secs(4);
+    let observed_at = started_at + Duration::from_secs(4);
+    let identity = OracleChildIdentity {
+        pid: 4242,
+        starttime: 114922562,
+    };
+    assert!(!matching_oracle_child_identity(
+        OracleChildIdentity {
+            pid: identity.pid,
+            starttime: 0,
+        },
+        &OwnedChildStat::Ready {
+            state: 'R',
+            starttime: 0,
+        },
+    ));
+    assert!(!matching_oracle_child_identity(
+        identity,
+        &OwnedChildStat::Ready {
+            state: 'R',
+            starttime: identity.starttime + 1,
+        },
+    ));
+    assert!(matching_oracle_child_identity(
+        identity,
+        &OwnedChildStat::Ready {
+            state: 'R',
+            starttime: identity.starttime,
+        },
+    ));
+    assert_eq!(
+        oracle_accept_progress(true, None, unobserved_deadline, unobserved_deadline),
+        OracleAcceptProgress::Accepted
+    );
+    assert_eq!(
+        oracle_accept_progress(
+            false,
+            None,
+            started_at + Duration::from_secs(4) - Duration::from_millis(1),
+            unobserved_deadline,
+        ),
+        OracleAcceptProgress::Wait
+    );
+    assert_eq!(
+        oracle_accept_progress(false, None, unobserved_deadline, unobserved_deadline),
+        OracleAcceptProgress::TimedOut
+    );
+    assert_eq!(
+        oracle_accept_progress(
+            false,
+            None,
+            started_at + ORACLE_TIMEOUT,
+            unobserved_deadline
+        ),
+        OracleAcceptProgress::TimedOut
+    );
+    assert_eq!(
+        oracle_accept_progress(false, Some(observed_at), observed_at, unobserved_deadline,),
+        OracleAcceptProgress::Wait
+    );
+    assert_eq!(
+        oracle_accept_progress(
+            false,
+            Some(observed_at),
+            observed_at + Duration::from_secs(4),
+            unobserved_deadline,
+        ),
+        OracleAcceptProgress::Wait
+    );
+    assert_eq!(
+        oracle_accept_progress(
+            false,
+            Some(observed_at),
+            observed_at + ORACLE_TIMEOUT,
+            unobserved_deadline,
+        ),
+        OracleAcceptProgress::TimedOut
+    );
+}
+
+#[test]
 fn oracle_output_diagnostics_require_proven_reap() {
     let root = temp_root("oracle-output-diagnostics");
     let stdout_path = root.join("stdout");
@@ -2575,14 +2763,15 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     let expected_source = fs::read(&workflow).expect("workflow fixture");
     let run_listener = listener.try_clone().expect("oracle run listener clone");
     let (child_done_tx, child_done_rx) = mpsc::sync_channel(1);
-    let run_deadline = Instant::now() + ORACLE_TIMEOUT;
+    let (spawned_tx, spawned_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
         serve_oracle_request_until_child_done(
             run_listener,
             CANARY,
             child_done_rx,
             None,
-            run_deadline,
+            Instant::now() + ORACLE_TIMEOUT,
+            Some(spawned_rx),
         )
     });
     let child_result = run_oracle_operation(
@@ -2600,7 +2789,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
             runs.to_str().expect("UTF-8 run base"),
         ],
         (HANDLE, Some(CANARY)),
-        run_deadline,
+        Some(&spawned_tx),
         "credential-run",
     );
     signal_oracle_child_done(&child_done_tx);
@@ -2683,7 +2872,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
             runs.to_str().expect("UTF-8 runs path"),
         ],
         (HANDLE, None),
-        Instant::now() + ORACLE_TIMEOUT,
+        None,
         "credential-inspect",
     )
     .expect("bounded oracle inspect child");
@@ -2715,7 +2904,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
             runs.to_str().expect("UTF-8 runs path"),
         ],
         (HANDLE, None),
-        Instant::now() + ORACLE_TIMEOUT,
+        None,
         "credential-resume-missing",
     )
     .expect("bounded missing-credential resume child");
@@ -2746,7 +2935,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
             runs.to_str().expect("UTF-8 runs path"),
         ],
         (HANDLE, Some(CANARY)),
-        Instant::now() + ORACLE_TIMEOUT,
+        None,
         "credential-resume",
     )
     .expect("bounded credential-backed resume child");

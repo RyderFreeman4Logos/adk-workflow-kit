@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -190,6 +190,7 @@ fn publish_script() -> Vec<String> {
 struct ScriptedServer {
     base_url: String,
     requests: Arc<AtomicU64>,
+    first_rate_limit_sent: Arc<OnceLock<Instant>>,
     extra: Arc<AtomicU64>,
     done: Arc<AtomicBool>,
     first_response_released: Arc<AtomicBool>,
@@ -271,17 +272,19 @@ fn serve_provider(
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("addr");
     let requests = Arc::new(AtomicU64::new(0));
+    let first_rate_limit_sent = Arc::new(OnceLock::new());
     let extra = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
     let first_response_released = Arc::new(AtomicBool::new(!hold_first_response));
     let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
     let request_count = Arc::clone(&requests);
+    let rate_limit_sent = Arc::clone(&first_rate_limit_sent);
     let extra_count = Arc::clone(&extra);
     let finished = Arc::clone(&done);
     let released = Arc::clone(&first_response_released);
     let captured = Arc::clone(&bodies);
     let handle = thread::spawn(move || {
-        let accept = |timeout: Duration| {
+        let accept = |timeout: Option<Duration>| {
             let started = Instant::now();
             loop {
                 if finished.load(Ordering::Acquire) {
@@ -290,7 +293,7 @@ fn serve_provider(
                 match listener.accept() {
                     Ok((socket, _)) => return Some(socket),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if started.elapsed() > timeout {
+                        if timeout.is_some_and(|limit| started.elapsed() > limit) {
                             return None;
                         }
                         thread::sleep(Duration::from_millis(20));
@@ -301,7 +304,7 @@ fn serve_provider(
         };
         let drain_extra = || {
             while !finished.load(Ordering::Acquire) {
-                if let Some(socket) = accept(Duration::from_millis(50)) {
+                if let Some(socket) = accept(Some(Duration::from_millis(50))) {
                     extra_count.fetch_add(1, Ordering::Relaxed);
                     request_count.fetch_add(1, Ordering::Relaxed);
                     drop(socket);
@@ -309,7 +312,7 @@ fn serve_provider(
             }
         };
         if stall {
-            let Some(mut socket) = accept(Duration::from_secs(2)) else {
+            let Some(mut socket) = accept(Some(Duration::from_secs(2))) else {
                 return;
             };
             request_count.fetch_add(1, Ordering::Relaxed);
@@ -324,7 +327,7 @@ fn serve_provider(
             .chain(responses.into_iter().map(Some))
             .enumerate()
         {
-            let Some(mut socket) = accept(Duration::from_secs(2)) else {
+            let Some(mut socket) = accept(None) else {
                 return;
             };
             request_count.fetch_add(1, Ordering::Relaxed);
@@ -380,6 +383,8 @@ fn serve_provider(
                         socket,
                         "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n"
                     );
+                    let _ = socket.flush();
+                    let _ = rate_limit_sent.set(Instant::now());
                 }
                 Some(_) if stall_body => {
                     let partial = r#"{"choices":[{"message":{"role":"assistant","content":""#;
@@ -411,6 +416,7 @@ fn serve_provider(
     ScriptedServer {
         base_url: format!("http://{address}/v1"),
         requests,
+        first_rate_limit_sent,
         extra,
         done,
         first_response_released,
@@ -572,19 +578,21 @@ fn provider_body_stall_fails_closed_at_timeout() {
 
 #[test]
 fn provider_retry_does_not_reset_timeout_on_body_stall() {
-    let server = serve_partial_body_stall(1, Duration::from_millis(600));
+    let server = serve_partial_body_stall(1, Duration::from_millis(1_400));
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
-    let profile = write_profile(&root.0, &timeout_profile(&server.base_url, 1_000, 5_000));
-    let started = Instant::now();
+    let profile = write_profile(&root.0, &timeout_profile(&server.base_url, 2_000, 5_000));
     let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
-    let elapsed_ms = report.metrics().expect("metrics").elapsed_ms();
+    let since_rate_limit = server
+        .first_rate_limit_sent
+        .get()
+        .expect("first 429 was sent")
+        .elapsed();
     assert!(
-        elapsed_ms < 2_000,
-        "elapsed_ms={elapsed_ms} must keep one absolute deadline across retry"
+        since_rate_limit < Duration::from_millis(1_400),
+        "since_rate_limit={since_rate_limit:?} must keep one absolute deadline across retry"
     );
-    assert!(started.elapsed() < Duration::from_secs(3));
     assert_scripted_fail(&report, "timeout", server, 2);
 }
 

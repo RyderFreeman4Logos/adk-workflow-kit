@@ -1,11 +1,11 @@
 //! Durable, provenance-complete node-result memoization.
 
 use std::{
+    cell::Cell,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -14,7 +14,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub const NODE_CACHE_SCHEMA_VERSION: u16 = 1;
-static DIR_SYNCS: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static DIR_SYNCS: Cell<u64> = const { Cell::new(0) };
+}
 
 /// Identity fields bound into a node-result cache key.
 pub struct NodeCacheKeyMaterial<'a> {
@@ -268,14 +270,14 @@ impl CacheDisposition {
     }
 }
 
-/// Test seam: successful directory fsyncs since the last reset.
+/// Test seam: successful directory fsyncs on this thread since its last reset.
 pub fn node_cache_dir_syncs() -> u64 {
-    DIR_SYNCS.load(Ordering::Relaxed)
+    DIR_SYNCS.with(Cell::get)
 }
 
-/// Test seam: clear the directory-fsync counter.
+/// Test seam: clear this thread's directory-fsync counter.
 pub fn reset_node_cache_dir_syncs() {
-    DIR_SYNCS.store(0, Ordering::Relaxed);
+    DIR_SYNCS.with(|count| count.set(0));
 }
 
 impl NodeCacheInspect {
@@ -512,7 +514,7 @@ fn sync_dir(path: &Path) -> Result<(), NodeCacheError> {
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|_| NodeCacheError::new(NodeCacheErrorKind::Io))?;
-    DIR_SYNCS.fetch_add(1, Ordering::Relaxed);
+    DIR_SYNCS.with(|count| count.set(count.get() + 1));
     Ok(())
 }
 

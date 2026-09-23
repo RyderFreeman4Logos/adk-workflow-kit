@@ -4,6 +4,7 @@ mod bench;
 pub mod code_investigation;
 pub mod compatibility;
 pub mod conformance;
+mod dataset_product;
 mod eval;
 pub mod live_conformance;
 mod non_progress;
@@ -11,6 +12,7 @@ mod replay;
 mod sandbox;
 
 pub use bench::{BenchmarkDiagnostics, BenchmarkReport, BenchmarkSample, run_suite};
+pub use dataset_product::run_dataset_product;
 
 use std::{
     collections::VecDeque,

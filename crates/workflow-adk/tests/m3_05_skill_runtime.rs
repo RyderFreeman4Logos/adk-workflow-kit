@@ -1011,7 +1011,7 @@ fn successful_skill_completion_resets_idle_budget() {
     let workflow = root.join("workflow.toml");
     fs::write(&workflow, WORKFLOW).unwrap();
     let mut value = serde_json::to_value(profile(&package)).unwrap();
-    value["model"]["response_delay_ms"] = json!(120);
+    value["model"]["response_delay_ms"] = json!(100);
     value["model"]["responses"] = json!([
         {"calls": [{"id":"activate","name":"activate_skill","args":{"skill_id":"code-investigation"}}]},
         {"calls": [{"id":"run","name":"run_skill_script","args":{"skill_id":"code-investigation","script_id":"answer","input":{"value":"done"}}}]},
