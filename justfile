@@ -131,7 +131,7 @@ issue-228-test:
     just issue-228-runtime
 
 # Focused #229 pinned dataset registry tests.
-issue-229-http test_name="dataset::dataset_http::tests::":
+issue-229-http test_name="dataset::dataset_http::":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --lib {{test_name}} --locked -- --nocapture
 
 issue-229-parquet test_name="dataset::dataset_parquet::tests::":

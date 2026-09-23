@@ -189,6 +189,10 @@ pub trait ByteSource {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, DatasetError>;
     /// Returns the total source length in bytes.
     fn len(&self) -> Result<u64, DatasetError>;
+    /// Optional transport pin, checked against the manifest before egress.
+    fn expected_sha256(&self) -> Option<&str> {
+        None
+    }
     /// Returns whether the source is empty.
     fn is_empty(&self) -> Result<bool, DatasetError> {
         Ok(self.len()? == 0)
@@ -750,6 +754,12 @@ fn fetch_resumable(
     let actual_identity = source.identity()?;
     if &actual_identity != expected_identity || !valid_source_identity(&actual_identity, suite) {
         return Err(DatasetError::new(DatasetErrorKind::SourceIdentityMismatch));
+    }
+    if source
+        .expected_sha256()
+        .is_some_and(|pin| pin != entry.sha256)
+    {
+        return Err(DatasetError::new(DatasetErrorKind::ChecksumMismatch));
     }
     ensure_parent(dest, cache_dir)?;
     let partial = partial_path(dest)?;

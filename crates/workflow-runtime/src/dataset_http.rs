@@ -1,7 +1,8 @@
 //! HTTPS byte source for immutable dataset objects.
-use super::{
-    ByteSource, DatasetError, DatasetErrorKind, DatasetSourceIdentity, digest_bytes, is_sha256,
-};
+#[cfg(test)]
+use super::digest_bytes;
+use super::{ByteSource, DatasetError, DatasetErrorKind, DatasetSourceIdentity, is_sha256};
+use reqwest::header::{ACCEPT_ENCODING, CONTENT_RANGE, ETAG, IF_RANGE, RANGE};
 use std::{io::Read, sync::OnceLock, time::Duration};
 
 const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
@@ -13,7 +14,7 @@ pub struct HttpByteSource {
     sha256: String,
     max_bytes: usize,
     local: bool,
-    bytes: OnceLock<Result<Vec<u8>, DatasetError>>,
+    metadata: OnceLock<Result<(u64, Option<String>), DatasetError>>,
 }
 
 impl HttpByteSource {
@@ -79,19 +80,30 @@ impl HttpByteSource {
             sha256: sha256.to_owned(),
             max_bytes,
             local,
-            bytes: OnceLock::new(),
+            metadata: OnceLock::new(),
         })
     }
 
-    fn bytes(&self) -> Result<&[u8], DatasetError> {
-        self.bytes
-            .get_or_init(|| self.fetch())
+    fn metadata(&self) -> Result<&(u64, Option<String>), DatasetError> {
+        self.metadata
+            .get_or_init(|| {
+                let (mut response, total, etag) = self.range(0, 0, None)?;
+                let mut byte = [0];
+                response
+                    .read_exact(&mut byte)
+                    .map_err(|_| DatasetErrorKind::Interrupted)?;
+                Ok((total, etag))
+            })
             .as_ref()
-            .map(Vec::as_slice)
             .map_err(|error| *error)
     }
 
-    fn fetch(&self) -> Result<Vec<u8>, DatasetError> {
+    fn range(
+        &self,
+        start: u64,
+        end: u64,
+        expected: Option<&(u64, Option<String>)>,
+    ) -> Result<(reqwest::blocking::Response, u64, Option<String>), DatasetError> {
         let mut builder = reqwest::blocking::Client::builder();
         if self.local {
             builder = builder.no_proxy();
@@ -116,31 +128,51 @@ impl HttpByteSource {
             }))
             .build()
             .map_err(|_| DatasetErrorKind::Io)?;
-        let response = client
+        let mut request = client
             .get(&self.url)
-            .send()
-            .map_err(|_| DatasetErrorKind::Io)?;
-        if !response.status().is_success() {
+            .header(RANGE, format!("bytes={start}-{end}"))
+            .header(ACCEPT_ENCODING, "identity");
+        if let Some(etag) = expected
+            .and_then(|(_, tag)| tag.as_deref())
+            .filter(|tag| !tag.starts_with("W/"))
+        {
+            request = request.header(IF_RANGE, etag);
+        }
+        let response = request.send().map_err(|_| DatasetErrorKind::Interrupted)?;
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
             return Err(DatasetErrorKind::Io.into());
         }
-        if response
-            .content_length()
-            .is_some_and(|length| length > self.max_bytes as u64)
+        let range = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("bytes "))
+            .ok_or(DatasetErrorKind::Io)?;
+        let (bounds, total) = range.split_once('/').ok_or(DatasetErrorKind::Io)?;
+        let (actual_start, actual_end) = bounds.split_once('-').ok_or(DatasetErrorKind::Io)?;
+        let total = total.parse::<u64>().map_err(|_| DatasetErrorKind::Io)?;
+        let etag = response
+            .headers()
+            .get(ETAG)
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .map_err(|_| DatasetErrorKind::Io)
+            })
+            .transpose()?;
+        if total == 0
+            || total > self.max_bytes as u64
+            || actual_start.parse::<u64>() != Ok(start)
+            || actual_end.parse::<u64>() != Ok(end)
+            || end >= total
+            || response.content_length() != Some(end - start + 1)
+            || expected
+                .is_some_and(|(length, tag)| *length != total || tag.as_ref() != etag.as_ref())
         {
             return Err(DatasetErrorKind::Io.into());
         }
-        let mut bytes = Vec::new();
-        response
-            .take(self.max_bytes as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| DatasetErrorKind::Interrupted)?;
-        if bytes.len() > self.max_bytes {
-            return Err(DatasetErrorKind::Io.into());
-        }
-        if digest_bytes(&bytes) != self.sha256 {
-            return Err(DatasetErrorKind::ChecksumMismatch.into());
-        }
-        Ok(bytes)
+        Ok((response, total, etag))
     }
 }
 
@@ -150,19 +182,30 @@ impl ByteSource for HttpByteSource {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, DatasetError> {
-        let start = usize::try_from(offset).map_err(|_| DatasetErrorKind::Io)?;
-        let Some(remaining) = self.bytes()?.get(start..) else {
+        let metadata = self.metadata()?;
+        if offset >= metadata.0 || buf.is_empty() {
             return Ok(0);
-        };
-        let count = remaining.len().min(buf.len());
-        buf[..count].copy_from_slice(&remaining[..count]);
-        Ok(count)
+        }
+        let count = (metadata.0 - offset).min(buf.len() as u64) as usize;
+        let end = offset + count as u64 - 1;
+        let (mut response, _, _) = self.range(offset, end, Some(metadata))?;
+        response
+            .read(&mut buf[..count])
+            .map_err(|_| DatasetErrorKind::Interrupted.into())
     }
 
     fn len(&self) -> Result<u64, DatasetError> {
-        Ok(self.bytes()?.len() as u64)
+        Ok(self.metadata()?.0)
+    }
+
+    fn expected_sha256(&self) -> Option<&str> {
+        Some(&self.sha256)
     }
 }
+
+#[cfg(test)]
+#[path = "dataset_http_resume_tests.rs"]
+mod resume_tests;
 
 #[cfg(test)]
 mod tests {
@@ -187,23 +230,27 @@ mod tests {
             listener.local_addr().expect("addr").port()
         );
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .expect("deadline");
-            let mut request = [0; 1024];
-            let read = stream.read(&mut request).expect("request");
-            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /resolve/"));
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        BYTES.len()
+            for (start, end) in [(0, 0), (0, BYTES.len() - 1)] {
+                let (mut stream, _) = listener.accept().expect("accept");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("deadline");
+                let mut request = [0; 1024];
+                let read = stream.read(&mut request).expect("request");
+                let text = String::from_utf8_lossy(&request[..read]);
+                assert!(text.starts_with("GET /resolve/"));
+                assert!(text.contains(&format!("range: bytes={start}-{end}")));
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            BYTES.len(), end - start + 1
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                )
-                .expect("headers");
-            stream.write_all(BYTES).expect("body");
+                    .expect("headers");
+                stream.write_all(&BYTES[start..=end]).expect("body");
+            }
         });
         let source = HttpByteSource::local_fixture(&url, REV, SHA, 128).expect("source");
         let root = fs::canonicalize(
@@ -269,28 +316,31 @@ suites = ["regression"]
             Err(error) if error.kind() == DatasetErrorKind::SourceIdentityMismatch
         ));
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .expect("deadline");
-            let mut request = [0; 1024];
-            let _ = stream.read(&mut request).expect("request");
-            let changed = b"issue-229-smoke-fixturE\n";
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        changed.len()
+            for (start, end) in [(0, 0), (0, BYTES.len() - 1)] {
+                let (mut stream, _) = listener.accept().expect("accept");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("deadline");
+                let mut request = [0; 1024];
+                let _ = stream.read(&mut request).expect("request");
+                let changed = b"issue-229-smoke-fixturE\n";
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            changed.len(), end - start + 1
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                )
-                .expect("headers");
-            stream.write_all(changed).expect("body");
+                    .expect("headers");
+                stream.write_all(&changed[start..=end]).expect("body");
+            }
         });
-        assert!(matches!(
-            HttpByteSource::local_fixture(&url, REV, SHA, 128).and_then(|source| source.len()),
-            Err(error) if error.kind() == DatasetErrorKind::ChecksumMismatch
-        ));
+        let source = HttpByteSource::local_fixture(&url, REV, SHA, 128).expect("source");
+        assert_eq!(source.len().expect("probe"), BYTES.len() as u64);
+        let mut fetched = [0; 128];
+        let count = source.read_at(0, &mut fetched).expect("range");
+        assert_ne!(digest_bytes(&fetched[..count]), SHA);
         server.join().expect("server");
     }
 
