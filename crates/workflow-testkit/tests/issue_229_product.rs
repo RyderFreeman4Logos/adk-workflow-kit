@@ -224,6 +224,56 @@ suites = ["regression"]
 }
 
 #[test]
+fn alternate_declared_license_is_rejected_before_cache_access() {
+    let bytes = fixture();
+    let revision = "c7d5e59960087f360bc32a5006bb994324b38c35";
+    let url = format!(
+        "https://huggingface.co/datasets/futurehouse/ether0-benchmark/resolve/{revision}/data/test-00000-of-00001.parquet"
+    );
+    let sha = format!("sha256:{:x}", Sha256::digest(&bytes));
+    let manifest = DatasetManifest::parse_str(&format!(
+        r#"schema_version = 1
+[[datasets]]
+id = "ether0"
+family = "futurehouse"
+language = "en"
+revision = "{revision}"
+url = "{url}"
+sha256 = "{sha}"
+license = "research-only"
+license_acceptance_required = true
+distribution = "fetch"
+adapter_version = "1"
+derivation = "first-rows"
+suites = ["regression"]
+"#
+    ))
+    .unwrap();
+    let source = Source {
+        bytes,
+        url,
+        revision: revision.into(),
+        interrupt: false,
+    };
+    let cache = PathBuf::from(std::env::var("HOME").unwrap())
+        .join("tmp")
+        .canonicalize()
+        .unwrap()
+        .join(format!("issue-229-license-mismatch-{}", std::process::id()));
+    assert!(!cache.exists());
+    let cold =
+        run_dataset_product(&manifest, "ether0", &source, &cache, true, false, 3).unwrap_err();
+    assert!(cold.contains("license"), "{cold}");
+    assert!(!cache.exists(), "cold mismatch must not create a cache");
+    fs::create_dir(&cache).unwrap();
+    let warm =
+        run_dataset_product(&manifest, "ether0", &source, &cache, true, true, 3).unwrap_err();
+    assert!(warm.contains("license"), "{warm}");
+    assert!(fs::read_dir(&cache).unwrap().next().is_none());
+    fs::remove_dir_all(cache).unwrap();
+}
+
+#[test]
 fn shipped_cli_refuses_unaccepted_license_without_a_report() {
     let root = PathBuf::from(std::env::var("HOME").unwrap())
         .join("tmp")

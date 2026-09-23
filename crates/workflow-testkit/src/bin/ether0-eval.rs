@@ -29,6 +29,7 @@ fn run() -> Result<(), String> {
     if entry.url() != URL
         || entry.revision() != REVISION
         || entry.sha256() != SHA
+        || entry.license() != "CC-BY-4.0"
         || !entry.license_acceptance_required()
     {
         return Err("committed dataset pin mismatch".into());

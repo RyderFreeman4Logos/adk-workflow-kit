@@ -56,6 +56,7 @@ pub fn run_dataset_product(
     let entry = manifest.dataset(id).ok_or("dataset is not registered")?;
     if entry.family() != "futurehouse"
         || entry.language() != "en"
+        || entry.license() != "CC-BY-4.0"
         || !entry.license_acceptance_required()
     {
         return Err("dataset license or split metadata mismatch".into());
