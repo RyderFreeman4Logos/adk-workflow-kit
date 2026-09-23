@@ -174,8 +174,31 @@ suites = ["regression"]
             .starts_with("sha256:")
     );
     let original = fs::read(&first).unwrap();
-    let second = run_dataset_product(&manifest, "ether0", &source, &cache, true, true, 3).unwrap();
-    assert_eq!(fs::read(second).unwrap(), original);
+    let offline_source = Source {
+        bytes: vec![],
+        url: "https://example.invalid/never-egress".into(),
+        revision: "main".into(),
+        interrupt: false,
+    };
+    let second =
+        run_dataset_product(&manifest, "ether0", &offline_source, &cache, true, true, 3).unwrap();
+    assert_eq!(fs::read(&second).unwrap(), original);
+    assert_eq!(
+        run_dataset_product(&manifest, "ether0", &offline_source, &cache, false, true, 3)
+            .unwrap_err(),
+        "dataset license acceptance is required"
+    );
+    assert_eq!(fs::read(&second).unwrap(), original);
+    let protected = cache.join("protected.txt");
+    fs::write(&protected, b"untouched").unwrap();
+    fs::remove_file(&second).unwrap();
+    std::os::unix::fs::symlink(&protected, &second).unwrap();
+    assert_eq!(
+        run_dataset_product(&manifest, "ether0", &offline_source, &cache, true, true, 3)
+            .unwrap_err(),
+        "unsafe report destination"
+    );
+    assert_eq!(fs::read(protected).unwrap(), b"untouched");
     fs::remove_dir_all(cache).unwrap();
 }
 
