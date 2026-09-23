@@ -436,6 +436,10 @@ fn open_fsyncs_parent_that_owns_the_cache_name() {
     let root = parent.join(".node-result-cache");
     reset_node_cache_dir_syncs();
     NodeResultCache::open(&root).expect("open cache");
+    // Another test can reset its own observation before this test reads ours.
+    thread::spawn(reset_node_cache_dir_syncs)
+        .join()
+        .expect("other test thread");
     assert!(
         node_cache_dir_syncs() >= 3,
         "first open must fsync entries, root, and the parent that owns the cache name"
