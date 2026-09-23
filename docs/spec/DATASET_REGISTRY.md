@@ -36,7 +36,22 @@ call a live model.
 
 ## Smoke path
 
-Prepare `smoke-fixture` with a local `ByteSource` that yields the 24-byte
-synthetic payload matching the pinned checksum. No AgentDojo/LongMemEval dump
-is required. This local fixture smoke does not execute an external upstream
-fetch path.
+The synthetic `smoke-fixture` remains a local `ByteSource` check, not a public
+fetch. For the pinned public FutureHouse ether0-benchmark test Parquet subset:
+
+```sh
+mise exec -- just issue-229-product "$HOME/tmp/ether0-r1" accept-cc-by-4.0 online 3
+mise exec -- just issue-229-product "$HOME/tmp/ether0-r1" accept-cc-by-4.0 offline 3
+```
+
+Read `$HOME/tmp/ether0-r1/ether0-report.json` after either command. Omit the
+explicit CC BY 4.0 acceptance and the command fails before network or cache
+access, including on warm cache. Use a private, safe cache root; the report is
+atomically replaced there. The URL is pinned to FutureHouse ©2025
+`ether0-benchmark` revision `c7d5e59960087f360bc32a5006bb994324b38c35`,
+SHA-256 `c53213a37ef319aa7f733751b93748db960cce33355c1d44124108e7f15c5bbc`.
+Original dataset license: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+Our bounded first-physical-row adapter and control-character normalization
+modify the source presentation. The report contains an existing deterministic
+trajectory-fixture evaluation acknowledgement for each case, **not** a model
+answer, answer-quality score, or the full #230 benchmark metrics harness.

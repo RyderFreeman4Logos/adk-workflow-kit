@@ -146,6 +146,13 @@ issue-229-runtime test_name="":
 issue-229-test:
     just issue-229-runtime
 
+issue-229-product-test test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --test issue_229_product {{test_name}} --locked -- --nocapture
+
+# Public, pinned FutureHouse product path (report is CACHE_DIR/ether0-report.json).
+issue-229-product cache license mode cases:
+    {{_io}} cargo +1.98.0 run -p workflow-testkit --bin ether0-eval --locked -- "{{cache}}" "{{license}}" "{{mode}}" "{{cases}}"
+
 # Focused #224 reference-workflow package and runner contract tests.
 m3-08-reference:
     {{_io}} cargo +1.98.0 test -p workflowctl --test m3_08_reference_workflow --locked -- --nocapture

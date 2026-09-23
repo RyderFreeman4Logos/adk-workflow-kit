@@ -229,6 +229,21 @@ pub struct DatasetEntry {
 }
 
 impl DatasetEntry {
+    /// Dataset family used for split discipline.
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    /// Dataset language used for split discipline.
+    pub fn language(&self) -> &str {
+        &self.language
+    }
+
+    /// Pinned source URL.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
     /// Dataset identifier.
     pub fn id(&self) -> &str {
         &self.id
