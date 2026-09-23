@@ -808,70 +808,70 @@ fn debug_redacts_paths_and_checksums() {
 
 #[test]
 fn missing_relative_cache_root_is_created_under_current_dir() {
-    let mode = std::env::var("ISSUE_229_RELATIVE_CHILD").ok();
-    if mode.as_deref() == Some("offline") {
-        panic!("offline child must not rebuild or touch the source");
+    struct NoSource;
+    impl ByteSource for NoSource {
+        fn identity(&self) -> Result<DatasetSourceIdentity, DatasetError> {
+            panic!("offline preparation accessed source identity");
+        }
+        fn len(&self) -> Result<u64, DatasetError> {
+            panic!("offline preparation accessed source length");
+        }
+        fn read_at(&self, _: u64, _: &mut [u8]) -> Result<usize, DatasetError> {
+            panic!("offline preparation read source bytes");
+        }
+        fn expected_sha256(&self) -> Option<&str> {
+            panic!("offline preparation accessed source pin");
+        }
     }
-    if mode.as_deref() == Some("first") || mode.as_deref() == Some("reuse") {
+    let mode = std::env::var("ISSUE_229_RELATIVE_CHILD").ok();
+    if let Some(mode @ ("first" | "reuse" | "offline")) = mode.as_deref() {
         let manifest = DatasetManifest::parse_str(&smoke_toml()).expect("manifest");
         let source = ScriptedSource::new(SMOKE_BYTES, SMOKE_BYTES.len());
-        prepare_dataset(
+        let result = prepare_dataset(
             &manifest,
             "smoke-fixture",
             &PrepareRequest {
-                cache_dir: Path::new("cache"),
-                source: &source,
+                cache_dir: Path::new(if mode == "offline" { "absent" } else { "cache" }),
+                source: if mode == "first" { &source } else { &NoSource },
                 suite: EvalSuite::Smoke,
-                offline: mode.as_deref() == Some("reuse"),
+                offline: mode != "first",
                 license_accepted: false,
                 manual_path: None,
             },
-        )
-        .expect("relative cache root");
+        );
+        if mode == "offline" {
+            assert_eq!(
+                result.expect_err("offline miss").kind(),
+                DatasetErrorKind::OfflineMiss
+            );
+            assert!(!Path::new("absent").exists());
+        } else {
+            assert_eq!(
+                result.expect("relative cache root").from_cache(),
+                mode == "reuse"
+            );
+        }
         return;
     }
     let home = TestRoot::new("relative-root");
     let cwd = home.0.join("child-cwd");
     fs::create_dir(&cwd).expect("child cwd");
     let exe = std::env::current_exe().expect("test executable");
-    let launch = |offline: bool| {
-        let mut command = Command::new(&exe);
-        command
+    for mode in ["first", "reuse", "offline"] {
+        let status = Command::new(&exe)
             .arg("missing_relative_cache_root_is_created_under_current_dir")
             .arg("--exact")
-            .env("ISSUE_229_RELATIVE_CHILD", "first")
-            .current_dir(&cwd);
-        if offline {
-            command.env("ISSUE_229_RELATIVE_CHILD", "offline");
-        }
-        command.status().expect("relative child")
-    };
-    assert!(
-        launch(false).success(),
-        "child relative first-use must succeed"
-    );
-    let artifact = cwd.join("cache/smoke-fixture/1.0.0/artifact");
-    assert_eq!(fs::read(&artifact).expect("relative artifact"), SMOKE_BYTES);
-    let cache = cwd.join("cache");
-    let warm = Command::new(&exe)
-        .arg("missing_relative_cache_root_is_created_under_current_dir")
-        .arg("--exact")
-        .arg("reuse")
-        .env("ISSUE_229_RELATIVE_CHILD", "reuse")
-        .current_dir(&cwd)
-        .status()
-        .expect("reuse child");
-    assert!(
-        warm.success(),
-        "same executable reuses the relative cache offline"
-    );
-    assert_eq!(
-        fs::read(cache.join("smoke-fixture/1.0.0/artifact")).unwrap(),
-        SMOKE_BYTES
-    );
-    let refused = launch(true);
-    assert!(
-        !refused.success(),
-        "offline child panics before source access"
-    );
+            .env("ISSUE_229_RELATIVE_CHILD", mode)
+            .current_dir(&cwd)
+            .status()
+            .expect("relative child");
+        assert!(
+            status.success(),
+            "{mode} must exercise preparation successfully"
+        );
+        assert_eq!(
+            fs::read(cwd.join("cache/smoke-fixture/1.0.0/artifact")).unwrap(),
+            SMOKE_BYTES
+        );
+    }
 }

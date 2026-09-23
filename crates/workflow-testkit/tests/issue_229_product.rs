@@ -265,11 +265,31 @@ suites = ["regression"]
         run_dataset_product(&manifest, "ether0", &source, &cache, true, false, 3).unwrap_err();
     assert!(cold.contains("license"), "{cold}");
     assert!(!cache.exists(), "cold mismatch must not create a cache");
-    fs::create_dir(&cache).unwrap();
+    // The generic registry accepts this declared license; the specialized product must not.
+    for offline in [false, true] {
+        let prepared = workflow_runtime::prepare_dataset(
+            &manifest,
+            "ether0",
+            &workflow_runtime::PrepareRequest {
+                cache_dir: &cache,
+                source: &source,
+                suite: workflow_runtime::EvalSuite::Regression,
+                offline,
+                license_accepted: true,
+                manual_path: None,
+            },
+        )
+        .expect("verified generic cache for the alternate declared license");
+        assert_eq!(prepared.from_cache(), offline);
+    }
+    let artifact = cache.join("ether0").join(revision).join("artifact");
+    let before = fs::read(&artifact).unwrap();
+    assert_eq!(format!("sha256:{:x}", Sha256::digest(&before)), sha);
     let warm =
         run_dataset_product(&manifest, "ether0", &source, &cache, true, true, 3).unwrap_err();
     assert!(warm.contains("license"), "{warm}");
-    assert!(fs::read_dir(&cache).unwrap().next().is_none());
+    assert_eq!(fs::read(artifact).unwrap(), before);
+    assert!(!cache.join("ether0-report.json").exists());
     fs::remove_dir_all(cache).unwrap();
 }
 
