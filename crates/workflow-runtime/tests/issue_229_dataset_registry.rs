@@ -1,7 +1,8 @@
 use std::{
-    fs,
+    env, fs,
     os::unix::fs::{PermissionsExt, symlink},
     path::Path,
+    process::Command,
     sync::atomic::Ordering,
 };
 
@@ -803,4 +804,43 @@ fn debug_redacts_paths_and_checksums() {
     let debug = format!("{manifest:?}");
     assert!(!debug.contains(SMOKE_SHA256));
     assert!(!debug.contains("memory://smoke-fixture"));
+}
+
+#[test]
+fn missing_relative_cache_root_is_created_under_current_dir() {
+    let home = TestRoot::new("relative-root");
+    let child = home.0.join("child-cwd");
+    fs::create_dir(&child).expect("child cwd");
+    let launch = |offline: bool| {
+        let mut command = Command::new("cargo");
+        command
+            .args([
+                "+1.98.0",
+                "run",
+                "--manifest-path",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+                "--bin",
+                "relative-cache-root",
+                "--locked",
+                "--quiet",
+                "--",
+            ])
+            .current_dir(&child);
+        if offline {
+            command.arg("offline");
+        }
+        command.status().expect("relative child")
+    };
+    assert!(
+        launch(false).success(),
+        "child relative first-use must succeed"
+    );
+    let artifact = child.join("cache/smoke-fixture/1.0.0/artifact");
+    assert_eq!(fs::read(&artifact).expect("relative artifact"), SMOKE_BYTES);
+    let absolute = fs::canonicalize(child.join("cache")).expect("absolute cache");
+    assert!(launch(true).success(), "relative warm reuse must succeed");
+    assert_eq!(
+        fs::read(absolute.join("smoke-fixture/1.0.0/artifact")).unwrap(),
+        SMOKE_BYTES
+    );
 }

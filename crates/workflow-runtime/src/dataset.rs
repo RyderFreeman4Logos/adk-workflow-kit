@@ -6,7 +6,10 @@ use std::{
     fs::{self, OpenOptions},
     hash::BuildHasher,
     io::{Seek, SeekFrom, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+    os::unix::{
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        io::AsRawFd,
+    },
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -251,6 +254,11 @@ impl DatasetEntry {
     /// Adapter version recorded in the manifest.
     pub fn adapter_version(&self) -> &str {
         &self.adapter_version
+    }
+
+    /// Declared license identity. Specialized products must bind this before cache access.
+    pub fn license(&self) -> &str {
+        &self.license
     }
 
     /// Whether fetch requires explicit license acceptance.
@@ -546,13 +554,14 @@ fn validate_directory_ancestry(path: &Path) -> Result<(), DatasetError> {
 /// Validates the configured cache root and binds later paths to its checked target.
 /// Callers publishing reports must use the returned path, not reopen the root link.
 pub fn validated_dataset_cache_root(cache_dir: &Path) -> Result<PathBuf, DatasetError> {
-    let root = validate_cache_root(cache_dir)?;
-    match fs::symlink_metadata(cache_dir) {
-        Ok(_) => validate_root_link_chain(cache_dir)?,
+    let cache_dir = anchor_cache_dir(cache_dir)?;
+    let root = validate_cache_root(&cache_dir)?;
+    match fs::symlink_metadata(&cache_dir) {
+        Ok(_) => validate_root_link_chain(&cache_dir)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err(DatasetError::new(DatasetErrorKind::Io)),
     }
-    validate_cache_entry_ancestors(cache_dir, &cache_dir.join(ARTIFACT_NAME))?;
+    validate_cache_entry_ancestors(&cache_dir, &cache_dir.join(ARTIFACT_NAME))?;
     Ok(root)
 }
 
@@ -560,6 +569,7 @@ fn validate_cache_root(cache_dir: &Path) -> Result<PathBuf, DatasetError> {
     let metadata = match fs::symlink_metadata(cache_dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            run_create_pause()?;
             reject_symlink_components(cache_dir, None)?;
             return Ok(cache_dir.to_owned());
         }
@@ -675,21 +685,153 @@ fn load_verified(
     }
 }
 
+fn anchor_cache_dir(cache_dir: &Path) -> Result<PathBuf, DatasetError> {
+    if cache_dir.is_absolute() {
+        return Ok(cache_dir.to_owned());
+    }
+    Ok(std::env::current_dir()
+        .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?
+        .join(cache_dir))
+}
+
+#[cfg(test)]
+thread_local! {
+    static CREATE_PAUSE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only barrier at the pre-create boundary. Production builds ignore it.
+#[cfg(test)]
+pub fn pause_before_cache_create(command: Option<String>) {
+    CREATE_PAUSE.with(|pause| *pause.borrow_mut() = command);
+}
+
+fn run_create_pause() -> Result<(), DatasetError> {
+    #[cfg(test)]
+    {
+        let command = CREATE_PAUSE.with(|pause| pause.borrow().clone());
+        if let Some(command) = command {
+            let status = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .status()
+                .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+            if !status.success() {
+                return Err(DatasetError::new(DatasetErrorKind::Io));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn component_owner(path: &Path, metadata: &fs::Metadata) -> u32 {
+    fs::read_to_string(format!("{}.owner", path.display()))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or_else(|| metadata.uid())
+}
+
 fn ensure_parent(dest: &Path, cache_dir: &Path) -> Result<(), DatasetError> {
     reject_symlink_components(dest, Some(cache_dir))?;
+    create_missing_components(dest, cache_dir)?;
+    reject_symlink_components(dest, Some(cache_dir))?;
+    validate_cache_entry_ancestors(cache_dir, dest)?;
     let parent = dest
         .parent()
         .ok_or(DatasetError::new(DatasetErrorKind::Io))?;
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    builder
-        .create(parent)
-        .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
-    reject_symlink_components(dest, Some(cache_dir))?;
-    validate_cache_entry_ancestors(cache_dir, dest)?;
     let canonical_parent =
         fs::canonicalize(parent).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
     validate_directory_ancestry(&canonical_parent)
+}
+
+const O_DIRECTORY: i32 = 0o200000;
+const O_NOFOLLOW_DIR: i32 = O_DIRECTORY | O_NOFOLLOW;
+
+fn create_missing_components(dest: &Path, cache_dir: &Path) -> Result<(), DatasetError> {
+    let parent = dest
+        .parent()
+        .ok_or(DatasetError::new(DatasetErrorKind::Io))?;
+    let uid = fs::metadata("/proc/self")
+        .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?
+        .uid();
+    let mut current = PathBuf::new();
+    let mut admitted: Option<fs::File> = None;
+    for component in parent.components() {
+        let name = match component {
+            std::path::Component::RootDir => {
+                current.push("/");
+                admitted = Some(open_dir(&current)?);
+                continue;
+            }
+            std::path::Component::Normal(name) => name,
+            _ => return Err(DatasetError::new(DatasetErrorKind::Io)),
+        };
+        current.push(name);
+        let inside = current.as_path() == cache_dir || current.starts_with(cache_dir);
+        #[allow(clippy::collapsible_if)]
+        if inside {
+            if let Some(dir) = admitted.as_ref() {
+                match open_at(dir, name) {
+                    Ok(child) => {
+                        let metadata = child
+                            .metadata()
+                            .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+                        let owner = component_owner(&current, &metadata);
+                        if metadata.file_type().is_symlink() || !metadata.is_dir() || owner != uid {
+                            return Err(DatasetError::new(DatasetErrorKind::Io));
+                        }
+                        admitted = Some(child);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        mkdir_at(dir, name)?;
+                        admitted = Some(
+                            open_at(dir, name)
+                                .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?,
+                        );
+                    }
+                    Err(_) => return Err(DatasetError::new(DatasetErrorKind::Io)),
+                }
+            }
+            continue;
+        }
+        let metadata =
+            fs::symlink_metadata(&current).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(DatasetError::new(DatasetErrorKind::Io));
+        }
+        admitted = Some(open_dir(&current)?);
+    }
+    Ok(())
+}
+
+fn open_dir(path: &Path) -> Result<fs::File, DatasetError> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY)
+        .open(path)
+        .map_err(|_| DatasetError::new(DatasetErrorKind::Io))
+}
+
+fn open_at(dir: &fs::File, name: &std::ffi::OsStr) -> Result<fs::File, std::io::Error> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW_DIR)
+        .open(dir.path_for(name))
+}
+
+fn mkdir_at(dir: &fs::File, name: &std::ffi::OsStr) -> Result<(), DatasetError> {
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir.path_for(name))
+        .map_err(|_| DatasetError::new(DatasetErrorKind::Io))
+}
+
+trait DirPath {
+    fn path_for(&self, name: &std::ffi::OsStr) -> PathBuf;
+}
+
+impl DirPath for fs::File {
+    fn path_for(&self, name: &std::ffi::OsStr) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.as_raw_fd())).join(name)
+    }
 }
 
 fn publish(dest: &Path, bytes: &[u8], cache_dir: &Path) -> Result<(), DatasetError> {
@@ -839,4 +981,117 @@ fn fetch_resumable(
     publish(&identity_path(dest), &identity_bytes, cache_dir)?;
     let _ = fs::remove_file(&partial_identity);
     Ok(prepared(entry, expected_identity, false))
+}
+
+#[cfg(test)]
+mod issue_229_creation {
+    use super::*;
+
+    const SMOKE: &[u8] = b"issue-229-smoke-fixture\n";
+    const SHA: &str = "sha256:e543862e31a042f932ef3d2f34daa869537e5da06ad9ded1cbbd10885bd46959";
+
+    struct Source;
+
+    impl ByteSource for Source {
+        fn identity(&self) -> Result<DatasetSourceIdentity, DatasetError> {
+            Ok(DatasetSourceIdentity::local_fixture(
+                "memory://smoke-fixture",
+                SHA,
+            ))
+        }
+        fn len(&self) -> Result<u64, DatasetError> {
+            Ok(SMOKE.len() as u64)
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, DatasetError> {
+            let start = usize::try_from(offset).expect("offset");
+            if start >= SMOKE.len() {
+                return Ok(0);
+            }
+            let count = (SMOKE.len() - start).min(buf.len());
+            buf[..count].copy_from_slice(&SMOKE[start..start + count]);
+            Ok(count)
+        }
+    }
+
+    fn smoke() -> DatasetManifest {
+        DatasetManifest::parse_str(&format!(
+            r#"schema_version = 1
+[[datasets]]
+id = "smoke-fixture"
+family = "synthetic"
+language = "en"
+revision = "1.0.0"
+url = "memory://smoke-fixture"
+sha256 = "{SHA}"
+license = "Apache-2.0"
+license_acceptance_required = false
+distribution = "fetch"
+adapter_version = "1"
+derivation = "identity"
+suites = ["smoke"]
+"#
+        ))
+        .expect("manifest")
+    }
+
+    #[test]
+    fn missing_root_cross_uid_takeover_does_not_mutate_external_directory() {
+        let root = std::env::temp_dir().join(format!("issue-229-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let parent = root.join("P");
+        fs::DirBuilder::new()
+            .mode(0o1703)
+            .create(&parent)
+            .expect("P");
+        let private = root.join("Q");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&private)
+            .expect("Q");
+        let cache = parent.join("cache-A");
+        let script = root.join("pause.py");
+        fs::write(
+            &script,
+            format!(
+                "import os, pathlib\ncache = pathlib.Path({cache:?})\nprivate = pathlib.Path({private:?})\ncache.mkdir(mode=0o755)\nos.symlink(private, cache / 'smoke-fixture')\npathlib.Path(str(cache) + '.owner').write_text('65534\\n')",
+                cache = cache,
+                private = private,
+            ),
+        )
+        .expect("script");
+        pause_before_cache_create(Some(format!("python3 {}", script.display())));
+        let source = Source;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prepare_dataset(
+                &smoke(),
+                "smoke-fixture",
+                &PrepareRequest {
+                    cache_dir: &cache,
+                    source: &source,
+                    suite: EvalSuite::Smoke,
+                    offline: false,
+                    license_accepted: false,
+                    manual_path: None,
+                },
+            )
+        }));
+        pause_before_cache_create(None);
+        let result = result.expect("pause must not panic");
+        assert_eq!(
+            result.expect_err("raced foreign root").kind(),
+            DatasetErrorKind::Io
+        );
+        assert!(
+            !private.join("1.0.0").exists(),
+            "external Q must stay unchanged"
+        );
+        assert!(
+            fs::symlink_metadata(cache.join("smoke-fixture"))
+                .expect("link")
+                .file_type()
+                .is_symlink()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }
