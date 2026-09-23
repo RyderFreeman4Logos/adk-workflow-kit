@@ -162,7 +162,7 @@ impl EvalSuite {
     }
 }
 
-use dataset_cache_security::validate_cache_entry_ancestors;
+use dataset_cache_security::{validate_cache_entry_ancestors, validate_root_link_chain};
 pub use dataset_http::HttpByteSource;
 pub use dataset_identity::{
     DatasetProvenance, DatasetReport, DatasetSourceIdentity, LocalFileSource, PreparedDataset,
@@ -547,6 +547,11 @@ fn validate_directory_ancestry(path: &Path) -> Result<(), DatasetError> {
 /// Callers publishing reports must use the returned path, not reopen the root link.
 pub fn validated_dataset_cache_root(cache_dir: &Path) -> Result<PathBuf, DatasetError> {
     let root = validate_cache_root(cache_dir)?;
+    match fs::symlink_metadata(cache_dir) {
+        Ok(_) => validate_root_link_chain(cache_dir)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(DatasetError::new(DatasetErrorKind::Io)),
+    }
     validate_cache_entry_ancestors(cache_dir, &cache_dir.join(ARTIFACT_NAME))?;
     Ok(root)
 }
