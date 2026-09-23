@@ -1,6 +1,6 @@
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -32,6 +32,53 @@ impl ByteSource for CountingSource {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(SMOKE_BYTES.len() as u64)
     }
+}
+
+#[test]
+fn hard_linked_partial_cannot_append_to_external_witness() {
+    let root = TestRoot::new("hard-linked-partial");
+    let cache = root.0.join("cache");
+    let manifest = DatasetManifest::parse_str(&smoke_toml()).expect("manifest");
+    let prefix_source = ScriptedSource::short_eof_after(SMOKE_BYTES, 8, 8);
+    let call = || Call {
+        id: "smoke-fixture",
+        suite: EvalSuite::Smoke,
+        offline: false,
+        license_accepted: false,
+        manual_path: None,
+    };
+    assert_eq!(
+        super::prepare(&manifest, &cache, &prefix_source, call())
+            .expect_err("seed a resumable partial")
+            .kind(),
+        DatasetErrorKind::Interrupted
+    );
+    let partial = cache.join("smoke-fixture/1.0.0/artifact.partial");
+    let identity = cache.join("smoke-fixture/1.0.0/artifact.partial.identity");
+    assert!(
+        identity.is_file(),
+        "retain matching source identity metadata"
+    );
+    let witness = root.0.join("external-witness");
+    fs::rename(&partial, &witness).expect("move authentic eight-byte partial outside cache");
+    fs::hard_link(&witness, &partial).expect("alias external witness into cache");
+    assert_eq!(fs::metadata(&partial).expect("partial").nlink(), 2);
+    assert_eq!(fs::read(&witness).expect("witness"), &SMOKE_BYTES[..8]);
+
+    let source = ScriptedSource::new(SMOKE_BYTES, SMOKE_BYTES.len());
+    let result = super::prepare(&manifest, &cache, &source, call());
+    assert_eq!(
+        fs::read(&witness).expect("external witness"),
+        &SMOKE_BYTES[..8]
+    );
+    assert_eq!(
+        result
+            .expect_err("hard-linked partial must fail closed")
+            .kind(),
+        DatasetErrorKind::Io
+    );
+    assert!(source.served.lock().expect("served").is_empty());
+    assert!(!cache.join("smoke-fixture/1.0.0/artifact").exists());
 }
 
 #[test]

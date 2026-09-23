@@ -32,7 +32,10 @@ call a live model.
   immutable object ID. Moving upstream revisions remain ineligible.
 - Reports list the resolved source identity, checksum, adapter version, and
   derivation hash.
-- Case IDs are `{id}/{family}/{language}/0000`.
+- `PreparedDataset::case_ids()` yields a singleton placeholder shaped
+  `{id}/{family}/{language}/0000`. The Parquet adapter/report preserve upstream
+  row IDs as `cases[].case_id`; family/language are `dataset.family` and
+  `dataset.language`, not part of each product case ID.
 
 ## Smoke path
 

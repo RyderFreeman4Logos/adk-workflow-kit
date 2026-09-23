@@ -789,6 +789,12 @@ fn fetch_resumable(
         .custom_flags(O_NOFOLLOW)
         .open(&partial)
         .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(DatasetError::new(DatasetErrorKind::Io));
+    }
     let mut offset = file
         .seek(SeekFrom::End(0))
         .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
