@@ -9,6 +9,7 @@ use std::{
 };
 use workflow_runtime::{
     ByteSource, DatasetManifest, EvalSuite, PrepareRequest, decode_parquet_cases, prepare_dataset,
+    validated_dataset_cache_root,
 };
 
 #[derive(Serialize)]
@@ -59,11 +60,12 @@ pub fn run_dataset_product(
     {
         return Err("dataset license or split metadata mismatch".into());
     }
+    let cache = validated_dataset_cache_root(cache).map_err(|error| error.to_string())?;
     let prepared = prepare_dataset(
         manifest,
         id,
         &PrepareRequest {
-            cache_dir: cache,
+            cache_dir: &cache,
             source,
             suite: EvalSuite::Regression,
             offline,

@@ -352,11 +352,11 @@ pub fn prepare_dataset(
     if request.suite.requires_pin() && !is_pinned_entry(entry, request.suite) {
         return Err(DatasetError::new(DatasetErrorKind::UnpinnedRevision));
     }
-    validate_cache_root(request.cache_dir)?;
+    let cache_root = validated_dataset_cache_root(request.cache_dir)?;
     let expected_identity = expected_identity(entry);
-    let dest = artifact_path(request.cache_dir, entry)?;
-    validate_cache_entry_ancestors(request.cache_dir, &dest)?;
-    if let Some(prepared) = load_verified(entry, &dest, request.cache_dir, &expected_identity)? {
+    let dest = artifact_path(&cache_root, entry)?;
+    validate_cache_entry_ancestors(&cache_root, &dest)?;
+    if let Some(prepared) = load_verified(entry, &dest, &cache_root, &expected_identity)? {
         return Ok(prepared);
     }
     match entry.distribution {
@@ -364,7 +364,7 @@ pub fn prepare_dataset(
             let path = request
                 .manual_path
                 .ok_or(DatasetError::new(DatasetErrorKind::ManualPathRequired))?;
-            copy_manual(entry, path, &dest, request.cache_dir, &expected_identity)
+            copy_manual(entry, path, &dest, &cache_root, &expected_identity)
         }
         DatasetDistribution::Fetch => {
             if request.offline {
@@ -374,7 +374,7 @@ pub fn prepare_dataset(
                 entry,
                 request.source,
                 &dest,
-                request.cache_dir,
+                &cache_root,
                 &expected_identity,
                 request.suite,
             )
@@ -543,11 +543,20 @@ fn validate_directory_ancestry(path: &Path) -> Result<(), DatasetError> {
     Ok(())
 }
 
-fn validate_cache_root(cache_dir: &Path) -> Result<(), DatasetError> {
+/// Validates the configured cache root and binds later paths to its checked target.
+/// Callers publishing reports must use the returned path, not reopen the root link.
+pub fn validated_dataset_cache_root(cache_dir: &Path) -> Result<PathBuf, DatasetError> {
+    let root = validate_cache_root(cache_dir)?;
+    validate_cache_entry_ancestors(cache_dir, &cache_dir.join(ARTIFACT_NAME))?;
+    Ok(root)
+}
+
+fn validate_cache_root(cache_dir: &Path) -> Result<PathBuf, DatasetError> {
     let metadata = match fs::symlink_metadata(cache_dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return reject_symlink_components(cache_dir, None);
+            reject_symlink_components(cache_dir, None)?;
+            return Ok(cache_dir.to_owned());
         }
         Err(_) => return Err(DatasetError::new(DatasetErrorKind::Io)),
     };
@@ -570,7 +579,7 @@ fn validate_cache_root(cache_dir: &Path) -> Result<(), DatasetError> {
         {
             return Err(DatasetError::new(DatasetErrorKind::Io));
         }
-        return Ok(());
+        return Ok(canonical_target);
     }
     let canonical_root =
         fs::canonicalize(cache_dir).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
@@ -579,7 +588,7 @@ fn validate_cache_root(cache_dir: &Path) -> Result<(), DatasetError> {
     if !same_identity(&metadata, &after) {
         return Err(DatasetError::new(DatasetErrorKind::Io));
     }
-    Ok(())
+    Ok(canonical_root)
 }
 
 fn reject_symlink_components(path: &Path, allowed_root: Option<&Path>) -> Result<(), DatasetError> {

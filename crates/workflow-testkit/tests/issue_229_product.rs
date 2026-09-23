@@ -189,6 +189,21 @@ suites = ["regression"]
         "dataset license acceptance is required"
     );
     assert_eq!(fs::read(&second).unwrap(), original);
+    let configured = cache.with_file_name(format!("issue-229-product-link-{}", std::process::id()));
+    std::os::unix::fs::symlink(&cache, &configured).unwrap();
+    let linked = run_dataset_product(
+        &manifest,
+        "ether0",
+        &offline_source,
+        &configured,
+        true,
+        true,
+        3,
+    )
+    .expect("report through trusted cache-root link");
+    assert_eq!(linked, second);
+    assert_eq!(fs::read(&linked).unwrap(), original);
+    fs::remove_file(configured).unwrap();
     let protected = cache.join("protected.txt");
     fs::write(&protected, b"untouched").unwrap();
     fs::remove_file(&second).unwrap();

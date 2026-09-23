@@ -1,10 +1,87 @@
 use std::{
     fs,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 use super::*;
+
+#[test]
+fn root_link_target_hop_cannot_redirect_resumed_partial() {
+    struct SwapSource<'a> {
+        source: &'a ScriptedSource,
+        hop: &'a Path,
+        outside: &'a Path,
+    }
+    impl ByteSource for SwapSource<'_> {
+        fn identity(&self) -> Result<DatasetSourceIdentity, DatasetError> {
+            self.source.identity()
+        }
+        fn len(&self) -> Result<u64, DatasetError> {
+            fs::remove_file(self.hop).expect("replace target-chain link at source boundary");
+            symlink(self.outside, self.hop).expect("redirect target-chain link");
+            self.source.len()
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, DatasetError> {
+            self.source.read_at(offset, buf)
+        }
+    }
+
+    let root = TestRoot::new("root-link-hop");
+    let cache = root.0.join("configured");
+    let hop_parent = root.0.join("hop-parent");
+    let hop = hop_parent.join("hop");
+    let safe = root.0.join("safe");
+    let outside = root.0.join("outside");
+    fs::create_dir(&hop_parent).expect("hop parent");
+    fs::create_dir(&safe).expect("safe cache");
+    fs::create_dir(&outside).expect("outside witness root");
+    symlink(&safe, &hop).expect("nested target link");
+    symlink(&hop, &cache).expect("configured root link");
+    let manifest = DatasetManifest::parse_str(&smoke_toml()).expect("manifest");
+    let call = || Call {
+        id: "smoke-fixture",
+        suite: EvalSuite::Smoke,
+        offline: false,
+        license_accepted: false,
+        manual_path: None,
+    };
+    let interrupted = ScriptedSource::short_eof_after(SMOKE_BYTES, 8, 8);
+    assert_eq!(
+        super::prepare(&manifest, &cache, &interrupted, call())
+            .expect_err("seed interrupted partial through trusted nested links")
+            .kind(),
+        DatasetErrorKind::Interrupted
+    );
+    let relative = Path::new("smoke-fixture/1.0.0/artifact.partial");
+    let witness = outside.join(relative);
+    fs::create_dir_all(witness.parent().expect("witness parent")).expect("witness parents");
+    fs::copy(safe.join(relative), &witness).expect("single-link outside witness");
+    fs::copy(
+        safe.join("smoke-fixture/1.0.0/artifact.partial.identity"),
+        outside.join("smoke-fixture/1.0.0/artifact.partial.identity"),
+    )
+    .expect("authentic identity for external partial");
+
+    let source = ScriptedSource::new(SMOKE_BYTES, SMOKE_BYTES.len());
+    let swapped = SwapSource {
+        source: &source,
+        hop: &hop,
+        outside: &outside,
+    };
+    let prepared = super::prepare(&manifest, &cache, &swapped, call())
+        .expect("validated cache root remains bound after link replacement");
+    assert_eq!(prepared.checksum(), SMOKE_SHA256);
+    assert_eq!(
+        fs::read(&witness).expect("outside witness"),
+        &SMOKE_BYTES[..8]
+    );
+    assert!(!outside.join("smoke-fixture/1.0.0/artifact").exists());
+    assert_eq!(
+        fs::read(safe.join("smoke-fixture/1.0.0/artifact")).expect("safe artifact"),
+        SMOKE_BYTES
+    );
+}
 
 struct CountingSource(AtomicUsize);
 

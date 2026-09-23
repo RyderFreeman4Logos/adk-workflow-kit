@@ -54,6 +54,7 @@ pub use dataset::{
     ByteSource, DatasetDistribution, DatasetEntry, DatasetError, DatasetErrorKind, DatasetManifest,
     DatasetProvenance, DatasetReport, DatasetSourceIdentity, EvalSuite, HttpByteSource,
     LocalFileSource, PrepareRequest, PreparedDataset, prepare_dataset,
+    validated_dataset_cache_root,
 };
 pub use dataset::{DatasetCase, ParquetCaseError, decode_parquet_cases};
 pub use effect_journal::{
