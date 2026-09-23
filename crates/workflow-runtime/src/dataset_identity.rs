@@ -10,6 +10,23 @@ use super::{
     digest_bytes,
 };
 
+impl DatasetEntry {
+    /// Dataset family used for split discipline.
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    /// Dataset language used for split discipline.
+    pub fn language(&self) -> &str {
+        &self.language
+    }
+
+    /// Pinned source URL.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+}
+
 /// Provenance kind carried by a resolved source identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DatasetProvenance {
