@@ -52,8 +52,8 @@ pub use controller::{
 };
 pub use dataset::{
     ByteSource, DatasetDistribution, DatasetEntry, DatasetError, DatasetErrorKind, DatasetManifest,
-    DatasetProvenance, DatasetReport, DatasetSourceIdentity, EvalSuite, LocalFileSource,
-    PrepareRequest, PreparedDataset, prepare_dataset,
+    DatasetProvenance, DatasetReport, DatasetSourceIdentity, EvalSuite, HttpByteSource,
+    LocalFileSource, PrepareRequest, PreparedDataset, prepare_dataset,
 };
 pub use effect_journal::{
     EffectCommit, EffectJournal, EffectJournalError, EffectJournalErrorKind, EffectKey,

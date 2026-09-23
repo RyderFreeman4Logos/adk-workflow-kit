@@ -163,6 +163,7 @@ impl EvalSuite {
 }
 
 use dataset_cache_security::validate_cache_entry_ancestors;
+pub use dataset_http::HttpByteSource;
 pub use dataset_identity::{
     DatasetProvenance, DatasetReport, DatasetSourceIdentity, LocalFileSource, PreparedDataset,
 };
@@ -170,6 +171,8 @@ use dataset_identity::{expected_identity, is_pinned_entry, is_sha256, valid_sour
 
 #[path = "dataset_cache_security.rs"]
 mod dataset_cache_security;
+#[path = "dataset_http.rs"]
+mod dataset_http;
 #[path = "dataset_identity.rs"]
 mod dataset_identity;
 
