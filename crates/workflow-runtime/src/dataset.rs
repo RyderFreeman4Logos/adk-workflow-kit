@@ -569,7 +569,6 @@ fn validate_cache_root(cache_dir: &Path) -> Result<PathBuf, DatasetError> {
     let metadata = match fs::symlink_metadata(cache_dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            run_create_pause()?;
             reject_symlink_components(cache_dir, None)?;
             return Ok(cache_dir.to_owned());
         }
@@ -696,37 +695,83 @@ fn anchor_cache_dir(cache_dir: &Path) -> Result<PathBuf, DatasetError> {
 
 #[cfg(test)]
 thread_local! {
-    static CREATE_PAUSE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static RECURSIVE_CREATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CREATE_BARRIER: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+    static BARRIER_HITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static RACE_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static RACE_PRIVATE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static FOREIGN_UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    static FOREIGN_COMPONENT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
 }
 
-/// Test-only barrier at the pre-create boundary. Production builds ignore it.
+/// Records the raced root and private directory for the test-only pre-create barrier.
 #[cfg(test)]
-pub fn pause_before_cache_create(command: Option<String>) {
-    CREATE_PAUSE.with(|pause| *pause.borrow_mut() = command);
+pub fn arm_create_witness() {
+    CREATE_BARRIER.with(|slot| slot.set(Some(count_only)));
+    BARRIER_HITS.with(|hits| hits.set(0));
 }
 
-fn run_create_pause() -> Result<(), DatasetError> {
+#[cfg(test)]
+fn count_only() {}
+
+/// Plants the raced root after the last pre-create check.
+#[cfg(test)]
+pub fn arm_race_barrier(cache: PathBuf, private: PathBuf) {
+    RACE_ROOT.with(|slot| *slot.borrow_mut() = Some(cache));
+    RACE_PRIVATE.with(|slot| *slot.borrow_mut() = Some(private));
+    CREATE_BARRIER.with(|slot| slot.set(Some(plant_raced_root)));
+    BARRIER_HITS.with(|hits| hits.set(0));
+}
+
+#[cfg(test)]
+fn plant_raced_root() {
     #[cfg(test)]
     {
-        let command = CREATE_PAUSE.with(|pause| pause.borrow().clone());
-        if let Some(command) = command {
-            let status = std::process::Command::new("sh")
-                .args(["-c", &command])
-                .status()
-                .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
-            if !status.success() {
-                return Err(DatasetError::new(DatasetErrorKind::Io));
-            }
+        let cache = RACE_ROOT.with(|slot| slot.borrow().clone());
+        let private = RACE_PRIVATE.with(|slot| slot.borrow().clone());
+        if let (Some(cache), Some(private)) = (cache, private) {
+            let _ = fs::DirBuilder::new().mode(0o755).create(&cache);
+            let _ = std::os::unix::fs::symlink(&private, cache.join("smoke-fixture"));
         }
     }
-    Ok(())
 }
 
-fn component_owner(path: &Path, metadata: &fs::Metadata) -> u32 {
-    fs::read_to_string(format!("{}.owner", path.display()))
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
-        .unwrap_or_else(|| metadata.uid())
+/// Clears the test-only pre-create barrier.
+#[cfg(test)]
+pub fn clear_create_barrier() {
+    CREATE_BARRIER.with(|slot| slot.set(None));
+    RACE_ROOT.with(|slot| *slot.borrow_mut() = None);
+    RACE_PRIVATE.with(|slot| *slot.borrow_mut() = None);
+    BARRIER_HITS.with(|hits| hits.set(0));
+}
+
+/// How many times the barrier ran at the pre-create boundary.
+#[cfg(test)]
+pub fn create_barrier_hits() -> u32 {
+    BARRIER_HITS.with(|hits| hits.get())
+}
+
+/// Test-only owner seam. Production always uses the live descriptor UID.
+#[cfg(test)]
+pub fn set_foreign_owner_component(component: Option<&'static str>, foreign_uid: u32) {
+    FOREIGN_COMPONENT.with(|slot| slot.set(component));
+    FOREIGN_UID.with(|slot| slot.set(component.map(|_| foreign_uid)));
+}
+
+#[cfg(test)]
+fn descriptor_owner(path: &Path, metadata: &fs::Metadata) -> u32 {
+    match (
+        FOREIGN_COMPONENT.with(|slot| slot.get()),
+        FOREIGN_UID.with(|slot| slot.get()),
+    ) {
+        (Some(component), Some(uid)) if path.ends_with(component) => uid,
+        _ => metadata.uid(),
+    }
+}
+
+#[cfg(not(test))]
+fn descriptor_owner(_path: &Path, metadata: &fs::Metadata) -> u32 {
+    metadata.uid()
 }
 
 fn ensure_parent(dest: &Path, cache_dir: &Path) -> Result<(), DatasetError> {
@@ -745,93 +790,120 @@ fn ensure_parent(dest: &Path, cache_dir: &Path) -> Result<(), DatasetError> {
 const O_DIRECTORY: i32 = 0o200000;
 const O_NOFOLLOW_DIR: i32 = O_DIRECTORY | O_NOFOLLOW;
 
+/// Test-only switch that restores the vulnerable recursive create for RED.
+#[cfg(test)]
+pub fn set_recursive_create(enabled: bool) {
+    RECURSIVE_CREATE.with(|slot| slot.set(enabled));
+}
+
 fn create_missing_components(dest: &Path, cache_dir: &Path) -> Result<(), DatasetError> {
+    run_create_barrier();
+    #[cfg(test)]
+    if RECURSIVE_CREATE.with(|slot| slot.get()) {
+        let _ = cache_dir;
+        let parent = dest
+            .parent()
+            .ok_or(DatasetError::new(DatasetErrorKind::Io))?;
+        return fs::create_dir_all(parent).map_err(|_| DatasetError::new(DatasetErrorKind::Io));
+    }
+    create_missing_components_fd(dest, cache_dir)
+}
+
+fn create_missing_components_fd(dest: &Path, cache_dir: &Path) -> Result<(), DatasetError> {
+    let _ = cache_dir;
     let parent = dest
         .parent()
         .ok_or(DatasetError::new(DatasetErrorKind::Io))?;
     let uid = fs::metadata("/proc/self")
         .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?
         .uid();
-    let mut current = PathBuf::new();
-    let mut admitted: Option<fs::File> = None;
+    let mut pin = PathBuf::new();
     for component in parent.components() {
         let name = match component {
+            std::path::Component::Normal(name) => name,
             std::path::Component::RootDir => {
-                current.push("/");
-                admitted = Some(open_dir(&current)?);
+                pin.push("/");
                 continue;
             }
+            _ => return Err(DatasetError::new(DatasetErrorKind::Io)),
+        };
+        let next = pin.join(name);
+        if fs::symlink_metadata(&next).is_err() {
+            break;
+        }
+        if open_nofollow(&next).is_err() {
+            return Err(DatasetError::new(DatasetErrorKind::Io));
+        }
+        pin = next;
+    }
+    if pin.as_os_str().is_empty() {
+        return Err(DatasetError::new(DatasetErrorKind::Io));
+    }
+    let mut admitted = open_nofollow(&pin)?;
+    admit_dir(&pin, &admitted, uid)?;
+    for component in parent.strip_prefix(&pin).unwrap_or(parent).components() {
+        let name = match component {
             std::path::Component::Normal(name) => name,
             _ => return Err(DatasetError::new(DatasetErrorKind::Io)),
         };
-        current.push(name);
-        let inside = current.as_path() == cache_dir || current.starts_with(cache_dir);
-        #[allow(clippy::collapsible_if)]
-        if inside {
-            if let Some(dir) = admitted.as_ref() {
-                match open_at(dir, name) {
-                    Ok(child) => {
-                        let metadata = child
-                            .metadata()
-                            .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
-                        let owner = component_owner(&current, &metadata);
-                        if metadata.file_type().is_symlink() || !metadata.is_dir() || owner != uid {
-                            return Err(DatasetError::new(DatasetErrorKind::Io));
-                        }
-                        admitted = Some(child);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        mkdir_at(dir, name)?;
-                        admitted = Some(
-                            open_at(dir, name)
-                                .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?,
-                        );
-                    }
-                    Err(_) => return Err(DatasetError::new(DatasetErrorKind::Io)),
-                }
+        pin.push(name);
+        run_create_barrier();
+        let child = match open_at(&admitted, name) {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                mkdir_at(&admitted, name)?;
+                open_at(&admitted, name).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?
             }
-            continue;
-        }
-        let metadata =
-            fs::symlink_metadata(&current).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(DatasetError::new(DatasetErrorKind::Io));
-        }
-        admitted = Some(open_dir(&current)?);
+            Err(_) => return Err(DatasetError::new(DatasetErrorKind::Io)),
+        };
+        admit_dir(&pin, &child, uid)?;
+        admitted = child;
     }
     Ok(())
 }
 
-fn open_dir(path: &Path) -> Result<fs::File, DatasetError> {
+fn admit_dir(path: &Path, dir: &fs::File, uid: u32) -> Result<(), DatasetError> {
+    let metadata = dir
+        .metadata()
+        .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || !safe_directory_metadata(&metadata)
+        || ![uid, 0].contains(&descriptor_owner(path, &metadata))
+    {
+        return Err(DatasetError::new(DatasetErrorKind::Io));
+    }
+    Ok(())
+}
+
+fn open_nofollow(path: &Path) -> Result<fs::File, DatasetError> {
     OpenOptions::new()
         .read(true)
-        .custom_flags(O_DIRECTORY)
+        .custom_flags(O_NOFOLLOW_DIR)
         .open(path)
         .map_err(|_| DatasetError::new(DatasetErrorKind::Io))
+}
+
+fn run_create_barrier() {
+    #[cfg(test)]
+    if let Some(barrier) = CREATE_BARRIER.with(|slot| slot.get()) {
+        BARRIER_HITS.with(|hits| hits.set(hits.get().saturating_add(1)));
+        barrier();
+    }
 }
 
 fn open_at(dir: &fs::File, name: &std::ffi::OsStr) -> Result<fs::File, std::io::Error> {
     OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW_DIR)
-        .open(dir.path_for(name))
+        .open(PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name))
 }
 
 fn mkdir_at(dir: &fs::File, name: &std::ffi::OsStr) -> Result<(), DatasetError> {
     fs::DirBuilder::new()
         .mode(0o700)
-        .create(dir.path_for(name))
+        .create(PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name))
         .map_err(|_| DatasetError::new(DatasetErrorKind::Io))
-}
-
-trait DirPath {
-    fn path_for(&self, name: &std::ffi::OsStr) -> PathBuf;
-}
-
-impl DirPath for fs::File {
-    fn path_for(&self, name: &std::ffi::OsStr) -> PathBuf {
-        PathBuf::from(format!("/proc/self/fd/{}", self.as_raw_fd())).join(name)
-    }
 }
 
 fn publish(dest: &Path, bytes: &[u8], cache_dir: &Path) -> Result<(), DatasetError> {
@@ -1034,11 +1106,44 @@ suites = ["smoke"]
         .expect("manifest")
     }
 
-    #[test]
-    fn missing_root_cross_uid_takeover_does_not_mutate_external_directory() {
-        let root = std::env::temp_dir().join(format!("issue-229-race-{}", std::process::id()));
+    fn request<'a>(cache: &'a Path, source: &'a Source) -> PrepareRequest<'a> {
+        PrepareRequest {
+            cache_dir: cache,
+            source,
+            suite: EvalSuite::Smoke,
+            offline: false,
+            license_accepted: false,
+            manual_path: None,
+        }
+    }
+
+    fn ssd_root(label: &str) -> PathBuf {
+        let root =
+            fs::canonicalize(Path::new(&std::env::var_os("HOME").expect("HOME")).join("tmp"))
+                .expect("SSD tmp")
+                .join(format!("issue-229-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("root");
+        fs::create_dir(&root).expect("root");
+        root
+    }
+
+    #[test]
+    fn create_barrier_witnesses_pre_create_boundary() {
+        let root = ssd_root("barrier");
+        let cache = root.join("cache");
+        arm_create_witness();
+        let source = Source;
+        prepare_dataset(&smoke(), "smoke-fixture", &request(&cache, &source)).expect("create");
+        let hits = create_barrier_hits();
+        clear_create_barrier();
+        assert!(hits >= 1, "barrier must run before component open");
+        assert!(cache.join("smoke-fixture/1.0.0/artifact").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn raced_foreign_root_does_not_create_private_child() {
+        let root = ssd_root("race");
         let parent = root.join("P");
         fs::DirBuilder::new()
             .mode(0o1703)
@@ -1050,48 +1155,138 @@ suites = ["smoke"]
             .create(&private)
             .expect("Q");
         let cache = parent.join("cache-A");
-        let script = root.join("pause.py");
-        fs::write(
-            &script,
-            format!(
-                "import os, pathlib\ncache = pathlib.Path({cache:?})\nprivate = pathlib.Path({private:?})\ncache.mkdir(mode=0o755)\nos.symlink(private, cache / 'smoke-fixture')\npathlib.Path(str(cache) + '.owner').write_text('65534\\n')",
-                cache = cache,
-                private = private,
-            ),
-        )
-        .expect("script");
-        pause_before_cache_create(Some(format!("python3 {}", script.display())));
+        arm_race_barrier(cache.clone(), private.clone());
         let source = Source;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            prepare_dataset(
-                &smoke(),
-                "smoke-fixture",
-                &PrepareRequest {
-                    cache_dir: &cache,
-                    source: &source,
-                    suite: EvalSuite::Smoke,
-                    offline: false,
-                    license_accepted: false,
-                    manual_path: None,
-                },
-            )
-        }));
-        pause_before_cache_create(None);
-        let result = result.expect("pause must not panic");
+        let error = prepare_dataset(&smoke(), "smoke-fixture", &request(&cache, &source));
+        let hits = create_barrier_hits();
+        let mutated = private.join("1.0.0").exists();
+        clear_create_barrier();
+        set_recursive_create(false);
+        assert!(hits >= 1, "must reach the pre-create boundary");
+        assert!(!mutated, "Q/1.0.0 must not be created");
+        assert_eq!(error.expect_err("raced root").kind(), DatasetErrorKind::Io);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owner_sidecar_cannot_deny_or_authorize_an_existing_component() {
+        let root = ssd_root("sidecar");
+        let cache = root.join("cache-A");
+        fs::create_dir(&cache).expect("existing cache");
+        fs::write(root.join("P-cache-A.owner"), "65534\n").ok();
+        fs::write(format!("{}.owner", cache.display()), "65534\n").expect("sidecar");
+        let source = Source;
+        prepare_dataset(&smoke(), "smoke-fixture", &request(&cache, &source))
+            .expect("live descriptor UID, not sidecar bytes");
+        assert!(cache.join("smoke-fixture/1.0.0/artifact").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn simulated_foreign_owner_is_refused_before_descent() {
+        let root = ssd_root("seam");
+        let parent = root.join("P");
+        fs::DirBuilder::new()
+            .mode(0o1703)
+            .create(&parent)
+            .expect("P");
+        let cache = parent.join("cache-A");
+        fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&cache)
+            .expect("foreign-shaped root");
+        let private = root.join("Q");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&private)
+            .expect("Q");
+        std::os::unix::fs::symlink(&private, cache.join("smoke-fixture")).expect("link");
+        let uid = fs::metadata("/proc/self").expect("uid").uid();
+        set_foreign_owner_component(Some("cache-A"), uid.saturating_add(1));
+        let source = Source;
+        let error = prepare_dataset(&smoke(), "smoke-fixture", &request(&cache, &source))
+            .expect_err("simulated foreign descriptor owner");
+        set_foreign_owner_component(None, 0);
+        assert_eq!(error.kind(), DatasetErrorKind::Io);
+        assert!(!private.join("1.0.0").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_nested_root_is_created_and_reused() {
+        let root = ssd_root("nested");
+        let cache = root.join("new/cache");
+        let source = Source;
+        prepare_dataset(&smoke(), "smoke-fixture", &request(&cache, &source)).expect("create");
         assert_eq!(
-            result.expect_err("raced foreign root").kind(),
-            DatasetErrorKind::Io
+            fs::read(cache.join("smoke-fixture/1.0.0/artifact")).expect("artifact"),
+            SMOKE
         );
+        let reused = prepare_dataset(
+            &smoke(),
+            "smoke-fixture",
+            &PrepareRequest {
+                offline: true,
+                ..request(&cache, &source)
+            },
+        )
+        .expect("reuse");
+        assert!(reused.from_cache());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn late_foreign_intermediate_link_does_not_create_private_child() {
+        let root = ssd_root("takeover");
+        let parent = root.join("P");
+        fs::DirBuilder::new()
+            .mode(0o1703)
+            .create(&parent)
+            .expect("P");
+        let private = root.join("Q");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&private)
+            .expect("Q");
+        let cache = parent.join("staging/next/cache-A");
+        let uid = fs::metadata("/proc/self").expect("uid").uid();
+        set_foreign_owner_component(Some("next"), uid.saturating_add(1));
+        let source = Source;
+        let error = prepare_dataset(&smoke(), "smoke-fixture", &request(&cache, &source))
+            .expect_err("simulated foreign intermediate");
+        set_foreign_owner_component(None, 0);
+        assert_eq!(error.kind(), DatasetErrorKind::Io);
         assert!(
-            !private.join("1.0.0").exists(),
-            "external Q must stay unchanged"
+            !private.join("cache-A").exists(),
+            "Q/cache-A must not be created"
         );
-        assert!(
-            fs::symlink_metadata(cache.join("smoke-fixture"))
-                .expect("link")
-                .file_type()
-                .is_symlink()
-        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn old_recursive_create_mutates_private_directory() {
+        let root = ssd_root("red");
+        let parent = root.join("P");
+        fs::DirBuilder::new()
+            .mode(0o1703)
+            .create(&parent)
+            .expect("P");
+        let private = root.join("Q");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&private)
+            .expect("Q");
+        let cache = parent.join("cache-A");
+        arm_race_barrier(cache.clone(), private.clone());
+        set_recursive_create(true);
+        let source = Source;
+        let _ = prepare_dataset(&smoke(), "smoke-fixture", &request(&cache, &source));
+        let hits = create_barrier_hits();
+        let mutated = private.join("1.0.0").exists();
+        clear_create_barrier();
+        set_recursive_create(false);
+        assert!(hits >= 1, "old path must still hit the pre-create boundary");
+        assert!(mutated, "old recursive create must plant Q/1.0.0");
         let _ = fs::remove_dir_all(root);
     }
 }

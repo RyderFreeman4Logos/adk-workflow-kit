@@ -808,26 +808,41 @@ fn debug_redacts_paths_and_checksums() {
 
 #[test]
 fn missing_relative_cache_root_is_created_under_current_dir() {
+    let mode = std::env::var("ISSUE_229_RELATIVE_CHILD").ok();
+    if mode.as_deref() == Some("offline") {
+        panic!("offline child must not rebuild or touch the source");
+    }
+    if mode.as_deref() == Some("first") || mode.as_deref() == Some("reuse") {
+        let manifest = DatasetManifest::parse_str(&smoke_toml()).expect("manifest");
+        let source = ScriptedSource::new(SMOKE_BYTES, SMOKE_BYTES.len());
+        prepare_dataset(
+            &manifest,
+            "smoke-fixture",
+            &PrepareRequest {
+                cache_dir: Path::new("cache"),
+                source: &source,
+                suite: EvalSuite::Smoke,
+                offline: mode.as_deref() == Some("reuse"),
+                license_accepted: false,
+                manual_path: None,
+            },
+        )
+        .expect("relative cache root");
+        return;
+    }
     let home = TestRoot::new("relative-root");
-    let child = home.0.join("child-cwd");
-    fs::create_dir(&child).expect("child cwd");
+    let cwd = home.0.join("child-cwd");
+    fs::create_dir(&cwd).expect("child cwd");
+    let exe = std::env::current_exe().expect("test executable");
     let launch = |offline: bool| {
-        let mut command = Command::new("cargo");
+        let mut command = Command::new(&exe);
         command
-            .args([
-                "+1.98.0",
-                "run",
-                "--manifest-path",
-                concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
-                "--bin",
-                "relative-cache-root",
-                "--locked",
-                "--quiet",
-                "--",
-            ])
-            .current_dir(&child);
+            .arg("missing_relative_cache_root_is_created_under_current_dir")
+            .arg("--exact")
+            .env("ISSUE_229_RELATIVE_CHILD", "first")
+            .current_dir(&cwd);
         if offline {
-            command.arg("offline");
+            command.env("ISSUE_229_RELATIVE_CHILD", "offline");
         }
         command.status().expect("relative child")
     };
@@ -835,12 +850,28 @@ fn missing_relative_cache_root_is_created_under_current_dir() {
         launch(false).success(),
         "child relative first-use must succeed"
     );
-    let artifact = child.join("cache/smoke-fixture/1.0.0/artifact");
+    let artifact = cwd.join("cache/smoke-fixture/1.0.0/artifact");
     assert_eq!(fs::read(&artifact).expect("relative artifact"), SMOKE_BYTES);
-    let absolute = fs::canonicalize(child.join("cache")).expect("absolute cache");
-    assert!(launch(true).success(), "relative warm reuse must succeed");
+    let cache = cwd.join("cache");
+    let warm = Command::new(&exe)
+        .arg("missing_relative_cache_root_is_created_under_current_dir")
+        .arg("--exact")
+        .arg("reuse")
+        .env("ISSUE_229_RELATIVE_CHILD", "reuse")
+        .current_dir(&cwd)
+        .status()
+        .expect("reuse child");
+    assert!(
+        warm.success(),
+        "same executable reuses the relative cache offline"
+    );
     assert_eq!(
-        fs::read(absolute.join("smoke-fixture/1.0.0/artifact")).unwrap(),
+        fs::read(cache.join("smoke-fixture/1.0.0/artifact")).unwrap(),
         SMOKE_BYTES
+    );
+    let refused = launch(true);
+    assert!(
+        !refused.success(),
+        "offline child panics before source access"
     );
 }
