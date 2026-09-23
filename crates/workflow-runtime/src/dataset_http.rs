@@ -337,11 +337,45 @@ suites = ["regression"]
             }
         });
         let source = HttpByteSource::local_fixture(&url, REV, SHA, 128).expect("source");
-        assert_eq!(source.len().expect("probe"), BYTES.len() as u64);
-        let mut fetched = [0; 128];
-        let count = source.read_at(0, &mut fetched).expect("range");
-        assert_ne!(digest_bytes(&fetched[..count]), SHA);
+        let root = fs::canonicalize(
+            std::path::Path::new(&std::env::var_os("HOME").expect("HOME")).join("tmp"),
+        )
+        .expect("temp")
+        .join(format!("issue-229-http-wrong-{}", std::process::id()));
+        fs::create_dir(&root).expect("cache");
+        let manifest = DatasetManifest::parse_str(&format!(
+            r#"schema_version = 1
+[[datasets]]
+id = "http-fixture"
+family = "synthetic"
+language = "en"
+revision = "{REV}"
+url = "{url}"
+sha256 = "{SHA}"
+license = "Apache-2.0"
+license_acceptance_required = false
+distribution = "fetch"
+adapter_version = "1"
+derivation = "identity"
+suites = ["regression"]
+"#
+        ))
+        .expect("manifest");
+        assert!(
+            matches!(prepare_dataset(&manifest, "http-fixture", &PrepareRequest {
+            cache_dir: &root,
+            source: &source,
+            suite: EvalSuite::Regression,
+            offline: false,
+            license_accepted: true,
+            manual_path: None,
+        }), Err(error) if error.kind() == DatasetErrorKind::ChecksumMismatch)
+        );
+        let artifact = root.join("http-fixture").join(REV).join("artifact");
+        assert!(!artifact.exists());
+        assert!(!artifact.with_file_name("artifact.partial").exists());
         server.join().expect("server");
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
