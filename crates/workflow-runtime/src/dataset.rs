@@ -182,6 +182,10 @@ mod dataset_identity;
 #[path = "dataset_parquet.rs"]
 mod dataset_parquet;
 
+#[cfg(test)]
+#[path = "dataset_creation_tests.rs"]
+mod dataset_creation_tests;
+
 /// Byte source used by fetch. Implementations must attest the selected source identity.
 pub trait ByteSource {
     /// Returns the identity resolved by this source/provider.
@@ -764,7 +768,10 @@ fn descriptor_owner(path: &Path, metadata: &fs::Metadata) -> u32 {
         FOREIGN_COMPONENT.with(|slot| slot.get()),
         FOREIGN_UID.with(|slot| slot.get()),
     ) {
-        (Some(component), Some(uid)) if path.ends_with(component) => uid,
+        (Some(component), Some(uid)) if path.ends_with(component) => {
+            dataset_creation_tests::record_owner_check();
+            uid
+        }
         _ => metadata.uid(),
     }
 }
@@ -810,38 +817,22 @@ fn create_missing_components(dest: &Path, cache_dir: &Path) -> Result<(), Datase
 }
 
 fn create_missing_components_fd(dest: &Path, cache_dir: &Path) -> Result<(), DatasetError> {
-    let _ = cache_dir;
     let parent = dest
         .parent()
         .ok_or(DatasetError::new(DatasetErrorKind::Io))?;
     let uid = fs::metadata("/proc/self")
         .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?
         .uid();
-    let mut pin = PathBuf::new();
-    for component in parent.components() {
-        let name = match component {
-            std::path::Component::Normal(name) => name,
-            std::path::Component::RootDir => {
-                pin.push("/");
-                continue;
-            }
-            _ => return Err(DatasetError::new(DatasetErrorKind::Io)),
-        };
-        let next = pin.join(name);
-        if fs::symlink_metadata(&next).is_err() {
-            break;
-        }
-        if open_nofollow(&next).is_err() {
-            return Err(DatasetError::new(DatasetErrorKind::Io));
-        }
-        pin = next;
-    }
-    if pin.as_os_str().is_empty() {
+    let mut components = parent.components();
+    if components.next() != Some(std::path::Component::RootDir) {
         return Err(DatasetError::new(DatasetErrorKind::Io));
     }
+    // Never reacquire a scanned pathname: every child, existing or missing,
+    // is opened through the admitted parent retained from the filesystem root.
+    let mut pin = PathBuf::from("/");
     let mut admitted = open_nofollow(&pin)?;
-    admit_dir(&pin, &admitted, uid)?;
-    for component in parent.strip_prefix(&pin).unwrap_or(parent).components() {
+    let mut metadata = admit_dir(&pin, &admitted, uid, false)?;
+    for component in components {
         let name = match component {
             std::path::Component::Normal(name) => name,
             _ => return Err(DatasetError::new(DatasetErrorKind::Io)),
@@ -856,24 +847,33 @@ fn create_missing_components_fd(dest: &Path, cache_dir: &Path) -> Result<(), Dat
             }
             Err(_) => return Err(DatasetError::new(DatasetErrorKind::Io)),
         };
-        admit_dir(&pin, &child, uid)?;
+        #[cfg(test)]
+        dataset_creation_tests::prefix_acquired(&pin);
+        let require_owner =
+            metadata.mode() & 0o1002 == 0o1002 || (pin != cache_dir && pin.starts_with(cache_dir));
+        metadata = admit_dir(&pin, &child, uid, require_owner)?;
         admitted = child;
     }
     Ok(())
 }
 
-fn admit_dir(path: &Path, dir: &fs::File, uid: u32) -> Result<(), DatasetError> {
+fn admit_dir(
+    path: &Path,
+    dir: &fs::File,
+    uid: u32,
+    require_owner: bool,
+) -> Result<fs::Metadata, DatasetError> {
     let metadata = dir
         .metadata()
         .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || !safe_directory_metadata(&metadata)
-        || ![uid, 0].contains(&descriptor_owner(path, &metadata))
+    let owner = descriptor_owner(path, &metadata);
+    if !safe_directory_metadata(&metadata)
+        || ![uid, 0].contains(&owner)
+        || (require_owner && owner != uid)
     {
         return Err(DatasetError::new(DatasetErrorKind::Io));
     }
-    Ok(())
+    Ok(metadata)
 }
 
 fn open_nofollow(path: &Path) -> Result<fs::File, DatasetError> {
@@ -1059,10 +1059,10 @@ fn fetch_resumable(
 mod issue_229_creation {
     use super::*;
 
-    const SMOKE: &[u8] = b"issue-229-smoke-fixture\n";
+    pub(super) const SMOKE: &[u8] = b"issue-229-smoke-fixture\n";
     const SHA: &str = "sha256:e543862e31a042f932ef3d2f34daa869537e5da06ad9ded1cbbd10885bd46959";
 
-    struct Source;
+    pub(super) struct Source;
 
     impl ByteSource for Source {
         fn identity(&self) -> Result<DatasetSourceIdentity, DatasetError> {
@@ -1085,7 +1085,7 @@ mod issue_229_creation {
         }
     }
 
-    fn smoke() -> DatasetManifest {
+    pub(super) fn smoke() -> DatasetManifest {
         DatasetManifest::parse_str(&format!(
             r#"schema_version = 1
 [[datasets]]
@@ -1106,7 +1106,7 @@ suites = ["smoke"]
         .expect("manifest")
     }
 
-    fn request<'a>(cache: &'a Path, source: &'a Source) -> PrepareRequest<'a> {
+    pub(super) fn request<'a>(cache: &'a Path, source: &'a Source) -> PrepareRequest<'a> {
         PrepareRequest {
             cache_dir: cache,
             source,
@@ -1117,7 +1117,7 @@ suites = ["smoke"]
         }
     }
 
-    fn ssd_root(label: &str) -> PathBuf {
+    pub(super) fn ssd_root(label: &str) -> PathBuf {
         let root =
             fs::canonicalize(Path::new(&std::env::var_os("HOME").expect("HOME")).join("tmp"))
                 .expect("SSD tmp")
@@ -1142,7 +1142,7 @@ suites = ["smoke"]
     }
 
     #[test]
-    fn raced_foreign_root_does_not_create_private_child() {
+    fn late_root_link_does_not_create_private_child() {
         let root = ssd_root("race");
         let parent = root.join("P");
         fs::DirBuilder::new()
@@ -1183,36 +1183,6 @@ suites = ["smoke"]
     }
 
     #[test]
-    fn simulated_foreign_owner_is_refused_before_descent() {
-        let root = ssd_root("seam");
-        let parent = root.join("P");
-        fs::DirBuilder::new()
-            .mode(0o1703)
-            .create(&parent)
-            .expect("P");
-        let cache = parent.join("cache-A");
-        fs::DirBuilder::new()
-            .mode(0o755)
-            .create(&cache)
-            .expect("foreign-shaped root");
-        let private = root.join("Q");
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&private)
-            .expect("Q");
-        std::os::unix::fs::symlink(&private, cache.join("smoke-fixture")).expect("link");
-        let uid = fs::metadata("/proc/self").expect("uid").uid();
-        set_foreign_owner_component(Some("cache-A"), uid.saturating_add(1));
-        let source = Source;
-        let error = prepare_dataset(&smoke(), "smoke-fixture", &request(&cache, &source))
-            .expect_err("simulated foreign descriptor owner");
-        set_foreign_owner_component(None, 0);
-        assert_eq!(error.kind(), DatasetErrorKind::Io);
-        assert!(!private.join("1.0.0").exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn missing_nested_root_is_created_and_reused() {
         let root = ssd_root("nested");
         let cache = root.join("new/cache");
@@ -1232,34 +1202,6 @@ suites = ["smoke"]
         )
         .expect("reuse");
         assert!(reused.from_cache());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn late_foreign_intermediate_link_does_not_create_private_child() {
-        let root = ssd_root("takeover");
-        let parent = root.join("P");
-        fs::DirBuilder::new()
-            .mode(0o1703)
-            .create(&parent)
-            .expect("P");
-        let private = root.join("Q");
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&private)
-            .expect("Q");
-        let cache = parent.join("staging/next/cache-A");
-        let uid = fs::metadata("/proc/self").expect("uid").uid();
-        set_foreign_owner_component(Some("next"), uid.saturating_add(1));
-        let source = Source;
-        let error = prepare_dataset(&smoke(), "smoke-fixture", &request(&cache, &source))
-            .expect_err("simulated foreign intermediate");
-        set_foreign_owner_component(None, 0);
-        assert_eq!(error.kind(), DatasetErrorKind::Io);
-        assert!(
-            !private.join("cache-A").exists(),
-            "Q/cache-A must not be created"
-        );
         let _ = fs::remove_dir_all(root);
     }
 
