@@ -2,7 +2,7 @@
 //! the foreign-UID cases override only descriptor metadata, not OS permissions.
 use super::*;
 use std::cell::{Cell, RefCell};
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 
 thread_local! {
     static SCHEDULE: RefCell<Option<Schedule>> = const { RefCell::new(None) };
@@ -57,6 +57,9 @@ fn prefix_race(manual: bool, foreign: bool) {
         .mode(0o1703)
         .create(&parent)
         .expect("sticky P");
+    // DirBuilder modes are masked by umask; the takeover model requires 1703.
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o1703)).expect("exact sticky mode");
+    assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o7777, 0o1703);
     let private = root.join("Q");
     fs::DirBuilder::new()
         .mode(0o700)
