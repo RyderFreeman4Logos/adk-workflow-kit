@@ -49,8 +49,12 @@ mise exec -- just issue-229-product "$HOME/tmp/ether0-r1" accept-cc-by-4.0 offli
 
 Read `$HOME/tmp/ether0-r1/ether0-report.json` after either command. Omit the
 explicit CC BY 4.0 acceptance and the command fails before network or cache
-access, including on warm cache. Use a private, safe cache root; the report is
-atomically replaced there. The URL is pinned to FutureHouse ©2025
+access, including on warm cache. The CLI accepts only direct children of
+`~/tmp`, including existing cache-root directory links admitted by the shared
+owner/mode/link-chain validator. Dangling or unsafe links fail without being
+replaced. Use a private, safe cache root; the report is atomically replaced
+there. `mise exec -- just issue-229-cli-links` opts into a public pinned-fixture
+check of the shipping binary's offline linked-cache path. The URL is pinned to FutureHouse ©2025
 `ether0-benchmark` revision `c7d5e59960087f360bc32a5006bb994324b38c35`,
 SHA-256 `c53213a37ef319aa7f733751b93748db960cce33355c1d44124108e7f15c5bbc`.
 Original dataset license: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).

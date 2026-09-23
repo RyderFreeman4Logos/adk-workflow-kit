@@ -288,3 +288,124 @@ fn shipped_cli_refuses_unaccepted_license_without_a_report() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("license acceptance is required"));
     assert!(!root.exists());
 }
+
+fn cli_root(label: &str) -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap())
+        .join("tmp")
+        .canonicalize()
+        .unwrap()
+        .join(format!("issue-229-cli-{label}-{}", std::process::id()))
+}
+
+fn run_cli(cache: &std::path::Path) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_ether0-eval"))
+        .arg(cache)
+        .args(["accept-cc-by-4.0", "offline", "3"])
+        .output()
+        .expect("shipping CLI")
+}
+
+#[test]
+#[ignore = "public pinned HTTPS fixture; invoke via just issue-229-cli-links"]
+fn shipped_cli_supports_verified_root_link() {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, symlink};
+    use workflow_runtime::{EvalSuite, HttpByteSource, PrepareRequest, prepare_dataset};
+    let manifest = DatasetManifest::parse_str(include_str!("../../../config/datasets.toml"))
+        .expect("committed manifest");
+    let entry = manifest.dataset("ether0").unwrap();
+    let source = HttpByteSource::new(entry.url(), entry.revision(), entry.sha256(), 100_000)
+        .expect("public pinned source");
+    let store = cli_root("verified-store");
+    fs::DirBuilder::new().mode(0o700).create(&store).unwrap();
+    // Real pinned bytes, not a synthetic artifact or a shipping pin override.
+    prepare_dataset(
+        &manifest,
+        "ether0",
+        &PrepareRequest {
+            cache_dir: &store,
+            source: &source,
+            suite: EvalSuite::Regression,
+            offline: false,
+            license_accepted: true,
+            manual_path: None,
+        },
+    )
+    .expect("verified warm cache");
+    let artifact = store.join("ether0").join(entry.revision()).join("artifact");
+    let bytes = fs::read(&artifact).unwrap();
+    assert_eq!(
+        format!("sha256:{:x}", Sha256::digest(&bytes)),
+        entry.sha256()
+    );
+    let linked = cli_root("verified-link");
+    symlink(&store, &linked).unwrap();
+    let before = fs::metadata(&store).unwrap();
+    let output = run_cli(&linked);
+    let report = fs::read(store.join("ether0-report.json"));
+    assert_eq!(fs::read_link(&linked).unwrap(), store);
+    assert_eq!(linked.canonicalize().unwrap(), store);
+    let after = fs::metadata(&linked).unwrap();
+    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    assert_eq!(fs::read(&artifact).unwrap(), bytes);
+    fs::remove_file(&linked).unwrap();
+    fs::remove_dir_all(&store).unwrap();
+    assert!(
+        output.status.success(),
+        "CLI refused verified linked cache: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        store.join("ether0-report.json").to_str().unwrap()
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&report.expect("published report")).unwrap();
+    assert_eq!(report["dataset"]["checksum"], entry.sha256());
+    assert_eq!(report["cases"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn shipped_cli_refuses_dangling_and_unsafe_links_and_nested_cache() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let root = cli_root("negative-store");
+    fs::create_dir(&root).unwrap();
+    let unsafe_target = root.join("unsafe-target");
+    fs::create_dir(&unsafe_target).unwrap();
+    fs::set_permissions(&unsafe_target, fs::Permissions::from_mode(0o777)).unwrap();
+    let unsafe_hop = root.join("unsafe-hop");
+    fs::create_dir(&unsafe_hop).unwrap();
+    fs::set_permissions(&unsafe_hop, fs::Permissions::from_mode(0o777)).unwrap();
+    let safe = root.join("safe");
+    fs::create_dir(&safe).unwrap();
+    symlink(&safe, unsafe_hop.join("hop")).unwrap();
+    for (label, target) in [
+        ("dangling", root.join("missing")),
+        ("unsafe", unsafe_target.clone()),
+        ("unsafe-chain", unsafe_hop.join("hop")),
+    ] {
+        let linked = cli_root(label);
+        symlink(&target, &linked).unwrap();
+        let output = run_cli(&linked);
+        assert!(!output.status.success(), "{label} must fail");
+        assert_eq!(
+            fs::read_link(&linked).unwrap(),
+            target,
+            "preserve refused link"
+        );
+        fs::remove_file(&linked).unwrap();
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("dataset storage failed"),
+            "{label}: shared validator must reject: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let nested = root.join("nested");
+    let output = run_cli(&nested);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("direct child"));
+    assert!(!nested.exists());
+    assert!(!root.join("missing").exists());
+    assert!(fs::read_dir(&unsafe_target).unwrap().next().is_none());
+    assert!(fs::read_dir(&safe).unwrap().next().is_none());
+    fs::remove_dir_all(root).unwrap();
+}

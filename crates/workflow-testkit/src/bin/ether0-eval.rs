@@ -1,5 +1,5 @@
 //! Fixed, license-gated FutureHouse ether0 benchmark smoke command.
-use std::{env, fs, os::unix::fs::DirBuilderExt, path::Path};
+use std::{env, path::Path};
 use workflow_runtime::{DatasetManifest, HttpByteSource};
 
 const MANIFEST: &str = include_str!("../../../../config/datasets.toml");
@@ -62,19 +62,6 @@ fn run() -> Result<(), String> {
         return Err("cache must be a direct child of ~/tmp".into());
     }
     let cache = allowed.join(leaf);
-    match fs::symlink_metadata(&cache) {
-        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
-            return Err("unsafe cache directory".into());
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&cache)
-                .map_err(|error| error.to_string())?;
-        }
-        Err(error) => return Err(error.to_string()),
-    }
     let path = workflow_testkit::run_dataset_product(
         &manifest,
         "ether0",

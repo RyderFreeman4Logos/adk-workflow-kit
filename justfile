@@ -149,6 +149,10 @@ issue-229-test:
 issue-229-product-test test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-testkit --test issue_229_product {{test_name}} --locked -- --nocapture
 
+# Opt-in real shipping CLI test with a public pinned, verified linked cache.
+issue-229-cli-links:
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --test issue_229_product shipped_cli_supports_verified_root_link --locked -- --exact --ignored --nocapture
+
 # Public, pinned FutureHouse product path (report is CACHE_DIR/ether0-report.json).
 issue-229-product cache license mode cases:
     {{_io}} cargo +1.98.0 run -p workflow-testkit --bin ether0-eval --locked -- "{{cache}}" "{{license}}" "{{mode}}" "{{cases}}"
