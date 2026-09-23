@@ -366,7 +366,7 @@ suites = ["regression"]
     // https://creativecommons.org/licenses/by/4.0/
     #[test]
     #[ignore = "requires a public HTTPS connection; invoke via just issue-229-live"]
-    fn futurehouse_pinned_product_fetch() {
+    fn futurehouse_pinned_product_source_to_cases() {
         const URL: &str = "https://huggingface.co/datasets/futurehouse/ether0-benchmark/resolve/c7d5e59960087f360bc32a5006bb994324b38c35/data/test-00000-of-00001.parquet";
         const EXPECTED: &str =
             "sha256:c53213a37ef319aa7f733751b93748db960cce33355c1d44124108e7f15c5bbc";
@@ -412,6 +412,28 @@ suites = ["regression"]
         let bytes = fs::read(root.join("ether0").join(REV).join("artifact")).expect("artifact");
         assert_eq!(bytes.len(), 80_281);
         assert_eq!(digest_bytes(&bytes), EXPECTED);
+        let cases = super::super::decode_parquet_cases(&prepared, &bytes, 3).expect("cases");
+        assert_eq!(cases.len(), 3);
+        assert_eq!(
+            cases
+                .iter()
+                .map(|case| case.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "00c8bc2d-0bb3-53c2-8bdf-cd19616d4536",
+                "066b28c7-c991-5095-8045-a5da176c150a",
+                "5c555f14-4a93-552c-bc9f-1d45ae1f6c29"
+            ]
+        );
+        for case in &cases {
+            assert!(!case.id.is_empty());
+            assert!(!case.problem.is_empty());
+            assert!(!case.solution.is_empty());
+            assert!(!case.ideal.is_empty());
+            assert!(!case.problem_type.is_empty());
+            assert!(!case.unformatted.is_empty());
+        }
+
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

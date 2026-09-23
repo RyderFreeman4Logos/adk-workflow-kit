@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+bytes = "1"
 jsonschema.workspace = true
+parquet = { version = "60", default-features = false, features = ["snap"] }
 reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
 rusqlite.workspace = true
 schemars.workspace = true

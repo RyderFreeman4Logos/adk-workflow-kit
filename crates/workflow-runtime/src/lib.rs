@@ -55,6 +55,7 @@ pub use dataset::{
     DatasetProvenance, DatasetReport, DatasetSourceIdentity, EvalSuite, HttpByteSource,
     LocalFileSource, PrepareRequest, PreparedDataset, prepare_dataset,
 };
+pub use dataset::{DatasetCase, ParquetCaseError, decode_parquet_cases};
 pub use effect_journal::{
     EffectCommit, EffectJournal, EffectJournalError, EffectJournalErrorKind, EffectKey,
 };

@@ -134,8 +134,11 @@ issue-228-test:
 issue-229-http test_name="dataset::dataset_http::tests::":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --lib {{test_name}} --locked -- --nocapture
 
+issue-229-parquet test_name="dataset::dataset_parquet::tests::":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --lib {{test_name}} --locked -- --nocapture
+
 issue-229-live:
-    {{_io}} cargo +1.98.0 test -p workflow-runtime --lib dataset::dataset_http::tests::futurehouse_pinned_product_fetch --locked -- --exact --ignored --nocapture
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --lib dataset::dataset_http::tests::futurehouse_pinned_product_source_to_cases --locked -- --exact --ignored --nocapture
 
 issue-229-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_229_dataset_registry {{test_name}} --locked -- --nocapture

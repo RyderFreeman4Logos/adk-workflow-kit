@@ -168,6 +168,7 @@ pub use dataset_identity::{
     DatasetProvenance, DatasetReport, DatasetSourceIdentity, LocalFileSource, PreparedDataset,
 };
 use dataset_identity::{expected_identity, is_pinned_entry, is_sha256, valid_source_identity};
+pub use dataset_parquet::{DatasetCase, ParquetCaseError, decode_parquet_cases};
 
 #[path = "dataset_cache_security.rs"]
 mod dataset_cache_security;
@@ -175,6 +176,8 @@ mod dataset_cache_security;
 mod dataset_http;
 #[path = "dataset_identity.rs"]
 mod dataset_identity;
+#[path = "dataset_parquet.rs"]
+mod dataset_parquet;
 
 /// Byte source used by fetch. Implementations must attest the selected source identity.
 pub trait ByteSource {
