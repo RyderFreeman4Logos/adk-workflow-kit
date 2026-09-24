@@ -19,6 +19,7 @@ mod production_profile;
 mod pure_transform;
 mod sandbox_execution;
 mod security;
+mod sentinel_carriers;
 mod sentinel_envelope;
 mod sentinel_segments;
 mod session;
@@ -104,6 +105,10 @@ pub use security::{
     ProbeBindingError, SECRET_POLICY_VERSION, SECURITY_MODEL_VERSION, SYNTHETIC_HONEYTOKEN_PREFIX,
     SecretPolicyError, SentinelProbe, SyntheticHoneytoken, SyntheticSecretPolicy, TrustDomain,
     TrustPolicy, TrustPolicyError,
+};
+pub use sentinel_carriers::{
+    CarrierAnalysis, CarrierCandidate, CarrierLimits, CarrierMode, CarrierReason, CarrierStatus,
+    DecodedCarrierView, SENTINEL_CARRIER_VERSION,
 };
 pub use sentinel_envelope::{
     CanonicalUntrustedText, CarrierAnnotation, CarrierKind, NormalizationLimits,

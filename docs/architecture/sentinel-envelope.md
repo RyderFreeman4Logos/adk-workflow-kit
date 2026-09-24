@@ -99,6 +99,53 @@ with confidence 1.0, which cannot resolve the required ambiguity. A future
 classifier needs pinned model/version identity, reliable abstention and measured
 multilingual hard-negative coverage before enabling supported-language routing.
 
+## Bounded carrier analysis (recognized syntax only)
+
+`CanonicalUntrustedText::analyze_carriers(mode, limits)` is an explicit optional
+stage, not part of normalization or language attribution. `AnnotateOnly` records
+root candidates without decoding; `Decode` also produces separate immutable
+UTF-8 analysis views and recursively searches those views. Neither mode changes
+the retained artifact, canonical text, envelope, author provenance or untrusted
+analysis domain. A candidate is not proof of Injection; no candidates is not Clean.
+Decoded text must stay in an untrusted data role, just like the original envelope.
+
+The v1 subset recognizes literal `<!--...-->`, `[//]: # (...)`, standalone runs
+of `%HH`, `\xHH` and `\uHHHH`, and explicitly labeled `base64:` / `hex:` tokens.
+The comment patterns are candidates, not claims about actual rendered visibility.
+Backtick/tilde-delimited literals and HTTP(S)/FTP/www URL runs are not decoded.
+Unclosed literal delimiters consume the remaining literal region. Bare Base64,
+hex digests, numeric literals, ordinary percent signs and normal backslash escapes
+are not guessed to be encoded instructions. This is **not an HTML, Markdown,
+JSON, CSS, or programming-language parser**. Hidden elements/attributes/styles,
+entities, arbitrary reference-comment forms, unlabeled encodings, mixed literal
+and escaped strings, URL encodings inside URLs, and surrogate-pair escapes remain
+unsupported. All original text still reaches the complete canonical envelope.
+
+Base64 uses the already-locked `base64 = 0.22.1` strict standard alphabet and
+canonical padding; URL-safe and unpadded variants are not silently accepted.
+Invalid encoding, malformed comment delimiters, or non-UTF-8 output retain an
+`InvalidEncoding` candidate with original evidence and no decoded view. Invalid
+encoding does not manufacture replacement characters or a security verdict.
+Each decoded scalar has an original-artifact covering `SourceSpan`; byte escapes
+compose exact spans, and Base64 conservatively covers its entire source quantum.
+Nested spans compose these covers, including any removed controls between them.
+Candidates form a deterministic preorder list with parent indices and root depth
+one. Decoded `Debug` output is content-free.
+
+Default limits are 65,536 input bytes, 256 candidates, depth 3, 65,536 aggregate
+expanded bytes and 1,048,576 work units. Hard ceilings are respectively 65,536,
+4,096, 8, 262,144 and 16,777,216. Caller policy rejects unknown fields and excessive
+values. Work units charge bytes admitted to each scan, decoder and output-mapping
+pass; fixed recognition checks, bounded binary searches for source spans and
+UTF-8 validation add constant-factor work under these hard ceilings. This is not
+a wall-clock guarantee. Expanded bytes include intermediate and attempted invalid
+output, not just final leaves. Allocation checks precede each decoded chunk.
+Limits are aggregate across siblings and nested transformations. Exceeding any
+limit, including discovery of a candidate beyond the depth ceiling, returns an
+atomic `ResourceLimit` error with no partial analysis. Annotation-only never
+claims nested coverage. Decoded controls are retained verbatim, not recursively
+normalized or assigned language/safety labels.
+
 ## Cache and telemetry
 
 `CanonicalUntrustedText::bind_cache_key` consumes existing `NodeCacheKeyMaterial`
@@ -135,7 +182,7 @@ Run `just issue-231-runtime` (offline, no credentials).
 | Cache identity and structured telemetry | `cache_consumes_canonical_policy_raw_bytes_and_trust_provenance`, `telemetry_is_versioned_deterministic_and_does_not_echo_text` |
 | en/zh/ja versus material unsupported spans | Blocked on validated attribution; `Unattributed` explicitly stops supported-language routing; no language allowlist claimed |
 | Code/URL/identifier/emoji/math/data segmentation | Bounded recognized-syntax subset, mapped spans; `segmentation::*` focused fixtures; exclusions are lexical, not safety approval |
-| Hidden HTML/Markdown, escaping, Base64, hex, nested decoding | Pending |
+| Hidden HTML/Markdown, escaping, Base64, hex, nested decoding | Bounded explicit candidate subset, optional decoded views and composed maps; `carriers::*`; arbitrary hidden markup remains pending |
 | Unicode mapping/resource property corpus | `deterministic_unicode_property_corpus_has_total_source_coverage` (512 deterministic cases), joiner/variation-selector fixture |
 | Multilingual/hard-negative/nested-encoding fuzz fixtures | Pending |
 | Spec/IR/compiler runtime routing | Pending design of the language-policy binding; existing artifact runtime integrated |

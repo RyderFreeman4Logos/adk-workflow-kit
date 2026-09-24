@@ -1,3 +1,5 @@
+#[path = "issue_231/carriers.rs"]
+mod carriers;
 #[path = "issue_231/segmentation.rs"]
 mod segmentation;
 

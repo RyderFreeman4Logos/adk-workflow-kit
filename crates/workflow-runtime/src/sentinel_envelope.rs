@@ -83,6 +83,12 @@ pub enum CarrierKind {
     ZeroWidth,
     Bidi,
     Control,
+    HtmlComment,
+    MarkdownComment,
+    Percent,
+    Escape,
+    Base64,
+    Hex,
 }
 
 impl CarrierKind {
@@ -91,6 +97,12 @@ impl CarrierKind {
             Self::ZeroWidth => "zero_width",
             Self::Bidi => "bidi",
             Self::Control => "control",
+            Self::HtmlComment => "html_comment",
+            Self::MarkdownComment => "markdown_comment",
+            Self::Percent => "percent",
+            Self::Escape => "escape",
+            Self::Base64 => "base64",
+            Self::Hex => "hex",
         }
     }
 }
@@ -118,6 +130,13 @@ pub struct NormalizedSourceSpan {
     source: SourceSpan,
 }
 impl NormalizedSourceSpan {
+    pub(super) fn new(normalized_start: usize, normalized_end: usize, source: SourceSpan) -> Self {
+        Self {
+            normalized_start,
+            normalized_end,
+            source,
+        }
+    }
     pub const fn normalized_start(&self) -> usize {
         self.normalized_start
     }
@@ -210,6 +229,7 @@ impl CanonicalUntrustedText {
             "schema_version": SENTINEL_ENVELOPE_SCHEMA_VERSION,
             "normalizer_version": SENTINEL_NORMALIZATION_VERSION,
             "segmentation_version": crate::SENTINEL_SEGMENTATION_VERSION,
+            "carrier_version": crate::SENTINEL_CARRIER_VERSION,
             "script_data_version": crate::SENTINEL_SCRIPT_DATA_VERSION,
             "state": "prepared",
             "trust_domain": TrustDomain::UntrustedContent,
@@ -228,6 +248,7 @@ impl CanonicalUntrustedText {
         let unicode = std::char::UNICODE_VERSION;
         hash_fields(&[
             SENTINEL_NORMALIZATION_VERSION.as_bytes(),
+            crate::SENTINEL_CARRIER_VERSION.as_bytes(),
             crate::SENTINEL_SEGMENTATION_VERSION.as_bytes(),
             crate::SENTINEL_SCRIPT_DATA_VERSION.as_bytes(),
             &SENTINEL_ENVELOPE_SCHEMA_VERSION.to_be_bytes(),

@@ -3411,6 +3411,7 @@ dependencies = [
 name = "workflow-runtime"
 version = "0.2.4"
 dependencies = [
+ "base64",
  "bytes",
  "jsonschema 0.45.1",
  "parquet",

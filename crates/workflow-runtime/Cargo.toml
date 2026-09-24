@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = "=0.22.1"
 bytes = "1"
 jsonschema.workspace = true
 parquet = { version = "60", default-features = false, features = ["snap"] }
