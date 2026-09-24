@@ -1,4 +1,8 @@
 //! Opt-in ADK graph judges. Immutable inputs, isolated stateless requests, no tools.
+#[cfg(test)]
+#[path = "semantic_firewall_tests.rs"]
+mod tests;
+
 use crate::TranslationError;
 use crate::model_invocation::{
     InferenceBudget, ModelInvocationSpec, PromptProtocol, ProviderRouteIdentity, ReasoningEffort,
@@ -123,6 +127,7 @@ impl SemanticFirewall {
             END, ExecutionConfig, GraphAgent, NodeOutput, START, State,
         };
         let mut graph = GraphAgent::builder("semantic_firewall_v1")
+            .max_concurrency(JudgeKind::ALL.len())
             .channels(&JudgeKind::ALL.map(JudgeKind::id));
         for (kind, (binding, low, high)) in &self.judges {
             let kind = *kind;

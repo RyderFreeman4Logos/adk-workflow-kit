@@ -60,7 +60,10 @@ or billed cost. Timing never enters deterministic decision/cache identity.
 ## Local checks and exclusions
 
 Run `mise exec -- just issue-239-runtime`, `mise exec -- just issue-239-adk`,
-`mise exec -- just issue-238-adk`, and `mise exec -- just issue-238-concurrent`.
+`mise exec -- just issue-238-adk`, `mise exec -- just issue-238-concurrent`, and
+`mise exec -- just issue-239-isolation`. The isolation suite uses a four-party
+barrier at first model entry (not a latency threshold), checks zero model entry on
+hard denial/approval/resume, and exercises a never-ending stream timeout.
 Fixtures use explicit provider-free fake models and exercise public compilation,
 translation, ordinary invocation and observed invocation. Wire tests reject duplicate
 keys before generic JSON decoding can collapse them.
