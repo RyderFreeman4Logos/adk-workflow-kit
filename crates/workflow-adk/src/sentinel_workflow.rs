@@ -11,7 +11,8 @@ use workflow_runtime::{
     NodeCacheKey, NodeCacheKeyMaterial, NormalizationLimits, SECURITY_MODEL_VERSION,
     SENTINEL_CARRIER_VERSION, SENTINEL_ENVELOPE_SCHEMA_VERSION, SENTINEL_LANGUAGE_POLICY_VERSION,
     SENTINEL_NORMALIZATION_VERSION, SENTINEL_SCRIPT_DATA_VERSION, SENTINEL_SEGMENTATION_VERSION,
-    SegmentationLimits, SentinelPreparation, SentinelVerdict, TrustDomain, prepare_untrusted_text,
+    SegmentationLimits, SentinelPreparation, SentinelVerdict, TYPED_OUTPUT_SCHEMA_VERSION_V1,
+    TrustDomain, prepare_untrusted_text,
 };
 use workflow_spec::UntrustedTextPreparation;
 
@@ -74,6 +75,7 @@ impl PreparationWorkflow {
             "version": VERSION,
             "normalizer": SENTINEL_NORMALIZATION_VERSION,
             "envelope_schema": SENTINEL_ENVELOPE_SCHEMA_VERSION,
+            "typed_output_schema": TYPED_OUTPUT_SCHEMA_VERSION_V1,
             "carrier": SENTINEL_CARRIER_VERSION,
             "segmentation": SENTINEL_SEGMENTATION_VERSION,
             "language": SENTINEL_LANGUAGE_POLICY_VERSION,

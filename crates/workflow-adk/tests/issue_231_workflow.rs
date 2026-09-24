@@ -172,6 +172,84 @@ fn actual_path_cache_identity_binds_raw_policy_and_workflow() {
 }
 
 #[test]
+fn actual_path_cache_key_has_an_independent_versioned_policy_oracle() {
+    use workflow_runtime::{
+        SECURITY_MODEL_VERSION, SENTINEL_CARRIER_VERSION, SENTINEL_ENVELOPE_SCHEMA_VERSION,
+        SENTINEL_LANGUAGE_POLICY_VERSION, SENTINEL_NORMALIZATION_VERSION,
+        SENTINEL_SCRIPT_DATA_VERSION, SENTINEL_SEGMENTATION_VERSION,
+        TYPED_OUTPUT_SCHEMA_VERSION_V1,
+    };
+    let root = Root::new();
+    let raw = b"1";
+    let (result, _) = run(&root, WORKFLOW, input(raw));
+    let policy = json!({
+        "version":"sentinel-workflow-preparation-v1",
+        "normalizer":SENTINEL_NORMALIZATION_VERSION,
+        "envelope_schema":SENTINEL_ENVELOPE_SCHEMA_VERSION,
+        "typed_output_schema":TYPED_OUTPUT_SCHEMA_VERSION_V1,
+        "carrier":SENTINEL_CARRIER_VERSION,
+        "segmentation":SENTINEL_SEGMENTATION_VERSION,
+        "language":SENTINEL_LANGUAGE_POLICY_VERSION,
+        "script_data":SENTINEL_SCRIPT_DATA_VERSION,
+        "unicode":std::char::UNICODE_VERSION,
+        "security":SECURITY_MODEL_VERSION,
+        "normalization_limits":{"max_input_bytes":65536,"max_output_bytes":262144,"max_work_units":1048576},
+        "carrier_limits":{"max_input_bytes":65536,"max_candidates":256,"max_depth":3,"max_expanded_bytes":65536,"max_work_units":1048576},
+        "carrier_mode":"decode",
+        "segmentation_limits":{"max_bytes":16384,"max_segments":4096},
+        "language_policy":{"en":true,"zh":true,"ja":true},
+        "trust_domain":"untrusted_content",
+    });
+    let digest = |bytes: &[u8]| format!("sha256:{:x}", Sha256::digest(bytes));
+    let expected_policy = digest(&serde_json::to_vec(&policy).unwrap());
+    assert_eq!(result["policy_digest"], expected_policy);
+    let plan = workflow_compiler::compile_str("sentinel.toml", WORKFLOW).unwrap();
+    let ir_hash = plan
+        .ir()
+        .canonical_hash()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let raw_digest = digest(raw);
+    let expected_key = |policy_digest: &str| {
+        let fields = [
+            ("WORKFLOW_ID", "sentinel-preparation"),
+            ("WORKFLOW_VERSION", "1"),
+            ("NODE_ID", "prepare"),
+            ("NODE_VERSION", "sentinel-workflow-preparation-v1"),
+            ("INVOCATION_IDENTITY", ir_hash.as_str()),
+            ("INPUT_ARTIFACT_HASHES", raw_digest.as_str()),
+            ("REQUEST_INPUT_DIGEST", raw_digest.as_str()),
+            ("POLICY_DIGEST", policy_digest),
+        ];
+        digest(
+            fields
+                .iter()
+                .map(|(label, value)| format!("{label}_BYTES:{}\n{value}", value.len()))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .as_bytes(),
+        )
+    };
+    assert_eq!(result["cache_key"], expected_key(&expected_policy));
+    let mut changed = policy.clone();
+    changed["typed_output_schema"] = json!(TYPED_OUTPUT_SCHEMA_VERSION_V1 + 1);
+    assert_ne!(
+        result["cache_key"],
+        expected_key(&digest(&serde_json::to_vec(&changed).unwrap()))
+    );
+    changed
+        .as_object_mut()
+        .unwrap()
+        .remove("typed_output_schema");
+    assert_ne!(
+        result["cache_key"],
+        expected_key(&digest(&serde_json::to_vec(&changed).unwrap()))
+    );
+}
+
+#[test]
 fn observed_boundary_rejects_forged_state_resume_and_unretained_execution() {
     use adk_rust::graph::prelude::{ExecutionConfig, State};
     use std::num::NonZeroU64;
