@@ -2,7 +2,9 @@ use super::*;
 use crate::firewall::tests::fixture;
 use crate::{
     AdkGraphError, AdkGraphTranslator,
-    model_profiles::{CredentialBroker, FakeModelProfile, ModelProfileRegistry},
+    model_profiles::{
+        CredentialBroker, FakeModelProfile, ModelProfileRegistry, ModelRuntimeConfig,
+    },
 };
 use adk_rust::{
     Content, Llm, LlmRequest, LlmResponse,
@@ -46,18 +48,16 @@ fn facts() -> SemanticFacts {
         "scope":"incident", "destination":"local service", "data_class":"internal", "provenance":"untrusted_content",
         "argument_summary":"one incident record", "impact":"low"})).unwrap()
 }
-fn semantic(probe: Arc<Probe>, timeout: Duration) -> SemanticFirewall {
+fn semantic(probe: Arc<dyn Llm>, timeout: Duration, profile_timeout: Duration) -> SemanticFirewall {
     let bindings = JudgeKind::ALL
         .into_iter()
         .map(|kind| {
             let mut registry = ModelProfileRegistry::new();
             registry
-                .register_worker(FakeModelProfile::new(
-                    kind.id(),
-                    "1",
-                    "scripted",
-                    ["unused"],
-                ))
+                .register_worker(
+                    FakeModelProfile::new(kind.id(), "1", "scripted", ["unused"])
+                        .with_runtime(ModelRuntimeConfig::default().with_timeout(profile_timeout)),
+                )
                 .unwrap();
             (
                 kind,
@@ -97,7 +97,7 @@ async fn four_judges_enter_concurrently_with_isolated_canonical_requests() {
     });
     let downstream = Arc::new(AtomicUsize::new(0));
     let graph = graph(
-        semantic(probe, Duration::from_secs(2)),
+        semantic(probe, Duration::from_secs(2), Duration::from_secs(30)),
         "low_risk",
         "noop",
         downstream.clone(),
@@ -155,7 +155,7 @@ async fn hard_denial_approval_and_resume_enter_zero_model_futures() {
         });
         let downstream = Arc::new(AtomicUsize::new(0));
         let graph = graph(
-            semantic(probe, Duration::from_secs(1)),
+            semantic(probe, Duration::from_secs(1), Duration::from_secs(30)),
             admission,
             tool,
             downstream.clone(),
@@ -182,7 +182,7 @@ async fn hanging_streams_timeout_without_escalation_or_downstream_work() {
     });
     let downstream = Arc::new(AtomicUsize::new(0));
     let graph = graph(
-        semantic(probe, Duration::from_millis(20)),
+        semantic(probe, Duration::from_millis(20), Duration::from_secs(30)),
         "low_risk",
         "noop",
         downstream.clone(),
@@ -204,4 +204,181 @@ async fn hanging_streams_timeout_without_escalation_or_downstream_work() {
         "timeouts never escalate/retry"
     );
     assert_eq!(downstream.load(Ordering::SeqCst), 0);
+}
+
+#[derive(Clone, Copy)]
+enum Failure {
+    PendingRequest,
+    PendingStream,
+    ProviderRequestTimeout,
+    ProviderStreamTimeout,
+    ProviderError,
+    Malformed,
+}
+const PRIVATE_DETAIL: &str = "synthetic-private-provider-detail";
+struct FailureProbe {
+    mode: Failure,
+    calls: AtomicUsize,
+}
+#[adk_rust::async_trait]
+impl Llm for FailureProbe {
+    fn name(&self) -> &str {
+        "scripted"
+    }
+    async fn generate_content(
+        &self,
+        _: LlmRequest,
+        _: bool,
+    ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let timeout = || {
+            adk_rust::AdkError::timeout(
+                adk_rust::ErrorComponent::Model,
+                "model.timeout",
+                PRIVATE_DETAIL,
+            )
+        };
+        match self.mode {
+            Failure::PendingRequest => std::future::pending().await,
+            Failure::PendingStream => Ok(Box::pin(adk_rust::futures::stream::pending())),
+            Failure::ProviderRequestTimeout => Err(timeout()),
+            Failure::ProviderStreamTimeout => {
+                Ok(Box::pin(adk_rust::futures::stream::iter([Err(timeout())])))
+            }
+            Failure::ProviderError => Err(adk_rust::AdkError::agent(PRIVATE_DETAIL)),
+            Failure::Malformed => Ok(Box::pin(adk_rust::futures::stream::iter([Ok(
+                LlmResponse::new(Content::new("assistant").with_text(PRIVATE_DETAIL)),
+            )]))),
+        }
+    }
+}
+async fn observed_failure(
+    mode: Failure,
+    profile_timeout: Duration,
+    timeout: Duration,
+    status: &str,
+) {
+    use crate::events::AdkEventMapper;
+    use workflow_runtime::{InMemoryArtifactStore, WorkflowRuntimeEventKindV1};
+    let probe = Arc::new(FailureProbe {
+        mode,
+        calls: AtomicUsize::new(0),
+    });
+    let downstream = Arc::new(AtomicUsize::new(0));
+    let graph = graph(
+        semantic(probe.clone(), timeout, profile_timeout),
+        "low_risk",
+        "noop",
+        downstream.clone(),
+    );
+    let mut mapper = AdkEventMapper::new("deadline-observed", "firewall-test").unwrap();
+    let limit = std::num::NonZeroU64::new(65536).unwrap();
+    let mut artifacts = InMemoryArtifactStore::new(limit, limit);
+    let result = adk_rust::tokio::time::timeout(
+        Duration::from_secs(10),
+        graph.invoke_observed(
+            State::from([("raw_content".into(), json!(PRIVATE_DETAIL))]),
+            ExecutionConfig::new("deadline"),
+            &mut mapper,
+            &mut artifacts,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.unwrap_err(), AdkGraphError::AuthorizationDenied);
+    assert_eq!(
+        graph.firewall_decisions().unwrap()["gate"].decision(),
+        FirewallDecision::Deny
+    );
+    assert_eq!(downstream.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        probe.calls.load(Ordering::SeqCst),
+        4,
+        "no retry or escalation"
+    );
+    let denied = mapper
+        .events()
+        .iter()
+        .filter(|event| event.kind() == WorkflowRuntimeEventKindV1::ToolDenied)
+        .collect::<Vec<_>>();
+    assert_eq!(denied.len(), 1);
+    let report = &denied[0].payload()["structured_output"]["semantic_firewall"];
+    assert_eq!(report["judges"].as_object().unwrap().len(), 4);
+    for kind in JudgeKind::ALL {
+        let judge = &report["judges"][kind.id()];
+        assert!(judge["decision"].is_null());
+        let passes = judge["passes"].as_array().unwrap();
+        assert_eq!(passes.len(), 1);
+        assert_eq!(passes[0]["inference_effort"], "low");
+        assert_eq!(passes[0]["canonical_output_bytes"], 0);
+        assert_eq!(passes[0]["status"], status);
+    }
+    for event in mapper.events() {
+        let payload = event.payload().to_string();
+        assert!(!payload.contains(PRIVATE_DETAIL));
+        assert!(!payload.contains("Read incident report"));
+    }
+}
+
+#[adk_rust::tokio::test]
+async fn observed_inner_request_deadline_is_timeout() {
+    observed_failure(
+        Failure::PendingRequest,
+        Duration::from_millis(20),
+        Duration::from_secs(5),
+        "timeout",
+    )
+    .await;
+}
+#[adk_rust::tokio::test]
+async fn observed_inner_stream_deadline_is_timeout() {
+    observed_failure(
+        Failure::PendingStream,
+        Duration::from_millis(20),
+        Duration::from_secs(5),
+        "timeout",
+    )
+    .await;
+}
+#[adk_rust::tokio::test]
+async fn observed_provider_request_timeout_is_timeout() {
+    observed_failure(
+        Failure::ProviderRequestTimeout,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        "timeout",
+    )
+    .await;
+}
+#[adk_rust::tokio::test]
+async fn observed_provider_stream_timeout_is_timeout() {
+    observed_failure(
+        Failure::ProviderStreamTimeout,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        "timeout",
+    )
+    .await;
+}
+#[adk_rust::tokio::test]
+async fn observed_outer_deadline_remains_timeout() {
+    observed_failure(
+        Failure::PendingStream,
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        "timeout",
+    )
+    .await;
+}
+#[adk_rust::tokio::test]
+async fn observed_malformed_and_provider_error_remain_invalid_or_failed() {
+    for mode in [Failure::Malformed, Failure::ProviderError] {
+        observed_failure(
+            mode,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            "invalid_or_failed",
+        )
+        .await;
+    }
 }

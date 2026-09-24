@@ -8,7 +8,7 @@ use crate::model_invocation::{
     InferenceBudget, ModelInvocationSpec, PromptProtocol, ProviderRouteIdentity, ReasoningEffort,
     StructuredOutputContract,
 };
-use crate::model_profiles::ModelBinding;
+use crate::model_profiles::{ModelBinding, ModelProfileErrorKind};
 use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use workflow_runtime::{argument_fingerprint, semantic_firewall::*};
@@ -96,7 +96,7 @@ impl SemanticFirewall {
             "low":low.invocation_identity(),"high":high.as_ref().map(ModelInvocationSpec::invocation_identity),
             "runtime":binding.runtime()})).collect::<Vec<_>>();
         argument_fingerprint(&json!({"version":SEMANTIC_FIREWALL_VERSION,"judges":judges,
-            "impact":self.impact,"timeout_ms":self.timeout.as_millis(),"input_schema":JudgeInput::schema()}))
+            "impact":self.impact,"timeout_ns":self.timeout.as_nanos(),"input_schema":JudgeInput::schema()}))
     }
 }
 fn instruction(kind: JudgeKind) -> &'static str {
@@ -209,6 +209,9 @@ async fn judge_pass(
     let mut bytes = 0;
     let (output, status) = match result {
         Err(_) => (None, "timeout"),
+        Ok(Err(error)) if error.model_error() == Some(ModelProfileErrorKind::Timeout) => {
+            (None, "timeout")
+        }
         Ok(Err(_)) => (None, "invalid_or_failed"),
         Ok(Ok(result)) => {
             let wire = result.output().to_string();

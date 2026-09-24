@@ -180,6 +180,40 @@ fn semantic_binding_rejects_partial_coverage_and_stale_compiled_identity() {
     );
 }
 
+#[test]
+fn semantic_deadline_binding_preserves_submillisecond_precision() {
+    let bind = |timeout| {
+        fixture::invocation("low_risk", "noop").with_semantic(
+            SemanticFirewall::new(facts("low"), bindings(["alw"; 4]), false, timeout).unwrap(),
+        )
+    };
+    let first = Duration::from_nanos(1_000_000_001);
+    let second = Duration::from_nanos(1_000_000_002);
+    assert_eq!(first.as_millis(), second.as_millis());
+    let original = bind(first);
+    let equal = bind(first);
+    let changed = bind(second);
+    let plan =
+        workflow_compiler::compile_str("semantic.toml", &fixture::source(&original.identity()))
+            .unwrap();
+    let agents = BTreeMap::from([(
+        "judge".into(),
+        Arc::new(fixture::CountingJudge(Arc::new(AtomicUsize::new(0)))) as Arc<dyn adk_rust::Agent>,
+    )]);
+    assert_eq!(original.identity(), equal.identity());
+    assert!(
+        AdkGraphTranslator::new()
+            .translate_with_firewall(&plan, equal, &agents)
+            .is_ok()
+    );
+    let distinct_identity = original.identity() != changed.identity();
+    let stale_rejected = matches!(
+        AdkGraphTranslator::new().translate_with_firewall(&plan, changed, &agents),
+        Err(workflow_adk::TranslationError::FirewallBinding)
+    );
+    assert_eq!((distinct_identity, stale_rejected), (true, true));
+}
+
 #[tokio::test]
 async fn duplicate_model_keys_cannot_collapse_into_an_allow() {
     let mut models = bindings(["alw"; 4]);
