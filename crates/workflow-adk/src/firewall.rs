@@ -46,6 +46,18 @@ impl FirewallInvocation {
 
 pub(crate) type Decisions = Arc<Mutex<BTreeMap<String, ToolDecision>>>;
 
+adk_rust::tokio::task_local! {
+    // ADK 2.1 polls node futures inline (buffer_unordered), including streamed
+    // super-steps. Scope follows the invocation future, not a checkpoint/thread ID.
+    // A future executor that spawns gate tasks must explicitly carry this scope;
+    // execute fails closed if the scope is absent.
+    static RUN_DECISIONS: Decisions;
+}
+
+#[cfg(test)]
+#[path = "firewall_tests.rs"]
+pub(crate) mod tests;
+
 impl AdkGraphTranslator {
     /// Translate an explicitly bound Firewall entry gate. Deny and approval waits
     /// both terminate execution before any downstream model, approval, or action.
@@ -60,14 +72,29 @@ impl AdkGraphTranslator {
     }
 }
 impl AdkGraph {
+    pub(crate) async fn firewall_run<T>(
+        &self,
+        run: impl std::future::Future<Output = Result<T, AdkGraphError>>,
+    ) -> Result<T, AdkGraphError> {
+        if self.firewall_entry.is_none() {
+            return run.await;
+        }
+        let records = Decisions::default();
+        let result = RUN_DECISIONS.scope(Arc::clone(&records), run).await;
+        // Publish a last-completed snapshot only. Mappers never consume this shared
+        // accessor, and cancellation drops the private records without publishing.
+        let snapshot = records.lock().map_err(|_| AdkGraphError::Failed)?.clone();
+        *self
+            .firewall_decisions
+            .lock()
+            .map_err(|_| AdkGraphError::Failed)? = snapshot;
+        result
+    }
+
     pub(crate) fn prepare_firewall_run(
         &self,
         config: &adk_rust::graph::prelude::ExecutionConfig,
     ) -> Result<(), AdkGraphError> {
-        self.firewall_decisions
-            .lock()
-            .map_err(|_| AdkGraphError::Failed)?
-            .clear();
         // Resume/approval execution needs the fresh-target ledger contract in #240.
         if self.firewall_entry.is_some() && config.resume_from.is_some() {
             return Err(AdkGraphError::AuthorizationDenied);
@@ -82,7 +109,14 @@ impl AdkGraph {
         artifacts: &mut S,
     ) -> Result<(), AdkGraphError> {
         use crate::events::AdkRuntimeObservationKindV1 as Kind;
-        for (node, decision) in self.firewall_decisions()? {
+        if self.firewall_entry.is_none() {
+            return Ok(());
+        }
+        let records = RUN_DECISIONS
+            .try_with(Arc::clone)
+            .map_err(|_| AdkGraphError::Failed)?;
+        let snapshot = records.lock().map_err(|_| AdkGraphError::Failed)?.clone();
+        for (node, decision) in snapshot {
             if !observed.insert(node.clone()) {
                 continue;
             }
@@ -107,7 +141,10 @@ impl AdkGraph {
         Ok(())
     }
 
-    /// Privacy-safe typed observations emitted by the gate actually executed.
+    /// Privacy-safe reports from the most recently completed invocation (including
+    /// errors). Rejected resume publishes an empty snapshot; cancellation does not
+    /// publish. Concurrent callers needing attribution must use `invoke_observed`:
+    /// its mapper owns only that invocation's reports, independently of this snapshot.
     pub fn firewall_decisions(&self) -> Result<BTreeMap<String, ToolDecision>, AdkGraphError> {
         self.firewall_decisions
             .lock()
@@ -143,7 +180,6 @@ pub(crate) fn validate_binding(
 
 pub(crate) fn execute(
     invocation: &FirewallInvocation,
-    records: &Decisions,
     node: &str,
 ) -> Result<NodeOutput, GraphError> {
     let decision = invocation
@@ -155,7 +191,9 @@ pub(crate) fn execute(
             .map_err(|_| GraphError::Other("Firewall output failed".into()))?,
     )
     .map_err(|_| GraphError::Other("Firewall output failed".into()))?;
-    records
+    RUN_DECISIONS
+        .try_with(Arc::clone)
+        .map_err(|_| GraphError::Other("Firewall invocation scope missing".into()))?
         .lock()
         .map_err(|_| GraphError::Other("Firewall observation failed".into()))?
         .insert(node.to_owned(), decision.clone());

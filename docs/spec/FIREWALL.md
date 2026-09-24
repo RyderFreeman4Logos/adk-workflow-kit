@@ -116,8 +116,13 @@ before downstream judges, approval nodes, or actions. `AdkGraphError::Authorizat
 is the execution stop; inspect the typed decision for the distinct outcome/reason.
 An allow writes the compact envelope to `node:gate` before continuing. Explicit
 checkpoint resume is rejected before execution; a stopped graph cannot be resumed
-past its hard gate. Each invocation clears prior decision observations.
-The observed execution path emits `ToolAuthorized`, `ToolDenied`, or
+past its hard gate. Gate records belong to the invocation future, independent of
+checkpoint thread IDs; concurrent runs do not clear, consume, or replay each other's
+reports. `firewall_decisions()` is a last-completed-invocation snapshot (including
+errors): rejected resume publishes an empty snapshot, while cancellation leaves the
+previous completed snapshot unchanged. Use each invocation's mapper for concurrent
+attribution, not that shared snapshot.
+The observed execution path emits exactly one `ToolAuthorized`, `ToolDenied`, or
 `ApprovalRequested` with the compact envelope under
 `payload.structured_output.firewall`, without emitting a model request.
 
@@ -133,6 +138,7 @@ coverage is inapplicable because the gate has no semantic-model behavior.
 ```sh
 mise exec -- just issue-238-runtime
 mise exec -- just issue-238-adk
+mise exec -- just issue-238-concurrent
 mise exec -- just issue-228-runtime
 mise exec -- just m1-15-translation
 ```

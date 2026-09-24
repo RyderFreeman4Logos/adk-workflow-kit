@@ -503,6 +503,14 @@ impl AdkGraph {
         state: State,
         config: ExecutionConfig,
     ) -> Result<State, AdkGraphError> {
+        self.firewall_run(self.invoke_inner(state, config)).await
+    }
+
+    async fn invoke_inner(
+        &self,
+        state: State,
+        config: ExecutionConfig,
+    ) -> Result<State, AdkGraphError> {
         self.prepare_firewall_run(&config)?;
         let mut state = self.input.map(state);
         state.retain(|key, _| !key.starts_with("visits:"));
@@ -568,6 +576,17 @@ impl AdkGraph {
 
     /// Executes the production graph stream and appends real ADK events through the project mapper.
     pub async fn invoke_observed<S: workflow_runtime::ArtifactStore>(
+        &self,
+        state: State,
+        config: ExecutionConfig,
+        mapper: &mut events::AdkEventMapper,
+        artifacts: &mut S,
+    ) -> Result<State, AdkGraphError> {
+        self.firewall_run(self.invoke_observed_inner(state, config, mapper, artifacts))
+            .await
+    }
+
+    async fn invoke_observed_inner<S: workflow_runtime::ArtifactStore>(
         &self,
         state: State,
         config: ExecutionConfig,
@@ -1235,12 +1254,17 @@ impl AdkGraphTranslator {
             order.push(id.clone());
             if node.firewall().is_some() {
                 let invocation = firewall.clone().ok_or(TranslationError::FirewallBinding)?;
-                let records = Arc::clone(&firewall_decisions);
                 builder = builder.node_fn(&id.clone(), move |_context| {
                     let invocation = invocation.clone();
-                    let records = Arc::clone(&records);
                     let node = id.clone();
-                    async move { firewall::execute(&invocation, &records, &node) }
+                    async move {
+                        #[cfg(test)]
+                        firewall::tests::at_gate(true).await;
+                        let result = firewall::execute(&invocation, &node);
+                        #[cfg(test)]
+                        firewall::tests::at_gate(false).await;
+                        result
+                    }
                 });
             } else if node.kind() == IrNodeKind::Agent {
                 agent_nodes.insert(id.clone());
