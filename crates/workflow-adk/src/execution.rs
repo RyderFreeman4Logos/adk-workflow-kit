@@ -4970,7 +4970,11 @@ impl ExecutionBackend {
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
                 let mut start = State::new();
                 start.insert("input".to_owned(), input.clone());
-                if let Some(object) = input.as_object() {
+                // Strict preparation consumes the immutable whole request above, not
+                // caller members. Preserve legacy flattening only for other workflows.
+                if graph.untrusted_text.is_none()
+                    && let Some(object) = input.as_object()
+                {
                     for (key, value) in object {
                         start.insert(key.clone(), value.clone());
                     }

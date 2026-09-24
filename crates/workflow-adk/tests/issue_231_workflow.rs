@@ -226,6 +226,44 @@ fn observed_boundary_rejects_forged_state_resume_and_unretained_execution() {
 }
 
 #[test]
+fn original_request_cannot_be_shadowed_by_a_caller_input_member() {
+    let root = Root::new();
+    for wrapped in [
+        json!({"schema_version":1,"bytes":[255],"input":input(b"1")}),
+        json!({"input":input(b"1")}),
+        json!({"input":input(b"1"),"__workflow_original_input":input(b"1")}),
+    ] {
+        let (result, path) = run(&root, WORKFLOW, wrapped);
+        assert_eq!(result["state"], "invalid_input");
+        assert_eq!(result["reason"], "invalid_byte_payload");
+        assert_eq!(result["original_artifact_id"], Value::Null);
+        assert_eq!(result["cache_key"], Value::Null);
+        assert!(!events(&path).iter().any(|event| {
+            event["payload"]["artifact_reference"]["artifact_id"]
+                == format!("{:x}", Sha256::digest(b"1"))
+        }));
+    }
+    let (admitted, _) = run(&root, WORKFLOW, input(b"1"));
+    assert_eq!(admitted["state"], "pending_classification");
+
+    // Legacy workflows still expose caller members, including the input collision.
+    let legacy = WORKFLOW.split("[nodes.untrusted_text]").next().unwrap();
+    let (_, path) = run(&root, legacy, json!({"input":"legacy", "other":7}));
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(path.join("run-manifest.json")).unwrap()).unwrap();
+    use workflow_runtime::{CheckpointManifestV1, RunId, SqliteCheckpointStore};
+    let run_id = RunId::new(manifest["run_id"].as_str().unwrap().to_owned()).unwrap();
+    let checkpoint_manifest: CheckpointManifestV1 =
+        serde_json::from_slice(&fs::read(path.join("checkpoint-manifest.json")).unwrap()).unwrap();
+    let store =
+        SqliteCheckpointStore::open(path.join("checkpoint.sqlite"), checkpoint_manifest).unwrap();
+    let checkpoint = store.load_latest(&run_id).unwrap().unwrap();
+    let output: Value = serde_json::from_slice(checkpoint.state()).unwrap();
+    assert_eq!(output["input"], "legacy");
+    assert_eq!(output["other"], 7);
+}
+
+#[test]
 fn explicit_byte_schema_and_carrier_pipeline_are_exercised_by_real_runs() {
     let root = Root::new();
     for invalid in [
