@@ -212,7 +212,7 @@ impl CanonicalUntrustedText {
             "state": "prepared",
             "trust_domain": TrustDomain::UntrustedContent,
             "original_artifact_id": self.original_id,
-            "normalized_sha256": hash_fields(&[self.normalized.as_bytes()]),
+            "normalized_sha256": format!("sha256:{:x}", Sha256::digest(self.normalized.as_bytes())),
             "normalized_bytes": self.normalized.len(),
             "source_map_entries": self.source_map.len(),
             "annotation_count": self.annotations.len(),
@@ -316,19 +316,24 @@ fn normalize(
         let source = SourceSpan::new(id.as_str(), start as u64, (start + ch.len_utf8()) as u64)
             .map_err(|_| NormalizationReason::InvalidPolicy)?;
         if let Some(kind) = carrier(ch) {
-            result.annotations.push(CarrierAnnotation { kind, source });
-        } else {
-            let normalized_start = result.normalized.len();
-            if normalized_start + ch.len_utf8() > limits.max_output_bytes {
-                return Err(NormalizationReason::ResourceLimit);
-            }
-            result.normalized.push(ch);
-            result.source_map.push(NormalizedSourceSpan {
-                normalized_start,
-                normalized_end: result.normalized.len(),
-                source,
+            result.annotations.push(CarrierAnnotation {
+                kind,
+                source: source.clone(),
             });
+            if !preserved_format(ch) {
+                continue;
+            }
         }
+        let normalized_start = result.normalized.len();
+        if normalized_start + ch.len_utf8() > limits.max_output_bytes {
+            return Err(NormalizationReason::ResourceLimit);
+        }
+        result.normalized.push(ch);
+        result.source_map.push(NormalizedSourceSpan {
+            normalized_start,
+            normalized_end: result.normalized.len(),
+            source,
+        });
     }
     Ok(result)
 }
@@ -342,14 +347,19 @@ fn hash_fields(fields: &[&[u8]]) -> String {
     format!("sha256:{:x}", hash.finalize())
 }
 
+fn preserved_format(ch: char) -> bool {
+    matches!(ch, '\u{200c}' | '\u{200d}' | '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}')
+}
+
 fn carrier(ch: char) -> Option<CarrierKind> {
     match ch {
         '\u{061c}'
         | '\u{200e}'..='\u{200f}'
         | '\u{202a}'..='\u{202e}'
         | '\u{2066}'..='\u{2069}' => Some(CarrierKind::Bidi),
-        // Preserve joiners/variation selectors: removing them changes legitimate
-        // emoji and orthography. They still need annotation in a later view.
+        ch if preserved_format(ch) => Some(CarrierKind::ZeroWidth),
+        // Joiners and variation selectors are annotated but preserved above:
+        // deleting them changes legitimate emoji and orthography.
         '\u{00ad}' | '\u{034f}' | '\u{180e}' | '\u{200b}' | '\u{2060}' | '\u{feff}' => {
             Some(CarrierKind::ZeroWidth)
         }

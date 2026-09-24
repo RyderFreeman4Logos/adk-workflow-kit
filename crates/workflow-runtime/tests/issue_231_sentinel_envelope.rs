@@ -245,3 +245,114 @@ fn telemetry_is_versioned_deterministic_and_does_not_echo_text() {
             .contains("PRIVATE_PAYLOAD")
     );
 }
+
+#[test]
+fn emoji_joiners_and_variation_selectors_are_annotated_without_deletion() {
+    let raw = "👩\u{200d}💻 ☕\u{fe0f} name\u{200c}名";
+    let text = prepared(raw.as_bytes(), NormalizationLimits::default());
+    assert_eq!(text.normalized(), raw);
+    assert_eq!(text.annotations().len(), 3);
+    assert!(
+        text.annotations()
+            .iter()
+            .all(|a| a.kind().code() == "zero_width")
+    );
+    for annotation in text.annotations() {
+        let span = annotation.source();
+        assert!(text.source_map().iter().any(|m| m.source() == span));
+    }
+}
+
+#[test]
+fn telemetry_normalized_sha256_is_the_actual_view_digest() {
+    use sha2::{Digest, Sha256};
+    let text = prepared("a\u{200b}b".as_bytes(), NormalizationLimits::default());
+    assert_eq!(
+        text.telemetry()["normalized_sha256"],
+        format!("sha256:{:x}", Sha256::digest(b"ab"))
+    );
+}
+
+#[test]
+fn deterministic_unicode_property_corpus_has_total_source_coverage() {
+    let mut state = 0x231_u32;
+    for _ in 0..512 {
+        let mut raw = String::from("A\u{200b}\u{202e}\u{0001}\u{200d}\u{fe0f}");
+        for _ in 0..32 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            if let Some(ch) = char::from_u32(state % 0x110000) {
+                raw.push(ch);
+            }
+        }
+        let text = prepared(raw.as_bytes(), NormalizationLimits::default());
+        let repeated = prepared(raw.as_bytes(), NormalizationLimits::default());
+        assert_eq!(text.envelope(), repeated.envelope());
+        assert_eq!(text.source_map(), repeated.source_map());
+        assert_eq!(text.annotations(), repeated.annotations());
+        assert!(text.work_units() <= text.limits().max_work_units);
+        assert!(text.normalized().len() <= text.limits().max_output_bytes);
+        let mut next = 0;
+        let mut original_ranges = Vec::new();
+        for mapping in text.source_map() {
+            assert_eq!(mapping.normalized_start(), next);
+            next = mapping.normalized_end();
+            let source = mapping.source();
+            assert_eq!(source.artifact_id(), text.original_id().as_str());
+            assert_eq!(
+                &text.normalized()[mapping.normalized_start()..next],
+                &raw[source.start() as usize..source.end() as usize]
+            );
+            original_ranges.push((source.start(), source.end()));
+        }
+        assert_eq!(next, text.normalized().len());
+        original_ranges.extend(
+            text.annotations()
+                .iter()
+                .map(|a| (a.source().start(), a.source().end())),
+        );
+        original_ranges.sort_unstable();
+        original_ranges.dedup();
+        let mut cursor = 0;
+        for (start, end) in original_ranges {
+            assert_eq!(start, cursor);
+            assert!(end > start && end <= raw.len() as u64);
+            cursor = end;
+        }
+        assert_eq!(cursor, raw.len() as u64);
+    }
+}
+
+#[test]
+fn untrusted_policy_fields_and_storage_failures_cannot_mint_a_view() {
+    assert!(serde_json::from_value::<NormalizationLimits>(serde_json::json!({"max_input_bytes":100,"max_output_bytes":100,"max_work_units":100,"trusted":true})).is_err());
+    for limits in [
+        NormalizationLimits {
+            max_input_bytes: usize::MAX,
+            ..NormalizationLimits::default()
+        },
+        NormalizationLimits {
+            max_output_bytes: usize::MAX,
+            ..NormalizationLimits::default()
+        },
+        NormalizationLimits {
+            max_work_units: usize::MAX,
+            ..NormalizationLimits::default()
+        },
+    ] {
+        assert!(matches!(
+            prepare_untrusted_text(&mut store(), b"x", limits).unwrap(),
+            SentinelPreparation::Invalid {
+                reason: NormalizationReason::InvalidPolicy,
+                original_id: None
+            }
+        ));
+    }
+    let mut small_store =
+        InMemoryArtifactStore::new(NonZeroU64::new(1).unwrap(), NonZeroU64::new(1).unwrap());
+    assert_eq!(
+        prepare_untrusted_text(&mut small_store, b"xx", NormalizationLimits::default())
+            .unwrap_err()
+            .kind(),
+        workflow_runtime::ArtifactErrorKind::ContentTooLarge
+    );
+}

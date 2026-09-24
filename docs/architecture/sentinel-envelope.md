@@ -24,8 +24,8 @@ verdicts. Evidence handles are checked against the raw SHA-256.
 
 The view removes annotated U+00AD, U+034F, U+180E, U+200B, U+2060, U+FEFF;
 U+061C, U+200E–200F, U+202A–202E, U+2066–2069; and Unicode controls other than
-TAB, LF, CR. Joiners and variation selectors remain intact to preserve emoji
-and orthography. This is an explicit carrier list, **not complete Unicode
+TAB, LF, CR. Joiners U+200C–200D and variation selectors U+FE00–FE0F /
+U+E0100–E01EF are annotated but remain intact to preserve emoji and orthography. This is an explicit carrier list, **not complete Unicode
 format-character detection**. No NFC/NFKC folding or transliteration occurs.
 Each retained scalar maps its normalized half-open UTF-8 byte interval to an
 existing `SourceSpan` in the original artifact. Removed scalars retain their
@@ -81,7 +81,8 @@ Run `just issue-231-runtime` (offline, no credentials).
 | en/zh/ja versus material unsupported spans | Pending; script presence is not language identification |
 | Code/URL/identifier/emoji/math/data segmentation | Pending; no unsupported-language claims made |
 | Hidden HTML/Markdown, escaping, Base64, hex, nested decoding | Pending |
-| Multilingual/hard-negative/property/fuzz fixtures | Pending beyond the deterministic fixtures above |
+| Unicode mapping/resource property corpus | `deterministic_unicode_property_corpus_has_total_source_coverage` (512 deterministic cases), joiner/variation-selector fixture |
+| Multilingual/hard-negative/nested-encoding fuzz fixtures | Pending |
 | Spec/IR/compiler runtime routing | Pending design of the language-policy binding; existing artifact runtime integrated |
 | Live semantic coverage | Not run; no authorized binding and no semantic model branch implemented |
 
