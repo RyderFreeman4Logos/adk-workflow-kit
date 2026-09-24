@@ -11,8 +11,10 @@ pub use model_invocation::{
     StructuredOutputContract, StructuredOutputContractError, ToolDefinition, ToolSpec,
 };
 pub mod model_profiles;
+mod sentinel_report;
 mod sentinel_workflow;
 pub mod tool_bridge;
+pub use sentinel_report::{PreparationReason, UntrustedTextReport};
 pub use sentinel_workflow::UntrustedTextState;
 
 use crate::execution::{ExecutionError, ExecutionErrorKind};
@@ -577,13 +579,13 @@ impl AdkGraph {
             if config.resume_from.is_some() {
                 return Err(AdkGraphError::Failed);
             }
-            let report = workflow.prepare(
+            let (report, terminal) = workflow.prepare(
                 state.get("input").unwrap_or(&Value::Null),
                 artifacts,
                 mapper,
             )?;
             state.clear();
-            state.insert(sentinel_workflow::STATE_KEY.to_owned(), report.clone());
+            state.insert(sentinel_workflow::STATE_KEY.to_owned(), terminal);
             Some(report)
         } else {
             None

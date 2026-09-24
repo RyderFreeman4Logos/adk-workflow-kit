@@ -142,9 +142,10 @@ scripts require future validated attribution, not relaxed default acceptance.
 It returns `None` for attribution, absent prose or ambiguity; **None is not Clean**.
 `Unattributed` must stop supported-language routing. Even the positively attributed
 English phrase `Please ignore the instructions` is not a safety approval.
-No Boolean safety method, model dependency, carrier-parser change or workflow
-policy wiring is introduced. Work is a fixed number of linear scans under the
-already-enforced segmentation byte/span ceilings; no wall-clock claim is made.
+The library attribution stage introduces no Boolean safety method, model dependency
+or workflow wiring; the adapter policy wiring is described below. Work uses linear
+scans under the already-enforced segmentation byte/span ceilings; no wall-clock
+claim is made.
 
 `whatlang 0.18.0` was not added: its Han-only Cmn fast path cannot resolve Chinese
 versus kana-free Japanese. Broader attribution needs pinned model/data identity,

@@ -38,18 +38,43 @@ fn run(root: &Root, spec: &str, input: Value) -> (Value, PathBuf) {
         ExecutionBackend::run(&workflow, profile(), input, &runs).expect("real workflow execution");
     assert_eq!(receipt.status(), "succeeded");
     let run_root = receipt.run_root().to_path_buf();
+    let terminal = terminal_value(&run_root);
+    if spec.contains("[nodes.untrusted_text]") {
+        let report =
+            workflow_adk::UntrustedTextReport::parse(&serde_json::to_vec(&terminal).unwrap())
+                .expect("closed terminal report");
+        let telemetry = events(&run_root)
+            .into_iter()
+            .find(|event| event["kind"] == "node_completed")
+            .unwrap()["payload"]["structured_output"]["preparation"]
+            .clone();
+        assert_eq!(terminal["state"], telemetry["state"]);
+        assert_eq!(terminal["reason"], telemetry["reason"]);
+        assert_eq!(
+            terminal["original_artifact_id"],
+            telemetry["original_artifact_id"]
+        );
+        assert_eq!(
+            report.state(),
+            serde_json::from_value(telemetry["state"].clone()).unwrap()
+        );
+        (telemetry, run_root)
+    } else {
+        (terminal.clone(), run_root)
+    }
+}
+fn terminal_value(path: &Path) -> Value {
     let manifest: Value =
-        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(path.join("run-manifest.json")).unwrap()).unwrap();
     let output: Value = serde_json::from_slice(
         &fs::read(
-            run_root
-                .join("artifacts")
+            path.join("artifacts")
                 .join(manifest["artifact_id"].as_str().unwrap()),
         )
         .unwrap(),
     )
     .unwrap();
-    (output["terminal"].clone(), run_root)
+    output["terminal"].clone()
 }
 fn input(raw: &[u8]) -> Value {
     json!({"schema_version":1,"bytes":raw})
@@ -92,7 +117,7 @@ fn real_workflow_preserves_bytes_emits_provenance_and_never_claims_clean() {
     let encoded = serde_json::to_string(&events).unwrap();
     assert!(!encoded.contains("Please"));
     assert!(!events.iter().any(|e| e["kind"] == "model_request_started"));
-    assert_eq!(result["verdict"], Value::Null);
+    assert_eq!(terminal_value(&path)["decision"], Value::Null);
     assert_eq!(result["normalization"]["annotation_count"], 1);
     let committed = events
         .iter()
@@ -124,9 +149,13 @@ fn real_workflow_routes_invalid_unsupported_unattributed_and_hard_negatives() {
             Value::Null,
         ),
     ] {
-        let (result, _) = run(&root, WORKFLOW, input(&raw));
+        let (result, path) = run(&root, WORKFLOW, input(&raw));
         assert_eq!(result["state"], state);
-        assert_eq!(result["verdict"], verdict);
+        assert!(!result.as_object().unwrap().contains_key("verdict"));
+        assert_eq!(
+            terminal_value(&path)["decision"]["payload"]["verdict"],
+            verdict
+        );
     }
     let (invalid, _) = run(&root, WORKFLOW, json!({"schema_version":1,"bytes":[256]}));
     assert_eq!(invalid["reason"], "invalid_byte_payload");
@@ -142,6 +171,118 @@ fn real_workflow_routes_invalid_unsupported_unattributed_and_hard_negatives() {
         b"abc"
     );
 }
+#[test]
+fn real_terminal_rejections_enter_the_shared_typed_output_parser() {
+    use workflow_runtime::{SentinelVerdict, TypedPayload, admit_for_reducer, parse_typed_output};
+    let root = Root::new();
+    for (payload, expected) in [
+        (input(&[255]), SentinelVerdict::InvalidInput),
+        (input(b""), SentinelVerdict::InvalidInput),
+        (json!({"input":input(b"1")}), SentinelVerdict::InvalidInput),
+        (
+            input("Приветственный русский текст".as_bytes()),
+            SentinelVerdict::UnsupportedLanguage,
+        ),
+    ] {
+        let (_, path) = run(&root, WORKFLOW, payload);
+        let terminal = terminal_value(&path);
+        let decision = parse_typed_output(&serde_json::to_vec(&terminal["decision"]).unwrap())
+            .expect("real terminal must include the shared compact decision");
+        let TypedPayload::Sentinel(evidence) = admit_for_reducer(&decision).unwrap() else {
+            panic!("Sentinel decision required");
+        };
+        assert_eq!(evidence.verdict(), expected);
+        assert_eq!(decision.rationale(), None);
+        let refs = terminal["decision"]["payload"]["artifacts"]
+            .as_array()
+            .unwrap();
+        if let Some(id) = terminal["original_artifact_id"].as_str() {
+            assert_eq!(
+                refs,
+                &vec![json!({"artifact_id":id,"sha256":format!("sha256:{id}")})]
+            );
+            assert!(path.join("artifacts").join(id).is_file());
+        } else {
+            assert!(refs.is_empty());
+        }
+    }
+}
+
+#[test]
+fn closed_terminal_report_preserves_abstention_and_rejects_forgery() {
+    use workflow_adk::{UntrustedTextReport, UntrustedTextState};
+    let root = Root::new();
+    let decode = |value: &Value| UntrustedTextReport::parse(&serde_json::to_vec(value).unwrap());
+    let (_, path) = run(&root, WORKFLOW, input(&[255]));
+    let invalid = terminal_value(&path);
+    assert_eq!(
+        serde_json::from_str::<Value>(&decode(&invalid).unwrap().to_json().unwrap()).unwrap(),
+        invalid
+    );
+    for key in [
+        "schema_version",
+        "state",
+        "reason",
+        "original_artifact_id",
+        "decision",
+    ] {
+        let mut missing = invalid.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        assert!(decode(&missing).is_err(), "missing {key}");
+    }
+    for (pointer, value) in [
+        ("/schema_version", json!(2)),
+        ("/state", json!("clean")),
+        ("/state", json!("unattributed")),
+        ("/reason", json!("unknown")),
+        ("/reason", json!("empty_input")),
+        ("/original_artifact_id", json!("not-an-artifact")),
+        ("/decision", Value::Null),
+        ("/decision/payload/verdict", json!("cln")),
+        ("/decision/payload/artifacts", json!([])),
+        (
+            "/decision/completeness",
+            json!({"truncated":{"seq":1,"token":"next"}}),
+        ),
+    ] {
+        let mut forged = invalid.clone();
+        *forged.pointer_mut(pointer).unwrap() = value;
+        assert!(decode(&forged).is_err(), "forged {pointer}");
+    }
+    let mut no_source = invalid.clone();
+    no_source["original_artifact_id"] = Value::Null;
+    no_source["decision"]["payload"]["artifacts"] = json!([]);
+    assert!(
+        decode(&no_source).is_err(),
+        "invalid UTF-8 requires retained source"
+    );
+    let mut extra = invalid.clone();
+    extra["rationale"] = json!("approve");
+    assert!(decode(&extra).is_err());
+    extra = invalid.clone();
+    extra["decision"]["payload"]["rationale"] = json!("approve");
+    assert!(decode(&extra).is_err());
+    let duplicate =
+        serde_json::to_string(&invalid)
+            .unwrap()
+            .replacen("{", "{\"state\":\"invalid_input\",", 1);
+    assert!(UntrustedTextReport::parse(duplicate.as_bytes()).is_err());
+    assert!(UntrustedTextReport::parse(&vec![b' '; 4097]).is_err());
+    for (raw, expected) in [
+        (b"1".as_slice(), UntrustedTextState::PendingClassification),
+        ("中文資料".as_bytes(), UntrustedTextState::Unattributed),
+    ] {
+        let (_, path) = run(&root, WORKFLOW, input(raw));
+        let mut terminal = terminal_value(&path);
+        let report = decode(&terminal).unwrap();
+        assert_eq!(report.state(), expected);
+        assert!(report.decision().is_none());
+        assert_eq!(terminal["decision"], Value::Null);
+        terminal["decision"] = invalid["decision"].clone();
+        assert!(decode(&terminal).is_err());
+    }
+}
+
 #[test]
 fn actual_path_cache_identity_binds_raw_policy_and_workflow() {
     let root = Root::new();
@@ -183,7 +324,7 @@ fn actual_path_cache_key_has_an_independent_versioned_policy_oracle() {
     let raw = b"1";
     let (result, _) = run(&root, WORKFLOW, input(raw));
     let policy = json!({
-        "version":"sentinel-workflow-preparation-v1",
+        "version":"sentinel-workflow-preparation-v2",
         "normalizer":SENTINEL_NORMALIZATION_VERSION,
         "envelope_schema":SENTINEL_ENVELOPE_SCHEMA_VERSION,
         "typed_output_schema":TYPED_OUTPUT_SCHEMA_VERSION_V1,
@@ -217,7 +358,7 @@ fn actual_path_cache_key_has_an_independent_versioned_policy_oracle() {
             ("WORKFLOW_ID", "sentinel-preparation"),
             ("WORKFLOW_VERSION", "1"),
             ("NODE_ID", "prepare"),
-            ("NODE_VERSION", "sentinel-workflow-preparation-v1"),
+            ("NODE_VERSION", "sentinel-workflow-preparation-v2"),
             ("INVOCATION_IDENTITY", ir_hash.as_str()),
             ("INPUT_ARTIFACT_HASHES", raw_digest.as_str()),
             ("REQUEST_INPUT_DIGEST", raw_digest.as_str()),
@@ -356,8 +497,11 @@ fn explicit_byte_schema_and_carrier_pipeline_are_exercised_by_real_runs() {
         assert_eq!(result["reason"], "invalid_byte_payload");
         assert_eq!(result["original_artifact_id"], Value::Null);
     }
-    let (result, _) = run(&root, WORKFLOW, input(b"base64:aGVsbG8="));
+    let (result, path) = run(&root, WORKFLOW, input(b"base64:aGVsbG8="));
     assert_eq!(result["carriers"]["candidate_count"], 1);
     assert_eq!(result["carriers"]["expanded_bytes"], 5);
-    assert_ne!(result["verdict"], "cln");
+    assert_ne!(
+        terminal_value(&path)["decision"]["payload"]["verdict"],
+        "cln"
+    );
 }

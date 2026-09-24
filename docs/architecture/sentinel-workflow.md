@@ -52,8 +52,8 @@ No alternate storage location or synthetic original handle is used.
 A normalized length-framed envelope is a separate immutable artifact, not a
 trusted prompt. Raw and envelope SHA-256 handles are checked after each write.
 Both emit `artifact_committed` observations with protected artifact references;
-`node_completed.payload.structured_output.preparation` and the terminal output
-contain only outcome, versions, policy/cache digests, counts and artifact handles.
+`node_completed.payload.structured_output.preparation` contains diagnostic outcome,
+versions, policy/cache digests, counts and artifact handles, not a reducer decision.
 Source maps and decoded views remain transient library values; the original
 artifact plus exact versions supports reconstruction, but this milestone does not
 persist a full decoded-view/source-map report.
@@ -68,12 +68,25 @@ and WASM workflows without `untrusted_text` are unchanged.
 
 ## Typed terminal output and limits
 
-`UntrustedTextState` serializes as `invalid_input`, `unsupported_language`,
-`unattributed`, or `pending_classification`. The first two carry the shared
-Sentinel wire verdicts `inv` and `uns`; the others have a null verdict. A successful
-run means preparation completed, never Clean. No state permits semantic approval,
-model invocation or graph continuation. `unattributed` is distinct from rejection
-and approval; Han-only Chinese remains unattributed under the conservative policy.
+The terminal is a closed v1 `UntrustedTextReport`, separate from stage telemetry.
+Its five required fields are `schema_version`, `state`, `reason`,
+`original_artifact_id` (handle or null), and `decision` (envelope or null).
+`UntrustedTextState` is `invalid_input`, `unsupported_language`, `unattributed`,
+or `pending_classification`. Only the first two have a `decision`: a shared
+`TypedOutput` Sentinel envelope (`inv` / `uns`, complete, no rationale), admitted
+through `admit_for_reducer`. It references the retained original artifact when one
+exists; no precise offending span is claimed. Feed **`terminal.decision`**, not the
+metadata/report, to `parse_typed_output`. Null means no classification, never Clean.
+
+`UntrustedTextReport::parse` rejects reports over 4,096 bytes, unknown versions,
+missing/duplicate/unknown report fields, unknown reasons/states, mismatched rejection
+codes/references, truncated decisions and any decision attached to abstention.
+It validates consistency, not origin authenticity; provenance still comes from
+host execution and retained artifacts. Reasons are closed preparation subcodes;
+invalid payload and empty input have no original, all other results retain one.
+A successful run means preparation completed, never semantic approval, model
+invocation or graph continuation. Han-only Chinese remains unattributed. Adapter
+identity `sentinel-workflow-preparation-v2` binds this changed output contract.
 
 Normalization uses the authored input ceiling and the runtime's default output/work
 limits. Carriers use bounded Decode defaults; segmentation uses its default 16,384
@@ -83,8 +96,9 @@ independent; zh is reserved pending genuine attribution, as described in
 [sentinel-envelope.md](sentinel-envelope.md).
 
 The existing `NodeCacheKey` binds raw-byte digest, artifact identity, canonical IR,
-workflow/node identity, every preparation stage version, Unicode/security/trust
-versions, all used limits, decode mode and language policy. Repeated runs have the
+workflow/node identity, every preparation stage and compact-output schema version,
+Unicode/security/trust versions, all used limits, decode mode and language policy.
+Repeated runs have the
 same key; policy, workflow or raw-byte changes miss that identity. This milestone
 emits the key but deliberately does not reuse cached preparation results: it always
 persists/verifies the current run's artifacts. It does not bind unused model or
