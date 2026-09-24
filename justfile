@@ -130,6 +130,13 @@ issue-228-runtime test_name="":
 issue-228-test:
     just issue-228-runtime
 
+# Focused #238 deterministic Firewall policy and workflow boundary tests.
+issue-238-runtime test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_238_firewall {{test_name}} --locked -- --nocapture
+
+issue-238-adk test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_238_firewall {{test_name}} --locked -- --nocapture --test-threads=1
+
 # Focused #229 pinned dataset registry tests.
 issue-229-http test_name="dataset::dataset_http::":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --lib {{test_name}} --locked -- --nocapture
