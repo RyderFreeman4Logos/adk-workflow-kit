@@ -4,6 +4,7 @@ pub mod events;
 pub mod execution;
 pub mod firewall;
 pub mod model_invocation;
+pub mod semantic_firewall;
 pub use model_invocation::{
     EscalationPolicy, InferenceBudget, InferenceBudgetError, InvocationProvenance,
     MAX_INVOCATION_RETRIES, ModelInvocationError, ModelInvocationErrorKind, ModelInvocationResult,
@@ -1260,7 +1261,7 @@ impl AdkGraphTranslator {
                     async move {
                         #[cfg(test)]
                         firewall::tests::at_gate(true).await;
-                        let result = firewall::execute(&invocation, &node);
+                        let result = firewall::execute(&invocation, &node).await;
                         #[cfg(test)]
                         firewall::tests::at_gate(false).await;
                         result

@@ -854,6 +854,16 @@ impl ModelInvocationSpec {
         &self,
         binding: &ModelBinding,
     ) -> Result<ModelInvocationResult, ModelInvocationError> {
+        self.invoke_validated(binding, |_| Ok(())).await
+    }
+
+    /// Domain validation runs on raw bounded bytes before Value can collapse duplicate keys.
+    /// The route, stream bounds and retry policy are identical to ordinary invocation.
+    pub async fn invoke_validated(
+        &self,
+        binding: &ModelBinding,
+        validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
+    ) -> Result<ModelInvocationResult, ModelInvocationError> {
         if !self.route.matches_binding(binding) {
             return Err(ModelInvocationError::route_mismatch());
         }
@@ -888,7 +898,7 @@ impl ModelInvocationSpec {
                     }
                 }
             }
-            match self.output.decode(output.as_bytes()) {
+            match validate(output.as_bytes()).and_then(|()| self.output.decode(output.as_bytes())) {
                 Ok(output) => {
                     return Ok(ModelInvocationResult {
                         output,

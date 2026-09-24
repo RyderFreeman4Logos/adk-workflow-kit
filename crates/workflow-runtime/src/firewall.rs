@@ -302,6 +302,33 @@ pub struct ToolDecision {
     identity: String,
 }
 impl ToolDecision {
+    /// Semantic evidence can only restrict this hard-policy result. No approval grant.
+    /// The identity excludes timing/usage; every admitted verdict is canonically ordered.
+    pub fn with_semantic_evidence(
+        &self,
+        impact: crate::semantic_firewall::Impact,
+        reports: &[crate::semantic_firewall::JudgeOutput],
+        binding_identity: &str,
+    ) -> Self {
+        if self.decision != FirewallDecision::Allow {
+            return self.clone();
+        }
+        let decision = crate::semantic_firewall::reduce(self, impact, reports);
+        let mut evidence = reports
+            .iter()
+            .map(|report| (report.judge(), format!("{:?}", report.decision())))
+            .collect::<Vec<_>>();
+        evidence.sort();
+        Self {
+            decision,
+            reason: FirewallReason::Semantic,
+            identity: digest(
+                &json!({"hard":self.identity,"semantic":binding_identity,"impact":impact,
+                "evidence":evidence,"implementation":crate::semantic_firewall::SEMANTIC_FIREWALL_VERSION}),
+            ),
+        }
+    }
+
     pub fn decision(&self) -> FirewallDecision {
         self.decision
     }

@@ -238,6 +238,8 @@ pub enum FirewallReason {
     StaleTarget,
     #[serde(rename = "low")]
     LowRisk,
+    #[serde(rename = "smt")]
+    Semantic,
     #[serde(rename = "hum")]
     HumanApproval,
 }

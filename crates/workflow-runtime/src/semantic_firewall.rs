@@ -136,3 +136,122 @@ pub fn reduce(hard: &ToolDecision, impact: Impact, reports: &[JudgeOutput]) -> F
     }
     Allow
 }
+
+/// Host-authored summaries, bound to the exact proposal by FirewallInvocation.
+/// Never populate these from raw retrieved prose or model-produced summaries.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticFacts {
+    pub schema_version: u32,
+    pub trusted_goal: String,
+    pub action: String,
+    pub scope: String,
+    pub destination: String,
+    pub data_class: DataClass,
+    pub provenance: crate::TrustDomain,
+    pub argument_summary: String,
+    pub impact: Impact,
+}
+#[derive(Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DataClass {
+    Public,
+    Internal,
+    Confidential,
+    Restricted,
+}
+
+/// Distinct v1 projections exclude unrelated facts and every raw-content field.
+#[derive(Clone, Serialize, schemars::JsonSchema)]
+pub struct JudgeInput {
+    #[schemars(range(min = 1, max = 1))]
+    schema_version: u32,
+    features: JudgeFeatures,
+}
+#[derive(Clone, Serialize, schemars::JsonSchema)]
+#[serde(tag = "judge", rename_all = "snake_case", deny_unknown_fields)]
+enum JudgeFeatures {
+    TaskAlignment {
+        goal: String,
+        action: String,
+    },
+    PrivilegeScope {
+        goal: String,
+        action: String,
+        scope: String,
+    },
+    Destination {
+        goal: String,
+        action: String,
+        destination: String,
+    },
+    DataFlow {
+        action: String,
+        destination: String,
+        data_class: DataClass,
+        provenance: crate::TrustDomain,
+        argument_summary: String,
+    },
+}
+impl JudgeInput {
+    pub fn schema() -> Value {
+        serde_json::to_value(schemars::schema_for!(Self)).expect("static input schema")
+    }
+}
+impl SemanticFacts {
+    /// Fixed total ceiling, no controls or known secret markers. Error carries no input.
+    pub fn validate(&self) -> Result<(), TypedOutputError> {
+        if self.schema_version != 1 {
+            return Err(TypedOutputError::UnknownSchemaVersion);
+        }
+        for text in [
+            &self.trusted_goal,
+            &self.action,
+            &self.scope,
+            &self.destination,
+            &self.argument_summary,
+        ] {
+            if text.trim().is_empty()
+                || text.len() > 512
+                || text.chars().any(char::is_control)
+                || text.contains(crate::SYNTHETIC_HONEYTOKEN_PREFIX)
+                || crate::SyntheticSecretPolicy::default()
+                    .sanitize_log(text)
+                    .is_err()
+            {
+                return Err(TypedOutputError::InvalidJson);
+            }
+        }
+        Ok(())
+    }
+    pub fn input(&self, judge: JudgeKind) -> Result<JudgeInput, TypedOutputError> {
+        self.validate()?;
+        let action = self.action.clone();
+        let goal = self.trusted_goal.clone();
+        let destination = self.destination.clone();
+        let features = match judge {
+            JudgeKind::TaskAlignment => JudgeFeatures::TaskAlignment { goal, action },
+            JudgeKind::PrivilegeScope => JudgeFeatures::PrivilegeScope {
+                goal,
+                action,
+                scope: self.scope.clone(),
+            },
+            JudgeKind::Destination => JudgeFeatures::Destination {
+                goal,
+                action,
+                destination,
+            },
+            JudgeKind::DataFlow => JudgeFeatures::DataFlow {
+                action,
+                destination,
+                data_class: self.data_class,
+                provenance: self.provenance,
+                argument_summary: self.argument_summary.clone(),
+            },
+        };
+        Ok(JudgeInput {
+            schema_version: 1,
+            features,
+        })
+    }
+}
