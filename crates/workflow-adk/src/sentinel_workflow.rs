@@ -1,0 +1,246 @@
+//! Artifact-backed admission for the compiler's preparation-only terminal.
+//! Runs before ADK streaming: node closures cannot borrow the observer's store.
+use crate::AdkGraphError;
+use crate::events::{AdkEventMapper, AdkRuntimeObservationKindV1, AdkRuntimeObservationV1};
+use serde::Serialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use workflow_ir::WorkflowIr;
+use workflow_runtime::{
+    ArtifactId, ArtifactStore, CarrierLimits, CarrierMode, LanguageAttribution, LanguagePolicy,
+    NodeCacheKey, NodeCacheKeyMaterial, NormalizationLimits, SECURITY_MODEL_VERSION,
+    SENTINEL_CARRIER_VERSION, SENTINEL_ENVELOPE_SCHEMA_VERSION, SENTINEL_LANGUAGE_POLICY_VERSION,
+    SENTINEL_NORMALIZATION_VERSION, SENTINEL_SCRIPT_DATA_VERSION, SENTINEL_SEGMENTATION_VERSION,
+    SegmentationLimits, SentinelPreparation, SentinelVerdict, TrustDomain, prepare_untrusted_text,
+};
+use workflow_spec::UntrustedTextPreparation;
+
+pub(crate) const STATE_KEY: &str = "__workflow_untrusted_preparation";
+const VERSION: &str = "sentinel-workflow-preparation-v1";
+
+/// Preparation-only terminal states. None means semantic Clean.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UntrustedTextState {
+    InvalidInput,
+    UnsupportedLanguage,
+    Unattributed,
+    PendingClassification,
+}
+impl UntrustedTextState {
+    fn verdict(self) -> Option<SentinelVerdict> {
+        match self {
+            Self::InvalidInput => Some(SentinelVerdict::InvalidInput),
+            Self::UnsupportedLanguage => Some(SentinelVerdict::UnsupportedLanguage),
+            Self::Unattributed | Self::PendingClassification => None,
+        }
+    }
+}
+
+pub(crate) struct PreparationWorkflow {
+    pub node_id: String,
+    policy: UntrustedTextPreparation,
+    workflow_id: String,
+    workflow_version: String,
+    ir_hash: String,
+}
+impl PreparationWorkflow {
+    pub fn new(ir: &WorkflowIr, policy: UntrustedTextPreparation) -> Self {
+        Self {
+            node_id: ir.entry_node_id().as_str().to_owned(),
+            policy,
+            workflow_id: ir.workflow_id().as_str().to_owned(),
+            workflow_version: ir.workflow_version().to_owned(),
+            ir_hash: crate::canonical_ir_hash(ir),
+        }
+    }
+
+    pub fn prepare(
+        &self,
+        input: &Value,
+        store: &mut impl ArtifactStore,
+        mapper: &mut AdkEventMapper,
+    ) -> Result<Value, AdkGraphError> {
+        let normalization = NormalizationLimits {
+            max_input_bytes: self.policy.max_input_bytes,
+            ..NormalizationLimits::default()
+        };
+        let language = LanguagePolicy {
+            en: self.policy.en,
+            zh: self.policy.zh,
+            ja: self.policy.ja,
+        };
+        let policy = json!({
+            "version": VERSION,
+            "normalizer": SENTINEL_NORMALIZATION_VERSION,
+            "envelope_schema": SENTINEL_ENVELOPE_SCHEMA_VERSION,
+            "carrier": SENTINEL_CARRIER_VERSION,
+            "segmentation": SENTINEL_SEGMENTATION_VERSION,
+            "language": SENTINEL_LANGUAGE_POLICY_VERSION,
+            "script_data": SENTINEL_SCRIPT_DATA_VERSION,
+            "unicode": std::char::UNICODE_VERSION,
+            "security": SECURITY_MODEL_VERSION,
+            "normalization_limits": normalization,
+            "carrier_limits": CarrierLimits::default(),
+            "carrier_mode": CarrierMode::Decode,
+            "segmentation_limits": SegmentationLimits::default(),
+            "language_policy": language,
+            "trust_domain": TrustDomain::UntrustedContent,
+        });
+        let policy_digest = digest_json(&policy)?;
+        let mut report = json!({
+            "schema_version": 1,
+            "preparation_version": VERSION,
+            "source_identity": "declared_byte_payload_v1",
+            "trust_domain": TrustDomain::UntrustedContent,
+            "ir_hash": self.ir_hash,
+            "policy_digest": policy_digest,
+            "original_artifact_id": null,
+        });
+        let Some(raw) = byte_payload(input) else {
+            set_outcome(
+                &mut report,
+                UntrustedTextState::InvalidInput,
+                json!("invalid_byte_payload"),
+            );
+            return Ok(report);
+        };
+        // Ingress retains bounded, nonempty bytes even if the authored policy denies
+        // them. Empty artifacts are unsupported by ArtifactStore, not rerouted.
+        let original = if raw.is_empty() {
+            None
+        } else {
+            Some(put_verified(
+                store,
+                &raw,
+                mapper,
+                &self.node_id,
+                "original",
+            )?)
+        };
+        report["original_artifact_id"] = json!(original);
+        let hashes = original
+            .iter()
+            .map(|id| format!("sha256:{}", id.as_str()))
+            .collect::<Vec<_>>();
+        let request_digest = format!("sha256:{:x}", Sha256::digest(&raw));
+        let key = NodeCacheKey::bind(NodeCacheKeyMaterial {
+            workflow_id: &self.workflow_id,
+            workflow_version: &self.workflow_version,
+            node_id: &self.node_id,
+            node_version: VERSION,
+            invocation_identity: &self.ir_hash,
+            input_artifact_hashes: &hashes,
+            request_input_digest: &request_digest,
+            policy_digest: &policy_digest,
+        })
+        .map_err(|_| AdkGraphError::Failed)?;
+        report["cache_key"] = json!(key.digest());
+        let prepared = prepare_untrusted_text(store, &raw, normalization)
+            .map_err(|_| AdkGraphError::Failed)?;
+        let text = match prepared {
+            SentinelPreparation::Invalid { reason, .. } => {
+                set_outcome(&mut report, UntrustedTextState::InvalidInput, json!(reason));
+                return Ok(report);
+            }
+            SentinelPreparation::Prepared(text) => text,
+        };
+        report["normalization"] = text.telemetry();
+        report["envelope_artifact_id"] = json!(put_verified(
+            store,
+            text.envelope().as_bytes(),
+            mapper,
+            &self.node_id,
+            "envelope"
+        )?);
+        let carriers = match text.analyze_carriers(CarrierMode::Decode, CarrierLimits::default()) {
+            Ok(carriers) => carriers,
+            Err(reason) => {
+                report["failed_stage"] = json!("carriers");
+                set_outcome(&mut report, UntrustedTextState::InvalidInput, json!(reason));
+                return Ok(report);
+            }
+        };
+        report["carriers"] = carriers.telemetry();
+        let assessment = text.segment_language(SegmentationLimits::default());
+        let segmented = match assessment {
+            Ok(segmented) => segmented,
+            Err(reason) => {
+                report["failed_stage"] = json!("segmentation");
+                set_outcome(&mut report, UntrustedTextState::InvalidInput, json!(reason));
+                return Ok(report);
+            }
+        };
+        let assessment = match segmented.assess_language(language) {
+            Ok(assessment) => assessment,
+            Err(reason) => {
+                report["failed_stage"] = json!("language");
+                set_outcome(&mut report, UntrustedTextState::InvalidInput, json!(reason));
+                return Ok(report);
+            }
+        };
+        report["language"] = json!(assessment.attribution());
+        let state = match assessment.attribution() {
+            LanguageAttribution::UnsupportedLanguage => UntrustedTextState::UnsupportedLanguage,
+            LanguageAttribution::Unattributed => UntrustedTextState::Unattributed,
+            LanguageAttribution::NoNaturalLanguage | LanguageAttribution::Attributed(_) => {
+                UntrustedTextState::PendingClassification
+            }
+        };
+        set_outcome(&mut report, state, json!(state));
+        Ok(report)
+    }
+}
+fn set_outcome(report: &mut Value, state: UntrustedTextState, reason: Value) {
+    report["state"] = json!(state);
+    report["verdict"] = json!(state.verdict().map(SentinelVerdict::as_code));
+    report["reason"] = reason;
+}
+fn byte_payload(input: &Value) -> Option<Vec<u8>> {
+    let object = input.as_object()?;
+    if object.len() != 2 || object.get("schema_version")?.as_u64()? != 1 {
+        return None;
+    }
+    let bytes = object.get("bytes")?.as_array()?;
+    if bytes.len() > 65_536 {
+        return None;
+    }
+    bytes
+        .iter()
+        .map(|b| u8::try_from(b.as_u64()?).ok())
+        .collect()
+}
+fn put_verified(
+    store: &mut impl ArtifactStore,
+    bytes: &[u8],
+    mapper: &mut AdkEventMapper,
+    node_id: &str,
+    role: &str,
+) -> Result<ArtifactId, AdkGraphError> {
+    let id = store.put(bytes).map_err(|_| AdkGraphError::Failed)?;
+    if id.as_str() != format!("{:x}", Sha256::digest(bytes)) {
+        return Err(AdkGraphError::Failed);
+    }
+    let reference = workflow_runtime::ProtectedArtifactReferenceV1::new(
+        id.as_str(),
+        format!("sha256:{}", id.as_str()),
+        bytes.len() as u64,
+    )
+    .map_err(|_| AdkGraphError::Failed)?;
+    mapper
+        .map(
+            AdkRuntimeObservationV1::new(
+                format!("sentinel-{role}"),
+                "sentinel-preparation",
+                AdkRuntimeObservationKindV1::ArtifactCommitted,
+            )
+            .with_node_id(node_id)
+            .with_artifact_reference(reference),
+        )
+        .map_err(|error| AdkGraphError::Observation(error.kind()))?;
+    Ok(id)
+}
+fn digest_json(value: &Value) -> Result<String, AdkGraphError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| AdkGraphError::Failed)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}

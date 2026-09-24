@@ -138,6 +138,9 @@ issue-231-runtime test_name="":
 issue-231-compiler:
     {{_io}} cargo +1.98.0 test -p workflow-compiler --test issue_231_workflow --locked -- --nocapture
 
+issue-231-adk:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_231_workflow --locked -- --nocapture --test-threads=1
+
 # Focused #229 pinned dataset registry tests.
 issue-229-http test_name="dataset::dataset_http::":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --lib {{test_name}} --locked -- --nocapture

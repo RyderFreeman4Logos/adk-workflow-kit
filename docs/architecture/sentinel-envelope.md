@@ -232,8 +232,9 @@ mode, candidate count and aggregate resource usage; it never echoes decoded text
 `telemetry()` returns deterministic v1 JSON with state `prepared`, content
 hashes/handles, resource counts and policy identity. It contains no input text,
 timestamps, or random values. Treat hashes as correlation-sensitive metadata;
-this is not permission to expose artifact contents. It is ready for a benchmark
-consumer but is not yet wired into a workflow event producer.
+this is not permission to expose artifact contents. The bounded
+[single-terminal preparation workflow](sentinel-workflow.md) now emits it through
+the existing event producer; shared #230 benchmark integration remains pending.
 
 ## Acceptance ledger and runnable checks
 
@@ -251,7 +252,7 @@ Run `just issue-231-runtime` (offline, no credentials).
 | Hidden HTML/Markdown, escaping, Base64, hex, nested decoding | Bounded explicit candidate subset, optional decoded views and composed maps; `carriers::*`; arbitrary hidden markup remains pending |
 | Unicode mapping/resource property corpus | `deterministic_unicode_property_corpus_has_total_source_coverage` (512 deterministic cases), joiner/variation-selector fixture |
 | Multilingual/hard-negative/nested-encoding fuzz fixtures | Carrier subset: 256 seeded nested UTF-8 mapping cases, 512 seeded malformed-input cases, quantum golden maps and code/URL/data negatives; complete language/markup coverage remains pending |
-| Spec/IR/compiler runtime routing | Runtime library language policy implemented; spec/IR/compiler/workflow policy binding remains pending |
+| Spec/IR/compiler runtime routing | Explicit v1 single-terminal preparation contract, canonical IR v10 and observed ADK execution; `just issue-231-compiler` / `just issue-231-adk`; general graph routing, resume and cache reuse remain pending |
 | Live semantic coverage | Not run; no authorized binding and no semantic model branch implemented |
 
 Do not close #231 from this ledger. #232 remains responsible for model branches;

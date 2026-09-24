@@ -11,7 +11,9 @@ pub use model_invocation::{
     StructuredOutputContract, StructuredOutputContractError, ToolDefinition, ToolSpec,
 };
 pub mod model_profiles;
+mod sentinel_workflow;
 pub mod tool_bridge;
+pub use sentinel_workflow::UntrustedTextState;
 
 use crate::execution::{ExecutionError, ExecutionErrorKind};
 use std::collections::{BTreeMap, BTreeSet};
@@ -486,6 +488,7 @@ pub struct AdkGraph {
     agent_nodes: BTreeSet<String>,
     plan_binding: Option<PlanBinding>,
     cache_dispositions: Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
+    untrusted_text: Option<sentinel_workflow::PreparationWorkflow>,
 }
 
 impl AdkGraph {
@@ -494,6 +497,10 @@ impl AdkGraph {
         state: State,
         config: ExecutionConfig,
     ) -> Result<State, AdkGraphError> {
+        // Preparation requires the observed artifact boundary, never caller-minted state.
+        if self.untrusted_text.is_some() {
+            return Err(AdkGraphError::Failed);
+        }
         let mut state = self.input.map(state);
         state.retain(|key, _| !key.starts_with("visits:"));
         let limit = match self.visit_bound {
@@ -565,6 +572,22 @@ impl AdkGraph {
         artifacts: &mut S,
     ) -> Result<State, AdkGraphError> {
         let mut state = self.input.map(state);
+        let preparation = if let Some(workflow) = &self.untrusted_text {
+            // v1 is a one-shot terminal; checkpoint admission needs a separate contract.
+            if config.resume_from.is_some() {
+                return Err(AdkGraphError::Failed);
+            }
+            let report = workflow.prepare(
+                state.get("input").unwrap_or(&Value::Null),
+                artifacts,
+                mapper,
+            )?;
+            state.clear();
+            state.insert(sentinel_workflow::STATE_KEY.to_owned(), report.clone());
+            Some(report)
+        } else {
+            None
+        };
         if config.resume_from.is_none() {
             state.retain(|key, _| !key.starts_with("visits:"));
         }
@@ -603,7 +626,7 @@ impl AdkGraph {
                     step,
                     duration_ms,
                 } => {
-                    let payload = match self
+                    let mut payload = match self
                         .cache_dispositions
                         .lock()
                         .ok()
@@ -615,6 +638,9 @@ impl AdkGraph {
                         }),
                         None => json!({ "step": step }),
                     };
+                    if let Some(report) = &preparation {
+                        payload["preparation"] = report.clone();
+                    }
                     mapper
                         .map_stream_observation(
                             Some(node),
@@ -1028,15 +1054,24 @@ impl AdkGraphTranslator {
         profile_backend: Option<ProfileNodeBackend>,
         checkpointer: Option<Arc<dyn Checkpointer>>,
     ) -> Result<AdkGraph, TranslationError> {
-        if let Some(node) = ir
+        let untrusted_text = ir
             .nodes()
             .iter()
-            .find(|node| node.untrusted_text().is_some())
+            .find_map(|node| node.untrusted_text().map(|policy| (node, policy)));
+        if let Some((node, policy)) = untrusted_text
+            && (ir.nodes().len() != 1
+                || node.kind() != IrNodeKind::Terminal
+                || !ir.edges().is_empty()
+                || !ir.routes().is_empty()
+                || policy.schema_version != 1
+                || policy.max_input_bytes > 65_536)
         {
             return Err(TranslationError::MissingNodeBackend {
                 node: node.id().as_str().to_owned(),
             });
         }
+        let untrusted_text = untrusted_text
+            .map(|(_, policy)| sentinel_workflow::PreparationWorkflow::new(ir, policy));
         let ids: std::collections::BTreeSet<&str> =
             ir.nodes().iter().map(|node| node.id().as_str()).collect();
         let mut incoming = BTreeMap::<String, BTreeSet<String>>::new();
@@ -1309,6 +1344,7 @@ impl AdkGraphTranslator {
                 );
             } else {
                 let terminal = node.kind() == IrNodeKind::Terminal;
+                let preparation_terminal = node.untrusted_text().is_some();
                 if terminal {
                     terminals.push(id.clone());
                 }
@@ -1366,7 +1402,19 @@ impl AdkGraphTranslator {
                         let mut output = NodeOutput::new()
                             .with_update(&key, value)
                             .with_update(&visits_key, json!(visits));
-                        if terminal {
+                        if preparation_terminal {
+                            let report = context
+                                .state
+                                .get(sentinel_workflow::STATE_KEY)
+                                .ok_or_else(|| {
+                                    GraphError::Other(
+                                        "missing untrusted-text preparation".to_owned(),
+                                    )
+                                })?;
+                            output = output
+                                .with_update(&key, report.clone())
+                                .with_update("terminal", report.clone());
+                        } else if terminal {
                             output = output.with_update("terminal", json!(id));
                         }
                         Ok(output)
@@ -1523,6 +1571,7 @@ impl AdkGraphTranslator {
             agent_nodes,
             plan_binding,
             cache_dispositions: Arc::new(Mutex::new(BTreeMap::new())),
+            untrusted_text,
         })
     }
 }
