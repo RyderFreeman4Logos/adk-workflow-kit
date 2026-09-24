@@ -221,6 +221,27 @@ impl std::error::Error for BindingValidationError {}
 
 fn validate_node_bindings(spec: &WorkflowSpec) -> Result<(), CompileError> {
     for node in spec.nodes() {
+        if let Some(firewall) = node.firewall() {
+            // A v1 hard gate must precede every model/action and cannot be re-entered.
+            if node.kind() != NodeKind::Validator
+                || node.id() != spec.workflow().entry()
+                || firewall.schema_version != 1
+                || firewall.identity.len() != 64
+                || !firewall
+                    .identity
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || spec.edges().iter().any(|edge| edge.to() == node.id())
+                || spec.routes().iter().any(|route| {
+                    route.cases().iter().any(|case| case.target() == node.id())
+                        || route.default() == Some(node.id())
+                })
+            {
+                return Err(CompileError::Binding(
+                    BindingValidationError::InvalidPlacement,
+                ));
+            }
+        }
         if node.kind() != NodeKind::Agent
             && (node.model().is_some()
                 || !node.tools().is_empty()
@@ -340,7 +361,7 @@ pub enum MissingEdgeEndpoint {
 /// A semantic workflow failure with source-free canonical IR identifiers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GraphValidationError {
-    /// A workflow or graph identifier is empty.
+    /// A workflow or graph identifier is empty, or a node ID is reserved by ADK.
     InvalidIdentifier {
         /// The stable structural path of the invalid identifier.
         field_path: &'static str,
@@ -400,6 +421,7 @@ pub enum GraphValidationError {
 /// Validates identifiers, graph structure, and terminal liveness for canonical workflow IR.
 ///
 /// The validator is deterministic, uses no recursive traversal, and accepts duplicate edges.
+/// Authored nodes cannot use ADK's `__start__` or `__end__` control identifiers.
 pub fn validate_graph(ir: &WorkflowIr) -> Result<(), GraphValidationError> {
     let nodes = ir.nodes();
     if let Some(error) = invalid_identifier_error(ir) {
@@ -597,7 +619,13 @@ fn invalid_identifier_error(ir: &WorkflowIr) -> Option<GraphValidationError> {
             return Some(GraphValidationError::InvalidIdentifier { field_path });
         }
     }
-    if ir.nodes().iter().any(|node| node.id().as_str().is_empty()) {
+    // ADK interprets these IDs as control flow, not ordinary authored nodes:
+    // an edge from __start__ creates another entry, bypassing an entry gate.
+    if ir
+        .nodes()
+        .iter()
+        .any(|node| matches!(node.id().as_str(), "" | "__start__" | "__end__"))
+    {
         return Some(GraphValidationError::InvalidIdentifier {
             field_path: "nodes[].id",
         });

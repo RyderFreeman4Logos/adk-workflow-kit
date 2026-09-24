@@ -689,6 +689,47 @@ fn resolved_plan(ir: &workflow_ir::WorkflowIr, capabilities: CapabilitySet) -> R
     ResolvedRuntimePlan::resolve(request, &AnyRuntimeBinding).expect("runtime plan resolves")
 }
 
+#[test]
+fn reserved_control_ids_are_rejected_even_when_ir_bypasses_compilation() {
+    let mut admitted = Vec::new();
+    for id in [
+        adk_rust::graph::prelude::START,
+        adk_rust::graph::prelude::END,
+    ] {
+        let source = SEQUENTIAL
+            .replace("\"action\"", &format!("\"{id}\""))
+            .replace(&format!("kind = \"{id}\""), "kind = \"action\"");
+        let spec = workflow_spec::parse_str("reserved.toml", &source).unwrap();
+        let ir = workflow_ir::WorkflowIr::from(&spec);
+        let plan = resolved_plan(&ir, CapabilitySet::default());
+        let agents = BTreeMap::from([("agent".into(), state_agent("agent", json!({})))]);
+        let translator = AdkGraphTranslator::new();
+        for (route, result) in [
+            ("resolved", translator.translate_resolved(&plan, &ir)),
+            (
+                "profile",
+                translator.translate_resolved_with_profile(
+                    &plan,
+                    &ir,
+                    &agents,
+                    Some(b"not a WASM module"),
+                    &json!({}),
+                    Some(Arc::new(MemoryCheckpointer::new())),
+                ),
+            ),
+        ] {
+            match result {
+                Err(error) => assert!(
+                    error.to_string().contains("invalid identifier"),
+                    "{id} {route}: {error}"
+                ),
+                Ok(_) => admitted.push(format!("{id} {route}")),
+            }
+        }
+    }
+    assert!(admitted.is_empty(), "reserved IR admitted: {admitted:?}");
+}
+
 #[tokio::test]
 async fn translates_and_executes_sequential_plan_through_adk() {
     let plan = compile_str("sequential.workflow.toml", SEQUENTIAL).expect("fixture compiles");

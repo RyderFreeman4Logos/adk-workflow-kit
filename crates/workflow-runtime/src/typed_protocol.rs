@@ -441,6 +441,7 @@ impl SentinelEvidence {
 pub struct FirewallRecord {
     decision: FirewallDecision,
     artifacts: Vec<ArtifactRef>,
+    policy: Option<crate::firewall::FirewallStamp>,
 }
 
 impl FirewallRecord {
@@ -448,7 +449,14 @@ impl FirewallRecord {
         Self {
             decision,
             artifacts,
+            policy: None,
         }
+    }
+
+    /// Adds deterministic hard-policy provenance, never a model-authored permit.
+    pub fn with_policy(mut self, policy: crate::firewall::FirewallStamp) -> Self {
+        self.policy = Some(policy);
+        self
     }
 }
 
@@ -603,6 +611,9 @@ impl TypedPayload {
                     Value::String(record.decision.as_code().to_owned()),
                 );
                 object.insert("artifacts".to_owned(), to_value(&record.artifacts)?);
+                if let Some(policy) = &record.policy {
+                    object.insert("policy".to_owned(), to_value(policy)?);
+                }
             }
             Self::CompactState(delta) => {
                 parse_state_op(&delta.op)?;
@@ -814,15 +825,26 @@ fn parse_payload(value: &Value) -> Result<TypedPayload, TypedOutputError> {
             )))
         }
         TypedNodeKind::Firewall => {
-            require_keys(object, &["kind", "decision", "artifacts"])?;
-            Ok(TypedPayload::Firewall(FirewallRecord::new(
+            let policy = if let Some(policy) = object.get("policy") {
+                require_keys(object, &["kind", "decision", "artifacts", "policy"])?;
+                Some(
+                    serde_json::from_value::<crate::firewall::FirewallStamp>(policy.clone())
+                        .map_err(|_| TypedOutputError::InvalidJson)?,
+                )
+            } else {
+                require_keys(object, &["kind", "decision", "artifacts"])?;
+                None
+            };
+            let mut record = FirewallRecord::new(
                 FirewallDecision::parse(string_field(object, "decision")?)?,
                 parse_artifacts(
                     object
                         .get("artifacts")
                         .ok_or(TypedOutputError::InvalidJson)?,
                 )?,
-            )))
+            );
+            record.policy = policy;
+            Ok(TypedPayload::Firewall(record))
         }
         TypedNodeKind::CompactState => {
             require_keys(object, &["kind", "key", "op", "artifacts"])?;
@@ -932,6 +954,10 @@ pub fn render_markdown(output: &TypedOutput) -> String {
         }
         TypedPayload::Firewall(record) => {
             lines.push(format!("- decision: {}", record.decision.as_code()));
+            if let Some(policy) = &record.policy {
+                lines.push(format!("- reason: {:?}", policy.reason()));
+                lines.push(format!("- identity: {}", policy.identity()));
+            }
             push_artifacts(&mut lines, &record.artifacts);
         }
         TypedPayload::CompactState(delta) => {

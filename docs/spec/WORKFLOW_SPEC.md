@@ -14,4 +14,6 @@ Route operators are closed and represented by `RouteOperator`: `equals`, `not_eq
 
 Source input is bounded. Unknown fields, malformed values, unsupported schema versions, invalid identifiers, and invalid structural combinations fail closed. The spec parser does not execute nodes or invoke predicates.
 
+Validator entry nodes may declare a versioned `firewall` invocation identity. The compiler and ADK translator require the exact trusted binding and never fall back to an ordinary validator. See [FIREWALL.md](FIREWALL.md).
+
 See [NODE_RESULT_CACHE.md](NODE_RESULT_CACHE.md) for the production node-result cache identity and replay dispositions.
