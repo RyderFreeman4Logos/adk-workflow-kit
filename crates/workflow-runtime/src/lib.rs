@@ -21,6 +21,7 @@ mod sandbox_execution;
 mod security;
 mod sentinel_carriers;
 mod sentinel_envelope;
+mod sentinel_language;
 mod sentinel_segments;
 mod session;
 mod tool;
@@ -114,6 +115,10 @@ pub use sentinel_envelope::{
     CanonicalUntrustedText, CarrierAnnotation, CarrierKind, NormalizationLimits,
     NormalizationReason, NormalizedSourceSpan, SENTINEL_ENVELOPE_SCHEMA_VERSION,
     SENTINEL_NORMALIZATION_VERSION, SentinelPreparation, prepare_untrusted_text,
+};
+pub use sentinel_language::{
+    LanguageAssessment, LanguageAttribution, LanguagePolicy, SENTINEL_LANGUAGE_POLICY_VERSION,
+    SentinelLanguage,
 };
 pub use sentinel_segments::{
     LanguageScreening, SENTINEL_SCRIPT_DATA_VERSION, SENTINEL_SEGMENTATION_VERSION, ScriptEvidence,

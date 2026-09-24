@@ -254,7 +254,7 @@ impl Properties {
     }
 }
 
-fn property(pattern: &str) -> Result<ClassUnicode, SegmentationReason> {
+pub(super) fn property(pattern: &str) -> Result<ClassUnicode, SegmentationReason> {
     let hir = regex_syntax::Parser::new()
         .parse(pattern)
         .map_err(|_| SegmentationReason::InvalidPolicy)?;
@@ -264,7 +264,7 @@ fn property(pattern: &str) -> Result<ClassUnicode, SegmentationReason> {
     }
 }
 
-fn contains(class: &ClassUnicode, ch: char) -> bool {
+pub(super) fn contains(class: &ClassUnicode, ch: char) -> bool {
     class
         .ranges()
         .binary_search_by(|range| {

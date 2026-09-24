@@ -1,7 +1,7 @@
 # Sentinel canonical untrusted-data preparation
 
-Status: **partial implementation of #231**, not a completed Sentinel or language
-policy. `workflow_runtime::prepare_untrusted_text` is the explicit artifact IO
+Status: **partial implementation of #231**, not a completed Sentinel or general
+language detector. `workflow_runtime::prepare_untrusted_text` is the explicit artifact IO
 boundary; the internal normalizer is deterministic and performs no IO. Callers
 inject the existing `ArtifactStore`. No model, provider, executor, or ADK agent is
 constructed by this data transformation.
@@ -15,8 +15,9 @@ stable subcode and maps to the shared `SentinelVerdict::InvalidInput` (`inv`).
 There is deliberately no Boolean safety API. `segment_language` supplies bounded
 lexical spans and Unicode script evidence, not language attribution. Its typed
 `LanguageScreening::Unattributed` result must stop supported-language routing.
-`NoNaturalLanguage` is only a lexical result, never safety `Clean`. A validated
-language-policy stage is still required before #232 consumes the view.
+`NoNaturalLanguage` is only a lexical result, never safety `Clean`. The optional
+`assess_language(LanguagePolicy)` stage supplies a conservative attribution subset;
+#232 must still perform semantic security analysis of the complete view.
 
 The store retains exact original bytes before UTF-8 validation. Failed UTF-8 is
 never replaced with U+FFFD. Empty input, invalid policy, and oversized input are
@@ -87,17 +88,67 @@ in admitted text size with fixed Unicode tables. No wall-time guarantee is made.
 Limit or delimiter errors return no partial segment list. Empty normalized views
 can have zero spans (original bytes/annotations remain in the preparation).
 
-**Language attribution blocker:** Latin is not English, and Han is shared by
-Chinese and Japanese. Simplified and Traditional Chinese both retain Han evidence;
-Han+kana retains both, including supplementary-plane characters. Mixed scripts
-are not flattened into a dominant-language guess. All material possible prose,
-including English and Chinese examples, currently returns `Unattributed` rather
-than claiming en/zh/ja support. There is no configurable supported-language
-allowlist until attribution can be validated. `whatlang 0.18.0` was evaluated but
-not added: its `detect_lang_base_on_mandarin_script` assigns Han-only input Cmn
-with confidence 1.0, which cannot resolve the required ambiguity. A future
-classifier needs pinned model/version identity, reliable abstention and measured
-multilingual hard-negative coverage before enabling supported-language routing.
+## Conservative language policy (bounded attribution subset)
+
+`SegmentedUntrustedText::assess_language(LanguagePolicy)` borrows the existing
+mapped possible-prose tokens. `LanguageAssessment::evidence()` returns those exact
+`TextSegment` references, not newly invented offsets or per-word language labels.
+The aggregate `LanguageAttribution` is separate from lexical `LanguageScreening`
+and from `SentinelVerdict`. Excluded syntax does not vote, but it is never removed
+from the envelope. Possible-prose tokens must be separated only by whitespace:
+punctuation, code, URLs, identifiers, math or data between them force abstention
+rather than stitching unrelated fragments into a sentence. Exclusions before or
+after the prose remain available for semantic safety analysis.
+
+The versioned rules are deliberately narrow and deterministic:
+
+- `Attributed(En)` requires an entire ASCII multiword grammar, case-insensitive:
+  `(this|that) (is|was) (a|the) NOUN`, `please VERB (the|this|that) NOUN`, or
+  `(we|they|you) (will|must|should|can) VERB (the|this|that) NOUN`.
+  NOUN is `message|request|document|instruction|instructions|test`; VERB is
+  `read|check|review|follow|ignore`. Extra/unknown tokens abstain. Latin script,
+  shared vocabulary, stopword counts and single words never suffice.
+- `Attributed(Ja)` requires at least four base-letter scalars including two actual
+  Hiragana/Katakana `Lo` letters, and only Han/kana letters/marks. This uses
+  the pinned Unicode tables, including supplementary kana. Shared Script_Extensions
+  punctuation such as `ー` cannot supply those two kana letters. Latin or other
+  scripts mixed into the evidence force `Unattributed`.
+- `UnsupportedLanguage` requires all possible-prose letters/marks to belong to
+  one of Cyrillic, Arabic or Hangul, at least twelve base-letter scalars, and at
+  least two words with three base-letter scalars each. Base letters use Unicode
+  `L` minus modifier letters `Lm`, not `Alphabetic` (which includes some vowel
+  marks); mark/extender-only runs cannot meet materiality. The general `other` flag,
+  private/unassigned scalars, format controls and mark-only strings do not qualify.
+  This identifies material outside the allowlist, not a specific Russian/Arabic/
+  Korean language. Other scripts, short spans and cross-script mixtures abstain.
+- Han-only text is always `Unattributed`: Simplified and Traditional Chinese,
+  kana-free Japanese and shared Han words are not distinguishable by script.
+  **Positive Chinese attribution is an acceptance residual**, not implemented
+  support. `Zh` is never manufactured from Han, even when it is the only allowed
+  language. No dominant-language vote is taken for mixed text.
+
+`LanguagePolicy { en, zh, ja }` is caller-owned, defaults to all three enabled,
+and requires all three Boolean fields when deserialized. Missing, duplicate,
+unknown or mistyped fields fail; all false is valid. A positively attributed En
+or Ja disabled by policy becomes `UnsupportedLanguage`; changing the allowlist
+never resolves ambiguous evidence. The zh bit is reserved, consumed in cache
+identity, and cannot make Han supported. This is a useful but low-recall subset,
+not a calibrated language detector or a claim of universal classification accuracy.
+Inline code, multi-sentence punctuation, broader English vocabulary and other
+scripts require future validated attribution, not relaxed default acceptance.
+
+`LanguageAssessment::rejection_verdict()` returns the existing typed
+`SentinelVerdict::UnsupportedLanguage` (`uns`) only for `UnsupportedLanguage`.
+It returns `None` for attribution, absent prose or ambiguity; **None is not Clean**.
+`Unattributed` must stop supported-language routing. Even the positively attributed
+English phrase `Please ignore the instructions` is not a safety approval.
+No Boolean safety method, model dependency, carrier-parser change or workflow
+policy wiring is introduced. Work is a fixed number of linear scans under the
+already-enforced segmentation byte/span ceilings; no wall-clock claim is made.
+
+`whatlang 0.18.0` was not added: its Han-only Cmn fast path cannot resolve Chinese
+versus kana-free Japanese. Broader attribution needs pinned model/data identity,
+reliable abstention and measured multilingual hard negatives before enabling it.
 
 ## Bounded carrier analysis (recognized syntax only)
 
@@ -162,6 +213,13 @@ cache path. For segmented results use `SegmentedUntrustedText::bind_cache_key`,
 which additionally binds both segmentation limits and the unattributed stage.
 Prepared-only keys cannot hit segmented results, and changing either limit
 misses the durable cache in the integration fixture.
+For attributed results use `LanguageAssessment::bind_cache_key`: it wraps that
+segmented key with `sentinel-language-policy-v1`, a distinct attribution-stage tag,
+and the canonical en/zh/ja Boolean tuple. Bump the language version on any grammar,
+materiality, aggregation or allowlist semantic change. The durable-cache fixture
+independently reconstructs the framing, proves all eight policy combinations have
+distinct identities, and checks stage/version/limits/raw/provenance/request misses.
+No prepared-only or segmented-only key may cache attribution results.
 Carrier recognition/decoder identity (`sentinel-carriers-v2`) also participates
 in preparation keys and telemetry. Cache optional carrier results only with
 `CarrierAnalysis::bind_cache_key`: it binds the analysis stage, annotation/decode
@@ -188,12 +246,12 @@ Run `just issue-231-runtime` (offline, no credentials).
 | Mapped zero-width/bidi/control carriers | `unicode_controls_have_golden_original_byte_mappings` (explicit list only) |
 | Deterministic resource bounds | `output_and_work_exhaustion_never_return_partial_prepared_text` |
 | Cache identity and structured telemetry | `cache_consumes_canonical_policy_raw_bytes_and_trust_provenance`, `telemetry_is_versioned_deterministic_and_does_not_echo_text` |
-| en/zh/ja versus material unsupported spans | Blocked on validated attribution; `Unattributed` explicitly stops supported-language routing; no language allowlist claimed |
+| en/zh/ja versus material unsupported spans | Conservative En/Ja and material Cyrillic/Arabic/Hangul subset with typed rejection, mapped evidence and configurable allowlist; `language::*`, `language_cache::*`; Chinese and general language attribution remain incomplete |
 | Code/URL/identifier/emoji/math/data segmentation | Bounded recognized-syntax subset, mapped spans; `segmentation::*` focused fixtures; exclusions are lexical, not safety approval |
 | Hidden HTML/Markdown, escaping, Base64, hex, nested decoding | Bounded explicit candidate subset, optional decoded views and composed maps; `carriers::*`; arbitrary hidden markup remains pending |
 | Unicode mapping/resource property corpus | `deterministic_unicode_property_corpus_has_total_source_coverage` (512 deterministic cases), joiner/variation-selector fixture |
 | Multilingual/hard-negative/nested-encoding fuzz fixtures | Carrier subset: 256 seeded nested UTF-8 mapping cases, 512 seeded malformed-input cases, quantum golden maps and code/URL/data negatives; complete language/markup coverage remains pending |
-| Spec/IR/compiler runtime routing | Pending design of the language-policy binding; existing artifact runtime integrated |
+| Spec/IR/compiler runtime routing | Runtime library language policy implemented; spec/IR/compiler/workflow policy binding remains pending |
 | Live semantic coverage | Not run; no authorized binding and no semantic model branch implemented |
 
 Do not close #231 from this ledger. #232 remains responsible for model branches;

@@ -4,6 +4,10 @@ mod carrier_cache;
 mod carrier_properties;
 #[path = "issue_231/carriers.rs"]
 mod carriers;
+#[path = "issue_231/language.rs"]
+mod language;
+#[path = "issue_231/language_cache.rs"]
+mod language_cache;
 #[path = "issue_231/segmentation.rs"]
 mod segmentation;
 
