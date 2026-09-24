@@ -49,6 +49,24 @@ artifact IO add a bounded number of linear passes; store latency is external.
 There is no claim of a wall-clock deadline. Limit exhaustion returns no partial
 prepared view. Maps/annotations have at most one entry per input scalar.
 
+## Cache and telemetry
+
+`CanonicalUntrustedText::bind_cache_key` consumes existing `NodeCacheKeyMaterial`
+and trusted `ContentProvenance`, returning an actual `NodeCacheKey` for
+`NodeResultCache`. It binds original artifact bytes by digest even when two
+inputs normalize identically; normalized bytes; all limits; normalizer, envelope,
+compact-output, security-model and Rust Unicode-data versions; and provenance
+including scope, author and trust-policy classification. The analysis domain
+remains untrusted even for allowlisted authors. Existing outer request/policy
+identities are combined, never discarded. Model/provider/prompt/tool/dataset
+versions remain the caller's responsibility in `invocation_identity`.
+
+`telemetry()` returns deterministic v1 JSON with state `prepared`, content
+hashes/handles, resource counts and policy identity. It contains no input text,
+timestamps, or random values. Treat hashes as correlation-sensitive metadata;
+this is not permission to expose artifact contents. It is ready for a benchmark
+consumer but is not yet wired into a workflow event producer.
+
 ## Acceptance ledger and runnable checks
 
 Run `just issue-231-runtime` (offline, no credentials).
@@ -59,7 +77,7 @@ Run `just issue-231-runtime` (offline, no credentials).
 | Typed invalid states, no lossy UTF-8 | `invalid_paths_are_typed_without_lossy_conversion` |
 | Mapped zero-width/bidi/control carriers | `unicode_controls_have_golden_original_byte_mappings` (explicit list only) |
 | Deterministic resource bounds | `output_and_work_exhaustion_never_return_partial_prepared_text` |
-| Cache identity and structured telemetry | Pending next milestone |
+| Cache identity and structured telemetry | `cache_consumes_canonical_policy_raw_bytes_and_trust_provenance`, `telemetry_is_versioned_deterministic_and_does_not_echo_text` |
 | en/zh/ja versus material unsupported spans | Pending; script presence is not language identification |
 | Code/URL/identifier/emoji/math/data segmentation | Pending; no unsupported-language claims made |
 | Hidden HTML/Markdown, escaping, Base64, hex, nested decoding | Pending |

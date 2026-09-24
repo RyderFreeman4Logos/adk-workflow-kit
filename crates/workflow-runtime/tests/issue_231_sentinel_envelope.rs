@@ -129,3 +129,119 @@ fn output_and_work_exhaustion_never_return_partial_prepared_text() {
         ));
     }
 }
+
+fn prepared(raw: &[u8], limits: NormalizationLimits) -> workflow_runtime::CanonicalUntrustedText {
+    let SentinelPreparation::Prepared(text) =
+        prepare_untrusted_text(&mut store(), raw, limits).unwrap()
+    else {
+        panic!("expected prepared")
+    };
+    text
+}
+
+fn cache_key(
+    text: &workflow_runtime::CanonicalUntrustedText,
+    author: &str,
+    policy: &str,
+) -> workflow_runtime::NodeCacheKey {
+    let provenance = workflow_runtime::TrustPolicy::new("scope", ["maintainer"])
+        .unwrap()
+        .classify(workflow_runtime::ContentObject::Comment {
+            object_id: "231",
+            author,
+        })
+        .unwrap();
+    text.bind_cache_key(
+        workflow_runtime::NodeCacheKeyMaterial {
+            workflow_id: "workflow",
+            workflow_version: "1",
+            node_id: "sentinel",
+            node_version: "1",
+            invocation_identity: "model-provider-prompt-tools-dataset-binding-v1",
+            input_artifact_hashes: &["another-artifact".into()],
+            request_input_digest: "outer-request",
+            policy_digest: policy,
+        },
+        &provenance,
+    )
+    .unwrap()
+}
+
+#[test]
+fn cache_consumes_canonical_policy_raw_bytes_and_trust_provenance() {
+    use workflow_runtime::{CacheProvenance, NodeCacheEntry, NodeCacheLookup, NodeResultCache};
+    let text = prepared(b"same text", NormalizationLimits::default());
+    let key = cache_key(&text, "unknown", "outer-policy");
+    let root = std::env::temp_dir().join(format!("issue-231-cache-{}", std::process::id()));
+    let cache = NodeResultCache::open(&root).unwrap();
+    cache
+        .put(
+            NodeCacheEntry::success(
+                key.clone(),
+                serde_json::json!({"prepared": true}),
+                CacheProvenance::from_key(&key),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        cache
+            .lookup(&cache_key(
+                &prepared(b"same text", NormalizationLimits::default()),
+                "unknown",
+                "outer-policy"
+            ))
+            .unwrap(),
+        NodeCacheLookup::Hit(_)
+    ));
+    for changed in [
+        cache_key(
+            &prepared(
+                "same\u{200b} text".as_bytes(),
+                NormalizationLimits::default(),
+            ),
+            "unknown",
+            "outer-policy",
+        ),
+        cache_key(
+            &prepared(
+                b"same text",
+                NormalizationLimits {
+                    max_output_bytes: 100,
+                    ..NormalizationLimits::default()
+                },
+            ),
+            "unknown",
+            "outer-policy",
+        ),
+        cache_key(&text, "maintainer", "outer-policy"),
+        cache_key(&text, "unknown", "changed-policy"),
+    ] {
+        assert_ne!(key.digest(), changed.digest());
+        assert!(matches!(
+            cache.lookup(&changed).unwrap(),
+            NodeCacheLookup::Miss
+        ));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn telemetry_is_versioned_deterministic_and_does_not_echo_text() {
+    let text = prepared(b"PRIVATE_PAYLOAD", NormalizationLimits::default());
+    let value = serde_json::to_value(text.telemetry()).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["normalizer_version"], "sentinel-normalization-v1");
+    assert_eq!(value["state"], "prepared");
+    assert_eq!(value["trust_domain"], "untrusted_content");
+    assert_eq!(value["work_units"], 15);
+    assert_eq!(
+        serde_json::to_string(&value).unwrap(),
+        serde_json::to_string(&serde_json::to_value(text.telemetry()).unwrap()).unwrap()
+    );
+    assert!(
+        !serde_json::to_string(&value)
+            .unwrap()
+            .contains("PRIVATE_PAYLOAD")
+    );
+}

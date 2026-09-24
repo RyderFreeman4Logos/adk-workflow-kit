@@ -8,7 +8,11 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{ArtifactError, ArtifactId, ArtifactStore, SentinelVerdict, SourceSpan};
+use crate::{
+    ArtifactError, ArtifactId, ArtifactStore, ContentProvenance, NodeCacheKey, NodeCacheKeyError,
+    NodeCacheKeyMaterial, SECURITY_MODEL_VERSION, SentinelVerdict, SourceSpan,
+    TYPED_OUTPUT_SCHEMA_VERSION_V1, TrustDomain,
+};
 
 /// Change whenever normalization, source mapping, or envelope semantics change.
 pub const SENTINEL_NORMALIZATION_VERSION: &str = "sentinel-normalization-v1";
@@ -165,6 +169,74 @@ impl CanonicalUntrustedText {
         self.limits
     }
 
+    /// Binds this view into the existing durable node-result cache contract.
+    /// Existing workflow, invocation and policy identities are preserved, not
+    /// replaced. The caller must bind model/provider/prompt/tool/dataset versions
+    /// in invocation_identity, as required by NodeCacheKeyMaterial.
+    pub fn bind_cache_key(
+        &self,
+        material: NodeCacheKeyMaterial<'_>,
+        provenance: &ContentProvenance,
+    ) -> Result<NodeCacheKey, NodeCacheKeyError> {
+        if material.request_input_digest.is_empty() || material.policy_digest.is_empty() {
+            return Err(NodeCacheKeyError::EmptyIdentity);
+        }
+        let request = hash_fields(&[
+            material.request_input_digest.as_bytes(),
+            self.original_id.as_str().as_bytes(),
+            self.normalized.as_bytes(),
+            provenance
+                .cache_key(self.original_id.as_str().as_bytes())
+                .as_bytes(),
+        ]);
+        let policy = hash_fields(&[
+            material.policy_digest.as_bytes(),
+            self.policy_digest().as_bytes(),
+        ]);
+        let mut hashes = material.input_artifact_hashes.to_vec();
+        hashes.push(format!("sha256:{}", self.original_id.as_str()));
+        NodeCacheKey::bind(NodeCacheKeyMaterial {
+            input_artifact_hashes: &hashes,
+            request_input_digest: &request,
+            policy_digest: &policy,
+            ..material
+        })
+    }
+
+    /// Content-free, deterministic telemetry. Artifact/digest fields are
+    /// provenance handles, not permission to expose retained content.
+    pub fn telemetry(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": SENTINEL_ENVELOPE_SCHEMA_VERSION,
+            "normalizer_version": SENTINEL_NORMALIZATION_VERSION,
+            "state": "prepared",
+            "trust_domain": TrustDomain::UntrustedContent,
+            "original_artifact_id": self.original_id,
+            "normalized_sha256": hash_fields(&[self.normalized.as_bytes()]),
+            "normalized_bytes": self.normalized.len(),
+            "source_map_entries": self.source_map.len(),
+            "annotation_count": self.annotations.len(),
+            "work_units": self.work_units,
+            "limits": self.limits,
+            "policy_digest": self.policy_digest(),
+        })
+    }
+
+    fn policy_digest(&self) -> String {
+        let unicode = std::char::UNICODE_VERSION;
+        hash_fields(&[
+            SENTINEL_NORMALIZATION_VERSION.as_bytes(),
+            &SENTINEL_ENVELOPE_SCHEMA_VERSION.to_be_bytes(),
+            &TYPED_OUTPUT_SCHEMA_VERSION_V1.to_be_bytes(),
+            SECURITY_MODEL_VERSION.as_bytes(),
+            TrustDomain::UntrustedContent.cache_salt().as_bytes(),
+            &[unicode.0, unicode.1, unicode.2],
+            &(self.limits.max_input_bytes as u64).to_be_bytes(),
+            &(self.limits.max_output_bytes as u64).to_be_bytes(),
+            &(self.limits.max_work_units as u64).to_be_bytes(),
+        ])
+    }
+
     /// A fixed policy prefix followed by an exact UTF-8 byte count and payload.
     /// Read the count, never search the body for a delimiter. Model consumers must
     /// also keep this entire envelope in a data role, never a trusted policy role.
@@ -259,6 +331,15 @@ fn normalize(
         }
     }
     Ok(result)
+}
+
+fn hash_fields(fields: &[&[u8]]) -> String {
+    let mut hash = Sha256::new();
+    for field in fields {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field);
+    }
+    format!("sha256:{:x}", hash.finalize())
 }
 
 fn carrier(ch: char) -> Option<CarrierKind> {
