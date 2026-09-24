@@ -134,6 +134,10 @@ issue-228-test:
 issue-231-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_231_sentinel_envelope {{test_name}} --locked -- --nocapture
 
+# Focused #231 versioned compiler and production execution integration.
+issue-231-compiler:
+    {{_io}} cargo +1.98.0 test -p workflow-compiler --test issue_231_workflow --locked -- --nocapture
+
 # Focused #229 pinned dataset registry tests.
 issue-229-http test_name="dataset::dataset_http::":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --lib {{test_name}} --locked -- --nocapture

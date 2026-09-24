@@ -26,6 +26,9 @@ pub const CANONICAL_IR_WIRE_VERSION_V8: u16 = 8;
 /// The canonical byte-wire version for per-node agent contracts.
 pub const CANONICAL_IR_WIRE_VERSION_V9: u16 = 9;
 
+/// Canonical wire for explicit untrusted-text terminal preparation policy.
+pub const CANONICAL_IR_WIRE_VERSION_V10: u16 = 10;
+
 const DOMAIN: &[u8] = b"adk-workflow-kit/workflow-ir\0";
 const IR_SCHEMA_VERSION_V1: u32 = 1;
 
@@ -245,9 +248,15 @@ pub struct IrNode {
     tools: Vec<IrToolReference>,
     skills: Vec<IrSkillReference>,
     agent_contract: Option<AgentNodeContract>,
+    untrusted_text: Option<workflow_spec::UntrustedTextPreparation>,
 }
 
 impl IrNode {
+    /// Returns the authored preparation policy without runtime objects.
+    pub fn untrusted_text(&self) -> Option<workflow_spec::UntrustedTextPreparation> {
+        self.untrusted_text
+    }
+
     /// Returns the node identifier.
     pub fn id(&self) -> &NodeId {
         &self.id
@@ -608,6 +617,7 @@ impl From<&WorkflowSpec> for WorkflowIr {
                         skills
                     },
                     agent_contract: node.agent_contract().cloned(),
+                    untrusted_text: node.untrusted_text(),
                 }
             })
             .collect::<Vec<_>>();
@@ -772,6 +782,21 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
     for node in &ir.nodes {
         write_frame(sink, node.id.as_str());
         sink.write_chunk(&[node.kind.tag()]);
+        if canonical_wire_version(ir) >= CANONICAL_IR_WIRE_VERSION_V10 {
+            match node.untrusted_text {
+                Some(policy) => {
+                    sink.write_chunk(&[1]);
+                    write_u16(sink, policy.schema_version);
+                    write_u64(sink, u64_from_usize(policy.max_input_bytes));
+                    sink.write_chunk(&[
+                        u8::from(policy.en),
+                        u8::from(policy.zh),
+                        u8::from(policy.ja),
+                    ]);
+                }
+                None => sink.write_chunk(&[0]),
+            }
+        }
         if node.kind == IrNodeKind::Approval {
             match node.timeout_ms {
                 Some(timeout_ms) => {
@@ -904,7 +929,9 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
 }
 
 fn canonical_wire_version(ir: &WorkflowIr) -> u16 {
-    if ir.nodes.iter().any(|node| node.agent_contract.is_some()) {
+    if ir.nodes.iter().any(|node| node.untrusted_text.is_some()) {
+        CANONICAL_IR_WIRE_VERSION_V10
+    } else if ir.nodes.iter().any(|node| node.agent_contract.is_some()) {
         CANONICAL_IR_WIRE_VERSION_V9
     } else if ir.nodes.iter().any(|node| !node.skills.is_empty()) {
         CANONICAL_IR_WIRE_VERSION_V8

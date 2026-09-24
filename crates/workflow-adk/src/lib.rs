@@ -1028,6 +1028,15 @@ impl AdkGraphTranslator {
         profile_backend: Option<ProfileNodeBackend>,
         checkpointer: Option<Arc<dyn Checkpointer>>,
     ) -> Result<AdkGraph, TranslationError> {
+        if let Some(node) = ir
+            .nodes()
+            .iter()
+            .find(|node| node.untrusted_text().is_some())
+        {
+            return Err(TranslationError::MissingNodeBackend {
+                node: node.id().as_str().to_owned(),
+            });
+        }
         let ids: std::collections::BTreeSet<&str> =
             ir.nodes().iter().map(|node| node.id().as_str()).collect();
         let mut incoming = BTreeMap::<String, BTreeSet<String>>::new();

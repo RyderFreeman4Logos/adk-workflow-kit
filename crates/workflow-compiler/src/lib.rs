@@ -205,6 +205,8 @@ pub enum BindingValidationError {
     ReviewerTool,
     /// A static tool attempted to use a public Skill runtime tool name.
     ReservedSkillTool,
+    /// Preparation v1 is restricted to a single terminal with bounded policy.
+    InvalidUntrustedTextPreparation,
 }
 
 impl fmt::Display for BindingValidationError {
@@ -213,6 +215,9 @@ impl fmt::Display for BindingValidationError {
             Self::InvalidPlacement => "binding fields require an agent node",
             Self::ReviewerTool => "reviewer nodes cannot own tools",
             Self::ReservedSkillTool => "static tool name is reserved by the Skill runtime",
+            Self::InvalidUntrustedTextPreparation => {
+                "untrusted-text preparation requires a single terminal and valid v1 policy"
+            }
         })
     }
 }
@@ -221,6 +226,18 @@ impl std::error::Error for BindingValidationError {}
 
 fn validate_node_bindings(spec: &WorkflowSpec) -> Result<(), CompileError> {
     for node in spec.nodes() {
+        if let Some(policy) = node.untrusted_text()
+            && (policy.schema_version != 1
+                || policy.max_input_bytes > 65_536
+                || node.kind() != NodeKind::Terminal
+                || spec.nodes().len() != 1
+                || !spec.edges().is_empty()
+                || !spec.routes().is_empty())
+        {
+            return Err(CompileError::Binding(
+                BindingValidationError::InvalidUntrustedTextPreparation,
+            ));
+        }
         if node.kind() != NodeKind::Agent
             && (node.model().is_some()
                 || !node.tools().is_empty()
