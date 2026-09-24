@@ -15,7 +15,7 @@ use tokio::{sync::Notify, time::timeout};
 use workflow_runtime::{InMemoryArtifactStore, WorkflowRuntimeEventKindV1 as Kind};
 
 #[path = "../tests/support/firewall.rs"]
-mod fixture;
+pub(crate) mod fixture;
 
 const DEADLINE: Duration = Duration::from_secs(5);
 

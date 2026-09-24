@@ -24,6 +24,7 @@ pub struct FirewallInvocation {
     policy: FirewallPolicy,
     goal: TrustedGoal,
     proposal: ToolProposal,
+    semantic: Option<crate::semantic_firewall::SemanticFirewall>,
 }
 impl FirewallInvocation {
     pub fn new(policy: FirewallPolicy, goal: TrustedGoal, proposal: ToolProposal) -> Self {
@@ -31,20 +32,37 @@ impl FirewallInvocation {
             policy,
             goal,
             proposal,
+            semantic: None,
         }
+    }
+    /// Opt in to semantic evidence. Recompile using the resulting identity.
+    pub fn with_semantic(mut self, semantic: crate::semantic_firewall::SemanticFirewall) -> Self {
+        self.semantic = Some(semantic);
+        self
     }
     /// Bind every policy, schema, goal, target, and proposal byte into compiled IR.
     /// Cache/checkpoint reuse must use that IR identity, not the workflow name alone.
     pub fn identity(&self) -> String {
-        argument_fingerprint(&json!({"implementation":FIREWALL_IMPLEMENTATION_VERSION,
+        let hard = argument_fingerprint(&json!({"implementation":FIREWALL_IMPLEMENTATION_VERSION,
             "schema_version":FIREWALL_SCHEMA_VERSION,"policy":self.policy,
             "goal":self.goal,"proposal":self.proposal,
             "security":workflow_runtime::SECURITY_MODEL_VERSION,
-            "secrets":workflow_runtime::SECRET_POLICY_VERSION}))
+            "secrets":workflow_runtime::SECRET_POLICY_VERSION}));
+        match &self.semantic {
+            None => hard,
+            Some(semantic) => {
+                argument_fingerprint(&json!({"hard":hard,"semantic":semantic.identity()}))
+            }
+        }
     }
 }
 
-pub(crate) type Decisions = Arc<Mutex<BTreeMap<String, ToolDecision>>>;
+#[derive(Clone)]
+pub(crate) struct GateRecord {
+    decision: ToolDecision,
+    semantic: Option<Value>,
+}
+pub(crate) type Decisions = Arc<Mutex<BTreeMap<String, GateRecord>>>;
 
 adk_rust::tokio::task_local! {
     // ADK 2.1 polls node futures inline (buffer_unordered), including streamed
@@ -116,7 +134,8 @@ impl AdkGraph {
             .try_with(Arc::clone)
             .map_err(|_| AdkGraphError::Failed)?;
         let snapshot = records.lock().map_err(|_| AdkGraphError::Failed)?.clone();
-        for (node, decision) in snapshot {
+        for (node, record) in snapshot {
+            let decision = record.decision;
             if !observed.insert(node.clone()) {
                 continue;
             }
@@ -128,14 +147,12 @@ impl AdkGraph {
             let output: Value =
                 serde_json::from_str(&decision.render_json().map_err(|_| AdkGraphError::Failed)?)
                     .map_err(|_| AdkGraphError::Failed)?;
+            let mut structured = json!({"firewall":output});
+            if let Some(semantic) = record.semantic {
+                structured["semantic_firewall"] = semantic;
+            }
             mapper
-                .map_stream_observation(
-                    Some(node),
-                    kind,
-                    Some(json!({"firewall":output})),
-                    None,
-                    artifacts,
-                )
+                .map_stream_observation(Some(node), kind, Some(structured), None, artifacts)
                 .map_err(|error| AdkGraphError::Observation(error.kind()))?;
         }
         Ok(())
@@ -148,7 +165,12 @@ impl AdkGraph {
     pub fn firewall_decisions(&self) -> Result<BTreeMap<String, ToolDecision>, AdkGraphError> {
         self.firewall_decisions
             .lock()
-            .map(|records| records.clone())
+            .map(|records| {
+                records
+                    .iter()
+                    .map(|(node, record)| (node.clone(), record.decision.clone()))
+                    .collect()
+            })
             .map_err(|_| AdkGraphError::Failed)
     }
 }
@@ -178,13 +200,26 @@ pub(crate) fn validate_binding(
     }
 }
 
-pub(crate) fn execute(
+pub(crate) async fn execute(
     invocation: &FirewallInvocation,
     node: &str,
 ) -> Result<NodeOutput, GraphError> {
-    let decision = invocation
+    let hard = invocation
         .policy
         .evaluate(&invocation.goal, &invocation.proposal);
+    let (decision, semantic) = if let Some(judges) = &invocation.semantic {
+        if hard.decision() == FirewallDecision::Allow {
+            let (reports, metrics) = judges.run().await;
+            (
+                hard.with_semantic_evidence(judges.impact(), &reports, &invocation.identity()),
+                Some(metrics),
+            )
+        } else {
+            (hard, None)
+        }
+    } else {
+        (hard, None)
+    };
     let output: Value = serde_json::from_str(
         &decision
             .render_json()
@@ -196,7 +231,13 @@ pub(crate) fn execute(
         .map_err(|_| GraphError::Other("Firewall invocation scope missing".into()))?
         .lock()
         .map_err(|_| GraphError::Other("Firewall observation failed".into()))?
-        .insert(node.to_owned(), decision.clone());
+        .insert(
+            node.to_owned(),
+            GateRecord {
+                decision: decision.clone(),
+                semantic,
+            },
+        );
     if decision.decision() != FirewallDecision::Allow {
         return Err(GraphError::Other("tool.bridge.authorization_denied".into()));
     }

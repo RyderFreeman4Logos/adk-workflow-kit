@@ -140,6 +140,19 @@ issue-238-adk test_name="":
 issue-238-concurrent:
     {{_io}} cargo +1.98.0 test -p workflow-adk --lib firewall::tests:: --locked -- --nocapture
 
+# Focused #239 semantic Firewall contracts and production integration.
+issue-239-runtime test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_239_semantic {{test_name}} --locked -- --nocapture
+
+issue-239-adk test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_239_semantic {{test_name}} --locked -- --nocapture --test-threads=1
+
+issue-239-invocation-regression:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_226_prompt_protocol --locked -- --nocapture
+
+issue-239-isolation:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --lib semantic_firewall::tests:: --locked -- --nocapture
+
 # Focused #229 pinned dataset registry tests.
 issue-229-http test_name="dataset::dataset_http::":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --lib {{test_name}} --locked -- --nocapture

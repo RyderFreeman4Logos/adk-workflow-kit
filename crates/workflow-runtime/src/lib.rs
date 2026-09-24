@@ -21,6 +21,7 @@ mod production_profile;
 mod pure_transform;
 mod sandbox_execution;
 mod security;
+pub mod semantic_firewall;
 mod session;
 mod tool;
 mod tool_registry;
