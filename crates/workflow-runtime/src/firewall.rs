@@ -25,7 +25,19 @@ impl ToolProposal {
         if bytes.len() > MAX_PROPOSAL_BYTES {
             return Err(FirewallReason::Arguments);
         }
-        serde_json::from_slice(bytes).map_err(|_| FirewallReason::Schema)
+        let proposal: Self = serde_json::from_slice(bytes).map_err(|_| FirewallReason::Schema)?;
+        if [
+            proposal.schema_version,
+            proposal.intent.schema_version,
+            proposal.intent.effect.schema_version,
+            proposal.intent.target_version.schema_version,
+        ]
+        .iter()
+        .any(|v| *v != FIREWALL_SCHEMA_VERSION)
+        {
+            return Err(FirewallReason::Schema);
+        }
+        Ok(proposal)
     }
 
     /// Lexically sorted keys and scalar JSON spellings; not RFC 8785 float coercion.
@@ -70,6 +82,23 @@ impl FirewallPolicy {
                 "schema_version":FIREWALL_SCHEMA_VERSION,"policy":self,"goal":goal,
                 "proposal":proposal,"reason":reason,
                 "security":crate::SECURITY_MODEL_VERSION,"secrets":crate::SECRET_POLICY_VERSION})),
+        }
+    }
+
+    fn contains_secret(&self, value: &Value) -> bool {
+        match value {
+            Value::String(text) => {
+                text.contains(SYNTHETIC_HONEYTOKEN_PREFIX)
+                    || self
+                        .forbidden_markers
+                        .iter()
+                        .any(|marker| text.contains(marker))
+            }
+            Value::Array(values) => values.iter().any(|v| self.contains_secret(v)),
+            Value::Object(values) => values.iter().any(|(key, v)| {
+                self.contains_secret(&Value::String(key.clone())) || self.contains_secret(v)
+            }),
+            _ => false,
         }
     }
 
@@ -126,11 +155,7 @@ impl FirewallPolicy {
             return Err(FirewallReason::Destination);
         }
         let arguments = proposal.canonical_arguments();
-        if arguments.contains(SYNTHETIC_HONEYTOKEN_PREFIX)
-            || self
-                .forbidden_markers
-                .iter()
-                .any(|marker| arguments.contains(marker))
+        if self.contains_secret(&value(proposal))
             || SyntheticSecretPolicy::default()
                 .sanitize_log(&arguments)
                 .is_err()

@@ -32,6 +32,53 @@ fn fixture() -> (FirewallPolicy, TrustedGoal, ToolProposal) {
     (policy, goal, proposal)
 }
 
+#[test]
+fn malformed_wire_rejects_duplicate_arguments_and_future_versions() {
+    let (_, _, proposal) = fixture();
+    let wire = serde_json::to_string(&proposal).unwrap();
+    let duplicate = wire.replace("\"count\":1", "\"count\":0,\"count\":1");
+    assert!(
+        ToolProposal::decode(duplicate.as_bytes()).is_err(),
+        "duplicate arguments"
+    );
+    for field in [
+        "/schema_version",
+        "/intent/schema_version",
+        "/intent/effect/schema_version",
+        "/intent/target_version/schema_version",
+    ] {
+        let mut changed = serde_json::to_value(&proposal).unwrap();
+        *changed.pointer_mut(field).unwrap() = json!(2);
+        assert!(
+            ToolProposal::decode(&serde_json::to_vec(&changed).unwrap()).is_err(),
+            "{field}"
+        );
+    }
+    for malformed in [b"{}".as_slice(), b"true", b"{", b"null"] {
+        assert!(ToolProposal::decode(malformed).is_err());
+    }
+    assert!(ToolProposal::decode(&vec![b' '; 16_385]).is_err());
+}
+
+#[test]
+fn honeytokens_in_metadata_are_denied_even_when_registered() {
+    let (mut policy, mut goal, mut proposal) = fixture();
+    let marker = "synthetic-honeytoken-v1:scope";
+    goal.scopes = [marker.to_owned()].into();
+    policy.tools.get_mut("noop").unwrap().scopes = goal.scopes.clone();
+    policy.tools.get_mut("noop").unwrap().scope = ArgumentBinding::Literal {
+        value: marker.into(),
+    };
+    let mut target = policy.targets.pop_first().unwrap();
+    target.scope = marker.into();
+    policy.targets.insert(target);
+    proposal.intent.scope = marker.into();
+    assert_eq!(
+        policy.evaluate(&goal, &proposal).reason(),
+        FirewallReason::Secret
+    );
+}
+
 fn decide(policy: &FirewallPolicy, goal: &TrustedGoal, proposal: &ToolProposal) -> ToolDecision {
     policy.evaluate(goal, proposal)
 }

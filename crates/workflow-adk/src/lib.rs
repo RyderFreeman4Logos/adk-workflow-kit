@@ -590,7 +590,9 @@ impl AdkGraph {
 
         let mut stream = Box::pin(self.graph.stream(state, config, StreamMode::Custom));
         let mut output = None;
+        let mut observed_firewall = BTreeSet::new();
         while let Some(item) = stream.next().await {
+            self.observe_firewall(&mut observed_firewall, mapper, artifacts)?;
             match item.map_err(|error| self.map_observed_error(&error))? {
                 StreamEvent::NodeStart { node, step } => {
                     mapper

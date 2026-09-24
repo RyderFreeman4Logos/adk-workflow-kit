@@ -60,6 +60,38 @@ impl AdkGraphTranslator {
     }
 }
 impl AdkGraph {
+    pub(crate) fn observe_firewall<S: workflow_runtime::ArtifactStore>(
+        &self,
+        observed: &mut std::collections::BTreeSet<String>,
+        mapper: &mut crate::events::AdkEventMapper,
+        artifacts: &mut S,
+    ) -> Result<(), AdkGraphError> {
+        use crate::events::AdkRuntimeObservationKindV1 as Kind;
+        for (node, decision) in self.firewall_decisions()? {
+            if !observed.insert(node.clone()) {
+                continue;
+            }
+            let kind = match decision.decision() {
+                FirewallDecision::Allow => Kind::ToolAuthorized,
+                FirewallDecision::Deny => Kind::ToolDenied,
+                FirewallDecision::RequireHumanApproval => Kind::ApprovalRequested,
+            };
+            let output: Value =
+                serde_json::from_str(&decision.render_json().map_err(|_| AdkGraphError::Failed)?)
+                    .map_err(|_| AdkGraphError::Failed)?;
+            mapper
+                .map_stream_observation(
+                    Some(node),
+                    kind,
+                    Some(json!({"firewall":output})),
+                    None,
+                    artifacts,
+                )
+                .map_err(|error| AdkGraphError::Observation(error.kind()))?;
+        }
+        Ok(())
+    }
+
     /// Privacy-safe typed observations emitted by the gate actually executed.
     pub fn firewall_decisions(&self) -> Result<BTreeMap<String, ToolDecision>, AdkGraphError> {
         self.firewall_decisions

@@ -95,6 +95,7 @@ pub struct ProposalProvenance {
 pub struct ToolProposal {
     pub schema_version: u32,
     pub intent: ToolIntent,
+    #[serde(deserialize_with = "unique_map")]
     pub arguments: BTreeMap<String, ToolArgument>,
     pub provenance: ProposalProvenance,
 }
@@ -151,6 +152,33 @@ pub struct FirewallPolicy {
     pub targets: BTreeSet<TargetState>,
     /// Synthetic markers or application-supplied prohibited substrings. Never logged.
     pub forbidden_markers: BTreeSet<String>,
+}
+
+fn unique_map<'de, D, T>(deserializer: D) -> Result<BTreeMap<String, T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Unique<T>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Unique<T> {
+        type Value = BTreeMap<String, T>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("unique argument keys")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut map = BTreeMap::new();
+            while let Some((key, value)) = access.next_entry()? {
+                if map.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate argument key"));
+                }
+            }
+            Ok(map)
+        }
+    }
+    deserializer.deserialize_map(Unique(std::marker::PhantomData))
 }
 
 /// Stable compact hard-policy reason registry. No free-form error payloads.

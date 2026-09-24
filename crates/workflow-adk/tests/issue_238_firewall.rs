@@ -57,6 +57,69 @@ to = "done"
 "#
     )
 }
+#[tokio::test]
+async fn observed_gate_emits_typed_privacy_safe_telemetry_before_terminal_denial() {
+    use workflow_adk::events::AdkEventMapper;
+    use workflow_runtime::{InMemoryArtifactStore, WorkflowRuntimeEventKindV1};
+    for (admission, tool, kind) in [
+        (
+            "low_risk",
+            "unknown",
+            WorkflowRuntimeEventKindV1::ToolDenied,
+        ),
+        (
+            "human_approval",
+            "noop",
+            WorkflowRuntimeEventKindV1::ApprovalRequested,
+        ),
+    ] {
+        let bound = invocation(admission, tool);
+        let plan = compile_str("firewall.toml", &source(&bound.identity())).unwrap();
+        let agents = BTreeMap::from([(
+            "judge".into(),
+            Arc::new(PanicJudge) as Arc<dyn adk_rust::Agent>,
+        )]);
+        let graph = AdkGraphTranslator::new()
+            .translate_with_firewall(&plan, bound, &agents)
+            .unwrap();
+        let mut mapper = AdkEventMapper::new("fw-observed", "firewall-test").unwrap();
+        let limit = std::num::NonZeroU64::new(65536).unwrap();
+        let mut artifacts = InMemoryArtifactStore::new(limit, limit);
+        assert_eq!(
+            graph
+                .invoke_observed(
+                    State::new(),
+                    ExecutionConfig::new("fw-observed"),
+                    &mut mapper,
+                    &mut artifacts
+                )
+                .await
+                .unwrap_err(),
+            AdkGraphError::AuthorizationDenied
+        );
+        let event = mapper
+            .events()
+            .iter()
+            .find(|event| event.kind() == kind)
+            .expect("typed policy telemetry");
+        assert_eq!(event.node_id(), Some("gate"));
+        assert_eq!(
+            event.payload()["structured_output"]["firewall"]["node"],
+            json!("firewall")
+        );
+        assert!(mapper.events().iter().all(|event| !matches!(
+            event.kind(),
+            WorkflowRuntimeEventKindV1::ModelRequestStarted
+                | WorkflowRuntimeEventKindV1::ModelRequestCompleted
+        )));
+        assert!(
+            !serde_json::to_string(mapper.events())
+                .unwrap()
+                .contains("source_digest")
+        );
+    }
+}
+
 struct PanicJudge;
 #[adk_rust::async_trait]
 impl adk_rust::Agent for PanicJudge {
