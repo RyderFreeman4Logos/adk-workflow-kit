@@ -1304,19 +1304,44 @@ fn finish_after_crash_resumes_without_another_model_request() {
 
 #[test]
 fn resume_reconstruction_does_not_consume_graph_idle_budget() {
+    if let Ok(root) = env::var("M3_04_CRASH_RUN_ROOT") {
+        let root = PathBuf::from(root);
+        let workflow = root.join("workflow.toml");
+        fs::write(&workflow, WORKFLOW).unwrap();
+        let mut policy = loop_policy();
+        policy["idle_time_ms"] = json!(400);
+        policy["wall_time_ms"] = json!(60_000);
+        let _ = ExecutionBackend::run(
+            &workflow,
+            profile_with(
+                vec![
+                    json!({"calls": [{"id":"call-before-crash","name":"search_code","args":{"query":"needle"}}]}),
+                    json!({"calls": [{"id":"call-after-resume","name":"read_source_range","args":{"path":"src/lib.rs","start":1}}]}),
+                    finish(json!({"answer":"held"})),
+                ],
+                Some(policy),
+            ),
+            json!({}),
+            &root,
+        );
+        panic!("crash barrier did not terminate the child");
+    }
+
     let root = root();
-    let workflow = root.join("workflow.toml");
-    fs::write(&workflow, WORKFLOW).unwrap();
-    let mut policy = loop_policy();
-    policy["idle_time_ms"] = json!(400);
-    policy["wall_time_ms"] = json!(60_000);
-    let receipt = ExecutionBackend::run(
-        &workflow,
-        profile_with(vec![finish(json!({"answer":"held"}))], Some(policy)),
-        json!({}),
+    let run_root = crash_run(
         &root,
-    )
-    .unwrap();
+        "resume_reconstruction_does_not_consume_graph_idle_budget",
+        "after-effect",
+    );
+    let receipt = ExecutionBackend::inspect(&root, &run_id(&run_root)).unwrap();
+    assert_eq!(receipt.status(), "running");
+    let ledger_path = run_root.join("loop-ledger.json");
+    let before: Value = serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    assert_eq!(before["nodes"]["work"]["model_iterations"], 1);
+    assert_eq!(before["nodes"]["work"]["finished_output"], Value::Null);
+    assert_eq!(effect_count(&run_root), 1);
+    // Pending model work must cross observe_model's synchronous idle check before
+    // succeeding, even if the graph wins the unbiased select's first poll.
     let barrier = root.join("resume-reconstruction-barrier");
     fs::create_dir(&barrier).unwrap();
     let worker_root = root.0.clone();
@@ -1347,5 +1372,15 @@ fn resume_reconstruction_does_not_consume_graph_idle_budget() {
     let resumed = worker.join().unwrap().unwrap();
     assert_eq!(resumed.status(), "succeeded");
     assert_eq!(resumed.run_id(), receipt.run_id());
+    let after: Value = serde_json::from_slice(&fs::read(ledger_path).unwrap()).unwrap();
+    assert_eq!(after["nodes"]["work"]["model_iterations"], 3);
+    assert_eq!(after["nodes"]["work"]["pending_calls"], json!([]));
+    assert_eq!(
+        after["nodes"]["work"]["finished_output"],
+        json!({"answer":"held"})
+    );
+    assert_eq!(effect_count(&run_root), 2);
+    let events = fs::read_to_string(run_root.join("events.jsonl")).unwrap();
+    assert!(events.contains("call-after-resume"));
     assert!(started.elapsed() < Duration::from_secs(15));
 }
