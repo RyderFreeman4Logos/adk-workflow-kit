@@ -1,6 +1,12 @@
 use adk_rust::graph::prelude::{ExecutionConfig, State};
 use serde_json::json;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 use workflow_adk::{AdkGraphError, AdkGraphTranslator, firewall::FirewallInvocation};
 use workflow_compiler::compile_str;
 use workflow_runtime::{FirewallDecision, argument_fingerprint, firewall::*};
@@ -236,6 +242,161 @@ async fn explicit_low_risk_gate_executes_and_emits_compact_output() {
         graph.firewall_decisions().unwrap()["gate"].decision(),
         FirewallDecision::Allow
     );
+}
+
+fn source_with_bridge(identity: &str, bridge: &str) -> String {
+    source(identity).replace(
+        "from = \"gate\"\nto = \"judge\"",
+        &format!(
+            "from = \"gate\"\nto = \"{bridge}\"\n[[edges]]\nfrom = \"{bridge}\"\nto = \"judge\""
+        ),
+    ) + &format!("\n[[nodes]]\nid = \"{bridge}\"\nkind = \"action\"\n")
+}
+
+struct CountingJudge(Arc<AtomicUsize>);
+#[adk_rust::async_trait]
+impl adk_rust::Agent for CountingJudge {
+    fn name(&self) -> &str {
+        "judge"
+    }
+    fn description(&self) -> &str {
+        "count entry even when no model events escape"
+    }
+    fn sub_agents(&self) -> &[Arc<dyn adk_rust::Agent>] {
+        &[]
+    }
+    async fn run(
+        &self,
+        _: Arc<dyn adk_rust::InvocationContext>,
+    ) -> adk_rust::Result<adk_rust::EventStream> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let mut event = adk_rust::Event::new("judge");
+        event.set_content(adk_rust::Content::new("assistant").with_text(r#"{"state":{}}"#));
+        Ok(Box::pin(adk_rust::futures::stream::iter([Ok(event)])))
+    }
+}
+
+#[tokio::test]
+async fn reserved_control_ids_cannot_dispatch_judges_before_hard_denial() {
+    use workflow_adk::events::AdkEventMapper;
+    use workflow_compiler::{CompileError, GraphValidationError};
+    use workflow_runtime::InMemoryArtifactStore;
+
+    let mut violations = Vec::new();
+    // The ordinary bridge also proves this oracle observes actual allowed judge entry.
+    for bridge in ["__start__", "__end__", "ordinary"] {
+        for (admission, tool, decision) in [
+            ("low_risk", "unknown", FirewallDecision::Deny),
+            (
+                "human_approval",
+                "noop",
+                FirewallDecision::RequireHumanApproval,
+            ),
+            ("low_risk", "noop", FirewallDecision::Allow),
+        ] {
+            for observed in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let bound = invocation(admission, tool);
+                let label = format!("{bridge} {decision:?} observed={observed}");
+                let plan = match compile_str(
+                    "reserved.toml",
+                    &source_with_bridge(&bound.identity(), bridge),
+                ) {
+                    Err(CompileError::Graph(GraphValidationError::InvalidIdentifier {
+                        field_path: "nodes[].id",
+                    })) if bridge != "ordinary" => {
+                        assert_eq!(calls.load(Ordering::SeqCst), 0);
+                        continue;
+                    }
+                    result => {
+                        result.expect("fixture must compile unless its control ID is rejected")
+                    }
+                };
+                let agents = BTreeMap::from([(
+                    "judge".into(),
+                    Arc::new(CountingJudge(calls.clone())) as Arc<dyn adk_rust::Agent>,
+                )]);
+                let graph = AdkGraphTranslator::new()
+                    .translate_with_firewall(&plan, bound, &agents)
+                    .expect("valid compiled fixture translates");
+                let result = if observed {
+                    let mut mapper = AdkEventMapper::new("reserved", "firewall-test").unwrap();
+                    let limit = std::num::NonZeroU64::new(65536).unwrap();
+                    let mut artifacts = InMemoryArtifactStore::new(limit, limit);
+                    graph
+                        .invoke_observed(
+                            State::new(),
+                            ExecutionConfig::new("reserved"),
+                            &mut mapper,
+                            &mut artifacts,
+                        )
+                        .await
+                } else {
+                    graph
+                        .invoke(State::new(), ExecutionConfig::new("reserved"))
+                        .await
+                };
+                let count = calls.load(Ordering::SeqCst);
+                println!("{label}: judge_entries={count}, result={result:?}");
+                if decision != FirewallDecision::Allow {
+                    assert_eq!(
+                        result.unwrap_err(),
+                        AdkGraphError::AuthorizationDenied,
+                        "{label}"
+                    );
+                    assert_eq!(
+                        graph.firewall_decisions().unwrap()["gate"].decision(),
+                        decision
+                    );
+                    if count != 0 {
+                        violations.push(format!(
+                            "{label}: judge entered {count} times despite denial"
+                        ));
+                    }
+                } else if bridge == "ordinary" {
+                    assert!(result.is_ok(), "{label}: {result:?}");
+                    assert!(count > 0, "positive control must reach the judge");
+                }
+                if bridge != "ordinary" {
+                    violations.push(format!("{label}: reserved authored ID was admitted"));
+                }
+            }
+        }
+    }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[test]
+fn reserved_control_ids_fail_shared_admission_without_a_firewall() {
+    use workflow_compiler::{
+        BuiltinPredicateRegistry, CompileError, GraphValidationError, compile_str_with_predicates,
+        validate_graph,
+    };
+    for bridge in [
+        adk_rust::graph::prelude::START,
+        adk_rust::graph::prelude::END,
+    ] {
+        let source = source_with_bridge(&invocation("low_risk", "noop").identity(), bridge);
+        let source = source
+            .lines()
+            .filter(|line| !line.starts_with("firewall ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let spec = workflow_spec::parse_str("reserved.toml", &source).unwrap();
+        let expected = GraphValidationError::InvalidIdentifier {
+            field_path: "nodes[].id",
+        };
+        assert_eq!(
+            validate_graph(&workflow_ir::WorkflowIr::from(&spec)),
+            Err(expected.clone())
+        );
+        for result in [
+            compile_str("reserved.toml", &source),
+            compile_str_with_predicates("reserved.toml", &source, &BuiltinPredicateRegistry),
+        ] {
+            assert!(matches!(result, Err(CompileError::Graph(error)) if error == expected));
+        }
+    }
 }
 
 #[test]

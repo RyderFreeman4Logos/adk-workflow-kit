@@ -283,6 +283,8 @@ pub struct GraphSummary {
 /// Stable failures produced while translating a validated compiler plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranslationError {
+    /// Direct IR failed the same graph admission required by the compiler.
+    InvalidGraph(workflow_compiler::GraphValidationError),
     /// A Firewall gate was missing its exact trusted invocation binding.
     FirewallBinding,
     UnknownTarget {
@@ -307,6 +309,7 @@ pub enum TranslationError {
 impl fmt::Display for TranslationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidGraph(error) => write!(f, "graph translation rejected: {error}"),
             Self::FirewallBinding => write!(f, "Firewall binding missing or mismatched"),
             Self::UnknownTarget { from, target } => {
                 write!(f, "graph translation rejected {from:?} to {target:?}")
@@ -1041,6 +1044,9 @@ impl AdkGraphTranslator {
         checkpointer: Option<Arc<dyn Checkpointer>>,
         firewall: Option<firewall::FirewallInvocation>,
     ) -> Result<AdkGraph, TranslationError> {
+        // Resolved-plan callers can supply IR without going through compilation.
+        // Reject reserved control IDs and dangling origins before ADK adds entries.
+        workflow_compiler::validate_graph(ir).map_err(TranslationError::InvalidGraph)?;
         firewall::validate_binding(ir, firewall.as_ref())?;
         let firewall_decisions = firewall::Decisions::default();
         let ids: std::collections::BTreeSet<&str> =
