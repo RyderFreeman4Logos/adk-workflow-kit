@@ -79,6 +79,243 @@ fn honeytokens_in_metadata_are_denied_even_when_registered() {
     );
 }
 
+#[test]
+fn proposal_schema_is_versioned_closed_and_excludes_document_arguments() {
+    let (_, _, proposal) = fixture();
+    let schema = ToolProposal::schema();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let wire = serde_json::to_value(&proposal).unwrap();
+    assert!(validator.is_valid(&wire));
+    for (pointer, value) in [
+        ("/schema_version", json!(2)),
+        ("/intent/capabilities", json!(["unknown"])),
+        ("/arguments/count", json!({"document":"raw"})),
+        ("/arguments/count", json!("raw untrusted document")),
+    ] {
+        let mut changed = wire.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        assert!(!validator.is_valid(&changed), "{pointer}");
+        assert!(
+            ToolProposal::decode(&serde_json::to_vec(&changed).unwrap()).is_err(),
+            "{pointer}"
+        );
+    }
+    for field in ["issue_body", "document", "reasoning"] {
+        let mut changed = wire.clone();
+        changed[field] = json!("raw document");
+        assert!(!validator.is_valid(&changed));
+    }
+}
+
+#[test]
+fn all_binary_policy_combinations_fail_closed_and_have_stable_identities() {
+    let (policy, goal, proposal) = fixture();
+    for mask in 0..128 {
+        let mut wire = serde_json::to_value(&proposal).unwrap();
+        if mask & 1 != 0 {
+            wire["intent"]["tool_id"] = json!("unknown");
+        }
+        if mask & 2 != 0 {
+            wire["intent"]["scope"] = json!("other");
+        }
+        if mask & 4 != 0 {
+            wire["intent"]["destination"] = json!("elsewhere");
+        }
+        if mask & 8 != 0 {
+            wire["arguments"]["count"] = json!("synthetic-honeytoken-v1:trap");
+            wire["provenance"]["arguments_digest"] =
+                json!(argument_fingerprint(&wire["arguments"]));
+        }
+        if mask & 16 != 0 {
+            wire["intent"]["effect"]["class"] = json!("destructive");
+        }
+        if mask & 32 != 0 {
+            wire["schema_version"] = json!(2);
+        }
+        if mask & 64 != 0 {
+            wire["intent"]["target_version"]["revision"] = json!("r0");
+        }
+        let candidate = serde_json::from_value(wire).unwrap();
+        let result = policy.evaluate(&goal, &candidate);
+        assert_eq!(
+            result.decision(),
+            if mask == 0 {
+                FirewallDecision::Allow
+            } else {
+                FirewallDecision::Deny
+            },
+            "mask {mask}"
+        );
+        assert_eq!(result, policy.evaluate(&goal, &candidate));
+    }
+}
+
+#[test]
+fn canonical_argument_json_and_digest_goldens_are_order_independent() {
+    let (_, _, proposal) = fixture();
+    assert_eq!(
+        proposal.arguments_digest(),
+        "6aea6dfe6561984cdc5c54ead84d47d2cf29e48253ae282aef237404adad4661"
+    );
+    let wire = serde_json::to_string(&proposal).unwrap();
+    let a = ToolProposal::decode(
+        wire.replace("\"count\":1", "\"a\":\"x\",\"count\":1")
+            .as_bytes(),
+    )
+    .unwrap();
+    let b = ToolProposal::decode(
+        wire.replace("\"count\":1", "\"count\":1,\"a\":\"x\"")
+            .as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(a.canonical_arguments(), r#"{"a":"x","count":1}"#);
+    assert_eq!(a.canonical_arguments(), b.canonical_arguments());
+    assert_eq!(
+        a.arguments_digest(),
+        "81ab6ea06f51a87bade25d7b85011dfd47e7c0baae42695200ecd1b32bfd3462"
+    );
+}
+
+#[test]
+fn github_issue_close_requires_approval_and_binds_actual_arguments() {
+    let (mut policy, mut goal, mut proposal) = fixture();
+    let rule: ToolRule = serde_json::from_value(json!({"version":"1","capabilities":["network"],
+        "scopes":["owner/repo"],"destinations":["github"],"effect":"write","admission":"human_approval",
+        "arguments":{"repository":{"kind":"token","max_bytes":128},"issue":{"kind":"integer","min":1,"max":99999},
+            "state":{"kind":"choice","values":["closed"]}},
+        "scope":{"kind":"argument","name":"repository"},"destination":{"kind":"literal","value":"github"},
+        "resource":{"kind":"argument","name":"issue"}})).unwrap();
+    goal.scopes = rule.scopes.clone();
+    goal.destinations = rule.destinations.clone();
+    goal.capabilities = rule.capabilities.clone();
+    policy.tools = [("github_issue_close".into(), rule)].into();
+    let mut target = policy.targets.pop_first().unwrap();
+    target.scope = "owner/repo".into();
+    target.destination = "github".into();
+    target.resource = "238".into();
+    policy.targets.insert(target);
+    proposal.intent.tool_id = "github_issue_close".into();
+    proposal.intent.scope = "owner/repo".into();
+    proposal.intent.destination = "github".into();
+    proposal.intent.resource = "238".into();
+    proposal.intent.capabilities = goal.capabilities.clone();
+    proposal.intent.effect.class = SideEffectClass::Write;
+    proposal.arguments =
+        serde_json::from_value(json!({"repository":"owner/repo","issue":238,"state":"closed"}))
+            .unwrap();
+    proposal.provenance.arguments_digest = proposal.arguments_digest();
+    let result = policy.evaluate(&goal, &proposal);
+    assert_eq!(result.decision(), FirewallDecision::RequireHumanApproval);
+    proposal
+        .arguments
+        .insert("issue".into(), ToolArgument::Integer(239));
+    proposal.provenance.arguments_digest = proposal.arguments_digest();
+    assert_eq!(
+        policy.evaluate(&goal, &proposal).reason(),
+        FirewallReason::Arguments
+    );
+    proposal
+        .arguments
+        .insert("issue".into(), ToolArgument::Integer(238));
+    proposal.provenance.arguments_digest = proposal.arguments_digest();
+    policy
+        .tools
+        .get_mut("github_issue_close")
+        .unwrap()
+        .admission = ToolAdmission::LowRisk;
+    assert_eq!(
+        policy.evaluate(&goal, &proposal).reason(),
+        FirewallReason::SideEffect
+    );
+}
+
+#[test]
+fn all_effect_classes_require_registry_agreement_and_writes_never_auto_allow() {
+    let classes = [
+        SideEffectClass::None,
+        SideEffectClass::Read,
+        SideEffectClass::Write,
+        SideEffectClass::Destructive,
+    ];
+    for registered in classes {
+        for claimed in classes {
+            for admission in [ToolAdmission::LowRisk, ToolAdmission::HumanApproval] {
+                let (mut policy, goal, mut proposal) = fixture();
+                let rule = policy.tools.get_mut("noop").unwrap();
+                rule.effect = registered;
+                rule.admission = admission;
+                proposal.intent.effect.class = claimed;
+                let expected = if registered != claimed
+                    || (admission == ToolAdmission::LowRisk
+                        && matches!(
+                            registered,
+                            SideEffectClass::Write | SideEffectClass::Destructive
+                        )) {
+                    FirewallDecision::Deny
+                } else if admission == ToolAdmission::LowRisk {
+                    FirewallDecision::Allow
+                } else {
+                    FirewallDecision::RequireHumanApproval
+                };
+                assert_eq!(policy.evaluate(&goal, &proposal).decision(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn trusted_versions_freshness_and_provenance_are_identity_bound() {
+    let (policy, goal, proposal) = fixture();
+    let original = policy.evaluate(&goal, &proposal);
+    let mut changed_goal = goal.clone();
+    changed_goal.version = "2".into();
+    assert_ne!(
+        original.identity(),
+        policy.evaluate(&changed_goal, &proposal).identity()
+    );
+    changed_goal.schema_version = 2;
+    assert_eq!(
+        policy.evaluate(&changed_goal, &proposal).reason(),
+        FirewallReason::Schema
+    );
+    let mut changed = policy.clone();
+    changed.version = "2".into();
+    assert_ne!(
+        original.identity(),
+        changed.evaluate(&goal, &proposal).identity()
+    );
+    changed.schema_version = 2;
+    assert_eq!(
+        changed.evaluate(&goal, &proposal).reason(),
+        FirewallReason::Schema
+    );
+    changed = policy.clone();
+    changed.targets.clear();
+    assert_eq!(
+        changed.evaluate(&goal, &proposal).reason(),
+        FirewallReason::StaleTarget
+    );
+    changed = policy.clone();
+    let mut extra = changed.targets.first().unwrap().clone();
+    extra.version.revision = "r2".into();
+    changed.targets.insert(extra);
+    assert_eq!(
+        changed.evaluate(&goal, &proposal).reason(),
+        FirewallReason::StaleTarget
+    );
+    let mut changed_proposal = proposal.clone();
+    changed_proposal.provenance.source_digest = "b".repeat(64);
+    assert_ne!(
+        original.identity(),
+        policy.evaluate(&goal, &changed_proposal).identity()
+    );
+    changed_proposal.provenance.source_digest = "invalid".into();
+    assert_eq!(
+        policy.evaluate(&goal, &changed_proposal).reason(),
+        FirewallReason::Provenance
+    );
+}
+
 fn decide(policy: &FirewallPolicy, goal: &TrustedGoal, proposal: &ToolProposal) -> ToolDecision {
     policy.evaluate(goal, proposal)
 }
@@ -144,7 +381,7 @@ fn synthetic_policy_matrix_is_fail_closed() {
         json!({"count":5}),
         json!({"count":"1"}),
         json!({}),
-        json!({"count":1,"body":"raw document"}),
+        json!({"count":1,"body":"raw-document"}),
     ] {
         let mut changed = original.clone();
         changed["arguments"] = args.clone();

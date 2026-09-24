@@ -120,6 +120,45 @@ async fn observed_gate_emits_typed_privacy_safe_telemetry_before_terminal_denial
     }
 }
 
+#[tokio::test]
+async fn firewall_resume_is_refused_without_replaying_prior_telemetry() {
+    use workflow_adk::events::AdkEventMapper;
+    use workflow_runtime::InMemoryArtifactStore;
+    let bound = invocation("low_risk", "unknown");
+    let plan = compile_str("firewall.toml", &source(&bound.identity())).unwrap();
+    let agents = BTreeMap::from([(
+        "judge".into(),
+        Arc::new(PanicJudge) as Arc<dyn adk_rust::Agent>,
+    )]);
+    let graph = AdkGraphTranslator::new()
+        .translate_with_firewall(&plan, bound, &agents)
+        .unwrap();
+    assert!(
+        graph
+            .invoke(State::new(), ExecutionConfig::new("first"))
+            .await
+            .is_err()
+    );
+    assert_eq!(graph.firewall_decisions().unwrap().len(), 1);
+    let mut mapper = AdkEventMapper::new("resume", "firewall-test").unwrap();
+    let limit = std::num::NonZeroU64::new(65536).unwrap();
+    let mut artifacts = InMemoryArtifactStore::new(limit, limit);
+    assert_eq!(
+        graph
+            .invoke_observed(
+                State::new(),
+                ExecutionConfig::new("second").with_resume_from("forged"),
+                &mut mapper,
+                &mut artifacts
+            )
+            .await
+            .unwrap_err(),
+        AdkGraphError::AuthorizationDenied
+    );
+    assert!(mapper.events().is_empty());
+    assert!(graph.firewall_decisions().unwrap().is_empty());
+}
+
 struct PanicJudge;
 #[adk_rust::async_trait]
 impl adk_rust::Agent for PanicJudge {
@@ -240,6 +279,12 @@ fn compiler_and_every_default_translator_fail_closed_on_firewall_contract() {
         .is_err()
     );
     let changed = invocation("human_approval", "noop");
+    let changed_source = source.replace(&bound.identity(), &changed.identity());
+    let changed_plan = compile_str("changed.toml", &changed_source).unwrap();
+    assert_ne!(
+        plan.ir().canonical_hash(),
+        changed_plan.ir().canonical_hash()
+    );
     assert!(
         AdkGraphTranslator::new()
             .translate_with_firewall(&plan, changed, &BTreeMap::new())

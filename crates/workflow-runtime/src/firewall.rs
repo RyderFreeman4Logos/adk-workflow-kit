@@ -20,6 +20,12 @@ use serde_json::{Value, json};
 const MAX_PROPOSAL_BYTES: usize = 16_384;
 
 impl ToolProposal {
+    /// Draft 2020-12 request schema. Dynamic registered argument rules are additional
+    /// hard policy; validating this schema alone never authorizes an action.
+    pub fn schema() -> Value {
+        serde_json::to_value(schemars::schema_for!(Self)).expect("Firewall schema serialization")
+    }
+
     /// Decode a bounded strict request. Errors contain no attacker-controlled text.
     pub fn decode(bytes: &[u8]) -> Result<Self, FirewallReason> {
         if bytes.len() > MAX_PROPOSAL_BYTES {
@@ -52,7 +58,7 @@ impl ToolProposal {
 }
 
 impl FirewallPolicy {
-    /// All bytes affecting admission, including target revisions, are identity-bound.
+    /// Canonical configuration identity, including policy/schema and target revisions.
     pub fn identity(&self) -> String {
         digest(self)
     }
@@ -230,7 +236,7 @@ impl ArgumentBinding {
         }
     }
 }
-fn token(value: &str, max: usize) -> bool {
+pub(crate) fn token(value: &str, max: usize) -> bool {
     !value.is_empty()
         && value.len() <= max
         && value

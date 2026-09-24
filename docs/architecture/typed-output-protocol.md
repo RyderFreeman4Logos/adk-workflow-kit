@@ -23,7 +23,7 @@ or action use.
 
 Sentinel: `inj` injection, `sus` suspicious, `uns` unsupported language, `inv` invalid input, `cln` clean.
 
-Firewall: `alw` allow, `den` deny, `rha` require human approval.
+Firewall: `alw` allow, `den` deny, `rha` require human approval. Deterministic hard-policy records add a strict versioned `policy` stamp (closed reason code plus evaluation identity); it is a report, not an executor permit. [Firewall reason registry and boundary](../spec/FIREWALL.md).
 
 Dependency: `blk` blocks, `dep` depends on, `unr` unrelated.
 

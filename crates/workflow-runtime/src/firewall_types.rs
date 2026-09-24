@@ -8,9 +8,10 @@ pub const FIREWALL_SCHEMA_VERSION: u32 = 1;
 pub const FIREWALL_IMPLEMENTATION_VERSION: &str = "firewall-hard-policy-v1";
 
 /// Authority supplied by the trusted application, never by a proposal or model.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TrustedGoal {
+    #[schemars(range(min = 1, max = 1))]
     pub schema_version: u32,
     pub id: String,
     pub version: String,
@@ -20,7 +21,7 @@ pub struct TrustedGoal {
 }
 
 /// Closed side-effect classes, independent of model claims about safety.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SideEffectClass {
     None,
@@ -30,23 +31,27 @@ pub enum SideEffectClass {
 }
 
 /// Versioned proposal claim; the registered policy must independently agree.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SideEffectDescriptor {
+    #[schemars(range(min = 1, max = 1))]
     pub schema_version: u32,
     pub class: SideEffectClass,
 }
 
 /// Opaque exact revision supplied independently by a trusted target reader.
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize, schemars::JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct TargetVersion {
+    #[schemars(range(min = 1, max = 1))]
     pub schema_version: u32,
     pub revision: String,
 }
 
 /// Snapshot identity includes the destination and scope, not only an object ID.
-#[derive(Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TargetState {
     pub scope: String,
@@ -56,9 +61,10 @@ pub struct TargetState {
 }
 
 /// Canonical action claim, containing identifiers rather than natural-language context.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ToolIntent {
+    #[schemars(range(min = 1, max = 1))]
     pub schema_version: u32,
     pub goal_id: String,
     pub tool_id: String,
@@ -72,16 +78,36 @@ pub struct ToolIntent {
 }
 
 /// Scalar-only arguments. Nested documents, arrays, nulls, and floats are excluded.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum ToolArgument {
     Integer(i64),
     Boolean(bool),
-    Token(String),
+    Token(
+        #[schemars(length(min = 1, max = 256), regex(pattern = r"^[A-Za-z0-9._/:@#-]+$"))] String,
+    ),
+}
+
+impl<'de> Deserialize<'de> for ToolArgument {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Bool(value) => Ok(Self::Boolean(value)),
+            serde_json::Value::Number(value) => value
+                .as_i64()
+                .map(Self::Integer)
+                .ok_or_else(|| serde::de::Error::custom("argument must be an integer")),
+            serde_json::Value::String(value) if crate::firewall::token(&value, 256) => {
+                Ok(Self::Token(value))
+            }
+            _ => Err(serde::de::Error::custom(
+                "argument must be a bounded scalar token",
+            )),
+        }
+    }
 }
 
 /// A content reference and argument binding; provenance never upgrades authority.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProposalProvenance {
     pub source_digest: String,
@@ -90,9 +116,10 @@ pub struct ProposalProvenance {
 }
 
 /// The entire untrusted Firewall request. TrustedGoal and policy are injected separately.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ToolProposal {
+    #[schemars(range(min = 1, max = 1))]
     pub schema_version: u32,
     pub intent: ToolIntent,
     #[serde(deserialize_with = "unique_map")]
@@ -101,7 +128,7 @@ pub struct ToolProposal {
 }
 
 /// Exact argument constraints; all registered arguments are required and extras denied.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ArgumentRule {
     Integer { min: i64, max: i64 },
@@ -111,7 +138,7 @@ pub enum ArgumentRule {
 }
 
 /// Binds asserted metadata to actual arguments or immutable registration-owned literals.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ArgumentBinding {
     Literal { value: String },
@@ -119,7 +146,7 @@ pub enum ArgumentBinding {
 }
 
 /// Automatic allow is opt-in and only applies to no-effect/read-only registrations.
-#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolAdmission {
     LowRisk,
@@ -127,7 +154,7 @@ pub enum ToolAdmission {
 }
 
 /// Trusted registration. These facts are not copied from ToolIntent.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ToolRule {
     pub version: String,
@@ -143,9 +170,10 @@ pub struct ToolRule {
 }
 
 /// Injected trusted configuration; absent tool entries deny, never default allow.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FirewallPolicy {
+    #[schemars(range(min = 1, max = 1))]
     pub schema_version: u32,
     pub version: String,
     pub tools: BTreeMap<String, ToolRule>,
@@ -182,7 +210,7 @@ where
 }
 
 /// Stable compact hard-policy reason registry. No free-form error payloads.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 pub enum FirewallReason {
     #[serde(rename = "sch")]
     Schema,

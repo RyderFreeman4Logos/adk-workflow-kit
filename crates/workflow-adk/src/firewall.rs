@@ -60,6 +60,21 @@ impl AdkGraphTranslator {
     }
 }
 impl AdkGraph {
+    pub(crate) fn prepare_firewall_run(
+        &self,
+        config: &adk_rust::graph::prelude::ExecutionConfig,
+    ) -> Result<(), AdkGraphError> {
+        self.firewall_decisions
+            .lock()
+            .map_err(|_| AdkGraphError::Failed)?
+            .clear();
+        // Resume/approval execution needs the fresh-target ledger contract in #240.
+        if self.firewall_entry.is_some() && config.resume_from.is_some() {
+            return Err(AdkGraphError::AuthorizationDenied);
+        }
+        Ok(())
+    }
+
     pub(crate) fn observe_firewall<S: workflow_runtime::ArtifactStore>(
         &self,
         observed: &mut std::collections::BTreeSet<String>,

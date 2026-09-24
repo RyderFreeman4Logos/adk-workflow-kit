@@ -491,6 +491,7 @@ pub struct AdkGraph {
     plan_binding: Option<PlanBinding>,
     cache_dispositions: Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
     firewall_decisions: firewall::Decisions,
+    firewall_entry: Option<String>,
 }
 
 impl AdkGraph {
@@ -499,6 +500,7 @@ impl AdkGraph {
         state: State,
         config: ExecutionConfig,
     ) -> Result<State, AdkGraphError> {
+        self.prepare_firewall_run(&config)?;
         let mut state = self.input.map(state);
         state.retain(|key, _| !key.starts_with("visits:"));
         let limit = match self.visit_bound {
@@ -569,6 +571,7 @@ impl AdkGraph {
         mapper: &mut events::AdkEventMapper,
         artifacts: &mut S,
     ) -> Result<State, AdkGraphError> {
+        self.prepare_firewall_run(&config)?;
         let mut state = self.input.map(state);
         if config.resume_from.is_none() {
             state.retain(|key, _| !key.starts_with("visits:"));
@@ -1536,6 +1539,11 @@ impl AdkGraphTranslator {
             plan_binding,
             cache_dispositions: Arc::new(Mutex::new(BTreeMap::new())),
             firewall_decisions,
+            firewall_entry: ir
+                .nodes()
+                .iter()
+                .find(|node| node.firewall().is_some())
+                .map(|node| node.id().as_str().to_owned()),
         })
     }
 }
