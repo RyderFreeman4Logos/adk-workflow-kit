@@ -1301,3 +1301,51 @@ fn finish_after_crash_resumes_without_another_model_request() {
         serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
     assert_eq!(ledger["nodes"]["work"]["model_iterations"], 1);
 }
+
+#[test]
+fn resume_reconstruction_does_not_consume_graph_idle_budget() {
+    let root = root();
+    let workflow = root.join("workflow.toml");
+    fs::write(&workflow, WORKFLOW).unwrap();
+    let mut policy = loop_policy();
+    policy["idle_time_ms"] = json!(400);
+    policy["wall_time_ms"] = json!(60_000);
+    let receipt = ExecutionBackend::run(
+        &workflow,
+        profile_with(vec![finish(json!({"answer":"held"}))], Some(policy)),
+        json!({}),
+        &root,
+    )
+    .unwrap();
+    let barrier = root.join("resume-reconstruction-barrier");
+    fs::create_dir(&barrier).unwrap();
+    let worker_root = root.0.clone();
+    let run_id = receipt.run_id().to_owned();
+    let worker = std::thread::spawn(move || {
+        unsafe {
+            env::set_var(
+                "WORKFLOW_KIT_TEST_RESUME_RECONSTRUCTION_BARRIER",
+                worker_root.join("resume-reconstruction-barrier"),
+            );
+        }
+        let result = ExecutionBackend::resume(&worker_root, &run_id);
+        unsafe {
+            env::remove_var("WORKFLOW_KIT_TEST_RESUME_RECONSTRUCTION_BARRIER");
+        }
+        result
+    });
+    let started = Instant::now();
+    while !barrier.join("ready").is_file() && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        barrier.join("ready").is_file(),
+        "resume reconstruction barrier"
+    );
+    std::thread::sleep(Duration::from_millis(700));
+    fs::write(barrier.join("continue"), b"continue").unwrap();
+    let resumed = worker.join().unwrap().unwrap();
+    assert_eq!(resumed.status(), "succeeded");
+    assert_eq!(resumed.run_id(), receipt.run_id());
+    assert!(started.elapsed() < Duration::from_secs(15));
+}
