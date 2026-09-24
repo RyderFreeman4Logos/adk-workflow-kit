@@ -1,3 +1,6 @@
+#[path = "issue_231/segmentation.rs"]
+mod segmentation;
+
 use std::num::NonZeroU64;
 
 use workflow_runtime::{
@@ -261,6 +264,19 @@ fn emoji_joiners_and_variation_selectors_are_annotated_without_deletion() {
         let span = annotation.source();
         assert!(text.source_map().iter().any(|m| m.source() == span));
     }
+}
+
+#[test]
+fn segmentation_identity_is_bound_before_language_screening() {
+    let text = prepared(b"unattributed prose", NormalizationLimits::default());
+    assert_eq!(
+        text.telemetry()["segmentation_version"],
+        "sentinel-segmentation-v1"
+    );
+    assert_eq!(
+        text.telemetry()["script_data_version"],
+        "regex-syntax-0.8.11-unicode-16.0.0"
+    );
 }
 
 #[test]

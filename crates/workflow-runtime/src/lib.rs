@@ -20,6 +20,7 @@ mod pure_transform;
 mod sandbox_execution;
 mod security;
 mod sentinel_envelope;
+mod sentinel_segments;
 mod session;
 mod tool;
 mod tool_registry;
@@ -108,6 +109,10 @@ pub use sentinel_envelope::{
     CanonicalUntrustedText, CarrierAnnotation, CarrierKind, NormalizationLimits,
     NormalizationReason, NormalizedSourceSpan, SENTINEL_ENVELOPE_SCHEMA_VERSION,
     SENTINEL_NORMALIZATION_VERSION, SentinelPreparation, prepare_untrusted_text,
+};
+pub use sentinel_segments::{
+    LanguageScreening, SENTINEL_SCRIPT_DATA_VERSION, SENTINEL_SEGMENTATION_VERSION, ScriptEvidence,
+    SegmentationLimits, SegmentationReason, SegmentedUntrustedText, TextSegment, TextSegmentKind,
 };
 pub use session::{
     RunSessionIds, SessionId, SessionIdentityError, SessionIdentityErrorKind, SessionRole,

@@ -12,9 +12,11 @@ constructed by this data transformation.
 bounded analysis view was produced. It is **not `SentinelVerdict::Clean`** and
 must not authorize a tool, action, or reducer decision. `Invalid` contains a
 stable subcode and maps to the shared `SentinelVerdict::InvalidInput` (`inv`).
-There is deliberately no Boolean safety API. A future language-policy stage
-must distinguish `UnsupportedLanguage` from eligible input before #232 consumes
-the view. This milestone does not supply that stage.
+There is deliberately no Boolean safety API. `segment_language` supplies bounded
+lexical spans and Unicode script evidence, not language attribution. Its typed
+`LanguageScreening::Unattributed` result must stop supported-language routing.
+`NoNaturalLanguage` is only a lexical result, never safety `Clean`. A validated
+language-policy stage is still required before #232 consumes the view.
 
 The store retains exact original bytes before UTF-8 validation. Failed UTF-8 is
 never replaced with U+FFFD. Empty input, invalid policy, and oversized input are
@@ -49,6 +51,54 @@ artifact IO add a bounded number of linear passes; store latency is external.
 There is no claim of a wall-clock deadline. Limit exhaustion returns no partial
 prepared view. Maps/annotations have at most one entry per input scalar.
 
+## Conservative segmentation (partial language prerequisite)
+
+`CanonicalUntrustedText::segment_language(SegmentationLimits)` returns an immutable
+borrowed `SegmentedUntrustedText`; it never discards bytes from the envelope.
+Every nonempty normalized span has a covering original `SourceSpan`. Covers may
+include removed controls between retained scalars; use the canonical scalar map
+for exact per-scalar evidence. The ranges partition the entire normalized view.
+
+Recognized exclusions are explicit backtick/tilde code delimiters; HTTP(S), FTP
+and `www.` URL runs; underscore-bearing identifiers; Unicode emoji runs including
+joiners/marks; explicit `$`, `$$`, `\(`, `\[` math delimiters and Unicode math
+symbols; numeric, lowercase Boolean and null literals. Quoted prose is not
+silently treated as a data literal. Bare code, camelCase/dotted identifiers,
+HTML, nested/escaped delimiters and arbitrary structured data are **not parsed**;
+possible prose in them remains unattributed. Unclosed recognized delimiters fail
+atomically. Delimited payloads are still untrusted and still reach safety analysis.
+
+Each possible-prose token records Latin, Han, kana and other-script evidence.
+Script_Extensions and character categories come from the already-locked
+`regex-syntax = 0.8.11` Unicode 16.0.0 generated tables (MIT/Apache-2.0 package;
+Unicode data license included). This direct dependency adds no new locked package.
+See [the upstream Unicode support contract](https://docs.rs/regex-syntax/0.8.11/regex_syntax/)
+and [Unicode Script Extensions](https://www.unicode.org/reports/tr24/).
+The fixed property parser runs once; range membership uses binary search. No
+user-supplied regular expression or hand-written partial script table is used.
+Bump `SENTINEL_SCRIPT_DATA_VERSION` with any data dependency change.
+
+Defaults are 16,384 normalized bytes and 4,096 segments; hard ceilings are 65,536
+bytes and 16,384 segments. Unknown policy fields and above-ceiling values fail.
+Zero denies a nonempty corresponding resource. Each token is consumed once,
+including malformed numeric runs; source mapping is one forward scalar walk.
+Fixed property lookups and a bounded number of scans per token give linear work
+in admitted text size with fixed Unicode tables. No wall-time guarantee is made.
+Limit or delimiter errors return no partial segment list. Empty normalized views
+can have zero spans (original bytes/annotations remain in the preparation).
+
+**Language attribution blocker:** Latin is not English, and Han is shared by
+Chinese and Japanese. Simplified and Traditional Chinese both retain Han evidence;
+Han+kana retains both, including supplementary-plane characters. Mixed scripts
+are not flattened into a dominant-language guess. All material possible prose,
+including English and Chinese examples, currently returns `Unattributed` rather
+than claiming en/zh/ja support. There is no configurable supported-language
+allowlist until attribution can be validated. `whatlang 0.18.0` was evaluated but
+not added: its `detect_lang_base_on_mandarin_script` assigns Han-only input Cmn
+with confidence 1.0, which cannot resolve the required ambiguity. A future
+classifier needs pinned model/version identity, reliable abstention and measured
+multilingual hard-negative coverage before enabling supported-language routing.
+
 ## Cache and telemetry
 
 `CanonicalUntrustedText::bind_cache_key` consumes existing `NodeCacheKeyMaterial`
@@ -60,6 +110,11 @@ including scope, author and trust-policy classification. The analysis domain
 remains untrusted even for allowlisted authors. Existing outer request/policy
 identities are combined, never discarded. Model/provider/prompt/tool/dataset
 versions remain the caller's responsibility in `invocation_identity`.
+Segmentation and pinned script-data versions also participate in this consumed
+cache path. For segmented results use `SegmentedUntrustedText::bind_cache_key`,
+which additionally binds both segmentation limits and the unattributed stage.
+Prepared-only keys cannot hit segmented results, and changing either limit
+misses the durable cache in the integration fixture.
 
 `telemetry()` returns deterministic v1 JSON with state `prepared`, content
 hashes/handles, resource counts and policy identity. It contains no input text,
@@ -78,8 +133,8 @@ Run `just issue-231-runtime` (offline, no credentials).
 | Mapped zero-width/bidi/control carriers | `unicode_controls_have_golden_original_byte_mappings` (explicit list only) |
 | Deterministic resource bounds | `output_and_work_exhaustion_never_return_partial_prepared_text` |
 | Cache identity and structured telemetry | `cache_consumes_canonical_policy_raw_bytes_and_trust_provenance`, `telemetry_is_versioned_deterministic_and_does_not_echo_text` |
-| en/zh/ja versus material unsupported spans | Pending; script presence is not language identification |
-| Code/URL/identifier/emoji/math/data segmentation | Pending; no unsupported-language claims made |
+| en/zh/ja versus material unsupported spans | Blocked on validated attribution; `Unattributed` explicitly stops supported-language routing; no language allowlist claimed |
+| Code/URL/identifier/emoji/math/data segmentation | Bounded recognized-syntax subset, mapped spans; `segmentation::*` focused fixtures; exclusions are lexical, not safety approval |
 | Hidden HTML/Markdown, escaping, Base64, hex, nested decoding | Pending |
 | Unicode mapping/resource property corpus | `deterministic_unicode_property_corpus_has_total_source_coverage` (512 deterministic cases), joiner/variation-selector fixture |
 | Multilingual/hard-negative/nested-encoding fuzz fixtures | Pending |

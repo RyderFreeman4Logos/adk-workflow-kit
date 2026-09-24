@@ -209,6 +209,8 @@ impl CanonicalUntrustedText {
         serde_json::json!({
             "schema_version": SENTINEL_ENVELOPE_SCHEMA_VERSION,
             "normalizer_version": SENTINEL_NORMALIZATION_VERSION,
+            "segmentation_version": crate::SENTINEL_SEGMENTATION_VERSION,
+            "script_data_version": crate::SENTINEL_SCRIPT_DATA_VERSION,
             "state": "prepared",
             "trust_domain": TrustDomain::UntrustedContent,
             "original_artifact_id": self.original_id,
@@ -226,6 +228,8 @@ impl CanonicalUntrustedText {
         let unicode = std::char::UNICODE_VERSION;
         hash_fields(&[
             SENTINEL_NORMALIZATION_VERSION.as_bytes(),
+            crate::SENTINEL_SEGMENTATION_VERSION.as_bytes(),
+            crate::SENTINEL_SCRIPT_DATA_VERSION.as_bytes(),
             &SENTINEL_ENVELOPE_SCHEMA_VERSION.to_be_bytes(),
             &TYPED_OUTPUT_SCHEMA_VERSION_V1.to_be_bytes(),
             SECURITY_MODEL_VERSION.as_bytes(),
@@ -338,7 +342,7 @@ fn normalize(
     Ok(result)
 }
 
-fn hash_fields(fields: &[&[u8]]) -> String {
+pub(super) fn hash_fields(fields: &[&[u8]]) -> String {
     let mut hash = Sha256::new();
     for field in fields {
         hash.update((field.len() as u64).to_be_bytes());
