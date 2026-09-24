@@ -111,18 +111,16 @@ fn allowlist_denies_only_positive_attribution_and_han_never_becomes_chinese() {
         let segments = text
             .segment_language(SegmentationLimits::default())
             .unwrap();
-        for policy in [
-            LanguagePolicy::default(),
-            LanguagePolicy {
-                en: false,
-                zh: false,
-                ja: false,
-            },
-        ] {
+        for mask in 0..8 {
+            let policy = LanguagePolicy {
+                en: mask & 1 != 0,
+                zh: mask & 2 != 0,
+                ja: mask & 4 != 0,
+            };
             let result = segments.assess_language(policy).unwrap();
             assert_eq!(
                 result.attribution(),
-                if policy == LanguagePolicy::default() {
+                if (language == L::En && policy.en) || (language == L::Ja && policy.ja) {
                     A::Attributed(language)
                 } else {
                     A::UnsupportedLanguage

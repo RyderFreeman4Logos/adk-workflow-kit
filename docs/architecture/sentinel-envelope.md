@@ -66,8 +66,8 @@ joiners/marks; explicit `$`, `$$`, `\(`, `\[` math delimiters and Unicode math
 symbols; numeric, lowercase Boolean and null literals. Quoted prose is not
 silently treated as a data literal. Bare code, camelCase/dotted identifiers,
 HTML, nested/escaped delimiters and arbitrary structured data are **not parsed**;
-possible prose in them remains unattributed. Unclosed recognized delimiters fail
-atomically. Delimited payloads are still untrusted and still reach safety analysis.
+they retain possible-prose tokens. Attribution does not prove that those tokens
+were prose rather than code or data. Unclosed recognized delimiters fail atomically. Delimited payloads are still untrusted and still reach safety analysis.
 
 Each possible-prose token records Latin, Han, kana and other-script evidence.
 Script_Extensions and character categories come from the already-locked
