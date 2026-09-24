@@ -7,7 +7,7 @@ use std::{fmt, ops::Range};
 mod codec;
 
 /// Bump with recognition, decoding, source-map, or resource-accounting changes.
-pub const SENTINEL_CARRIER_VERSION: &str = "sentinel-carriers-v1";
+pub const SENTINEL_CARRIER_VERSION: &str = "sentinel-carriers-v2";
 
 /// Caller-owned policy, not parsed from the untrusted content.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -116,6 +116,56 @@ pub struct CarrierAnalysis<'a> {
     work_units: usize,
 }
 impl CarrierAnalysis<'_> {
+    /// Bind this optional stage before caching its results.
+    pub fn bind_cache_key(
+        &self,
+        material: crate::NodeCacheKeyMaterial<'_>,
+        provenance: &crate::ContentProvenance,
+    ) -> Result<crate::NodeCacheKey, crate::NodeCacheKeyError> {
+        if material.policy_digest.is_empty() {
+            return Err(crate::NodeCacheKeyError::EmptyIdentity);
+        }
+        let policy = self.policy_digest(material.policy_digest);
+        self.text.bind_cache_key(
+            crate::NodeCacheKeyMaterial {
+                policy_digest: &policy,
+                ..material
+            },
+            provenance,
+        )
+    }
+    fn policy_digest(&self, outer: &str) -> String {
+        crate::sentinel_envelope::hash_fields(&[
+            outer.as_bytes(),
+            SENTINEL_CARRIER_VERSION.as_bytes(),
+            b"carrier-analysis-untrusted",
+            match self.mode {
+                CarrierMode::AnnotateOnly => b"annotate_only",
+                CarrierMode::Decode => b"decode",
+            },
+            &(self.limits.max_input_bytes as u64).to_be_bytes(),
+            &(self.limits.max_candidates as u64).to_be_bytes(),
+            &(self.limits.max_depth as u64).to_be_bytes(),
+            &(self.limits.max_expanded_bytes as u64).to_be_bytes(),
+            &(self.limits.max_work_units as u64).to_be_bytes(),
+        ])
+    }
+    /// Content-free deterministic stage telemetry. Handles remain sensitive metadata.
+    pub fn telemetry(&self) -> serde_json::Value {
+        serde_json::json!({
+            "carrier_version": SENTINEL_CARRIER_VERSION,
+            "state": "carrier_analysis",
+            "trust_domain": crate::TrustDomain::UntrustedContent,
+            "original_artifact_id": self.text.original_id(),
+            "mode": self.mode,
+            "limits": self.limits,
+            "candidate_count": self.candidates.len(),
+            "expanded_bytes": self.expanded_bytes,
+            "work_units": self.work_units,
+            "policy_digest": self.policy_digest(""),
+        })
+    }
+
     pub fn text(&self) -> &CanonicalUntrustedText {
         self.text
     }

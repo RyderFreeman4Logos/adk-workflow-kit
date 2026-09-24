@@ -109,7 +109,7 @@ the retained artifact, canonical text, envelope, author provenance or untrusted
 analysis domain. A candidate is not proof of Injection; no candidates is not Clean.
 Decoded text must stay in an untrusted data role, just like the original envelope.
 
-The v1 subset recognizes literal `<!--...-->`, `[//]: # (...)`, standalone runs
+The v2 subset recognizes literal `<!--...-->`, `[//]: # (...)`, standalone runs
 of `%HH`, `\xHH` and `\uHHHH`, and explicitly labeled `base64:` / `hex:` tokens.
 The comment patterns are candidates, not claims about actual rendered visibility.
 Backtick/tilde-delimited literals and HTTP(S)/FTP/www URL runs are not decoded.
@@ -162,6 +162,14 @@ cache path. For segmented results use `SegmentedUntrustedText::bind_cache_key`,
 which additionally binds both segmentation limits and the unattributed stage.
 Prepared-only keys cannot hit segmented results, and changing either limit
 misses the durable cache in the integration fixture.
+Carrier recognition/decoder identity (`sentinel-carriers-v2`) also participates
+in preparation keys and telemetry. Cache optional carrier results only with
+`CarrierAnalysis::bind_cache_key`: it binds the analysis stage, annotation/decode
+mode, all five limits and the decoder version while preserving outer request,
+policy and original provenance identities. The durable-cache fixture independently
+reconstructs that versioned policy hash and proves version, mode, raw-byte, trust
+and limit changes miss. `CarrierAnalysis::telemetry` adds content-free stage,
+mode, candidate count and aggregate resource usage; it never echoes decoded text.
 
 `telemetry()` returns deterministic v1 JSON with state `prepared`, content
 hashes/handles, resource counts and policy identity. It contains no input text,
@@ -184,7 +192,7 @@ Run `just issue-231-runtime` (offline, no credentials).
 | Code/URL/identifier/emoji/math/data segmentation | Bounded recognized-syntax subset, mapped spans; `segmentation::*` focused fixtures; exclusions are lexical, not safety approval |
 | Hidden HTML/Markdown, escaping, Base64, hex, nested decoding | Bounded explicit candidate subset, optional decoded views and composed maps; `carriers::*`; arbitrary hidden markup remains pending |
 | Unicode mapping/resource property corpus | `deterministic_unicode_property_corpus_has_total_source_coverage` (512 deterministic cases), joiner/variation-selector fixture |
-| Multilingual/hard-negative/nested-encoding fuzz fixtures | Pending |
+| Multilingual/hard-negative/nested-encoding fuzz fixtures | Carrier subset: 256 seeded nested UTF-8 mapping cases, 512 seeded malformed-input cases, quantum golden maps and code/URL/data negatives; complete language/markup coverage remains pending |
 | Spec/IR/compiler runtime routing | Pending design of the language-policy binding; existing artifact runtime integrated |
 | Live semantic coverage | Not run; no authorized binding and no semantic model branch implemented |
 

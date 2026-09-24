@@ -167,6 +167,7 @@ pub(super) fn decode(
         let len = prefix + digits;
         let value = tail
             .get(prefix..len)
+            .filter(|s| s.iter().all(u8::is_ascii_hexdigit))
             .and_then(|s| std::str::from_utf8(s).ok())
             .and_then(|s| u32::from_str_radix(s, 16).ok());
         let Some(value) = value else {

@@ -6,9 +6,22 @@ use workflow_runtime::{
 };
 
 #[test]
+fn strict_hex_digits_do_not_accept_numeric_sign_syntax() {
+    let text = prepared(b"hex:+1", NormalizationLimits::default());
+    let result = text
+        .analyze_carriers(CarrierMode::Decode, CarrierLimits::default())
+        .unwrap();
+    assert_eq!(
+        result.candidates()[0].status(),
+        CarrierStatus::InvalidEncoding
+    );
+    assert!(result.candidates()[0].decoded().is_none());
+}
+
+#[test]
 fn carrier_identity_is_exposed_before_analysis() {
     let text = prepared(b"text", NormalizationLimits::default());
-    assert_eq!(text.telemetry()["carrier_version"], "sentinel-carriers-v1");
+    assert_eq!(text.telemetry()["carrier_version"], "sentinel-carriers-v2");
 }
 
 #[test]

@@ -1,3 +1,7 @@
+#[path = "issue_231/carrier_cache.rs"]
+mod carrier_cache;
+#[path = "issue_231/carrier_properties.rs"]
+mod carrier_properties;
 #[path = "issue_231/carriers.rs"]
 mod carriers;
 #[path = "issue_231/segmentation.rs"]
