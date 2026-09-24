@@ -556,6 +556,7 @@ pub struct Node {
     tools: Vec<ToolReference>,
     skills: Vec<SkillReference>,
     agent_contract: Option<AgentNodeContract>,
+    firewall: Option<FirewallContract>,
 }
 
 impl Node {
@@ -602,6 +603,11 @@ impl Node {
     /// Returns the explicitly declared Skill subset in source order.
     pub fn skills(&self) -> &[SkillReference] {
         &self.skills
+    }
+
+    /// Returns the exact deterministic Firewall invocation identity, when declared.
+    pub fn firewall(&self) -> Option<&FirewallContract> {
+        self.firewall.as_ref()
     }
 
     /// Returns the complete first-class agent contract, when declared.
@@ -915,6 +921,7 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
                         })
                         .collect(),
                     agent_contract,
+                    firewall: node.firewall,
                 })
             })
             .collect::<Result<_, SpecError>>()?,
@@ -1159,6 +1166,17 @@ struct RawNode {
     output: Option<RawOutputContract>,
     #[serde(default)]
     session: Option<String>,
+    #[serde(default)]
+    firewall: Option<FirewallContract>,
+}
+
+/// Source-level binding to one immutable, schema-versioned Firewall invocation.
+/// The digest binds policy, goal, proposal, provenance, and fresh target snapshot.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FirewallContract {
+    pub schema_version: u32,
+    pub identity: String,
 }
 
 #[derive(Deserialize)]

@@ -221,6 +221,27 @@ impl std::error::Error for BindingValidationError {}
 
 fn validate_node_bindings(spec: &WorkflowSpec) -> Result<(), CompileError> {
     for node in spec.nodes() {
+        if let Some(firewall) = node.firewall() {
+            // A v1 hard gate must precede every model/action and cannot be re-entered.
+            if node.kind() != NodeKind::Validator
+                || node.id() != spec.workflow().entry()
+                || firewall.schema_version != 1
+                || firewall.identity.len() != 64
+                || !firewall
+                    .identity
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || spec.edges().iter().any(|edge| edge.to() == node.id())
+                || spec.routes().iter().any(|route| {
+                    route.cases().iter().any(|case| case.target() == node.id())
+                        || route.default() == Some(node.id())
+                })
+            {
+                return Err(CompileError::Binding(
+                    BindingValidationError::InvalidPlacement,
+                ));
+            }
+        }
         if node.kind() != NodeKind::Agent
             && (node.model().is_some()
                 || !node.tools().is_empty()

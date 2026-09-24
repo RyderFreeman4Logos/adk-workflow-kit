@@ -2,6 +2,7 @@
 
 pub mod events;
 pub mod execution;
+pub mod firewall;
 pub mod model_invocation;
 pub use model_invocation::{
     EscalationPolicy, InferenceBudget, InferenceBudgetError, InvocationProvenance,
@@ -282,6 +283,8 @@ pub struct GraphSummary {
 /// Stable failures produced while translating a validated compiler plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranslationError {
+    /// A Firewall gate was missing its exact trusted invocation binding.
+    FirewallBinding,
     UnknownTarget {
         from: String,
         target: String,
@@ -304,6 +307,7 @@ pub enum TranslationError {
 impl fmt::Display for TranslationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::FirewallBinding => write!(f, "Firewall binding missing or mismatched"),
             Self::UnknownTarget { from, target } => {
                 write!(f, "graph translation rejected {from:?} to {target:?}")
             }
@@ -486,6 +490,7 @@ pub struct AdkGraph {
     agent_nodes: BTreeSet<String>,
     plan_binding: Option<PlanBinding>,
     cache_dispositions: Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
+    firewall_decisions: firewall::Decisions,
 }
 
 impl AdkGraph {
@@ -901,7 +906,7 @@ impl AdkGraphTranslator {
     }
 
     pub fn translate(&self, plan: &CompiledPlan) -> Result<AdkGraph, TranslationError> {
-        self.translate_ir(plan.ir(), None, None, None, None)
+        self.translate_ir(plan.ir(), None, None, None, None, None)
     }
 
     /// Translates with exact live agents supplied for every agent node.
@@ -910,7 +915,7 @@ impl AdkGraphTranslator {
         plan: &CompiledPlan,
         agents: &BTreeMap<String, Arc<dyn Agent>>,
     ) -> Result<AdkGraph, TranslationError> {
-        self.translate_ir(plan.ir(), None, Some(agents), None, None)
+        self.translate_ir(plan.ir(), None, Some(agents), None, None, None)
     }
 
     /// Translates a profile graph with WASM-backed non-Agent execution nodes.
@@ -942,6 +947,7 @@ impl AdkGraphTranslator {
                 input: input.clone(),
             }),
             checkpointer,
+            None,
         )
     }
 
@@ -1008,6 +1014,7 @@ impl AdkGraphTranslator {
             agents,
             profile_backend,
             checkpointer,
+            None,
         )
     }
 
@@ -1027,7 +1034,10 @@ impl AdkGraphTranslator {
         agents: Option<&BTreeMap<String, Arc<dyn Agent>>>,
         profile_backend: Option<ProfileNodeBackend>,
         checkpointer: Option<Arc<dyn Checkpointer>>,
+        firewall: Option<firewall::FirewallInvocation>,
     ) -> Result<AdkGraph, TranslationError> {
+        firewall::validate_binding(ir, firewall.as_ref())?;
+        let firewall_decisions = firewall::Decisions::default();
         let ids: std::collections::BTreeSet<&str> =
             ir.nodes().iter().map(|node| node.id().as_str()).collect();
         let mut incoming = BTreeMap::<String, BTreeSet<String>>::new();
@@ -1212,7 +1222,16 @@ impl AdkGraphTranslator {
         for node in ir.nodes() {
             let id = node.id().as_str().to_owned();
             order.push(id.clone());
-            if node.kind() == IrNodeKind::Agent {
+            if node.firewall().is_some() {
+                let invocation = firewall.clone().ok_or(TranslationError::FirewallBinding)?;
+                let records = Arc::clone(&firewall_decisions);
+                builder = builder.node_fn(&id.clone(), move |_context| {
+                    let invocation = invocation.clone();
+                    let records = Arc::clone(&records);
+                    let node = id.clone();
+                    async move { firewall::execute(&invocation, &records, &node) }
+                });
+            } else if node.kind() == IrNodeKind::Agent {
                 agent_nodes.insert(id.clone());
                 let agent: Arc<dyn Agent> = match agents {
                     Some(agents) => agents
@@ -1514,6 +1533,7 @@ impl AdkGraphTranslator {
             agent_nodes,
             plan_binding,
             cache_dispositions: Arc::new(Mutex::new(BTreeMap::new())),
+            firewall_decisions,
         })
     }
 }
