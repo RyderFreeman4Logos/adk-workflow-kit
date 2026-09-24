@@ -5512,6 +5512,7 @@ impl ExecutionBackend {
 
         let mut retry_models = Vec::new();
         let node_cache = node_cache_open(workdir_base.as_ref())?;
+        resume_reconstruction_test_barrier();
         let cache_dispositions = Arc::new(Mutex::new(BTreeMap::new()));
         let agents = compiled
             .ir()
@@ -5592,6 +5593,10 @@ impl ExecutionBackend {
             .enable_all()
             .build()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        *last_progress
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))? =
+            Instant::now();
         let state = match invoke_graph_with_deadline(
             &runtime,
             deadline,
@@ -5861,6 +5866,24 @@ impl EffectFence {
         Ok(())
     }
 }
+
+#[cfg(debug_assertions)]
+fn resume_reconstruction_test_barrier() {
+    let Ok(root) = std::env::var("WORKFLOW_KIT_TEST_RESUME_RECONSTRUCTION_BARRIER") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    if fs::write(root.join("ready"), b"ready").is_err() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !root.join("continue").is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn resume_reconstruction_test_barrier() {}
 
 fn test_effect_barrier(cancellation: &AtomicBool) {
     let Ok(configured) = std::env::var("WORKFLOW_KIT_TEST_EFFECT_BARRIER") else {
