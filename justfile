@@ -130,6 +130,10 @@ issue-228-runtime test_name="":
 issue-228-test:
     just issue-228-runtime
 
+# Focused #231 canonical untrusted-data preparation tests.
+issue-231-runtime test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_231_sentinel_envelope {{test_name}} --locked -- --nocapture
+
 # Focused #229 pinned dataset registry tests.
 issue-229-http test_name="dataset::dataset_http::":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --lib {{test_name}} --locked -- --nocapture
