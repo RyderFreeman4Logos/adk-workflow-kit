@@ -19,4 +19,4 @@ The `workflowctl` binary is the CLI composition layer. It maps compiler, skill, 
 
 ## Compatibility
 
-The workspace pins `adk-rust = 1.0.0` and enables its `agents`, `models`, `graph`, `guardrail`, and `telemetry` features. `workflow-adk` intentionally does not re-export ADK implementation types: its contract is the validated Verbatim boundary.
+The workspace pins `adk-rust = 2.1.0` and enables its `agents`, `models`, `graph`, `guardrail`, `telemetry`, and `openai` features. `workflow-adk` intentionally does not re-export ADK implementation types: its contract is the validated Verbatim boundary.
