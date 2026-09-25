@@ -8,6 +8,14 @@ if [[ ! -x "$source_runner" ]]; then
     exit 1
 fi
 
+# Inspect the expanded canonical gate, not just the focused recipe's definition.
+selection="$(just --justfile "$repo_root/justfile" --dry-run _quality-gates 2>&1)"
+if [[ "$selection" != *'cargo +1.98.0 test -p workflow-adk --locked -- --test-threads=1'* ||
+    "$selection" != *'cargo +1.98.0 test -p workflow-adk --features test-support --test issue_233_behavioral --test issue_233_translation --locked -- --nocapture --test-threads=1'* ]]; then
+    printf 'FAIL canonical gate must select default ADK and feature-enabled authored behavioral tests\n' >&2
+    exit 1
+fi
+
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/adk-local-gates.XXXXXX")"
 trap 'rm -rf -- "$test_root"' EXIT
 fixture="$test_root/repo"
@@ -42,7 +50,7 @@ mkdir -p "$fixture/.local-gates"
 runner="$fixture/scripts/local-gates.sh"
 gate_log="$fixture/.local-gates/gate.log"
 csa_log="$fixture/.local-gates/csa.log"
-assertions=0
+assertions=1 # Canonical default/feature-enabled selection checked above.
 
 lock_fixture="$test_root/lock-mismatch"
 cargo_bin="$test_root/cargo-bin"
@@ -103,7 +111,7 @@ fi
 
 justfile_contract="$(<"$repo_root/justfile")"
 if [[ "$justfile_contract" != *'pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit pattern-catalog-test m2-02-green test-local-gates'* ||
-    "$justfile_contract" != *'_quality-gates: fmt-check check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test test-local-gates'* ||
+    "$justfile_contract" != *'_quality-gates: fmt-check check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk test-local-gates'* ||
     "$justfile_contract" == *'pre-commit-fast: '*m2-02-red* ||
     "$justfile_contract" == *'_quality-gates: '*m2-02-red* ]]; then
     printf 'FAIL quality gates omit the canonical M2-02/#269 consumer contracts\n' >&2

@@ -29,8 +29,11 @@ use workflow_runtime::{
     behavioral::{ProbeLimits, TrustedScript},
 };
 
+#[path = "support/behavioral_oracles.rs"]
+mod behavioral_oracles;
 #[path = "support/behavioral_order.rs"]
 mod behavioral_order;
+use behavioral_oracles::no_report;
 
 const WORKFLOW: &str = include_str!("fixtures/sentinel.workflow.toml");
 const BEHAVIORAL: &str =
@@ -130,14 +133,14 @@ async fn assert_rejected(translated: Result<AdkGraph, TranslationError>) {
         Some(TranslationError::MissingNodeBackend {
             node: "prepare".into()
         }),
-        "behavioral execution is unsupported, never ordinary preparation"
+        "behavioral execution requires a host-bound translator, never ordinary preparation"
     );
     assert_eq!(calls, 0, "must not enter the Sentinel model");
     assert_eq!(events, 0, "must not prepare artifacts or execute the graph");
 }
 
 #[tokio::test]
-async fn approved_behavioral_compilation_is_rejected_by_public_translation() {
+async fn approved_behavioral_compilation_is_rejected_by_unbound_translation() {
     let spec =
         workflow_spec::parse_str("sentinel.toml", &format!("{WORKFLOW}{BEHAVIORAL}")).unwrap();
     let hash = WorkflowIr::from(&spec).canonical_hash();
@@ -294,7 +297,7 @@ async fn host_approved_authored_terminal_executes_and_retains_typed_report() {
     );
     let events = serde_json::to_string(mapper.events()).unwrap();
     assert!(events.contains(id.as_str()));
-    assert!(!events.contains("model_request_completed"));
+    behavioral_oracles::no_model(&mapper);
     assert!(!events.contains("semantics"));
     assert!(!events.contains("forged"));
     let before = mapper.events().len();
@@ -388,13 +391,6 @@ fn deadline() -> std::time::Instant {
 }
 fn uncancelled() -> Arc<std::sync::atomic::AtomicBool> {
     Arc::new(std::sync::atomic::AtomicBool::new(false))
-}
-fn no_report(mapper: &AdkEventMapper) {
-    let events = serde_json::to_string(mapper.events()).unwrap();
-    assert!(!events.contains("model_request_completed"));
-    assert!(!events.contains("sentinel-behavioral"));
-    assert!(!events.contains("workflow.completed"));
-    assert!(!events.contains("forged"));
 }
 
 #[tokio::test]
@@ -585,6 +581,11 @@ async fn observed_controls_source_model_and_forgery_fail_closed() {
         }
         let mut mapper = AdkEventMapper::new("negative", "sentinel-preparation").unwrap();
         let mut artifacts = store();
+        let supplied = if case == "source" {
+            b"wrong".as_slice()
+        } else {
+            RAW
+        };
         let mut state = input_state();
         let mut config = ExecutionConfig::new("negative");
         match case {
@@ -593,7 +594,7 @@ async fn observed_controls_source_model_and_forgery_fail_closed() {
             "long-run" => config.thread_id = "x".repeat(257),
             "resume" => config.resume_from = Some("forged".into()),
             "source" => state
-                .insert("input".into(), json!({"schema_version":1,"bytes":b"wrong"}))
+                .insert("input".into(), json!({"schema_version":1,"bytes":supplied}))
                 .map(|_| ())
                 .unwrap_or(()),
             "json" => state
@@ -631,23 +632,37 @@ async fn observed_controls_source_model_and_forgery_fail_closed() {
         assert!(result.is_err(), "{case}");
         assert_eq!(entries.0.load(Ordering::SeqCst), 0, "{case}");
         no_report(&mapper);
-        let id = ArtifactId::parse(format!("{:x}", Sha256::digest(RAW))).unwrap();
+        let id = ArtifactId::parse(format!("{:x}", Sha256::digest(supplied))).unwrap();
         assert!(
             artifacts
                 .read_page(&id, PageRequest::new(0, 100_000.try_into().unwrap()))
                 .is_err(),
+            "{case}: supplied source must not be retained"
+        );
+        assert!(
+            mapper.events().iter().all(|event| event.kind()
+                != workflow_runtime::WorkflowRuntimeEventKindV1::ArtifactCommitted),
             "{case}"
         );
+        if case != "json" {
+            assert!(
+                mapper.events().is_empty(),
+                "{case}: admission must precede observations"
+            );
+        }
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_invocations_and_discarded_future_cannot_exchange_reports() {
-    let graph = Arc::new(authored(json!([
+    let steps = json!([
         {"kind":"call","tool":"synthetic_credentials","arguments":{}},
         {"kind":"output","text":"${PROBE_CANARY}"},
         {"kind":"call","tool":"complete","arguments":{}}
-    ])));
+    ]);
+    let expected_a = behavioral_oracles::expected_report(steps.clone(), "concurrent-a");
+    let expected_b = behavioral_oracles::expected_report(steps.clone(), "concurrent-b");
+    let graph = Arc::new(authored(steps));
     let mut mapper = AdkEventMapper::new("dropped", "sentinel-preparation").unwrap();
     let mut artifacts = store();
     drop(graph.invoke_observed_with_sentinel_script(
@@ -682,18 +697,28 @@ async fn concurrent_invocations_and_discarded_future_cannot_exchange_reports() {
             assert!(mapper.events().iter().all(|event| event.run_id() == run));
             let events = serde_json::to_string(mapper.events()).unwrap();
             assert!(!events.contains("forged"));
-            assert!(!events.contains("model_request_completed"));
-            (report.to_json().unwrap(), events)
+            behavioral_oracles::no_model(&mapper);
+            (report, mapper, artifacts)
         }));
     }
     let a = tasks.remove(0).await.unwrap();
     let b = tasks.remove(0).await.unwrap();
-    let av: serde_json::Value = serde_json::from_str(&a.0).unwrap();
-    let bv: serde_json::Value = serde_json::from_str(&b.0).unwrap();
+    behavioral_oracles::owned_report(&expected_a, &a.0, &a.1, &a.2);
+    behavioral_oracles::owned_report(&expected_b, &b.0, &b.1, &b.2);
+    let av: serde_json::Value = serde_json::from_str(&a.0.to_json().unwrap()).unwrap();
+    let bv: serde_json::Value = serde_json::from_str(&b.0.to_json().unwrap()).unwrap();
     assert_ne!(av["identity"], bv["identity"]);
     assert_ne!(av["canary_digest"], bv["canary_digest"]);
-    assert!(!a.1.contains(bv["identity"].as_str().unwrap()));
-    assert!(!b.1.contains(av["identity"].as_str().unwrap()));
+    assert!(
+        !serde_json::to_string(a.1.events())
+            .unwrap()
+            .contains(bv["identity"].as_str().unwrap())
+    );
+    assert!(
+        !serde_json::to_string(b.1.events())
+            .unwrap()
+            .contains(av["identity"].as_str().unwrap())
+    );
 }
 
 struct ControlledStore {
@@ -800,11 +825,7 @@ async fn cancellation_during_preparation_and_report_failure_do_not_publish_stale
             assert_eq!(report.events().len(), usize::from(case == "fresh"));
             assert!(report.evidence().unwrap().is_none());
         }
-        assert!(
-            !serde_json::to_string(mapper.events())
-                .unwrap()
-                .contains("model_request_completed")
-        );
+        behavioral_oracles::no_model(&mapper);
     }
 }
 
@@ -842,10 +863,6 @@ async fn authored_crash_and_step_exhaustion_never_reach_later_completion() {
         assert_eq!(report.stop(), stop);
         assert_eq!(report.events().len(), count);
         assert!(report.evidence().unwrap().is_none());
-        assert!(
-            !serde_json::to_string(mapper.events())
-                .unwrap()
-                .contains("model_request_completed")
-        );
+        behavioral_oracles::no_model(&mapper);
     }
 }

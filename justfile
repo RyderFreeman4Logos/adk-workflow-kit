@@ -326,7 +326,7 @@ check-branch:
 
 pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit pattern-catalog-test m2-02-green test-local-gates
 
-_quality-gates: fmt-check check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test test-local-gates
+_quality-gates: fmt-check check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk test-local-gates
 
 quality-gates:
     scripts/local-gates.sh produce
