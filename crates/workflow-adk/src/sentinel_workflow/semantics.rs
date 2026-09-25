@@ -1,5 +1,5 @@
 //! Isolated ADK superstep: only complete, source-bound typed drafts reach publication.
-use super::{UntrustedTextState, probes};
+use super::{UntrustedTextState, probes, task_alignment};
 use crate::{
     AdkGraphError, InferenceBudget, ModelInvocationSpec, PromptProtocol, ProviderRouteIdentity,
     ReasoningEffort, StructuredOutputContract, model_invocation::ResponsePolicy,
@@ -18,7 +18,7 @@ use workflow_runtime::{
     TypedOutput, TypedPayload, admit_for_reducer, argument_fingerprint, parse_typed_output,
 };
 
-pub(super) const VERSION: &str = "sentinel-semantic-probes-v1";
+pub(super) const VERSION: &str = "sentinel-semantic-probes-v2";
 pub(super) const MAX_REQUESTS: usize = 8;
 pub(super) const DEADLINE_MS: u64 = 30_000;
 pub(super) const OUTPUT_BYTES: usize = 512;
@@ -56,12 +56,16 @@ struct Report {
     decision: Option<Value>,
 }
 impl Report {
-    fn new(reason: Reason) -> Self {
+    fn new(reason: Reason, has_goal: bool) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             version: VERSION,
             reason,
-            task_alignment: "trusted_goal_unavailable",
+            task_alignment: if has_goal {
+                "not_completed"
+            } else {
+                "trusted_goal_unavailable"
+            },
             causal_attribution: "not_measured",
             findings: vec![],
             decision: None,
@@ -83,15 +87,17 @@ pub(super) async fn run(
     gate: UntrustedTextState,
     binding: Option<&std::sync::Arc<ModelBinding>>,
     preparation_identity: &str,
+    goal: Option<&task_alignment::TrustedGoal>,
 ) -> Result<Vec<u8>, AdkGraphError> {
+    let report = |reason| Report::new(reason, goal.is_some());
     if gate != UntrustedTextState::PendingClassification {
-        return Report::new(Reason::LanguageGate).encode();
+        return report(Reason::LanguageGate).encode();
     }
     if !(2..=MAX_REQUESTS).contains(&inputs.len()) {
-        return Report::new(Reason::ViewBudget).encode();
+        return report(Reason::ViewBudget).encode();
     }
     let Some(binding) = binding else {
-        return Report::new(Reason::ModelUnavailable).encode();
+        return report(Reason::ModelUnavailable).encode();
     };
     let keys: Vec<_> = (0..inputs.len()).map(|i| format!("probe-{i}")).collect();
     let channels: Vec<_> = keys.iter().map(String::as_str).collect();
@@ -99,7 +105,7 @@ pub(super) async fn run(
     let (failed, mut failures) = mpsc::channel(1);
     let mut expected = Vec::new();
     for (input, key) in inputs.into_iter().zip(&keys) {
-        let spec = specification(&input, binding, preparation_identity)?;
+        let spec = specification(&input, binding, preparation_identity, goal)?;
         let provenance = spec.provenance();
         expected.push(Finding {
             branch: input.branch,
@@ -152,25 +158,35 @@ pub(super) async fn run(
     // Keep a sender alive through select: channel closure is not branch failure.
     drop(failed);
     let state = match outcome {
-        Err(_) => return Report::new(Reason::Deadline).encode(),
-        Ok(None) => return Report::new(Reason::InvalidOrFailed).encode(),
+        Err(_) => return report(Reason::Deadline).encode(),
+        Ok(None) => return report(Reason::InvalidOrFailed).encode(),
         Ok(Some(state)) => state,
     };
     let mut consensus = None;
+    let mut relation = None;
     for (finding, key) in expected.iter_mut().zip(keys) {
         let Some(value) = state.get(&key) else {
-            return Report::new(Reason::InvalidOrFailed).encode();
+            return report(Reason::InvalidOrFailed).encode();
         };
-        let bytes = serde_json::to_vec(value).map_err(|_| AdkGraphError::Failed)?;
-        let Ok(output) = parse_typed_output(&bytes) else {
-            return Report::new(Reason::InvalidOrFailed).encode();
+        let verdict = if finding.branch == "task_alignment" {
+            let Some(admitted) = goal.and_then(|goal| goal.admit(value, &finding.view.source))
+            else {
+                return report(Reason::InvalidOrFailed).encode();
+            };
+            relation = Some(admitted);
+            admitted.verdict()
+        } else {
+            let bytes = serde_json::to_vec(value).map_err(|_| AdkGraphError::Failed)?;
+            let Ok(output) = parse_typed_output(&bytes) else {
+                return report(Reason::InvalidOrFailed).encode();
+            };
+            let Ok(TypedPayload::Sentinel(evidence)) = admit_for_reducer(&output) else {
+                return report(Reason::InvalidOrFailed).encode();
+            };
+            evidence.verdict()
         };
-        let Ok(TypedPayload::Sentinel(evidence)) = admit_for_reducer(&output) else {
-            return Report::new(Reason::InvalidOrFailed).encode();
-        };
-        let verdict = evidence.verdict();
         if consensus.is_some_and(|previous| previous != verdict) {
-            return Report::new(Reason::Conflict).encode();
+            return report(Reason::Conflict).encode();
         }
         consensus = Some(verdict);
         finding.output = value.clone();
@@ -178,15 +194,22 @@ pub(super) async fn run(
     // ponytail: unanimous non-Clean evidence only. Calibrated Clean admission needs
     // all deterministic/behavioral gates and is deliberately not implemented here.
     if consensus == Some(SentinelVerdict::Clean) {
-        return Report::new(Reason::CleanNotAuthoritative).encode();
+        let mut report = report(Reason::CleanNotAuthoritative);
+        if let Some(relation) = relation {
+            report.task_alignment = relation.code();
+        }
+        return report.encode();
     }
     if !matches!(
         consensus,
         Some(SentinelVerdict::Injection | SentinelVerdict::Suspicious)
     ) {
-        return Report::new(Reason::InvalidOrFailed).encode();
+        return report(Reason::InvalidOrFailed).encode();
     }
-    let mut report = Report::new(Reason::Agreement);
+    let mut report = report(Reason::Agreement);
+    if let Some(relation) = relation {
+        report.task_alignment = relation.code();
+    }
     report.decision = expected.first().map(|finding| finding.output.clone());
     report.findings = expected;
     report.encode()
@@ -196,6 +219,7 @@ fn specification(
     input: &probes::Input,
     binding: &ModelBinding,
     preparation_identity: &str,
+    goal: Option<&task_alignment::TrustedGoal>,
 ) -> Result<ModelInvocationSpec, AdkGraphError> {
     let choices = [
         SentinelVerdict::Injection,
@@ -218,9 +242,17 @@ fn specification(
             .map_err(|_| AdkGraphError::Failed)
     })
     .collect::<Result<Vec<_>, _>>()?;
-    let schema = json!({"$id":format!("urn:{VERSION}:{}", input.branch), "enum": choices});
+    let (schema, policy) = if input.branch == "task_alignment" {
+        let goal = goal.ok_or(AdkGraphError::Failed)?;
+        (goal.schema(input), goal.policy())
+    } else {
+        (
+            json!({"$id":format!("urn:{VERSION}:{}", input.branch), "enum": choices}),
+            POLICY.to_owned(),
+        )
+    };
     let protocol = PromptProtocol::new(
-        POLICY,
+        policy,
         vec![],
         schema.clone(),
         json!({"trust_domain":TrustDomain::UntrustedContent,"preparation_identity":preparation_identity,"view":input.view,"text":input.text}),
@@ -262,5 +294,6 @@ struct Span {
 fn validate_wire(bytes: &[u8]) -> Result<(), StructuredOutputError> {
     serde_json::from_slice::<Wire>(bytes)
         .map(|_| ())
+        .or_else(|_| serde_json::from_slice::<task_alignment::Evidence>(bytes).map(|_| ()))
         .map_err(|_| StructuredOutputError::InvalidJson)
 }

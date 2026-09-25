@@ -39,7 +39,22 @@ enum Mode {
     LateIncomplete,
     LateError,
     Interrupted,
+    TaskBenign,
+    TaskAligned,
+    TaskMalformed,
+    TaskForeign,
+    TaskStale,
+    TaskWrongGoal,
+    TaskWrongOrigin,
+    TaskDuplicate,
+    TaskDuplicateSource,
+    TaskLegacy,
+    TaskConflict,
+    TaskUncertain,
 }
+
+#[path = "task_alignment.rs"]
+mod task_alignment;
 struct Probe {
     mode: Mode,
     barrier: Arc<Barrier>,
@@ -83,7 +98,49 @@ impl Llm for Probe {
     ) -> adk_rust::Result<LlmResponseStream> {
         let schema: Value =
             serde_json::from_str(frame(&text(&request.contents[0]), "OUTPUT_SCHEMA_JSON")).unwrap();
-        let mut content = Content::new("assistant").with_text(schema["enum"][0].to_string());
+        let task = schema["$id"].as_str().unwrap().ends_with(":task_alignment");
+        let choice = match self.mode {
+            Mode::TaskBenign | Mode::TaskConflict if task => 1,
+            Mode::TaskUncertain if task => 3,
+            Mode::TaskUncertain => 1,
+            Mode::TaskAligned if task => 2,
+            Mode::TaskBenign | Mode::TaskAligned => 2,
+            _ => 0,
+        };
+        let mut answer = schema["enum"][choice].clone();
+        if task {
+            match self.mode {
+                Mode::TaskForeign => answer["source"]["artifact_id"] = json!("0".repeat(64)),
+                Mode::TaskStale => answer["schema_version"] = json!(0),
+                Mode::TaskWrongGoal => {
+                    answer["goal_identity"] = json!("sha256:".to_owned() + &"0".repeat(64))
+                }
+                Mode::TaskWrongOrigin => answer["trust_origin"] = json!("untrusted_content"),
+                Mode::TaskLegacy => {
+                    answer = serde_json::from_str(&super::reply(
+                        RAW,
+                        workflow_runtime::SentinelVerdict::Injection,
+                    ))
+                    .unwrap()
+                }
+                _ => {}
+            }
+        }
+        let wire = if task && matches!(self.mode, Mode::TaskMalformed) {
+            "{\"relation\":\"redirects_goal\",\"relation\":\"benign_discussion\"}".to_owned()
+        } else if task && matches!(self.mode, Mode::TaskDuplicate) {
+            answer.to_string().replace(
+                "\"relation\":",
+                "\"relation\":\"redirects_goal\",\"relation\":",
+            )
+        } else if task && matches!(self.mode, Mode::TaskDuplicateSource) {
+            answer
+                .to_string()
+                .replace("\"start\":", "\"start\":0,\"start\":")
+        } else {
+            answer.to_string()
+        };
+        let mut content = Content::new("assistant").with_text(wire);
         let ordinal = {
             let mut requests = self.requests.lock().unwrap();
             let ordinal = requests.len();

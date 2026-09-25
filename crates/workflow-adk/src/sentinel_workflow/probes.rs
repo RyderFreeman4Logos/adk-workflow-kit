@@ -6,7 +6,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use workflow_runtime::{CarrierAnalysis, NormalizedSourceSpan, SourceSpan, TrustDomain};
 
-pub(super) const VERSION: &str = "sentinel-source-probes-v1";
+pub(super) const VERSION: &str = "sentinel-source-probes-v2";
 
 /// Fixed host-owned ceilings, never read from untrusted data. These bound descriptor
 /// construction, not future model tokens, wall time or semantic coverage.
@@ -108,11 +108,12 @@ struct Report<'a> {
 }
 
 /// Emitted even when language is ambiguous: source transforms confer no permission
-/// to run semantic branches. Task alignment abstains because v1 ingress has no
-/// separately authenticated trusted goal; text can never supply one implicitly.
+/// to run semantic branches. Only a separately host-bound goal adds a task view;
+/// the byte ingress cannot supply one implicitly.
 pub(super) fn prepare(
     carriers: &CarrierAnalysis<'_>,
     language_gate: UntrustedTextState,
+    has_trusted_goal: bool,
 ) -> Result<Prepared, AdkGraphError> {
     let text = carriers.text();
     let normalized = text.normalized();
@@ -142,6 +143,14 @@ pub(super) fn prepare(
             break;
         }
     }
+    let mut task = Branch::new(
+        ProbeKind::TaskAlignment,
+        ProbeReason::TrustedGoalUnavailable,
+    );
+    if has_trusted_goal {
+        task.reason = ordered.reason;
+        task.views = ordered.views.clone();
+    }
     let mut report = Report {
         schema_version: 1,
         version: VERSION,
@@ -151,15 +160,7 @@ pub(super) fn prepare(
         language_gate,
         causal_attribution: CausalAttribution::NotMeasured,
         budget: BUDGET,
-        branches: [
-            ordered,
-            shuffled,
-            decoded,
-            Branch::new(
-                ProbeKind::TaskAlignment,
-                ProbeReason::TrustedGoalUnavailable,
-            ),
-        ],
+        branches: [ordered, shuffled, decoded, task],
     };
     let bytes = serde_json::to_vec(&report).map_err(|_| AdkGraphError::Failed)?;
     if bytes.len() > BUDGET.max_report_bytes {
@@ -189,7 +190,7 @@ pub(super) fn prepare(
             ProbeKind::Ordered => "ordered",
             ProbeKind::Shuffled => "shuffled",
             ProbeKind::Decoded => "decoded",
-            ProbeKind::TaskAlignment => continue,
+            ProbeKind::TaskAlignment => "task_alignment",
         };
         for view in &branch.views {
             let text = match view.candidate {

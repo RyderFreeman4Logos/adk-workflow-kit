@@ -18,9 +18,10 @@ use workflow_spec::UntrustedTextPreparation;
 
 mod probes;
 mod semantics;
+mod task_alignment;
 
 pub(crate) const STATE_KEY: &str = "__workflow_untrusted_preparation";
-const VERSION: &str = "sentinel-workflow-preparation-v4";
+const VERSION: &str = "sentinel-workflow-preparation-v5";
 
 /// Preparation-only terminal states. None means semantic Clean.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -43,6 +44,7 @@ impl UntrustedTextState {
 
 pub(crate) struct PreparationWorkflow {
     pub node_id: String,
+    trusted_goal: Option<task_alignment::TrustedGoal>,
     policy: UntrustedTextPreparation,
     workflow_id: String,
     workflow_version: String,
@@ -53,6 +55,7 @@ impl PreparationWorkflow {
         Self {
             node_id: ir.entry_node_id().as_str().to_owned(),
             policy,
+            trusted_goal: None,
             workflow_id: ir.workflow_id().as_str().to_owned(),
             workflow_version: ir.workflow_version().to_owned(),
             ir_hash: crate::canonical_ir_hash(ir),
@@ -80,6 +83,9 @@ impl PreparationWorkflow {
             "probe_version": probes::VERSION,
             "probe_budget": probes::BUDGET,
             "semantic_version": semantics::VERSION,
+            "task_alignment_version": task_alignment::VERSION,
+            "max_goal_bytes": task_alignment::MAX_GOAL_BYTES,
+            "trusted_goal": self.trusted_goal.as_ref().map(task_alignment::TrustedGoal::binding),
             "semantic_budget": {
                 "max_requests": semantics::MAX_REQUESTS,
                 "deadline_ms": semantics::DEADLINE_MS,
@@ -197,14 +203,21 @@ impl PreparationWorkflow {
                 UntrustedTextState::PendingClassification
             }
         };
-        let probes = probes::prepare(&carriers, state)?;
+        let probes = probes::prepare(&carriers, state, self.trusted_goal.is_some())?;
         let probe_id = put_verified(store, &probes.bytes, mapper, &self.node_id, "probes")?;
         report["probes"] = json!({
             "version": probes::VERSION,
             "artifact_id": probe_id,
             "bytes": probes.bytes.len(),
         });
-        let semantic_bytes = semantics::run(probes.inputs, state, model, key.digest()).await?;
+        let semantic_bytes = semantics::run(
+            probes.inputs,
+            state,
+            model,
+            key.digest(),
+            self.trusted_goal.as_ref(),
+        )
+        .await?;
         let semantic_id = put_verified(store, &semantic_bytes, mapper, &self.node_id, "semantics")?;
         report["semantics"] = json!({"version":semantics::VERSION, "artifact_id":semantic_id, "bytes":semantic_bytes.len()});
         set_outcome(report, state, json!(state))

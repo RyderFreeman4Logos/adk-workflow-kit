@@ -88,9 +88,11 @@ invalid payload and empty input have no original, all other results retain one.
 A successful run means preparation completed, never semantic approval or graph
 continuation. The separate #232 report records executed model evidence or explicit
 abstention; the terminal is unchanged. Han-only Chinese remains unattributed.
-Adapter identity `sentinel-workflow-preparation-v4` binds the output contract and
+Adapter identity `sentinel-workflow-preparation-v5` binds the output contract and
 [source descriptors plus semantic evidence](sentinel-probes.md). No trusted
-task-alignment goal is inferred from input.
+task-alignment goal is inferred from input. Embedding hosts can separately bind an
+authenticated goal through `AdkGraph::with_sentinel_trusted_goal`; the CLI/JSON
+execution boundary continues to abstain. See the linked host-authentication contract.
 
 Normalization uses the authored input ceiling and the runtime's default output/work
 limits. Carriers use bounded Decode defaults; segmentation uses its default 16,384

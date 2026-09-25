@@ -324,10 +324,13 @@ fn actual_path_cache_key_has_an_independent_versioned_policy_oracle() {
     let raw = b"1";
     let (result, _) = run(&root, WORKFLOW, input(raw));
     let policy = json!({
-        "version":"sentinel-workflow-preparation-v4",
-        "probe_version":"sentinel-source-probes-v1",
+        "version":"sentinel-workflow-preparation-v5",
+        "probe_version":"sentinel-source-probes-v2",
         "probe_budget":{"max_views_per_branch":32,"max_bytes_per_branch":65536,"max_report_bytes":32768,"chunk_bytes":256,"overlap_bytes":64},
-        "semantic_version":"sentinel-semantic-probes-v1",
+        "semantic_version":"sentinel-semantic-probes-v2",
+        "task_alignment_version":"sentinel-task-alignment-v1",
+        "max_goal_bytes":4096,
+        "trusted_goal":null,
         "semantic_budget":{"max_requests":8,"deadline_ms":30000,"output_bytes":512,"output_tokens":128},
         "normalizer":SENTINEL_NORMALIZATION_VERSION,
         "envelope_schema":SENTINEL_ENVELOPE_SCHEMA_VERSION,
@@ -362,7 +365,7 @@ fn actual_path_cache_key_has_an_independent_versioned_policy_oracle() {
             ("WORKFLOW_ID", "sentinel-preparation"),
             ("WORKFLOW_VERSION", "1"),
             ("NODE_ID", "prepare"),
-            ("NODE_VERSION", "sentinel-workflow-preparation-v4"),
+            ("NODE_VERSION", "sentinel-workflow-preparation-v5"),
             ("INVOCATION_IDENTITY", ir_hash.as_str()),
             ("INPUT_ARTIFACT_HASHES", raw_digest.as_str()),
             ("REQUEST_INPUT_DIGEST", raw_digest.as_str()),
