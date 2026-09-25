@@ -254,7 +254,7 @@ Run `just issue-231-runtime` (offline, no credentials).
 | Unicode mapping/resource property corpus | `deterministic_unicode_property_corpus_has_total_source_coverage` (512 deterministic cases), joiner/variation-selector fixture |
 | Multilingual/hard-negative/nested-encoding fuzz fixtures | Carrier subset: 256 seeded nested UTF-8 mapping cases, 512 seeded malformed-input cases, quantum golden maps and code/URL/data negatives; complete language/markup coverage remains pending |
 | Spec/IR/compiler runtime routing | Explicit v1 single-terminal preparation contract, canonical IR v11 and observed ADK execution; `just issue-231-compiler` / `just issue-231-adk`; general graph routing, resume and cache reuse remain pending |
-| Live semantic coverage | Not run; no authorized binding and no semantic model branch implemented |
+| Live semantic coverage | Bounded #232 model branches are implemented and exercised offline with scripted bindings ([sentinel-probes.md](sentinel-probes.md)); live semantic quality and authorized live binding remain unverified |
 
 Do not close #231 from this ledger. #232 remains responsible for model branches;
 preparation alone cannot supply their final security judgment.
