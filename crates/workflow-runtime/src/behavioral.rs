@@ -2,6 +2,9 @@
 //!
 //! No handler, callback, filesystem, network, secret broker, or process capability
 //! crosses this boundary. The only executor is a sealed, data-only catalog.
+#[path = "trajectory.rs"]
+pub mod trajectory;
+
 use crate::{
     ArtifactId, ArtifactRef, CanonicalUntrustedText, Completeness, ContentProvenance,
     ExecutorTarget, RunId, SYNTHETIC_HONEYTOKEN_PREFIX, SentinelEvidence, SentinelProbe,
