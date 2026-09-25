@@ -11,6 +11,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use workflow_adk::firewall::FirewallInvocation;
 use workflow_adk::{
     AdkGraph, AdkGraphTranslator, TranslationError,
     events::AdkEventMapper,
@@ -21,6 +22,8 @@ use workflow_compiler::{
     RuntimePlanRegistry, RuntimePlanRequest, compile_spec_with_sentinel_script, compile_str,
 };
 use workflow_ir::WorkflowIr;
+#[path = "support/firewall.rs"]
+mod firewall_fixture;
 use workflow_runtime::{
     ArtifactId, ArtifactStore, ContentObject, InMemoryArtifactStore, PageRequest, TrustPolicy,
     behavioral::{ProbeLimits, TrustedScript},
@@ -389,6 +392,42 @@ fn no_report(mapper: &AdkEventMapper) {
     assert!(!events.contains("sentinel-behavioral"));
     assert!(!events.contains("workflow.completed"));
     assert!(!events.contains("forged"));
+}
+
+#[tokio::test]
+async fn firewall_and_agent_siblings_cannot_bypass_script_approval() {
+    let spec =
+        workflow_spec::parse_str("sentinel.toml", &format!("{WORKFLOW}{BEHAVIORAL}")).unwrap();
+    let a = approval(&spec, RAW, "a", json!([]));
+    let b = approval(&spec, RAW, "b", json!([]));
+    let plan_a = compile_spec_with_sentinel_script(&spec, &a).unwrap();
+    let plan_b = compile_spec_with_sentinel_script(&spec, &b).unwrap();
+    let translator = AdkGraphTranslator::new()
+        .with_sentinel_trusted_script(&plan_a, a)
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agents = std::collections::BTreeMap::from([(
+        "judge".into(),
+        Arc::new(firewall_fixture::CountingJudge(Arc::clone(&calls))) as Arc<dyn adk_rust::Agent>,
+    )]);
+    let firewall = || firewall_fixture::invocation("low_risk", "noop");
+    let ordinary = compile_str(
+        "firewall.toml",
+        &firewall_fixture::source(&firewall().identity()),
+    )
+    .unwrap();
+    assert!(translator.translate(&ordinary).is_err());
+    for candidate in [
+        AdkGraphTranslator::new().translate_with_firewall(&plan_a, firewall(), &agents),
+        translator.translate_with_firewall(&plan_a, firewall(), &agents),
+        translator.translate_with_firewall(&plan_b, firewall(), &agents),
+        translator.translate_with_agents(&plan_b, &agents),
+        translator.translate_profile(&plan_b, &agents, None, &json!({})),
+        translator.translate_with_agents(&plan_a, &agents),
+    ] {
+        assert_rejected(candidate).await;
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
