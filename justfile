@@ -141,6 +141,10 @@ issue-231-compiler:
 issue-231-adk:
     {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_231_workflow --locked -- --nocapture --test-threads=1
 
+# Focused #232 source-only probe evidence through public ADK execution.
+issue-232-adk:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_232_probes --locked -- --nocapture --test-threads=1
+
 # Focused #229 pinned dataset registry tests.
 issue-229-http test_name="dataset::dataset_http::":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --lib {{test_name}} --locked -- --nocapture

@@ -86,7 +86,9 @@ host execution and retained artifacts. Reasons are closed preparation subcodes;
 invalid payload and empty input have no original, all other results retain one.
 A successful run means preparation completed, never semantic approval, model
 invocation or graph continuation. Han-only Chinese remains unattributed. Adapter
-identity `sentinel-workflow-preparation-v2` binds this changed output contract.
+identity `sentinel-workflow-preparation-v3` binds the output contract and the
+additional [source-only probe descriptor artifact](sentinel-probes.md); it supplies
+no semantic verdict or trusted task-alignment goal.
 
 Normalization uses the authored input ceiling and the runtime's default output/work
 limits. Carriers use bounded Decode defaults; segmentation uses its default 16,384

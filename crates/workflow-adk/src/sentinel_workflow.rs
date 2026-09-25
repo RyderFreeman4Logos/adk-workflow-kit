@@ -16,8 +16,10 @@ use workflow_runtime::{
 };
 use workflow_spec::UntrustedTextPreparation;
 
+mod probes;
+
 pub(crate) const STATE_KEY: &str = "__workflow_untrusted_preparation";
-const VERSION: &str = "sentinel-workflow-preparation-v2";
+const VERSION: &str = "sentinel-workflow-preparation-v3";
 
 /// Preparation-only terminal states. None means semantic Clean.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -73,6 +75,8 @@ impl PreparationWorkflow {
         };
         let policy = json!({
             "version": VERSION,
+            "probe_version": probes::VERSION,
+            "probe_budget": probes::BUDGET,
             "normalizer": SENTINEL_NORMALIZATION_VERSION,
             "envelope_schema": SENTINEL_ENVELOPE_SCHEMA_VERSION,
             "typed_output_schema": TYPED_OUTPUT_SCHEMA_VERSION_V1,
@@ -184,6 +188,13 @@ impl PreparationWorkflow {
                 UntrustedTextState::PendingClassification
             }
         };
+        let probe_bytes = probes::encode(&carriers, state)?;
+        let probe_id = put_verified(store, &probe_bytes, mapper, &self.node_id, "probes")?;
+        report["probes"] = json!({
+            "version": probes::VERSION,
+            "artifact_id": probe_id,
+            "bytes": probe_bytes.len(),
+        });
         set_outcome(report, state, json!(state))
     }
 }
