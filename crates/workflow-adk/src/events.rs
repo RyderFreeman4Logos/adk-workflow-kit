@@ -180,6 +180,10 @@ pub struct AdkEventMapper {
 }
 
 impl AdkEventMapper {
+    pub(crate) fn run_id(&self) -> &str {
+        self.log.run_id()
+    }
+
     /// Creates an empty mapper for one run and workflow.
     pub fn new(
         run_id: impl Into<String>,

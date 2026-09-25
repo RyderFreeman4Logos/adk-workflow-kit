@@ -51,6 +51,10 @@ pub(crate) struct PreparationWorkflow {
     ir_hash: String,
 }
 impl PreparationWorkflow {
+    pub(crate) fn behavioral_timeout_ms(&self) -> Option<u64> {
+        self.policy.behavioral.map(|policy| policy.timeout_ms)
+    }
+
     pub fn new(ir: &WorkflowIr, policy: UntrustedTextPreparation) -> Self {
         Self {
             node_id: ir.entry_node_id().as_str().to_owned(),
@@ -125,6 +129,12 @@ impl PreparationWorkflow {
                 json!("invalid_byte_payload"),
             );
         };
+        if self.policy.behavioral.is_some() {
+            crate::behavioral::admit_source(&raw)?;
+            if self.trusted_goal.is_some() || model.is_some() {
+                return Err(AdkGraphError::AuthorizationDenied);
+            }
+        }
         // Ingress retains bounded, nonempty bytes even if the authored policy denies
         // them. Empty artifacts are unsupported by ArtifactStore, not rerouted.
         let original = if raw.is_empty() {
@@ -203,6 +213,16 @@ impl PreparationWorkflow {
                 UntrustedTextState::PendingClassification
             }
         };
+        if self.policy.behavioral.is_some() {
+            if state != UntrustedTextState::PendingClassification {
+                return Err(AdkGraphError::Failed);
+            }
+            let identity = crate::behavioral::prepare_probe(&text)?;
+            report["cache_key"] = json!(digest_json(
+                &json!({"preparation":key.digest(), "behavioral":identity})
+            )?);
+            return set_outcome(report, state, json!(state));
+        }
         let probes = probes::prepare(&carriers, state, self.trusted_goal.is_some())?;
         let probe_id = put_verified(store, &probes.bytes, mapper, &self.node_id, "probes")?;
         report["probes"] = json!({
@@ -260,7 +280,7 @@ fn byte_payload(input: &Value) -> Option<Vec<u8>> {
         .map(|b| u8::try_from(b.as_u64()?).ok())
         .collect()
 }
-fn put_verified(
+pub(crate) fn put_verified(
     store: &mut impl ArtifactStore,
     bytes: &[u8],
     mapper: &mut AdkEventMapper,

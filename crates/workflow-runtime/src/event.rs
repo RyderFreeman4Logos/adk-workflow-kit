@@ -315,6 +315,11 @@ pub struct WorkflowRuntimeEventLogV1 {
 }
 
 impl WorkflowRuntimeEventLogV1 {
+    /// Returns the host-owned run identity, including before the first event.
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
     /// Creates an empty event log for one run and workflow identity.
     pub fn new(
         run_id: impl Into<String>,

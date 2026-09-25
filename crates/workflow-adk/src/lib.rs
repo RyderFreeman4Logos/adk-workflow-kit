@@ -501,6 +501,7 @@ pub struct AdkGraph {
     cache_dispositions: Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
     untrusted_text: Option<sentinel_workflow::PreparationWorkflow>,
     sentinel_model: Option<Arc<model_profiles::ModelBinding>>,
+    sentinel_script: Option<Arc<workflow_runtime::behavioral::TrustedScript>>,
     firewall_decisions: firewall::Decisions,
     firewall_entry: Option<String>,
 }
@@ -601,6 +602,9 @@ impl AdkGraph {
         mapper: &mut events::AdkEventMapper,
         artifacts: &mut S,
     ) -> Result<State, AdkGraphError> {
+        if self.sentinel_script.is_some() {
+            return Err(AdkGraphError::AuthorizationDenied);
+        }
         self.firewall_run(self.invoke_observed_inner(state, config, mapper, artifacts))
             .await
     }
@@ -613,8 +617,9 @@ impl AdkGraph {
         artifacts: &mut S,
     ) -> Result<State, AdkGraphError> {
         self.prepare_firewall_run(&config)?;
+        self.check_behavioral_invocation(&config, mapper)?;
         let mut state = self.input.map(state);
-        let preparation = if let Some(workflow) = &self.untrusted_text {
+        let mut preparation = if let Some(workflow) = &self.untrusted_text {
             // v1 is a one-shot terminal; checkpoint admission needs a separate contract.
             if config.resume_from.is_some() {
                 return Err(AdkGraphError::Failed);
@@ -685,7 +690,8 @@ impl AdkGraph {
                         }),
                         None => json!({ "step": step }),
                     };
-                    if let Some(report) = &preparation {
+                    if let Some(report) = &mut preparation {
+                        self.observe_behavioral(report, mapper, artifacts)?;
                         payload["preparation"] = report.clone();
                     }
                     mapper
@@ -901,8 +907,10 @@ impl AdkGraph {
 }
 
 /// Translates canonical compiler output into a real in-process ADK graph.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AdkGraphTranslator;
+#[derive(Clone, Debug, Default)]
+pub struct AdkGraphTranslator {
+    sentinel_script: Option<Arc<workflow_runtime::behavioral::TrustedScript>>,
+}
 
 #[derive(Clone)]
 struct ProfileNodeBackend {
@@ -970,10 +978,13 @@ impl Checkpointer for FanInCheckpointer {
 
 impl AdkGraphTranslator {
     pub const fn new() -> Self {
-        Self
+        Self {
+            sentinel_script: None,
+        }
     }
 
     pub fn translate(&self, plan: &CompiledPlan) -> Result<AdkGraph, TranslationError> {
+        self.validate_behavioral_plan(plan)?;
         self.translate_ir(plan.ir(), None, None, None, None, None)
     }
 
@@ -983,6 +994,7 @@ impl AdkGraphTranslator {
         plan: &CompiledPlan,
         agents: &BTreeMap<String, Arc<dyn Agent>>,
     ) -> Result<AdkGraph, TranslationError> {
+        self.validate_behavioral_plan(plan)?;
         self.translate_ir(plan.ir(), None, Some(agents), None, None, None)
     }
 
@@ -1006,6 +1018,7 @@ impl AdkGraphTranslator {
         input: &Value,
         checkpointer: Option<Arc<dyn Checkpointer>>,
     ) -> Result<AdkGraph, TranslationError> {
+        self.validate_behavioral_plan(plan)?;
         self.translate_ir(
             plan.ir(),
             None,
@@ -1114,12 +1127,21 @@ impl AdkGraphTranslator {
                 || !ir.edges().is_empty()
                 || !ir.routes().is_empty()
                 || policy.schema_version != 1
-                // Authored behavioral execution is unsupported, never preparation-only.
-                || policy.behavioral.is_some()
                 || policy.max_input_bytes > 65_536)
         {
             return Err(TranslationError::MissingNodeBackend {
                 node: node.id().as_str().to_owned(),
+            });
+        }
+        self.validate_behavioral_translation(ir)?;
+        if self.sentinel_script.is_some()
+            && (agents.is_some_and(|agents| !agents.is_empty())
+                || profile_backend.is_some()
+                || checkpointer.is_some()
+                || firewall.is_some())
+        {
+            return Err(TranslationError::MissingNodeBackend {
+                node: ir.entry_node_id().as_str().to_owned(),
             });
         }
         let untrusted_text = untrusted_text
@@ -1416,6 +1438,9 @@ impl AdkGraphTranslator {
             } else {
                 let terminal = node.kind() == IrNodeKind::Terminal;
                 let preparation_terminal = node.untrusted_text().is_some();
+                let behavioral_terminal = node
+                    .untrusted_text()
+                    .is_some_and(|policy| policy.behavioral.is_some());
                 if terminal {
                     terminals.push(id.clone());
                 }
@@ -1473,6 +1498,11 @@ impl AdkGraphTranslator {
                         let mut output = NodeOutput::new()
                             .with_update(&key, value)
                             .with_update(&visits_key, json!(visits));
+                        if behavioral_terminal {
+                            behavioral::execute_prepared().map_err(|_| {
+                                GraphError::Other("behavioral invocation rejected".to_owned())
+                            })?;
+                        }
                         if preparation_terminal {
                             let report = context
                                 .state
@@ -1629,6 +1659,7 @@ impl AdkGraphTranslator {
             })?;
         Ok(AdkGraph {
             sentinel_model: None,
+            sentinel_script: self.sentinel_script.clone(),
             graph,
             summary: GraphSummary {
                 node_order: order,

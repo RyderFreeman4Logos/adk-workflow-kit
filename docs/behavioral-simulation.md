@@ -80,12 +80,12 @@ Retain `to_json()` under that reference if persisting the evidence. The report
 has no deserializer that could mint host authority from untrusted JSON.
 
 Deferred: real-model tool-call observation, independently enforced process/OS
-containment, encoded-canary detection, authored ADK execution,
+containment, encoded-canary detection, production backend host overload,
 live semantic quality/calibration, durable checkpoint/crash recovery and causal
 attribution. This milestone does not close all of #233's acceptance criteria.
 No production action can be authorized by the simulator.
 
-## Host-authorized compilation (not authored execution)
+## Host-authorized authored execution
 
 A preparation terminal may opt in with this strict policy-only table:
 
@@ -123,14 +123,11 @@ behavioral opt-in without authority, before registry resolution. The CLI has no
 host-authority channel and rejects opt-in. Approval on non-opted workflows and
 mismatched IR/schema/limits are rejected, never silently ignored or clamped.
 
-**Boundary still pending:** compilation does not bind a script to the authored
-ADK terminal. Every translator entry rejects behavioral opt-in before preparation
-or graph construction, including host-approved plans and direct IR. Source matching after
-preparation, source/run-bound probe identity, model-free preparation, per-run
-typed report handoff, cancellation/deadline plumbing, report retention and
-checkpoint denial remain the next integration milestone. Existing standalone
-simulation APIs do not implicitly gain authored authority. This is not full
-#233 acceptance and supplies no execution or replay authorization.
+Consume that same capability with `AdkGraphTranslator::new().with_sentinel_trusted_script(&compiled, script)` before `translate(&compiled)`. Translation without live authority still rejects behavioral opt-in, including direct/resolved IR. Different compiled approval, IR, duplicate binding, profile adapters, model bindings and checkpoint continuation fail closed.
+
+Call `graph.invoke_observed_with_sentinel_script(state, config, mapper, artifacts, cancelled, deadline).await` with explicit host cancellation and an absolute deadline. `config.thread_id` must equal the fresh mapper's host run ID. Ordinary `invoke`/`invoke_observed` cannot execute this mode. Actual source identity is checked before retention; prepared normalization telemetry, host provenance/approval and run ID bind the sealed probe and preparation cache identity. Preparation skips semantic/model work. The existing authored terminal consumes its probe once, using invocation-local typed state rather than graph JSON, and returns `(State, ProbeReport)` only after report retention. Events reference that report's digest and optional Suspicious evidence, never Clean or causal attribution.
+
+The embedding-host route is implemented; `ExecutionBackend` and CLI still have no host-script channel and reject opt-in during ordinary compilation. Profile execution and durable resume remain unsupported. No result cache, approval serialization, new executor registry or production IO was added. Cancellation/deadlines cover preparation/queue time cooperatively; host artifact-store IO is outside the inert reducer, not preemptively bounded. This is not full #233 acceptance.
 
 ## Public ADK path
 
@@ -144,7 +141,7 @@ The direct runtime API is a deterministic data reducer, not a second agent loop.
 
 ## Verification
 
-Run `just issue-233-runtime`, `just issue-233-adk` (including public translation denial), and `just issue-233-doc` with the repository's safe
+Run `just issue-233-runtime`, `just issue-233-adk` (including authored execution and public default denial), and `just issue-233-doc` with the repository's safe
 SSD temp setup. Tests cover every honeytool, benign completion, parameter traps,
 network/filesystem/symlink/process-shaped requests, production-binding refusal,
 canary lifecycle, resource limits, cancellation, expired deadlines and replay.

@@ -241,7 +241,7 @@ impl std::error::Error for ProbeError {}
 /// This is not a signature verifier. The embedding Rust host MUST authenticate all
 /// inputs out of band; never call `authorize` on workflow/profile/state/model data.
 /// No deserializer, serializer, raw-script getter, executor setter, or payload Debug.
-/// Compilation admission does not yet enable authored ADK behavioral execution.
+/// Compilation and translation both require this live capability.
 ///
 /// ```compile_fail
 /// use workflow_runtime::behavioral::TrustedScript;
@@ -324,8 +324,32 @@ impl TrustedScript {
         )
     }
 
+    /// Checks the actual ingress artifact before any preparation artifacts are retained.
+    pub fn approves_source(&self, source: &ArtifactId) -> bool {
+        &self.approved_source == source
+    }
+
+    /// Binds approved prepared bytes and the host's actual run to a sealed probe.
+    /// Full normalization telemetry and host approval identity are identity material.
+    pub fn bind(
+        &self,
+        source: &CanonicalUntrustedText,
+        run_id: RunId,
+    ) -> Result<BehavioralProbe, ProbeError> {
+        if !self.approves_source(source.original_id()) {
+            return Err(ProbeError::InvalidIdentity);
+        }
+        BehavioralProbe::from_script(
+            source,
+            &self.provenance,
+            run_id,
+            self.script.clone(),
+            self.limits,
+            Some(self.identity()),
+        )
+    }
+
     /// Compares a compiler's exact canonical IR and policy limits to this approval.
-    /// Source-content matching belongs to the future prepared invocation boundary.
     pub fn matches_approval(&self, ir_hash: &str, limits: ProbeLimits) -> bool {
         self.approved_ir_hash == ir_hash && self.limits == limits
     }
@@ -360,16 +384,35 @@ impl BehavioralProbe {
     ) -> Result<Self, ProbeError> {
         SentinelProbe::bind(target).map_err(|_| ProbeError::ProductionExecutorForbidden)?;
         limits.validate()?;
+        Self::from_script(
+            source,
+            provenance,
+            run_id,
+            Script::parse(script)?,
+            limits,
+            None,
+        )
+    }
+    fn from_script(
+        source: &CanonicalUntrustedText,
+        provenance: &ContentProvenance,
+        run_id: RunId,
+        script: Script,
+        limits: ProbeLimits,
+        approval: Option<String>,
+    ) -> Result<Self, ProbeError> {
         if run_id.as_str().trim().is_empty() || run_id.as_str().len() > 256 {
             return Err(ProbeError::InvalidIdentity);
         }
-        let script = Script::parse(script)?;
-        let material = serde_json::json!({
+        let mut material = serde_json::json!({
             "version": BEHAVIORAL_VERSION, "schema_version":1, "tools":PROBE_TOOL_CATALOG,
             "mode":"scripted_simulation", "model":null, "provider":null, "prompt":null,
             "source":source.telemetry(), "provenance":provenance.cache_key(source.original_id().as_str().as_bytes()).as_hex(),
             "run":run_id, "script":script, "limits":limits,
         });
+        if let Some(approval) = approval {
+            material["host_approval"] = serde_json::json!(approval);
+        }
         let identity = hash(&serde_json::to_vec(&material).map_err(|_| ProbeError::InvalidScript)?);
         Ok(Self {
             identity,
@@ -377,6 +420,10 @@ impl BehavioralProbe {
             script,
             limits,
         })
+    }
+    /// Identity of the complete prepared-source/run/authority binding.
+    pub fn identity(&self) -> &str {
+        &self.identity
     }
     /// Replays a bounded script. Cancellation is checked at each step, with no callbacks.
     pub fn run(&self, cancelled: &AtomicBool) -> ProbeReport {
