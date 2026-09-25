@@ -134,6 +134,37 @@ issue-228-runtime test_name="":
 issue-228-test:
     just issue-228-runtime
 
+# Focused #231 canonical untrusted-data preparation tests.
+issue-231-runtime test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_231_sentinel_envelope {{test_name}} --locked -- --nocapture
+
+# Focused #231 versioned compiler and production execution integration.
+issue-231-compiler:
+    {{_io}} cargo +1.98.0 test -p workflow-compiler --test issue_231_workflow --locked -- --nocapture
+
+issue-231-adk:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_231_workflow --locked -- --nocapture --test-threads=1
+
+# Focused #232 executed semantic probes (offline fake model only).
+issue-232-semantics test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_232_semantics --test issue_226_prompt_protocol {{test_name}} --locked -- --nocapture --test-threads=1
+
+issue-232-clippy:
+    {{_io}} cargo +1.98.0 clippy -p workflow-adk --features test-support --all-targets --locked -- -D warnings
+
+# Focused #232 source-only probe evidence through public ADK execution.
+issue-232-adk:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_232_probes --locked -- --nocapture --test-threads=1
+# Focused #233 inert scripted behavioral simulation (no live model or IO).
+issue-233-runtime:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_233_behavioral --locked -- --nocapture
+
+issue-233-adk:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_233_behavioral --test issue_233_translation --locked -- --nocapture --test-threads=1
+
+issue-233-doc:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --doc behavioral --locked
+
 # Focused #238 deterministic Firewall policy and workflow boundary tests.
 issue-238-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_238_firewall {{test_name}} --locked -- --nocapture
@@ -295,7 +326,7 @@ check-branch:
 
 pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit pattern-catalog-test m2-02-green test-local-gates
 
-_quality-gates: fmt-check check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test test-local-gates
+_quality-gates: fmt-check check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk test-local-gates
 
 quality-gates:
     scripts/local-gates.sh produce

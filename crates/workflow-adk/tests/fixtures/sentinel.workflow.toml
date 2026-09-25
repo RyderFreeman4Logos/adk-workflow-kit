@@ -1,0 +1,15 @@
+schema_version = 1
+edges = []
+[workflow]
+id = "sentinel-preparation"
+version = "1"
+entry = "prepare"
+[[nodes]]
+id = "prepare"
+kind = "terminal"
+[nodes.untrusted_text]
+schema_version = 1
+max_input_bytes = 65536
+en = true
+zh = true
+ja = true

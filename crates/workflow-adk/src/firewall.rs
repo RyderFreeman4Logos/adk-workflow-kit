@@ -86,6 +86,7 @@ impl AdkGraphTranslator {
         invocation: FirewallInvocation,
         agents: &BTreeMap<String, Arc<dyn Agent>>,
     ) -> Result<AdkGraph, TranslationError> {
+        self.validate_behavioral_plan(plan)?;
         self.translate_ir(plan.ir(), None, Some(agents), None, None, Some(invocation))
     }
 }

@@ -15,6 +15,7 @@ mod skill_runtime;
 use std::{collections::VecDeque, fmt};
 
 use workflow_ir::{IrNode, IrNodeKind, NodeId, WorkflowIr};
+use workflow_runtime::behavioral::{ProbeLimits, TrustedScript};
 use workflow_spec::{
     NodeKind, SourcePath, SpecError, WorkflowSpec, is_reserved_skill_tool_name, parse_file,
     parse_str,
@@ -111,9 +112,16 @@ impl std::error::Error for CompileError {
 pub struct CompiledPlan {
     ir: WorkflowIr,
     registry_binding_count: usize,
+    sentinel_script_identity: Option<String>,
 }
 
 impl CompiledPlan {
+    /// Checked host capability identity, not a serializable execution authorization.
+    /// An eventual behavioral executor must independently require the same live capability.
+    pub fn sentinel_script_identity(&self) -> Option<&str> {
+        self.sentinel_script_identity.as_deref()
+    }
+
     /// Returns the normalized canonical workflow IR.
     pub fn ir(&self) -> &WorkflowIr {
         &self.ir
@@ -159,14 +167,31 @@ pub fn compile_file_with_predicates<R: PredicateRegistry>(
     compile_with_predicates(&spec, registry)
 }
 
+/// Compiles a behavioral opt-in against an independently authenticated host script.
+/// All ordinary validation still applies. Missing opt-in, a different canonical IR,
+/// schema or limits fail closed; the returned plan retains only the checked identity.
+/// This admission milestone does not execute the script or bind an ADK translator.
+pub fn compile_spec_with_sentinel_script(
+    spec: &WorkflowSpec,
+    script: &TrustedScript,
+) -> Result<CompiledPlan, CompileError> {
+    let ir = validated_ir(spec, Some(script))?;
+    Ok(CompiledPlan {
+        ir,
+        registry_binding_count: 0,
+        sentinel_script_identity: Some(script.identity()),
+    })
+}
+
 fn compile_without_predicates(spec: &WorkflowSpec) -> Result<CompiledPlan, CompileError> {
-    let ir = validated_ir(spec)?;
+    let ir = validated_ir(spec, None)?;
     if !ir.routes().is_empty() {
         return Err(CompileError::PredicateRegistryRequired);
     }
     Ok(CompiledPlan {
         ir,
         registry_binding_count: 0,
+        sentinel_script_identity: None,
     })
 }
 
@@ -174,7 +199,7 @@ fn compile_with_predicates<R: PredicateRegistry>(
     spec: &WorkflowSpec,
     registry: &R,
 ) -> Result<CompiledPlan, CompileError> {
-    let ir = validated_ir(spec)?;
+    let ir = validated_ir(spec, None)?;
     for route in ir.routes() {
         registry
             .resolve(route.predicate().id(), route.predicate().version())
@@ -184,15 +209,53 @@ fn compile_with_predicates<R: PredicateRegistry>(
     Ok(CompiledPlan {
         ir,
         registry_binding_count,
+        sentinel_script_identity: None,
     })
 }
 
-fn validated_ir(spec: &WorkflowSpec) -> Result<WorkflowIr, CompileError> {
+fn validated_ir(
+    spec: &WorkflowSpec,
+    script: Option<&TrustedScript>,
+) -> Result<WorkflowIr, CompileError> {
     validate_approval_nodes(spec)?;
     validate_node_bindings(spec)?;
     let ir = WorkflowIr::from(spec);
     validate_graph(&ir).map_err(CompileError::Graph)?;
     validate_state(&ir).map_err(CompileError::State)?;
+    match (
+        ir.nodes()
+            .iter()
+            .find_map(|node| node.untrusted_text()?.behavioral),
+        script,
+    ) {
+        (None, None) => {}
+        (Some(policy), Some(script)) => {
+            let hash = format!(
+                "sha256:{}",
+                ir.canonical_hash()
+                    .as_bytes()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            );
+            if !script.matches_approval(
+                &hash,
+                ProbeLimits {
+                    max_steps: policy.max_steps,
+                    timeout_ms: policy.timeout_ms,
+                },
+            ) {
+                return Err(CompileError::Binding(
+                    BindingValidationError::InvalidSentinelScript,
+                ));
+            }
+        }
+        _ => {
+            return Err(CompileError::Binding(
+                BindingValidationError::InvalidSentinelScript,
+            ));
+        }
+    }
     Ok(ir)
 }
 
@@ -205,14 +268,24 @@ pub enum BindingValidationError {
     ReviewerTool,
     /// A static tool attempted to use a public Skill runtime tool name.
     ReservedSkillTool,
+    /// Preparation v1 is restricted to a single terminal with bounded policy.
+    InvalidUntrustedTextPreparation,
+    /// Behavioral opt-in and the exact live host approval must both be present.
+    InvalidSentinelScript,
 }
 
 impl fmt::Display for BindingValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::InvalidSentinelScript => {
+                "behavioral policy requires matching host script authority"
+            }
             Self::InvalidPlacement => "binding fields require an agent node",
             Self::ReviewerTool => "reviewer nodes cannot own tools",
             Self::ReservedSkillTool => "static tool name is reserved by the Skill runtime",
+            Self::InvalidUntrustedTextPreparation => {
+                "untrusted-text preparation requires a single terminal and valid v1 policy"
+            }
         })
     }
 }
@@ -221,6 +294,21 @@ impl std::error::Error for BindingValidationError {}
 
 fn validate_node_bindings(spec: &WorkflowSpec) -> Result<(), CompileError> {
     for node in spec.nodes() {
+        if let Some(policy) = node.untrusted_text()
+            && (policy.schema_version != 1
+                || policy
+                    .behavioral
+                    .is_some_and(|behavioral| behavioral.schema_version != 1)
+                || policy.max_input_bytes > 65_536
+                || node.kind() != NodeKind::Terminal
+                || spec.nodes().len() != 1
+                || !spec.edges().is_empty()
+                || !spec.routes().is_empty())
+        {
+            return Err(CompileError::Binding(
+                BindingValidationError::InvalidUntrustedTextPreparation,
+            ));
+        }
         if let Some(firewall) = node.firewall() {
             // A v1 hard gate must precede every model/action and cannot be re-entered.
             if node.kind() != NodeKind::Validator

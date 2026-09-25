@@ -724,6 +724,13 @@ impl fmt::Display for ModelInvocationSpecError {
 
 impl std::error::Error for ModelInvocationSpecError {}
 
+/// Ordinary callers permit optional completion metadata; Sentinel requires complete text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponsePolicy {
+    Ordinary,
+    CompleteText,
+}
+
 impl ModelInvocationSpec {
     pub fn new(
         protocol: PromptProtocol,
@@ -861,14 +868,24 @@ impl ModelInvocationSpec {
         self.invoke_validated(binding, |_| Ok(())).await
     }
 
-    /// Domain validation runs on raw bounded bytes before Value can collapse duplicate keys.
-    /// The route, stream bounds and retry policy are identical to ordinary invocation.
-    /// Provider error fields or non-Stop finish reasons abort before validation, without
-    /// retrying. Partial chunks and absent optional finish/usage metadata remain valid.
+    /// Domain validators see bounded raw bytes before Value can collapse duplicate keys.
+    /// Provider failures abort before validation without retry. Optional completion metadata,
+    /// partial chunks and usage-only trailers retain the ordinary invocation contract.
     pub async fn invoke_validated(
         &self,
         binding: &ModelBinding,
         validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
+    ) -> Result<ModelInvocationResult, ModelInvocationError> {
+        self.invoke_with_policy(binding, validate, ResponsePolicy::Ordinary)
+            .await
+    }
+
+    /// One bounded collector; strict completion/text-only admission is opt-in.
+    pub(crate) async fn invoke_with_policy(
+        &self,
+        binding: &ModelBinding,
+        validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
+        policy: ResponsePolicy,
     ) -> Result<ModelInvocationResult, ModelInvocationError> {
         if !self.route.matches_binding(binding) {
             return Err(ModelInvocationError::route_mismatch());
@@ -883,12 +900,12 @@ impl ModelInvocationSpec {
                 .await
                 .map_err(|error| ModelInvocationError::model(error.kind(), attempts))?;
             let mut output = String::new();
+            let mut complete = false;
             while let Some(response) = stream.next().await {
                 let response = response
                     .map_err(|error| ModelInvocationError::model(error.kind(), attempts))?;
-                // An Ok transport envelope can still report provider failure. Check every
-                // chunk (including metadata-only trailers) before admitting any output.
-                if response.error_code.is_some()
+                if response.interrupted
+                    || response.error_code.is_some()
                     || response.error_message.is_some()
                     || response
                         .finish_reason
@@ -898,6 +915,17 @@ impl ModelInvocationSpec {
                         ModelProfileErrorKind::Provider,
                         attempts,
                     ));
+                }
+                // A harmless metadata trailer must not erase terminal evidence. New content
+                // or explicit progress does invalidate it until a fresh complete Stop.
+                if response.content.is_some()
+                    || response.partial
+                    || response.turn_complete
+                    || response.finish_reason.is_some()
+                {
+                    complete = response.turn_complete
+                        && !response.partial
+                        && response.finish_reason == Some(FinishReason::Stop);
                 }
                 if let Some(content) = response.content {
                     for part in content.parts {
@@ -913,9 +941,20 @@ impl ModelInvocationSpec {
                                 ));
                             }
                             output.push_str(&text);
+                        } else if policy == ResponsePolicy::CompleteText {
+                            return Err(ModelInvocationError::structured(
+                                StructuredOutputError::InvalidJson,
+                                attempts,
+                            ));
                         }
                     }
                 }
+            }
+            if policy == ResponsePolicy::CompleteText && !complete {
+                return Err(ModelInvocationError::structured(
+                    StructuredOutputError::InvalidJson,
+                    attempts,
+                ));
             }
             match validate(output.as_bytes()).and_then(|()| self.output.decode(output.as_bytes())) {
                 Ok(output) => {

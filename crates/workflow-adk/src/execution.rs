@@ -1,4 +1,7 @@
-//! Profile-driven execution and kit-owned run-state persistence.
+//! Profile-driven execution, explicit host-authorized simulation, and run-state persistence.
+
+mod behavioral;
+pub use behavioral::BehavioralExecutionReceipt;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -2902,6 +2905,8 @@ impl ExecutionProfileV1 {
         role: IrModelRole,
         completed_turns: u64,
     ) -> Result<Arc<ModelBinding>, ExecutionError> {
+        #[cfg(feature = "test-support")]
+        behavioral::MODEL_BINDINGS.with(|count| count.set(count.get() + 1));
         let model = match role {
             IrModelRole::Worker => &self.model,
             IrModelRole::Reviewer => self
@@ -4964,13 +4969,22 @@ impl ExecutionBackend {
                     )
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?
                     .with_cache_dispositions(Arc::clone(&cache_dispositions));
+                let graph = if graph.untrusted_text.is_some() {
+                    graph.with_sentinel_model(profile.bind_model(IrModelRole::Worker, 0)?)
+                } else {
+                    graph
+                };
                 let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
                 let mut start = State::new();
                 start.insert("input".to_owned(), input.clone());
-                if let Some(object) = input.as_object() {
+                // Strict preparation consumes the immutable whole request above, not
+                // caller members. Preserve legacy flattening only for other workflows.
+                if graph.untrusted_text.is_none()
+                    && let Some(object) = input.as_object()
+                {
                     for (key, value) in object {
                         start.insert(key.clone(), value.clone());
                     }
@@ -6113,6 +6127,8 @@ fn build_tool_registry(
     effect_journal: Option<Arc<EffectJournal>>,
     effect_fence: Arc<EffectFence>,
 ) -> Result<ToolBridge, ExecutionError> {
+    #[cfg(feature = "test-support")]
+    behavioral::TOOL_REGISTRIES.with(|count| count.set(count.get() + 1));
     let mut bridge = ToolBridge::new(sandbox);
     for tool in profile.tool_wires() {
         let registration = profile.tool_registration(tool)?;

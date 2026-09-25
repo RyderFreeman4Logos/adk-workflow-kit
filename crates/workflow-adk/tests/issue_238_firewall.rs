@@ -369,6 +369,7 @@ fn compiler_and_every_default_translator_fail_closed_on_firewall_contract() {
         .is_err()
     );
     let changed = invocation("human_approval", "noop");
+    assert_eq!(plan.ir().canonical_wire_version(), 10);
     let changed_source = source.replace(&bound.identity(), &changed.identity());
     let changed_plan = compile_str("changed.toml", &changed_source).unwrap();
     assert_ne!(

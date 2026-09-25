@@ -2,6 +2,7 @@
 
 mod approval;
 mod artifact;
+pub mod behavioral;
 mod bridge;
 mod bubblewrap;
 mod checkpoint;
@@ -22,6 +23,10 @@ mod pure_transform;
 mod sandbox_execution;
 mod security;
 pub mod semantic_firewall;
+mod sentinel_carriers;
+mod sentinel_envelope;
+mod sentinel_language;
+mod sentinel_segments;
 mod session;
 mod tool;
 mod tool_registry;
@@ -105,6 +110,23 @@ pub use security::{
     ProbeBindingError, SECRET_POLICY_VERSION, SECURITY_MODEL_VERSION, SYNTHETIC_HONEYTOKEN_PREFIX,
     SecretPolicyError, SentinelProbe, SyntheticHoneytoken, SyntheticSecretPolicy, TrustDomain,
     TrustPolicy, TrustPolicyError,
+};
+pub use sentinel_carriers::{
+    CarrierAnalysis, CarrierCandidate, CarrierLimits, CarrierMode, CarrierReason, CarrierStatus,
+    DecodedCarrierView, SENTINEL_CARRIER_VERSION,
+};
+pub use sentinel_envelope::{
+    CanonicalUntrustedText, CarrierAnnotation, CarrierKind, NormalizationLimits,
+    NormalizationReason, NormalizedSourceSpan, SENTINEL_ENVELOPE_SCHEMA_VERSION,
+    SENTINEL_NORMALIZATION_VERSION, SentinelPreparation, prepare_untrusted_text,
+};
+pub use sentinel_language::{
+    LanguageAssessment, LanguageAttribution, LanguagePolicy, SENTINEL_LANGUAGE_POLICY_VERSION,
+    SentinelLanguage,
+};
+pub use sentinel_segments::{
+    LanguageScreening, SENTINEL_SCRIPT_DATA_VERSION, SENTINEL_SEGMENTATION_VERSION, ScriptEvidence,
+    SegmentationLimits, SegmentationReason, SegmentedUntrustedText, TextSegment, TextSegmentKind,
 };
 pub use session::{
     RunSessionIds, SessionId, SessionIdentityError, SessionIdentityErrorKind, SessionRole,

@@ -103,7 +103,8 @@ pub enum SentinelVerdict {
 }
 
 impl SentinelVerdict {
-    fn as_code(self) -> &'static str {
+    /// Returns the stable compact wire code, including non-Clean terminal reasons.
+    pub const fn as_code(self) -> &'static str {
         match self {
             Self::Injection => "inj",
             Self::Suspicious => "sus",

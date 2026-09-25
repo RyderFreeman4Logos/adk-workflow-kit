@@ -543,6 +543,29 @@ impl AgentNodeContract {
     }
 }
 
+/// Explicit opt-in to host-authorized scripted simulation, never execution authority.
+/// V1 requires 1..=32 steps and 1..=1000 milliseconds at compiler admission.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BehavioralPolicy {
+    pub schema_version: u16,
+    pub max_steps: usize,
+    pub timeout_ms: u64,
+}
+
+/// Versioned, deterministic untrusted-text terminal contract.
+/// All language flags are explicit; preparation never authorizes content as Clean.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UntrustedTextPreparation {
+    pub schema_version: u16,
+    pub max_input_bytes: usize,
+    pub en: bool,
+    pub zh: bool,
+    pub ja: bool,
+    pub behavioral: Option<BehavioralPolicy>,
+}
+
 /// A source-level node with its closed kind and optional approval timeout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Node {
@@ -556,10 +579,16 @@ pub struct Node {
     tools: Vec<ToolReference>,
     skills: Vec<SkillReference>,
     agent_contract: Option<AgentNodeContract>,
+    untrusted_text: Option<UntrustedTextPreparation>,
     firewall: Option<FirewallContract>,
 }
 
 impl Node {
+    /// Returns the explicit preparation-only terminal contract.
+    pub fn untrusted_text(&self) -> Option<UntrustedTextPreparation> {
+        self.untrusted_text
+    }
+
     /// Returns the node identifier.
     pub fn id(&self) -> &NodeId {
         &self.id
@@ -921,6 +950,7 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
                         })
                         .collect(),
                     agent_contract,
+                    untrusted_text: node.untrusted_text,
                     firewall: node.firewall,
                 })
             })
@@ -1166,6 +1196,8 @@ struct RawNode {
     output: Option<RawOutputContract>,
     #[serde(default)]
     session: Option<String>,
+    #[serde(default)]
+    untrusted_text: Option<UntrustedTextPreparation>,
     #[serde(default)]
     firewall: Option<FirewallContract>,
 }

@@ -136,6 +136,8 @@ async fn provider_error_fields_reject_valid_text_and_trailing_metadata() {
             response.error_message = message.map(str::to_owned);
             let mut responses = if trailing { vec![text(OUTPUT)] } else { vec![] };
             responses.push(response);
+            rejected(responses.clone(), false).await;
+            responses.push(text(OUTPUT));
             rejected(responses, false).await;
         }
     }
@@ -158,6 +160,8 @@ async fn unsuccessful_finish_rejects_valid_text_and_trailing_metadata() {
             response.finish_reason = Some(reason);
             let mut responses = if trailing { vec![text(OUTPUT)] } else { vec![] };
             responses.push(response);
+            rejected(responses.clone(), false).await;
+            responses.push(text(OUTPUT));
             rejected(responses, false).await;
         }
     }
@@ -183,6 +187,7 @@ async fn normal_stop_optional_metadata_and_partial_chunks_remain_valid() {
     };
     for responses in [
         vec![text(OUTPUT)],
+        vec![text(OUTPUT), usage.clone()],
         vec![missing_metadata],
         vec![partial, text(r#"private-output"}"#), usage],
     ] {
