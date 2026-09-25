@@ -2,6 +2,7 @@
 
 mod approval;
 mod artifact;
+pub mod behavioral;
 mod bridge;
 mod bubblewrap;
 mod checkpoint;

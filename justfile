@@ -155,6 +155,13 @@ issue-232-clippy:
 # Focused #232 source-only probe evidence through public ADK execution.
 issue-232-adk:
     {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_232_probes --locked -- --nocapture --test-threads=1
+# Focused #233 inert scripted behavioral simulation (no live model or IO).
+issue-233-runtime:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_233_behavioral --locked -- --nocapture
+
+issue-233-doc:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --doc behavioral --locked
+
 # Focused #238 deterministic Firewall policy and workflow boundary tests.
 issue-238-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_238_firewall {{test_name}} --locked -- --nocapture
