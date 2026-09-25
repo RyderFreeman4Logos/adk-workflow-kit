@@ -682,6 +682,7 @@ impl ModelProfileRegistry {
         }
         Ok(())
     }
+    /// Rejects non-finite sampling policy before creating any live model binding.
     pub fn bind(
         &self,
         role: ModelRole,
@@ -763,6 +764,21 @@ impl ModelProfile {
         role: ModelRole,
         broker: &CredentialBroker,
     ) -> Result<ModelBinding, ModelProfileError> {
+        // Every live binding must have lossless JSON policy provenance. Validate here,
+        // including deserialized registries, before provider construction or identity use.
+        let sampling = self.runtime().sampling();
+        if [
+            sampling.temperature,
+            sampling.top_p,
+            sampling.frequency_penalty,
+            sampling.presence_penalty,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_finite())
+        {
+            return Err(ModelProfileError::invalid());
+        }
         let (llm, requested, provider, fake_queue) = match self {
             Self::Fake(value) => {
                 let mut responses = VecDeque::new();

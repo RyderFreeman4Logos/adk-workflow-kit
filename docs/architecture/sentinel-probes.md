@@ -1,7 +1,7 @@
 # Sentinel bounded probes (#232 milestone)
 
 **Offline execution verified; live semantic quality remains unverified.** The v1
-`nodes.untrusted_text` spec, canonical IR v10, compiler admission and observed ADK
+`nodes.untrusted_text` spec, canonical IR v11, compiler admission and observed ADK
 terminal retain source descriptors and execute bounded semantic probes using the
 profile's worker binding. No new authored configuration, dependency or trusted-goal
 input is introduced. Direct translated graphs can supply `with_sentinel_model`;

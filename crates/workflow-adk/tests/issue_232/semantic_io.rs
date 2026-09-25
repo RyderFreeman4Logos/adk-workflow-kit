@@ -19,7 +19,8 @@ use workflow_adk::{
     AdkGraph, AdkGraphTranslator,
     events::AdkEventMapper,
     model_profiles::{
-        CredentialBroker, FakeModelProfile, ModelProfileRegistry, ModelRuntimeConfig,
+        CredentialBroker, FakeModelProfile, ModelProfileError, ModelProfileErrorKind,
+        ModelProfileRegistry, ModelRuntimeConfig, SamplingConfig,
     },
 };
 use workflow_runtime::{ArtifactId, ArtifactStore, InMemoryArtifactStore, PageRequest};
@@ -168,6 +169,19 @@ fn setup_runtime(
     count: usize,
     runtime: ModelRuntimeConfig,
 ) -> (AdkGraph, Arc<Probe>, InMemoryArtifactStore, AdkEventMapper) {
+    let (graph, probe, store, mapper) = setup_runtime_checked(mode, count, runtime);
+    (graph.unwrap(), probe, store, mapper)
+}
+fn setup_runtime_checked(
+    mode: Mode,
+    count: usize,
+    runtime: ModelRuntimeConfig,
+) -> (
+    Result<AdkGraph, ModelProfileError>,
+    Arc<Probe>,
+    InMemoryArtifactStore,
+    AdkEventMapper,
+) {
     let probe = Arc::new(Probe {
         mode,
         barrier: Arc::new(Barrier::new(count)),
@@ -180,14 +194,14 @@ fn setup_runtime(
             FakeModelProfile::new("fake-model", "1", "fake", ["unused"]).with_runtime(runtime),
         )
         .unwrap()
-        .bind_worker(&CredentialBroker::new())
-        .unwrap()
-        .with_test_llm(probe.clone());
-    let plan = workflow_compiler::compile_str("sentinel.toml", WORKFLOW).unwrap();
-    let graph = AdkGraphTranslator::new()
-        .translate(&plan)
-        .unwrap()
-        .with_sentinel_model(Arc::new(binding));
+        .bind_worker(&CredentialBroker::new());
+    let graph = binding.map(|binding| {
+        let plan = workflow_compiler::compile_str("sentinel.toml", WORKFLOW).unwrap();
+        AdkGraphTranslator::new()
+            .translate(&plan)
+            .unwrap()
+            .with_sentinel_model(Arc::new(binding.with_test_llm(probe.clone())))
+    });
     let limit = NonZeroU64::new(100_000).unwrap();
     (
         graph,
@@ -238,12 +252,77 @@ async fn complete_sentinel_text_accepts_usage_only_trailer() {
 }
 
 #[tokio::test]
+async fn nonfinite_sampling_cannot_alias_absent_sentinel_runtime() {
+    let (graph, _, mut store, mut mapper) = setup(Mode::Agree, 2);
+    graph
+        .invoke_observed(
+            state(RAW),
+            ExecutionConfig::new("probe-run"),
+            &mut mapper,
+            &mut store,
+        )
+        .await
+        .unwrap();
+    let absent = report(&store, &mapper);
+    assert_eq!(absent["reason"], "agreement");
+    let setters = [
+        SamplingConfig::with_temperature,
+        SamplingConfig::with_top_p,
+        SamplingConfig::with_frequency_penalty,
+        SamplingConfig::with_presence_penalty,
+    ];
+    let mut accepted = vec![];
+    for (field, set) in setters.into_iter().enumerate() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let runtime = ModelRuntimeConfig::default().with_sampling(|s| set(s, value));
+            let (graph, probe, mut store, mut mapper) =
+                setup_runtime_checked(Mode::Agree, 2, runtime);
+            match graph {
+                Ok(graph) => {
+                    graph
+                        .invoke_observed(
+                            state(RAW),
+                            ExecutionConfig::new("probe-run"),
+                            &mut mapper,
+                            &mut store,
+                        )
+                        .await
+                        .unwrap();
+                    accepted.push((field, value, report(&store, &mapper) == absent));
+                }
+                Err(error) => {
+                    assert_eq!(error.kind(), ModelProfileErrorKind::InvalidProfile);
+                    assert_eq!(error.to_string(), "model profile InvalidProfile");
+                    assert!(error.profile().is_none());
+                    assert!(probe.requests.lock().unwrap().is_empty());
+                    assert!(mapper.events().is_empty());
+                }
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "nonfinite bindings accepted (field, value, aliases absent): {accepted:?}"
+    );
+}
+
+#[tokio::test]
 async fn semantic_identity_binds_runtime_without_publishing_policy() {
-    let base = ModelRuntimeConfig::default().with_sampling(|s| s.with_temperature(0.0));
+    let base = ModelRuntimeConfig::default().with_sampling(|s| {
+        s.with_temperature(0.0)
+            .with_top_p(0.0)
+            .with_frequency_penalty(0.0)
+            .with_presence_penalty(0.0)
+    });
     let variants = [
         base.clone(),
         base.clone(),
         base.clone().with_sampling(|s| s.with_temperature(1.0)),
+        base.clone().with_sampling(|s| s.with_top_p(1.0)),
+        base.clone()
+            .with_sampling(|s| s.with_frequency_penalty(1.0)),
+        base.clone().with_sampling(|s| s.with_presence_penalty(1.0)),
+        ModelRuntimeConfig::default(),
         base.clone().with_timeout(Duration::from_secs(10)),
         base.clone()
             .with_provider_extension("synthetic-policy", json!({"mode":"private-policy-canary"})),
@@ -265,6 +344,12 @@ async fn semantic_identity_binds_runtime_without_publishing_policy() {
         for request in probe.requests.lock().unwrap().iter() {
             let config = request.config.as_ref().unwrap();
             assert_eq!(config.temperature, runtime.sampling().temperature);
+            assert_eq!(config.top_p, runtime.sampling().top_p);
+            assert_eq!(
+                config.frequency_penalty,
+                runtime.sampling().frequency_penalty
+            );
+            assert_eq!(config.presence_penalty, runtime.sampling().presence_penalty);
             assert_eq!(
                 config.extensions.get("synthetic-policy"),
                 runtime.provider_extensions().get("synthetic-policy")
