@@ -1,4 +1,7 @@
-//! Profile-driven execution and kit-owned run-state persistence.
+//! Profile-driven execution, explicit host-authorized simulation, and run-state persistence.
+
+mod behavioral;
+pub use behavioral::BehavioralExecutionReceipt;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -2902,6 +2905,8 @@ impl ExecutionProfileV1 {
         role: IrModelRole,
         completed_turns: u64,
     ) -> Result<Arc<ModelBinding>, ExecutionError> {
+        #[cfg(feature = "test-support")]
+        behavioral::MODEL_BINDINGS.with(|count| count.set(count.get() + 1));
         let model = match role {
             IrModelRole::Worker => &self.model,
             IrModelRole::Reviewer => self
@@ -6122,6 +6127,8 @@ fn build_tool_registry(
     effect_journal: Option<Arc<EffectJournal>>,
     effect_fence: Arc<EffectFence>,
 ) -> Result<ToolBridge, ExecutionError> {
+    #[cfg(feature = "test-support")]
+    behavioral::TOOL_REGISTRIES.with(|count| count.set(count.get() + 1));
     let mut bridge = ToolBridge::new(sandbox);
     for tool in profile.tool_wires() {
         let registration = profile.tool_registration(tool)?;

@@ -80,7 +80,7 @@ Retain `to_json()` under that reference if persisting the evidence. The report
 has no deserializer that could mint host authority from untrusted JSON.
 
 Deferred: real-model tool-call observation, independently enforced process/OS
-containment, encoded-canary detection, production backend host overload,
+containment, encoded-canary detection, profile-backed behavioral execution,
 live semantic quality/calibration, durable checkpoint/crash recovery and causal
 attribution. This milestone does not close all of #233's acceptance criteria.
 No production action can be authorized by the simulator.
@@ -127,7 +127,9 @@ Consume that same capability with `AdkGraphTranslator::new().with_sentinel_trust
 
 Call `graph.invoke_observed_with_sentinel_script(state, config, mapper, artifacts, cancelled, deadline).await` with explicit host cancellation and an absolute deadline. `config.thread_id` must equal the fresh mapper's host run ID. Ordinary `invoke`/`invoke_observed` cannot execute this mode. Actual source identity is checked before retention; prepared normalization telemetry, host provenance/approval and run ID bind the sealed probe and preparation cache identity. Preparation skips semantic/model work. The existing authored terminal consumes its probe once, using invocation-local typed state rather than graph JSON, and returns `(State, ProbeReport)` only after report retention. Events reference that report's digest and optional Suspicious evidence, never Clean or causal attribution.
 
-The embedding-host route is implemented; `ExecutionBackend` and CLI still have no host-script channel and reject opt-in during ordinary compilation. Profile execution and durable resume remain unsupported. No result cache, approval serialization, new executor registry or production IO was added. Cancellation/deadlines cover preparation/queue time cooperatively; host artifact-store IO is outside the inert reducer, not preemptively bounded. This is not full #233 acceptance.
+The production backend also exposes `ExecutionBackend::run_with_sentinel_script(&spec, script, input, &mut artifacts, cancelled, deadline)`. It owns compilation, closed-input/source admission, a fresh backend RunId, authority-bound translation and observed invocation. It returns `BehavioralExecutionReceipt { run_id, report, observer }` only after report retention. Call this synchronous API outside a Tokio runtime; inspect `report.stop()` rather than treating receipt delivery as benign completion. Cancelled, timed-out and scripted-crash trajectories remain typed non-benign stops.
+
+This overload accepts no execution profile, model, tool registry, credentials, caller run ID or checkpoint. It creates no durable run directory/manifest, so `inspect`/`resume` cannot recover it. The host chooses artifact storage; storage failure returns an execution error, with no rollback claim for previously retained preparation artifacts. Default `ExecutionBackend::run` siblings and CLI still reject behavioral opt-in before adapters/credential resolution. Profile execution and durable resume remain unsupported. No result cache, approval serialization, new executor registry or production action was added. Cancellation/deadlines cover preparation/queue time cooperatively; host artifact-store IO is outside the inert reducer, not preemptively bounded. This is not full #233 acceptance.
 
 ## Public ADK path
 

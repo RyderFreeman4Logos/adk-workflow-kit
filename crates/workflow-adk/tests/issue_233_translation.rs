@@ -29,6 +29,8 @@ use workflow_runtime::{
     behavioral::{ProbeLimits, TrustedScript},
 };
 
+#[path = "support/behavioral_backend.rs"]
+mod behavioral_backend;
 #[path = "support/behavioral_oracles.rs"]
 mod behavioral_oracles;
 #[path = "support/behavioral_order.rs"]

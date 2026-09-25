@@ -266,7 +266,7 @@ fn set_outcome(
         serde_json::from_str(&terminal).map_err(|_| AdkGraphError::Failed)?,
     ))
 }
-fn byte_payload(input: &Value) -> Option<Vec<u8>> {
+pub(crate) fn byte_payload(input: &Value) -> Option<Vec<u8>> {
     let object = input.as_object()?;
     if object.len() != 2 || object.get("schema_version")?.as_u64()? != 1 {
         return None;
