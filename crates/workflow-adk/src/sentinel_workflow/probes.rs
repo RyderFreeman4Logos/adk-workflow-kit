@@ -34,7 +34,7 @@ enum ProbeKind {
     Decoded,
     TaskAlignment,
 }
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ProbeReason {
     SemanticNotRun,
@@ -48,13 +48,22 @@ enum ProbeReason {
 enum CausalAttribution {
     NotMeasured,
 }
-#[derive(Serialize)]
-struct View {
+#[derive(Clone, Serialize)]
+pub(super) struct View {
     start: usize,
     end: usize,
-    source: SourceSpan,
+    pub source: SourceSpan,
     sha256: String,
     candidate: Option<usize>,
+}
+pub(super) struct Input {
+    pub branch: &'static str,
+    pub view: View,
+    pub text: String,
+}
+pub(super) struct Prepared {
+    pub bytes: Vec<u8>,
+    pub inputs: Vec<Input>,
 }
 #[derive(Serialize)]
 struct Branch {
@@ -101,10 +110,10 @@ struct Report<'a> {
 /// Emitted even when language is ambiguous: source transforms confer no permission
 /// to run semantic branches. Task alignment abstains because v1 ingress has no
 /// separately authenticated trusted goal; text can never supply one implicitly.
-pub(super) fn encode(
+pub(super) fn prepare(
     carriers: &CarrierAnalysis<'_>,
     language_gate: UntrustedTextState,
-) -> Result<Vec<u8>, AdkGraphError> {
+) -> Result<Prepared, AdkGraphError> {
     let text = carriers.text();
     let normalized = text.normalized();
     let mut ordered = Branch::new(ProbeKind::Ordered, ProbeReason::EmptyView);
@@ -153,20 +162,56 @@ pub(super) fn encode(
         ],
     };
     let bytes = serde_json::to_vec(&report).map_err(|_| AdkGraphError::Failed)?;
-    if bytes.len() <= BUDGET.max_report_bytes {
-        return Ok(bytes);
-    }
-    for branch in &mut report.branches {
-        if !branch.views.is_empty() {
-            branch.views.clear();
-            branch.reason = ProbeReason::BudgetExhausted;
+    if bytes.len() > BUDGET.max_report_bytes {
+        for branch in &mut report.branches {
+            if !branch.views.is_empty() {
+                branch.views.clear();
+                branch.reason = ProbeReason::BudgetExhausted;
+            }
         }
     }
     let bytes = serde_json::to_vec(&report).map_err(|_| AdkGraphError::Failed)?;
     if bytes.len() > BUDGET.max_report_bytes {
         return Err(AdkGraphError::Failed);
     }
-    Ok(bytes)
+    let mut inputs = Vec::new();
+    // Semantic admission is all-or-nothing; descriptors remain available on denial.
+    if report
+        .branches
+        .iter()
+        .any(|b| b.reason == ProbeReason::BudgetExhausted)
+        || report.branches[..2].iter().any(|b| b.views.is_empty())
+    {
+        return Ok(Prepared { bytes, inputs });
+    }
+    for branch in &report.branches {
+        let name = match branch.kind {
+            ProbeKind::Ordered => "ordered",
+            ProbeKind::Shuffled => "shuffled",
+            ProbeKind::Decoded => "decoded",
+            ProbeKind::TaskAlignment => continue,
+        };
+        for view in &branch.views {
+            let text = match view.candidate {
+                None => normalized,
+                Some(index) => carriers
+                    .candidates()
+                    .get(index)
+                    .and_then(|candidate| candidate.decoded())
+                    .ok_or(AdkGraphError::Failed)?
+                    .text(),
+            };
+            inputs.push(Input {
+                branch: name,
+                view: view.clone(),
+                text: text
+                    .get(view.start..view.end)
+                    .ok_or(AdkGraphError::Failed)?
+                    .to_owned(),
+            });
+        }
+    }
+    Ok(Prepared { bytes, inputs })
 }
 
 fn view(

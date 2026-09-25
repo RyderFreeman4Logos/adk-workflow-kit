@@ -491,9 +491,17 @@ pub struct AdkGraph {
     plan_binding: Option<PlanBinding>,
     cache_dispositions: Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
     untrusted_text: Option<sentinel_workflow::PreparationWorkflow>,
+    sentinel_model: Option<Arc<model_profiles::ModelBinding>>,
 }
 
 impl AdkGraph {
+    /// Supplies tool-free, stateless Sentinel probe I/O; never inherits agent history.
+    /// Without a binding, preparation explicitly abstains from semantic inference.
+    pub fn with_sentinel_model(mut self, model: Arc<model_profiles::ModelBinding>) -> Self {
+        self.sentinel_model = Some(model);
+        self
+    }
+
     pub async fn invoke(
         &self,
         state: State,
@@ -579,11 +587,14 @@ impl AdkGraph {
             if config.resume_from.is_some() {
                 return Err(AdkGraphError::Failed);
             }
-            let (report, terminal) = workflow.prepare(
-                state.get("input").unwrap_or(&Value::Null),
-                artifacts,
-                mapper,
-            )?;
+            let (report, terminal) = workflow
+                .prepare(
+                    state.get("input").unwrap_or(&Value::Null),
+                    artifacts,
+                    mapper,
+                    self.sentinel_model.as_ref(),
+                )
+                .await?;
             state.clear();
             state.insert(sentinel_workflow::STATE_KEY.to_owned(), terminal);
             Some(report)
@@ -1559,6 +1570,7 @@ impl AdkGraphTranslator {
                 target: error.to_string(),
             })?;
         Ok(AdkGraph {
+            sentinel_model: None,
             graph,
             summary: GraphSummary {
                 node_order: order,

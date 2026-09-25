@@ -4964,6 +4964,11 @@ impl ExecutionBackend {
                     )
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?
                     .with_cache_dispositions(Arc::clone(&cache_dispositions));
+                let graph = if graph.untrusted_text.is_some() {
+                    graph.with_sentinel_model(profile.bind_model(IrModelRole::Worker, 0)?)
+                } else {
+                    graph
+                };
                 let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()

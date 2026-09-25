@@ -1,6 +1,6 @@
 # Versioned Sentinel preparation workflow
 
-This is a bounded #231 milestone, not semantic classification (#232). Workflow
+This is the bounded #231 admission contract with [#232 semantic evidence](sentinel-probes.md). Workflow
 schema v1 accepts `nodes.untrusted_text` only on the sole terminal node, with no
 edges or routes. Compiler admission rejects unsupported policy versions,
 unknown/missing/mistyped fields, and byte limits above 65,536. Zero denies input.
@@ -58,9 +58,10 @@ Source maps and decoded views remain transient library values; the original
 artifact plus exact versions supports reconstruction, but this milestone does not
 persist a full decoded-view/source-map report.
 
-The compiler restriction makes preparation the only operation. Preparation occurs
-before ADK streaming because graph closures cannot borrow the observer's artifact
-store; ADK still owns terminal-node execution and checkpoint delivery. Input state
+The compiler restriction keeps a single authored terminal. Preparation and bounded
+#232 semantic inference occur before the outer ADK stream because its closures
+cannot borrow the observer's artifact store; a private ADK graph owns isolated
+probe scheduling. ADK still owns terminal execution and checkpoint delivery. Input state
 is replaced by the host-created report before the stream starts, preventing
 caller-injected state from minting a preparation result. Unobserved `invoke` and
 checkpoint-resume invocations fail closed for this contract. Existing model/tool
@@ -84,11 +85,12 @@ codes/references, truncated decisions and any decision attached to abstention.
 It validates consistency, not origin authenticity; provenance still comes from
 host execution and retained artifacts. Reasons are closed preparation subcodes;
 invalid payload and empty input have no original, all other results retain one.
-A successful run means preparation completed, never semantic approval, model
-invocation or graph continuation. Han-only Chinese remains unattributed. Adapter
-identity `sentinel-workflow-preparation-v3` binds the output contract and the
-additional [source-only probe descriptor artifact](sentinel-probes.md); it supplies
-no semantic verdict or trusted task-alignment goal.
+A successful run means preparation completed, never semantic approval or graph
+continuation. The separate #232 report records executed model evidence or explicit
+abstention; the terminal is unchanged. Han-only Chinese remains unattributed.
+Adapter identity `sentinel-workflow-preparation-v4` binds the output contract and
+[source descriptors plus semantic evidence](sentinel-probes.md). No trusted
+task-alignment goal is inferred from input.
 
 Normalization uses the authored input ceiling and the runtime's default output/work
 limits. Carriers use bounded Decode defaults; segmentation uses its default 16,384
@@ -103,8 +105,9 @@ Unicode/security/trust versions, all used limits, decode mode and language polic
 Repeated runs have the
 same key; policy, workflow or raw-byte changes miss that identity. This milestone
 emits the key but deliberately does not reuse cached preparation results: it always
-persists/verifies the current run's artifacts. It does not bind unused model or
-provider settings or pretend an issue-body author identity for generic bytes.
+persists/verifies the current run's artifacts. That preparation key is not a
+semantic cache key; #232 invocation identities additionally bind the model route,
+prompt/task/schema and budgets. Generic bytes have no claimed issue-body author.
 
 Verify with `just issue-231-compiler`, `just issue-231-adk` and
 `just issue-231-runtime`. Full #231 acceptance remains incomplete: general graph

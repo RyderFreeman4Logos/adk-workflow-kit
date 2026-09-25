@@ -17,9 +17,10 @@ use workflow_runtime::{
 use workflow_spec::UntrustedTextPreparation;
 
 mod probes;
+mod semantics;
 
 pub(crate) const STATE_KEY: &str = "__workflow_untrusted_preparation";
-const VERSION: &str = "sentinel-workflow-preparation-v3";
+const VERSION: &str = "sentinel-workflow-preparation-v4";
 
 /// Preparation-only terminal states. None means semantic Clean.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -58,11 +59,12 @@ impl PreparationWorkflow {
         }
     }
 
-    pub fn prepare(
+    pub async fn prepare(
         &self,
         input: &Value,
         store: &mut impl ArtifactStore,
         mapper: &mut AdkEventMapper,
+        model: Option<&std::sync::Arc<crate::model_profiles::ModelBinding>>,
     ) -> Result<(Value, Value), AdkGraphError> {
         let normalization = NormalizationLimits {
             max_input_bytes: self.policy.max_input_bytes,
@@ -77,6 +79,13 @@ impl PreparationWorkflow {
             "version": VERSION,
             "probe_version": probes::VERSION,
             "probe_budget": probes::BUDGET,
+            "semantic_version": semantics::VERSION,
+            "semantic_budget": {
+                "max_requests": semantics::MAX_REQUESTS,
+                "deadline_ms": semantics::DEADLINE_MS,
+                "output_bytes": semantics::OUTPUT_BYTES,
+                "output_tokens": semantics::OUTPUT_TOKENS,
+            },
             "normalizer": SENTINEL_NORMALIZATION_VERSION,
             "envelope_schema": SENTINEL_ENVELOPE_SCHEMA_VERSION,
             "typed_output_schema": TYPED_OUTPUT_SCHEMA_VERSION_V1,
@@ -188,13 +197,16 @@ impl PreparationWorkflow {
                 UntrustedTextState::PendingClassification
             }
         };
-        let probe_bytes = probes::encode(&carriers, state)?;
-        let probe_id = put_verified(store, &probe_bytes, mapper, &self.node_id, "probes")?;
+        let probes = probes::prepare(&carriers, state)?;
+        let probe_id = put_verified(store, &probes.bytes, mapper, &self.node_id, "probes")?;
         report["probes"] = json!({
             "version": probes::VERSION,
             "artifact_id": probe_id,
-            "bytes": probe_bytes.len(),
+            "bytes": probes.bytes.len(),
         });
+        let semantic_bytes = semantics::run(probes.inputs, state, model, key.digest()).await?;
+        let semantic_id = put_verified(store, &semantic_bytes, mapper, &self.node_id, "semantics")?;
+        report["semantics"] = json!({"version":semantics::VERSION, "artifact_id":semantic_id, "bytes":semantic_bytes.len()});
         set_outcome(report, state, json!(state))
     }
 }

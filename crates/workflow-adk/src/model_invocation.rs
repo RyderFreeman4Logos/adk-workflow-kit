@@ -854,6 +854,15 @@ impl ModelInvocationSpec {
         &self,
         binding: &ModelBinding,
     ) -> Result<ModelInvocationResult, ModelInvocationError> {
+        self.invoke_checked(binding, |_| Ok(())).await
+    }
+
+    /// Domain validators see bounded raw bytes before Value can collapse duplicate keys.
+    pub(crate) async fn invoke_checked(
+        &self,
+        binding: &ModelBinding,
+        validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
+    ) -> Result<ModelInvocationResult, ModelInvocationError> {
         if !self.route.matches_binding(binding) {
             return Err(ModelInvocationError::route_mismatch());
         }
@@ -867,9 +876,25 @@ impl ModelInvocationSpec {
                 .await
                 .map_err(|error| ModelInvocationError::model(error.kind(), attempts))?;
             let mut output = String::new();
+            let mut complete = false;
             while let Some(response) = stream.next().await {
                 let response = response
                     .map_err(|error| ModelInvocationError::model(error.kind(), attempts))?;
+                if response.interrupted
+                    || response.error_code.is_some()
+                    || response.error_message.is_some()
+                    || response
+                        .finish_reason
+                        .is_some_and(|reason| reason != adk_rust::FinishReason::Stop)
+                {
+                    return Err(ModelInvocationError::structured(
+                        StructuredOutputError::InvalidJson,
+                        attempts,
+                    ));
+                }
+                complete = response.turn_complete
+                    && !response.partial
+                    && response.finish_reason == Some(adk_rust::FinishReason::Stop);
                 if let Some(content) = response.content {
                     for part in content.parts {
                         if let Part::Text { text } = part {
@@ -884,11 +909,22 @@ impl ModelInvocationSpec {
                                 ));
                             }
                             output.push_str(&text);
+                        } else {
+                            return Err(ModelInvocationError::structured(
+                                StructuredOutputError::InvalidJson,
+                                attempts,
+                            ));
                         }
                     }
                 }
             }
-            match self.output.decode(output.as_bytes()) {
+            if !complete {
+                return Err(ModelInvocationError::structured(
+                    StructuredOutputError::InvalidJson,
+                    attempts,
+                ));
+            }
+            match validate(output.as_bytes()).and_then(|()| self.output.decode(output.as_bytes())) {
                 Ok(output) => {
                     return Ok(ModelInvocationResult {
                         output,
