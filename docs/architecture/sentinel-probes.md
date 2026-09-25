@@ -65,7 +65,7 @@ their task branch still abstains. The byte ingress remains exactly two fields;
 a sibling `trusted_goal` makes it invalid, while embedded claims remain untrusted.
 
 Only the task request receives the goal, not source classifier siblings. Its fixed
-schema permits exactly four evidence objects, containing `schema_version: 1`,
+schema enumerates four alternative one-object choices, each containing `schema_version: 1`,
 `relation`, the ordered original `source` cover, `goal_identity` and fixed
 `trust_origin: authenticated_host_api_v1`. Relations are `redirects_goal`,
 `benign_discussion`, `aligned_intent`, and `uncertain`; no free text, rationale or

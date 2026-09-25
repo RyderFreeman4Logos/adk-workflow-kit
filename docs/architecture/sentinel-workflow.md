@@ -92,7 +92,7 @@ Adapter identity `sentinel-workflow-preparation-v5` binds the output contract an
 [source descriptors plus semantic evidence](sentinel-probes.md). No trusted
 task-alignment goal is inferred from input. Embedding hosts can separately bind an
 authenticated goal through `AdkGraph::with_sentinel_trusted_goal`; the CLI/JSON
-execution boundary continues to abstain. See the linked host-authentication contract.
+execution boundary continues to abstain. See [host goal and task-alignment evidence](sentinel-probes.md#host-goal-and-task-alignment-evidence).
 
 Normalization uses the authored input ceiling and the runtime's default output/work
 limits. Carriers use bounded Decode defaults; segmentation uses its default 16,384
