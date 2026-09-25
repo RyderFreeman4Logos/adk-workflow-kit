@@ -2,6 +2,9 @@
 //!
 //! No handler, callback, filesystem, network, secret broker, or process capability
 //! crosses this boundary. The only executor is a sealed, data-only catalog.
+#[path = "trajectory.rs"]
+pub mod trajectory;
+
 use crate::{
     ArtifactId, ArtifactRef, CanonicalUntrustedText, Completeness, ContentProvenance,
     ExecutorTarget, RunId, SYNTHETIC_HONEYTOKEN_PREFIX, SentinelEvidence, SentinelProbe,
@@ -262,6 +265,7 @@ pub struct TrustedScript {
     revision: String,
     script: Script,
     limits: ProbeLimits,
+    observer: Option<std::sync::Arc<trajectory::AuthoredObserver>>,
 }
 impl fmt::Debug for TrustedScript {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -305,23 +309,25 @@ impl TrustedScript {
             revision: revision.to_owned(),
             script: Script::parse(script)?,
             limits,
+            observer: None,
         })
     }
 
     /// Content-free, deterministic identity; copying this string grants no authority.
     pub fn identity(&self) -> String {
-        format!(
-            "sha256:{}",
-            crate::argument_fingerprint(&serde_json::json!({
-                "admission_version": "sentinel-trusted-script-v1",
-                "trust_origin": "authenticated_host_api_v1",
-                "version": BEHAVIORAL_VERSION, "tools": PROBE_TOOL_CATALOG,
-                "mode": "scripted_simulation", "approved_ir_hash": self.approved_ir_hash,
-                "approved_source": self.approved_source,
-                "provenance": self.provenance.cache_key(self.approved_source.as_str().as_bytes()).as_hex(),
-                "revision": self.revision, "script": self.script, "limits": self.limits,
-            }))
-        )
+        let mut material = serde_json::json!({
+            "admission_version": "sentinel-trusted-script-v1",
+            "trust_origin": "authenticated_host_api_v1",
+            "version": BEHAVIORAL_VERSION, "tools": PROBE_TOOL_CATALOG,
+            "mode": "scripted_simulation", "approved_ir_hash": self.approved_ir_hash,
+            "approved_source": self.approved_source,
+            "provenance": self.provenance.cache_key(self.approved_source.as_str().as_bytes()).as_hex(),
+            "revision": self.revision, "script": self.script, "limits": self.limits,
+        });
+        if let Some(observer) = &self.observer {
+            material["trajectory"] = observer.identity_material();
+        }
+        format!("sha256:{}", crate::argument_fingerprint(&material))
     }
 
     /// Checks the actual ingress artifact before any preparation artifacts are retained.
@@ -339,14 +345,16 @@ impl TrustedScript {
         if !self.approves_source(source.original_id()) {
             return Err(ProbeError::InvalidIdentity);
         }
-        BehavioralProbe::from_script(
+        let mut probe = BehavioralProbe::from_script(
             source,
             &self.provenance,
             run_id,
             self.script.clone(),
             self.limits,
             Some(self.identity()),
-        )
+        )?;
+        probe.observer = self.observer.clone();
+        Ok(probe)
     }
 
     /// Compares a compiler's exact canonical IR and policy limits to this approval.
@@ -363,6 +371,7 @@ pub struct BehavioralProbe {
     original_artifact_id: String,
     script: Script,
     limits: ProbeLimits,
+    observer: Option<std::sync::Arc<trajectory::AuthoredObserver>>,
 }
 impl fmt::Debug for BehavioralProbe {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -419,6 +428,7 @@ impl BehavioralProbe {
             original_artifact_id: source.original_id().as_str().into(),
             script,
             limits,
+            observer: None,
         })
     }
     /// Identity of the complete prepared-source/run/authority binding.

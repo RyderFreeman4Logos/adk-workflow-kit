@@ -214,6 +214,7 @@ fn backend_report_failure_and_cooperative_stops_never_return_stale_success() {
             inner: store(),
             cancel: (case == "cancel-in-preparation").then(|| cancelled.clone()),
             fail_report: case == "retention",
+            fail_trajectory: false,
             expire: case == "expire-in-preparation",
             report_attempts: 0,
         };

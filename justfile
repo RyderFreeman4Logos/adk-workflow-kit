@@ -165,6 +165,13 @@ issue-233-adk:
 issue-233-doc:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --doc behavioral --locked
 
+# Focused #234 default-off canonical trajectory observer (offline fixtures only).
+issue-234-runtime:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_234_trajectory --locked -- --nocapture
+
+issue-234-authored:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_233_translation trajectory_authored:: --locked -- --nocapture --test-threads=1
+
 # Focused #238 deterministic Firewall policy and workflow boundary tests.
 issue-238-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_238_firewall {{test_name}} --locked -- --nocapture
