@@ -151,6 +151,7 @@ impl TrajectoryObservation {
     /// Preserve #233's exact hard evidence first, then optional weak Suspicious.
     /// None means unclassified, never Clean/Allow or side-effect authorization.
     /// Weak evidence's artifact reference addresses `to_json()`; retain it if publishing.
+    /// Hard evidence addresses the original `ProbeReport::to_json()`; retain that artifact.
     pub fn evidence(&self) -> Result<Option<TypedOutput>, TypedOutputError> {
         if let Some(hard) = &self.hard_evidence {
             return Ok(Some(hard.clone()));
@@ -185,6 +186,8 @@ pub fn observe(
     let parsed = if mode == ObserverMode::OfflineSummary {
         summary
             .filter(|bytes| bytes.len() <= 1024)
+            // Serde's named-struct parser also accepts positional arrays.
+            .filter(|bytes| bytes.trim_ascii_start().starts_with(b"{"))
             .and_then(|bytes| serde_json::from_slice::<Summary>(bytes).ok())
             .filter(|value| value.schema_version == 1)
     } else {

@@ -29,13 +29,13 @@ information that the report intentionally discarded.
 
 ## Compact fixture, not raw reasoning
 
-The optional fixture is UTF-8 JSON, bounded to 1024 bytes:
+The optional fixture is a UTF-8 JSON object, bounded to 1024 bytes:
 
 ```json
 {"schema_version":1,"goal_override":false,"secret_seeking":false,"tool_manipulation":false,"claims_no_tools":true}
 ```
 
-All fields are required. Unknown/duplicate fields, non-booleans, unknown
+All fields are required. Arrays, unknown/duplicate fields, non-booleans, unknown
 versions, invalid UTF-8/JSON and oversized input produce `Malformed` without
 retaining bytes. No fixture produces `Unavailable`; disabled mode does not
 parse submitted bytes. `Present` describes only this compact fixture, **never
@@ -56,8 +56,10 @@ The report keeps typed weak hints separate from the hard stop.
 
 ## Retention, identity and deferred acceptance
 
-Retain only `TrajectoryObservation::to_json()` if evidence is published; its
-bytes contain no task text, raw fixture, attacker arguments or CoT. Do not retain
+For published weak evidence, retain `TrajectoryObservation::to_json()`. For
+returned hard-tripwire evidence, preserve the original `ProbeReport::to_json()`
+artifact it references; retaining only the observation is insufficient. Both
+artifacts omit task text, raw fixtures, attacker arguments and CoT. Never retain
 the task-bearing canonical input as ordinary telemetry. There is deliberately
 no raw artifact API, retention timer or purported access-control guarantee.
 Raw reasoning capture requires a separately verified storage/access/retention

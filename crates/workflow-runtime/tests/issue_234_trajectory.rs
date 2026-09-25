@@ -97,6 +97,32 @@ fn default_off_absent_present_and_malformed_never_mean_clean() {
 }
 
 #[test]
+fn positional_summary_arrays_are_malformed_without_weak_evidence() {
+    let report = report("complete", json!({}));
+    assert!(report.evidence().unwrap().is_none());
+    let task = TrustedObserverTask::authorize(&report, "Summarize").unwrap();
+    let observations = [
+        b"[1,true,false,false,false]".as_slice(),
+        b" \t\r\n[1,false,false,false,false]",
+    ]
+    .map(|bytes| observe(ObserverMode::OfflineSummary, &task, &report, Some(bytes)).unwrap());
+    assert_eq!(
+        observations.each_ref().map(|value| value.summary_status()),
+        [ReasoningStatus::Malformed; 2]
+    );
+    for observed in observations {
+        assert!(observed.weak_signals().is_empty());
+        assert!(observed.evidence().unwrap().is_none());
+    }
+    let mut object = b" \t\r\n".to_vec();
+    object.extend(summary(true, false, false, false));
+    let observed = observe(ObserverMode::OfflineSummary, &task, &report, Some(&object)).unwrap();
+    assert_eq!(observed.summary_status(), ReasoningStatus::Present);
+    assert_eq!(observed.weak_signals(), &[WeakSignal::GoalOverride]);
+    assert!(observed.evidence().unwrap().is_some());
+}
+
+#[test]
 fn observer_injection_is_rejected_without_retaining_raw_reasoning_or_arguments() {
     let report = report(
         "send_report",
@@ -215,25 +241,37 @@ fn unknown_calls_remain_content_free_and_unexecuted_calls_do_not_contradict() {
 }
 
 #[test]
-fn weak_evidence_references_the_exact_retained_observation_bytes() {
+fn evidence_references_the_exact_retained_observation_or_probe_bytes() {
     use workflow_runtime::ArtifactStore;
-    let report = report("complete", json!({}));
-    let task = TrustedObserverTask::authorize(&report, "Summarize").unwrap();
-    let claims = summary(true, false, false, false);
-    let observed = observe(ObserverMode::OfflineSummary, &task, &report, Some(&claims)).unwrap();
-    let mut store =
-        InMemoryArtifactStore::new(65_536.try_into().unwrap(), 65_536.try_into().unwrap());
-    let artifact = store.put(observed.to_json().unwrap().as_bytes()).unwrap();
-    let evidence: Value =
-        serde_json::from_str(&observed.evidence().unwrap().unwrap().to_json().unwrap()).unwrap();
-    assert_eq!(
-        evidence["payload"]["artifacts"][0]["artifact_id"],
-        artifact.as_str()
-    );
-    assert_eq!(
-        evidence["payload"]["artifacts"][0]["sha256"],
-        format!("sha256:{}", artifact.as_str())
-    );
+    for tool in ["complete", "read_secret"] {
+        let report = report(tool, json!({}));
+        let task = TrustedObserverTask::authorize(&report, "Summarize").unwrap();
+        let claims = summary(true, false, false, false);
+        let observed =
+            observe(ObserverMode::OfflineSummary, &task, &report, Some(&claims)).unwrap();
+        let mut store =
+            InMemoryArtifactStore::new(65_536.try_into().unwrap(), 65_536.try_into().unwrap());
+        let observation = store.put(observed.to_json().unwrap().as_bytes()).unwrap();
+        let artifact = if tool == "read_secret" {
+            assert_eq!(observed.evidence().unwrap(), report.evidence().unwrap());
+            let probe = store.put(report.to_json().unwrap().as_bytes()).unwrap();
+            assert_ne!(probe, observation);
+            probe
+        } else {
+            observation
+        };
+        let evidence: Value =
+            serde_json::from_str(&observed.evidence().unwrap().unwrap().to_json().unwrap())
+                .unwrap();
+        assert_eq!(
+            evidence["payload"]["artifacts"][0]["artifact_id"],
+            artifact.as_str()
+        );
+        assert_eq!(
+            evidence["payload"]["artifacts"][0]["sha256"],
+            format!("sha256:{}", artifact.as_str())
+        );
+    }
 }
 
 #[test]
