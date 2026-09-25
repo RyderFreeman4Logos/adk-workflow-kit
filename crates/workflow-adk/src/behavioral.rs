@@ -72,6 +72,7 @@ impl AdkGraphTranslator {
             (None, None) => true,
             (Some(policy), Some(script)) => {
                 policy.schema_version == 1
+                    && script.matches_trajectory_policy(policy.trajectory.map(|p| p.schema_version))
                     && script.matches_approval(
                         &format!("sha256:{}", crate::canonical_ir_hash(ir)),
                         ProbeLimits {
@@ -104,6 +105,7 @@ struct Invocation {
     deadline: Instant,
     probe: Option<BehavioralProbe>,
     report: Option<ProbeReport>,
+    trajectory: Option<workflow_runtime::behavioral::trajectory::TrajectoryObservation>,
     retained: bool,
 }
 fn with_run<T>(
@@ -155,6 +157,7 @@ impl AdkGraph {
             deadline: deadline.min(Instant::now() + std::time::Duration::from_millis(timeout_ms)),
             probe: None,
             report: None,
+            trajectory: None,
             retained: false,
         });
         RUN.scope(invocation, async {
@@ -227,6 +230,26 @@ impl AdkGraph {
                 .transpose()
                 .map_err(|_| AdkGraphError::Failed)?;
             preparation["behavioral"] = serde_json::json!({"identity":report.identity(),"artifact_id":id,"evidence":evidence});
+            if let Some(observation) = &run.trajectory {
+                let bytes = observation.to_json().map_err(|_| AdkGraphError::Failed)?;
+                let id = crate::sentinel_workflow::put_verified(
+                    artifacts,
+                    bytes.as_bytes(),
+                    mapper,
+                    node,
+                    "trajectory",
+                )?;
+                let evidence = observation
+                    .evidence()
+                    .and_then(|e| e.map(|e| e.to_json()).transpose())
+                    .map_err(|_| AdkGraphError::Failed)?;
+                let evidence: Option<serde_json::Value> = evidence
+                    .map(|e| serde_json::from_str(&e))
+                    .transpose()
+                    .map_err(|_| AdkGraphError::Failed)?;
+                preparation["trajectory"] =
+                    serde_json::json!({"artifact_id": id, "evidence": evidence});
+            }
             run.retained = true;
             Ok(())
         })
@@ -266,7 +289,11 @@ pub(crate) fn execute_prepared() -> Result<(), AdkGraphError> {
             return Err(AdkGraphError::Failed);
         }
         let probe = run.probe.take().ok_or(AdkGraphError::Failed)?;
-        run.report = Some(probe.run_until(&run.cancelled, run.deadline));
+        let report = probe.run_until(&run.cancelled, run.deadline);
+        run.trajectory = probe
+            .observe_trajectory(&report)
+            .map_err(|_| AdkGraphError::Failed)?;
+        run.report = Some(report);
         Ok(())
     })
 }

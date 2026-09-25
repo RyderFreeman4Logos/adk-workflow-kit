@@ -99,7 +99,9 @@ timeout_ms = 100
 All fields are required; v1 is scripted simulation only. Limits must exactly
 match host approval, within 1..=32 steps and 1..=1000ms. No script, revision,
 provenance, report or authority field is accepted here. Canonical IR uses wire
-v12 only when opted in; non-opted workflows retain their earlier bytes/hashes.
+v12 for this policy alone; non-opted workflows retain their earlier bytes/hashes.
+The separate [offline trajectory opt-in](trajectory-observer.md#authored-host-only-execution)
+uses v13 and additionally requires independently authenticated host task authority.
 
 The embedding Rust host parses with `workflow_spec::parse_str`, lowers with
 `WorkflowIr::from(&spec)` and obtains `canonical_hash().as_bytes()`. Format that

@@ -3,7 +3,8 @@
 `workflow_runtime::behavioral::trajectory` is an **offline partial milestone**,
 not a provider CoT monitor. Ordinary workflow execution remains unchanged.
 `ObserverMode::default()` is `Disabled`; only an explicit Rust host call enables
-`OfflineSummary`. No new workflow/profile/CLI opt-in, model calls, tool registry,
+`OfflineSummary`. Authored workflows require both the policy below and an explicit
+host capability. No profile/CLI authority channel, model calls, tool registry,
 raw-CoT capture, raw storage or second agent loop is introduced.
 
 ## Host API and data boundary
@@ -71,7 +72,50 @@ retained nor hashed. Provider/model are explicitly absent from this offline
 identity; changing fixture key order/whitespace is immaterial. Existing #233
 report bytes and non-opted workflow cache identities are unchanged.
 
-Run `just issue-234-runtime` and `just issue-233-doc` for offline contracts.
+## Authored host-only execution
+
+Add this table to a #233 behavioral terminal to request the offline observer:
+
+```toml
+[nodes.untrusted_text.behavioral.trajectory]
+schema_version = 1
+```
+
+V1 fixes the existing 2048-byte task, 1024-byte compact fixture and 32-event
+ceilings. Unknown/duplicate fields and missing versions are rejected. It accepts
+no task, summary, report, raw reasoning or authority. Omission disables the
+observer and preserves existing v12 IR, script identity, report and preparation
+cache bytes. Opt-in uses canonical IR v13; the observer version and canonical
+fixture status/claims plus task digest participate in host approval identity.
+Malformed fixture bytes are discarded, never hashed or stored.
+
+Authenticate the exact authored IR/source/script as described in
+[behavioral simulation](behavioral-simulation.md#host-authorized-authored-execution),
+then consume that `TrustedScript` using
+`script.with_trajectory_observer(trusted_task, optional_summary_bytes)` before
+compilation. Authenticate the task independently; this is a host capability API,
+not authentication of arbitrary strings or protection against hostile in-process
+Rust code. Rebinding, missing host task, missing policy and unknown policy versions
+fail closed. Do not call this API with workflow/input/state/model-derived tasks.
+
+The existing `compile_spec_with_sentinel_script`, authorized ADK translator and
+`ExecutionBackend::run_with_sentinel_script` execute the observer without another
+registry or provider adapter. Source/run/IR/host approval bind the sealed probe;
+`probe.observe_trajectory(&report)` rejects foreign reports before authorizing the
+exact report bytes. Task/summary authority and reports never travel in caller JSON
+or checkpoints. Only validated compact claims, not raw fixture bytes, are retained
+ephemerally inside the host capability.
+
+Observed invocation retains the original behavioral report, then the content-free
+trajectory observation before publishing node/workflow completion. The
+`sentinel-trajectory` artifact event and `preparation.trajectory` reference the
+observation; weak evidence references it, hard evidence still references the
+original report. Artifact-store failure returns an error, not success; previously
+retained preparation/report artifacts are not rolled back. Host storage remains
+outside the inert reducer, with no new raw-CoT retention/access-control claim.
+
+Run `just issue-234-authored`, `just issue-234-runtime`, `just issue-231-compiler`,
+`just issue-233-adk` and `just issue-233-doc` for offline contracts.
 Live-provider availability, semantic quality, token/decode overhead measurement,
-raw-artifact access/retention tests and authored spec/IR/compiler integration
+raw-artifact access/retention tests and independent OS isolation
 remain deferred. This milestone does not close #234 or #233.

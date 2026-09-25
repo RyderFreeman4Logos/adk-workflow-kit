@@ -29,6 +29,9 @@ use workflow_runtime::{
     behavioral::{ProbeLimits, TrustedScript},
 };
 
+#[path = "support/trajectory_authored.rs"]
+mod trajectory_authored;
+
 #[path = "support/behavioral_backend.rs"]
 mod behavioral_backend;
 #[path = "support/behavioral_oracles.rs"]
@@ -727,6 +730,7 @@ struct ControlledStore {
     inner: InMemoryArtifactStore,
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     fail_report: bool,
+    fail_trajectory: bool,
     expire: bool,
     report_attempts: usize,
 }
@@ -750,6 +754,15 @@ impl ArtifactStore for ControlledStore {
             if self.fail_report {
                 return self.inner.stage(&[]);
             }
+        }
+        if self.fail_trajectory
+            && serde_json::from_slice::<serde_json::Value>(bytes)
+                .ok()
+                .is_some_and(|v| {
+                    v["version"] == workflow_runtime::behavioral::trajectory::TRAJECTORY_VERSION
+                })
+        {
+            return self.inner.stage(&[]);
         }
         self.inner.stage(bytes)
     }
@@ -796,6 +809,7 @@ async fn cancellation_during_preparation_and_report_failure_do_not_publish_stale
             inner: store(),
             cancel: (case == "cancel").then(|| Arc::clone(&cancel)),
             fail_report: case == "retention-failure",
+            fail_trajectory: false,
             expire: case == "expired-in-preparation",
             report_attempts: 0,
         };

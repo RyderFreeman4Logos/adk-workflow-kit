@@ -238,13 +238,15 @@ fn validated_ir(
                     .map(|b| format!("{b:02x}"))
                     .collect::<String>()
             );
-            if !script.matches_approval(
-                &hash,
-                ProbeLimits {
-                    max_steps: policy.max_steps,
-                    timeout_ms: policy.timeout_ms,
-                },
-            ) {
+            if !script.matches_trajectory_policy(policy.trajectory.map(|p| p.schema_version))
+                || !script.matches_approval(
+                    &hash,
+                    ProbeLimits {
+                        max_steps: policy.max_steps,
+                        timeout_ms: policy.timeout_ms,
+                    },
+                )
+            {
                 return Err(CompileError::Binding(
                     BindingValidationError::InvalidSentinelScript,
                 ));

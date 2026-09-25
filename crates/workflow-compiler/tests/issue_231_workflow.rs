@@ -19,6 +19,32 @@ ja = true
 "#;
 
 #[test]
+fn trajectory_policy_is_versioned_strict_and_requires_additional_host_authority() {
+    let text = format!("{WORKFLOW}{BEHAVIORAL}");
+    let baseline = workflow_ir::WorkflowIr::from(&workflow_spec::parse_str("base", &text).unwrap());
+    let opted =
+        format!("{text}\n[nodes.untrusted_text.behavioral.trajectory]\nschema_version = 1\n");
+    let spec = workflow_spec::parse_str("observer", &opted).expect("observer policy parses");
+    let ir = workflow_ir::WorkflowIr::from(&spec);
+    assert_eq!(baseline.canonical_wire_version(), 12);
+    assert_eq!(ir.canonical_wire_version(), 13);
+    assert_ne!(baseline.canonical_hash(), ir.canonical_hash());
+    assert!(
+        workflow_compiler::compile_spec_with_sentinel_script(&spec, &authorize(&spec, "r"))
+            .is_err()
+    );
+    for field in ["task", "authority", "summary", "report", "raw_reasoning"] {
+        assert!(
+            workflow_spec::parse_str("forged", &format!("{opted}{field} = 'forged'\n")).is_err()
+        );
+    }
+    assert!(
+        workflow_spec::parse_str("duplicate", &format!("{opted}schema_version = 1\n")).is_err()
+    );
+    assert!(compile_str("no-authority", &opted).is_err());
+}
+
+#[test]
 fn preparation_contract_is_compiled_and_participates_in_ir_identity() {
     let plan = compile_str("sentinel.toml", WORKFLOW).expect("preparation compiles");
     for (from, to) in [

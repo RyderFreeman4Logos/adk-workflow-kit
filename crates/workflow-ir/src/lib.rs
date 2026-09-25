@@ -34,6 +34,9 @@ pub const CANONICAL_IR_WIRE_VERSION_V11: u16 = 11;
 /// Canonical wire for opt-in host-authorized behavioral policy (not authority).
 pub const CANONICAL_IR_WIRE_VERSION_V12: u16 = 12;
 
+/// Canonical wire for default-off offline trajectory policy, never host authority.
+pub const CANONICAL_IR_WIRE_VERSION_V13: u16 = 13;
+
 const DOMAIN: &[u8] = b"adk-workflow-kit/workflow-ir\0";
 const IR_SCHEMA_VERSION_V1: u32 = 1;
 
@@ -812,6 +815,15 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
                                 write_u16(sink, behavioral.schema_version);
                                 write_u64(sink, u64_from_usize(behavioral.max_steps));
                                 write_u64(sink, behavioral.timeout_ms);
+                                if canonical_wire_version(ir) >= CANONICAL_IR_WIRE_VERSION_V13 {
+                                    match behavioral.trajectory {
+                                        Some(observer) => {
+                                            sink.write_chunk(&[1]);
+                                            write_u16(sink, observer.schema_version);
+                                        }
+                                        None => sink.write_chunk(&[0]),
+                                    }
+                                }
                             }
                             None => sink.write_chunk(&[0]),
                         }
@@ -964,7 +976,13 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
 }
 
 fn canonical_wire_version(ir: &WorkflowIr) -> u16 {
-    if ir
+    if ir.nodes.iter().any(|node| {
+        node.untrusted_text
+            .and_then(|p| p.behavioral)
+            .is_some_and(|p| p.trajectory.is_some())
+    }) {
+        CANONICAL_IR_WIRE_VERSION_V13
+    } else if ir
         .nodes
         .iter()
         .any(|node| node.untrusted_text.is_some_and(|p| p.behavioral.is_some()))

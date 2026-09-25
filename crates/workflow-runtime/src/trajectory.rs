@@ -124,6 +124,78 @@ struct Summary {
     claims_no_tools: bool,
 }
 
+/// Private, bounded host approval. Never holds the submitted fixture bytes.
+pub(super) struct AuthoredObserver {
+    task: String,
+    status: ReasoningStatus,
+    summary: Option<Summary>,
+}
+impl AuthoredObserver {
+    pub(super) fn identity_material(&self) -> serde_json::Value {
+        serde_json::json!({"version": TRAJECTORY_VERSION, "mode": ObserverMode::OfflineSummary,
+            "task_digest": hash(self.task.as_bytes()), "status": self.status, "summary": self.summary})
+    }
+}
+impl super::TrustedScript {
+    /// Attach an independently authenticated host task to this exact IR/source/script
+    /// approval. Never take the task from workflow/input/state/model data. Rebinding
+    /// is rejected. The optional untrusted compact fixture is parsed now; raw bytes
+    /// are discarded even when malformed. No provider or raw-reasoning capture.
+    /// Compilation/translation require the matching authored v1 trajectory policy.
+    pub fn with_trajectory_observer(
+        mut self,
+        task: &str,
+        summary: Option<&[u8]>,
+    ) -> Result<Self, super::ProbeError> {
+        if self.observer.is_some() || task.trim().is_empty() || task.len() > 2048 {
+            return Err(super::ProbeError::InvalidIdentity);
+        }
+        let (status, summary) = parse_summary(ObserverMode::OfflineSummary, summary);
+        self.observer = Some(std::sync::Arc::new(AuthoredObserver {
+            task: task.into(),
+            status,
+            summary,
+        }));
+        Ok(self)
+    }
+
+    /// Both compiler and direct-IR translation must check this alongside exact IR
+    /// and probe limits. Neither missing policy nor missing host task is ignored.
+    pub fn matches_trajectory_policy(&self, schema_version: Option<u16>) -> bool {
+        matches!(
+            (schema_version, self.observer.is_some()),
+            (None, false) | (Some(1), true)
+        )
+    }
+}
+impl super::BehavioralProbe {
+    /// Observe only a genuine report from this exact source/run/host approval.
+    /// The immutable report identity is checked before binding its exact bytes to
+    /// the pre-authenticated task. None means disabled, never Clean. Retain both
+    /// report and returned observation before publishing evidence.
+    pub fn observe_trajectory(
+        &self,
+        report: &ProbeReport,
+    ) -> Result<Option<TrajectoryObservation>, TypedOutputError> {
+        if self.identity() != report.identity() {
+            return Err(TypedOutputError::InvalidJson);
+        }
+        self.observer
+            .as_ref()
+            .map(|observer| {
+                let task = TrustedObserverTask::authorize(report, &observer.task)?;
+                observe_parsed(
+                    ObserverMode::OfflineSummary,
+                    &task,
+                    report,
+                    observer.status,
+                    observer.summary.as_ref(),
+                )
+            })
+            .transpose()
+    }
+}
+
 /// Content-free, versioned report. Hard behavioral evidence is never downgraded.
 #[derive(Debug, Serialize)]
 pub struct TrajectoryObservation {
@@ -182,7 +254,11 @@ pub fn observe(
     report: &ProbeReport,
     summary: Option<&[u8]>,
 ) -> Result<TrajectoryObservation, TypedOutputError> {
-    let input = task.canonical_input(report)?;
+    let (status, parsed) = parse_summary(mode, summary);
+    observe_parsed(mode, task, report, status, parsed.as_ref())
+}
+
+fn parse_summary(mode: ObserverMode, summary: Option<&[u8]>) -> (ReasoningStatus, Option<Summary>) {
     let parsed = if mode == ObserverMode::OfflineSummary {
         summary
             .filter(|bytes| bytes.len() <= 1024)
@@ -199,6 +275,17 @@ pub fn observe(
         (_, _, None) => ReasoningStatus::Malformed,
         (_, _, Some(_)) => ReasoningStatus::Present,
     };
+    (reasoning, parsed)
+}
+
+fn observe_parsed(
+    mode: ObserverMode,
+    task: &TrustedObserverTask,
+    report: &ProbeReport,
+    reasoning: ReasoningStatus,
+    parsed: Option<&Summary>,
+) -> Result<TrajectoryObservation, TypedOutputError> {
+    let input = task.canonical_input(report)?;
     let mut weak_signals = Vec::new();
     if let Some(claims) = &parsed {
         for (present, signal) in [

@@ -551,6 +551,15 @@ pub struct BehavioralPolicy {
     pub schema_version: u16,
     pub max_steps: usize,
     pub timeout_ms: u64,
+    pub trajectory: Option<TrajectoryPolicy>,
+}
+
+/// Offline observer opt-in, not task authority or provider reasoning capture.
+/// V1 fixes task/summary/event ceilings at 2048 bytes/1024 bytes/32 events.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TrajectoryPolicy {
+    pub schema_version: u16,
 }
 
 /// Versioned, deterministic untrusted-text terminal contract.

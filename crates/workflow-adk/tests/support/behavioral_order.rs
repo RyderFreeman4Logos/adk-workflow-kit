@@ -60,6 +60,7 @@ async fn behavioral_order(resolved: bool) {
             inner: store(),
             cancel: None,
             fail_report: false,
+            fail_trajectory: false,
             expire: false,
             report_attempts: 0,
         };
