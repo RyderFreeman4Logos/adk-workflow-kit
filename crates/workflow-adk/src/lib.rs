@@ -690,7 +690,12 @@ impl AdkGraph {
                         }),
                         None => json!({ "step": step }),
                     };
-                    if let Some(report) = &mut preparation {
+                    if let Some(report) = &mut preparation
+                        && self
+                            .untrusted_text
+                            .as_ref()
+                            .is_some_and(|workflow| workflow.node_id == node)
+                    {
                         self.observe_behavioral(report, mapper, artifacts)?;
                         payload["preparation"] = report.clone();
                     }

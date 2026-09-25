@@ -29,6 +29,9 @@ use workflow_runtime::{
     behavioral::{ProbeLimits, TrustedScript},
 };
 
+#[path = "support/behavioral_order.rs"]
+mod behavioral_order;
+
 const WORKFLOW: &str = include_str!("fixtures/sentinel.workflow.toml");
 const BEHAVIORAL: &str =
     "\n[nodes.untrusted_text.behavioral]\nschema_version = 1\nmax_steps = 8\ntimeout_ms = 100\n";
