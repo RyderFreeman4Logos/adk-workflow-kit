@@ -1,5 +1,6 @@
 //! Domain-neutral Verbatim boundary for platform-owned workflow calls.
 
+pub mod behavioral;
 pub mod events;
 pub mod execution;
 pub mod firewall;

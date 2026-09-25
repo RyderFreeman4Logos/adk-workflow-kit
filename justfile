@@ -159,6 +159,9 @@ issue-232-adk:
 issue-233-runtime:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_233_behavioral --locked -- --nocapture
 
+issue-233-adk:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_233_behavioral --locked -- --nocapture --test-threads=1
+
 issue-233-doc:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --doc behavioral --locked
 

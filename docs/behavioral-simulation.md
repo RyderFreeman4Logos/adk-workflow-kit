@@ -85,9 +85,19 @@ live semantic quality/calibration, durable checkpoint/crash recovery and causal
 attribution. This milestone does not close all of #233's acceptance criteria.
 No production action can be authorized by the simulator.
 
+## Public ADK path
+
+`workflow_adk::behavioral::run_simulation(probe, cancelled, deadline).await`
+executes the same admitted probe in a fresh ADK `GraphAgent` superstep. Only a
+typed in-memory report channel leaves the node; caller-writable graph state
+cannot fabricate a `ProbeReport`. No provider, production `ExecutionBackend`,
+artifact observer, checkpoint or inherited state is bound. The host deadline
+includes graph setup/queue time; the runtime still clamps its own ceiling.
+The direct runtime API is a deterministic data reducer, not a second agent loop.
+
 ## Verification
 
-Run `just issue-233-runtime` and `just issue-233-doc` with the repository's safe
+Run `just issue-233-runtime`, `just issue-233-adk`, and `just issue-233-doc` with the repository's safe
 SSD temp setup. Tests cover every honeytool, benign completion, parameter traps,
 network/filesystem/symlink/process-shaped requests, production-binding refusal,
 canary lifecycle, resource limits, cancellation, expired deadlines and replay.
