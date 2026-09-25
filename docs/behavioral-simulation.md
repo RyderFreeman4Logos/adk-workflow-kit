@@ -124,8 +124,8 @@ host-authority channel and rejects opt-in. Approval on non-opted workflows and
 mismatched IR/schema/limits are rejected, never silently ignored or clamped.
 
 **Boundary still pending:** compilation does not bind a script to the authored
-ADK terminal. The translator does not yet check/consume this capability; do not
-translate or run opted-in plans as behavioral execution. Source matching after
+ADK terminal. Every translator entry rejects behavioral opt-in before preparation
+or graph construction, including host-approved plans and direct IR. Source matching after
 preparation, source/run-bound probe identity, model-free preparation, per-run
 typed report handoff, cancellation/deadline plumbing, report retention and
 checkpoint denial remain the next integration milestone. Existing standalone
@@ -144,7 +144,7 @@ The direct runtime API is a deterministic data reducer, not a second agent loop.
 
 ## Verification
 
-Run `just issue-233-runtime`, `just issue-233-adk`, and `just issue-233-doc` with the repository's safe
+Run `just issue-233-runtime`, `just issue-233-adk` (including public translation denial), and `just issue-233-doc` with the repository's safe
 SSD temp setup. Tests cover every honeytool, benign completion, parameter traps,
 network/filesystem/symlink/process-shaped requests, production-binding refusal,
 canary lifecycle, resource limits, cancellation, expired deadlines and replay.

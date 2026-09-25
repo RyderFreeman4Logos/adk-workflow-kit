@@ -1114,6 +1114,8 @@ impl AdkGraphTranslator {
                 || !ir.edges().is_empty()
                 || !ir.routes().is_empty()
                 || policy.schema_version != 1
+                // Authored behavioral execution is unsupported, never preparation-only.
+                || policy.behavioral.is_some()
                 || policy.max_input_bytes > 65_536)
         {
             return Err(TranslationError::MissingNodeBackend {
