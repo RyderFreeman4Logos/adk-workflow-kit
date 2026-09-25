@@ -237,6 +237,44 @@ fn oversized_argument_is_rejected_before_dispatch() {
 }
 
 #[test]
+fn behavioral_opt_in_has_no_cli_authority_channel() {
+    let fixture = temporary_fixture_path("behavioral");
+    fs::write(
+        &fixture,
+        r#"
+schema_version = 1
+edges = []
+[workflow]
+id = "behavioral"
+version = "1"
+entry = "done"
+[[nodes]]
+id = "done"
+kind = "terminal"
+[nodes.untrusted_text]
+schema_version = 1
+max_input_bytes = 65536
+en = true
+zh = true
+ja = true
+[nodes.untrusted_text.behavioral]
+schema_version = 1
+max_steps = 8
+timeout_ms = 100
+"#,
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
+    command.args(["--json", "validate"]).arg(&fixture);
+    let result = output(&mut command);
+    fs::remove_file(fixture).unwrap();
+    assert_error(
+        result,
+        "{\"diagnostic_version\":1,\"code\":\"workflow.node.invalid_binding\",\"message\":\"invalid node binding\",\"location\":null,\"details\":{}}\n",
+    );
+}
+
+#[test]
 fn minimal_fixture_validates_and_emits_exact_graph_and_lock_bytes() {
     let mut validate = Command::new(env!("CARGO_BIN_EXE_workflowctl"));
     validate.args(["validate", MINIMAL_FIXTURE]);

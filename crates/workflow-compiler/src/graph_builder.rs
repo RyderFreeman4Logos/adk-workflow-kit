@@ -167,7 +167,7 @@ where
     where
         I: IntoIterator<Item = RegistryBinding>,
     {
-        let ir = validated_ir(spec).map_err(GraphBuildError::Compile)?;
+        let ir = validated_ir(spec, None).map_err(GraphBuildError::Compile)?;
         let mut registry_binding_count = 0;
 
         for route in ir.routes() {
@@ -192,6 +192,7 @@ where
         Ok(CompiledPlan {
             ir,
             registry_binding_count,
+            sentinel_script_identity: None,
         })
     }
 

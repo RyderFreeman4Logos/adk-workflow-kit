@@ -31,6 +31,9 @@ pub const CANONICAL_IR_WIRE_VERSION_V10: u16 = 10;
 /// Canonical wire for explicit untrusted-text terminal preparation policy.
 pub const CANONICAL_IR_WIRE_VERSION_V11: u16 = 11;
 
+/// Canonical wire for opt-in host-authorized behavioral policy (not authority).
+pub const CANONICAL_IR_WIRE_VERSION_V12: u16 = 12;
+
 const DOMAIN: &[u8] = b"adk-workflow-kit/workflow-ir\0";
 const IR_SCHEMA_VERSION_V1: u32 = 1;
 
@@ -802,6 +805,17 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
                         u8::from(policy.zh),
                         u8::from(policy.ja),
                     ]);
+                    if canonical_wire_version(ir) >= CANONICAL_IR_WIRE_VERSION_V12 {
+                        match policy.behavioral {
+                            Some(behavioral) => {
+                                sink.write_chunk(&[1]);
+                                write_u16(sink, behavioral.schema_version);
+                                write_u64(sink, u64_from_usize(behavioral.max_steps));
+                                write_u64(sink, behavioral.timeout_ms);
+                            }
+                            None => sink.write_chunk(&[0]),
+                        }
+                    }
                 }
                 None => sink.write_chunk(&[0]),
             }
@@ -950,7 +964,13 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
 }
 
 fn canonical_wire_version(ir: &WorkflowIr) -> u16 {
-    if ir.nodes.iter().any(|node| node.untrusted_text.is_some()) {
+    if ir
+        .nodes
+        .iter()
+        .any(|node| node.untrusted_text.is_some_and(|p| p.behavioral.is_some()))
+    {
+        CANONICAL_IR_WIRE_VERSION_V12
+    } else if ir.nodes.iter().any(|node| node.untrusted_text.is_some()) {
         CANONICAL_IR_WIRE_VERSION_V11
     } else if ir.nodes.iter().any(|node| node.firewall.is_some()) {
         CANONICAL_IR_WIRE_VERSION_V10

@@ -1,4 +1,247 @@
 //! Offline simulation contracts. Attacker strings are data, never host instructions.
+
+#[test]
+fn host_script_admission_binds_every_approved_input_without_payload_debug() {
+    use workflow_runtime::behavioral::TrustedScript;
+    use workflow_runtime::{ArtifactId, ContentProvenance};
+    let provenance = TrustPolicy::new("scope", ["trusted"])
+        .unwrap()
+        .classify(ContentObject::Comment {
+            object_id: "233",
+            author: "attacker",
+        })
+        .unwrap();
+    let other_provenance = TrustPolicy::new("other-scope", ["trusted"])
+        .unwrap()
+        .classify(ContentObject::Comment {
+            object_id: "233",
+            author: "attacker",
+        })
+        .unwrap();
+    let ir = format!("sha256:{}", "a".repeat(64));
+    let other_ir = format!("sha256:{}", "b".repeat(64));
+    let source = ArtifactId::parse("c".repeat(64)).unwrap();
+    let other_source = ArtifactId::parse("d".repeat(64)).unwrap();
+    let bytes = br#"{"schema_version":1,"steps":[{"kind":"output","text":"PRIVATE_SCRIPT"}]}"#;
+    let make = |ir: &str,
+                source: ArtifactId,
+                provenance: ContentProvenance,
+                revision: &str,
+                bytes: &[u8],
+                limits| {
+        TrustedScript::authorize(ir, source, provenance, revision, bytes, limits).unwrap()
+    };
+    let approved = make(
+        &ir,
+        source.clone(),
+        provenance.clone(),
+        "PRIVATE_REVISION",
+        bytes,
+        ProbeLimits::default(),
+    );
+    assert!(approved.matches_approval(&ir, ProbeLimits::default()));
+    assert!(!approved.matches_approval(&other_ir, ProbeLimits::default()));
+    assert!(!approved.matches_approval(
+        &ir,
+        ProbeLimits {
+            max_steps: 9,
+            timeout_ms: 100
+        }
+    ));
+    assert!(!approved.matches_approval(
+        &ir,
+        ProbeLimits {
+            max_steps: 8,
+            timeout_ms: 101
+        }
+    ));
+    assert!(!format!("{approved:?}").contains("PRIVATE"));
+    let reordered =
+        br#"{ "steps": [{"text":"PRIVATE_SCRIPT", "kind":"output"}], "schema_version":1 }"#;
+    assert_eq!(
+        approved.identity(),
+        make(
+            &ir,
+            source.clone(),
+            provenance.clone(),
+            "PRIVATE_REVISION",
+            reordered,
+            ProbeLimits::default()
+        )
+        .identity()
+    );
+    for changed in [
+        make(
+            &other_ir,
+            source.clone(),
+            provenance.clone(),
+            "PRIVATE_REVISION",
+            bytes,
+            ProbeLimits::default(),
+        ),
+        make(
+            &ir,
+            other_source,
+            provenance.clone(),
+            "PRIVATE_REVISION",
+            bytes,
+            ProbeLimits::default(),
+        ),
+        make(
+            &ir,
+            source.clone(),
+            other_provenance,
+            "PRIVATE_REVISION",
+            bytes,
+            ProbeLimits::default(),
+        ),
+        make(
+            &ir,
+            source.clone(),
+            provenance.clone(),
+            "OTHER_REVISION",
+            bytes,
+            ProbeLimits::default(),
+        ),
+        make(
+            &ir,
+            source.clone(),
+            provenance.clone(),
+            "PRIVATE_REVISION",
+            br#"{"schema_version":1,"steps":[]}"#,
+            ProbeLimits::default(),
+        ),
+        make(
+            &ir,
+            source,
+            provenance,
+            "PRIVATE_REVISION",
+            bytes,
+            ProbeLimits {
+                max_steps: 9,
+                timeout_ms: 100,
+            },
+        ),
+    ] {
+        assert_ne!(approved.identity(), changed.identity());
+    }
+}
+
+#[test]
+fn host_script_rejects_invalid_identity_bounds_provenance_and_forged_json() {
+    use workflow_runtime::behavioral::{ProbeError, TrustedScript};
+    use workflow_runtime::{ArtifactId, ContentProvenance};
+    let policy = TrustPolicy::new("scope", ["trusted"]).unwrap();
+    let provenance = policy
+        .classify(ContentObject::IssueBody {
+            object_id: "233",
+            author: "attacker",
+        })
+        .unwrap();
+    let conditional = policy
+        .classify(ContentObject::IssueBody {
+            object_id: "233",
+            author: "trusted",
+        })
+        .unwrap();
+    let ir = format!("sha256:{}", "a".repeat(64));
+    let bytes = br#"{"schema_version":1,"steps":[]}"#;
+    let make = |ir: &str, provenance: ContentProvenance, revision: &str, bytes: &[u8], limits| {
+        TrustedScript::authorize(
+            ir,
+            ArtifactId::parse("b".repeat(64)).unwrap(),
+            provenance,
+            revision,
+            bytes,
+            limits,
+        )
+    };
+    for bad in [
+        "".into(),
+        "a".repeat(64),
+        format!(" {ir}"),
+        ir.to_uppercase(),
+        format!("{ir}0"),
+        format!("sha256:{}", "g".repeat(64)),
+    ] {
+        assert_eq!(
+            make(&bad, provenance.clone(), "r", bytes, ProbeLimits::default()).unwrap_err(),
+            ProbeError::InvalidIdentity
+        );
+    }
+    for bad in ["".into(), " ".into(), "r".repeat(129), "é".repeat(65)] {
+        assert_eq!(
+            make(&ir, provenance.clone(), &bad, bytes, ProbeLimits::default()).unwrap_err(),
+            ProbeError::InvalidIdentity
+        );
+    }
+    assert!(
+        make(
+            &ir,
+            provenance.clone(),
+            &"r".repeat(128),
+            bytes,
+            ProbeLimits {
+                max_steps: 32,
+                timeout_ms: 1000
+            }
+        )
+        .is_ok()
+    );
+    assert!(
+        make(
+            &ir,
+            provenance.clone(),
+            "r",
+            bytes,
+            ProbeLimits {
+                max_steps: 1,
+                timeout_ms: 1
+            }
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        make(&ir, conditional, "r", bytes, ProbeLimits::default()).unwrap_err(),
+        ProbeError::InvalidIdentity
+    );
+    for limits in [
+        ProbeLimits {
+            max_steps: 0,
+            timeout_ms: 100,
+        },
+        ProbeLimits {
+            max_steps: 33,
+            timeout_ms: 100,
+        },
+        ProbeLimits {
+            max_steps: 8,
+            timeout_ms: 0,
+        },
+        ProbeLimits {
+            max_steps: 8,
+            timeout_ms: 1001,
+        },
+    ] {
+        assert_eq!(
+            make(&ir, provenance.clone(), "r", bytes, limits).unwrap_err(),
+            ProbeError::InvalidLimits
+        );
+    }
+    for bad in [
+        br#"{"schema_version":2,"steps":[]}"#.as_slice(),
+        br#"{"schema_version":1,"schema_version":1,"steps":[]}"#,
+        br#"{"schema_version":1,"steps":[],"trusted_script":true}"#,
+        br#"{"schema_version":1,"steps":[{"kind":"call","tool":"complete","arguments":{"a":"x","a":"y"}}]}"#,
+    ] {
+        assert_eq!(make(&ir, provenance.clone(), "r", bad, ProbeLimits::default()).unwrap_err(), ProbeError::InvalidScript);
+    }
+    assert!(
+        serde_json::from_value::<ContentProvenance>(serde_json::to_value(provenance).unwrap())
+            .is_err()
+    );
+}
+
 use serde_json::{Value, json};
 use std::sync::atomic::AtomicBool;
 use workflow_runtime::behavioral::{BehavioralProbe, ProbeLimits, ProbeSignal, ProbeStop};

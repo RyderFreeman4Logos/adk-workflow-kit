@@ -3,9 +3,9 @@
 //! No handler, callback, filesystem, network, secret broker, or process capability
 //! crosses this boundary. The only executor is a sealed, data-only catalog.
 use crate::{
-    ArtifactRef, CanonicalUntrustedText, Completeness, ContentProvenance, ExecutorTarget, RunId,
-    SYNTHETIC_HONEYTOKEN_PREFIX, SentinelEvidence, SentinelProbe, SentinelVerdict,
-    SyntheticHoneytoken, TypedOutput, TypedOutputError, TypedPayload,
+    ArtifactId, ArtifactRef, CanonicalUntrustedText, Completeness, ContentProvenance,
+    ExecutorTarget, RunId, SYNTHETIC_HONEYTOKEN_PREFIX, SentinelEvidence, SentinelProbe,
+    SentinelVerdict, SyntheticHoneytoken, TypedOutput, TypedOutputError, TypedPayload,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -34,10 +34,18 @@ pub const PROBE_TOOL_CATALOG: &[&str] = &[
 const CANARY_SLOT: &str = "${PROBE_CANARY}";
 
 /// Validated at admission. Defaults are eight steps and 100ms, with hard ceilings.
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct ProbeLimits {
     pub max_steps: usize,
     pub timeout_ms: u64,
+}
+impl ProbeLimits {
+    fn validate(self) -> Result<(), ProbeError> {
+        if !(1..=32).contains(&self.max_steps) || !(1..=1000).contains(&self.timeout_ms) {
+            return Err(ProbeError::InvalidLimits);
+        }
+        Ok(())
+    }
 }
 impl Default for ProbeLimits {
     fn default() -> Self {
@@ -161,6 +169,21 @@ struct Script {
     schema_version: u32,
     steps: Vec<Action>,
 }
+impl Script {
+    fn parse(bytes: &[u8]) -> Result<Self, ProbeError> {
+        if bytes.len() > 32_768 {
+            return Err(ProbeError::InvalidScript);
+        }
+        let script: Self = serde_json::from_slice(bytes).map_err(|_| ProbeError::InvalidScript)?;
+        if script.schema_version != 1
+            || script.steps.len() > 32
+            || !script.steps.iter().all(Action::valid)
+        {
+            return Err(ProbeError::InvalidScript);
+        }
+        Ok(script)
+    }
+}
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
@@ -214,6 +237,100 @@ impl fmt::Display for ProbeError {
 }
 impl std::error::Error for ProbeError {}
 
+/// Host-only approval of an exact workflow/source/provenance/script/limits contract.
+/// This is not a signature verifier. The embedding Rust host MUST authenticate all
+/// inputs out of band; never call `authorize` on workflow/profile/state/model data.
+/// No deserializer, serializer, raw-script getter, executor setter, or payload Debug.
+/// Compilation admission does not yet enable authored ADK behavioral execution.
+///
+/// ```compile_fail
+/// use workflow_runtime::behavioral::TrustedScript;
+/// let _: TrustedScript = serde_json::from_str("{}").unwrap();
+/// ```
+/// ```compile_fail
+/// use workflow_runtime::behavioral::TrustedScript;
+/// fn persist(script: &TrustedScript) { let _ = serde_json::to_string(script); }
+/// ```
+/// ```compile_fail
+/// use workflow_runtime::behavioral::TrustedScript;
+/// let script = TrustedScript {};
+/// ```
+pub struct TrustedScript {
+    approved_ir_hash: String,
+    approved_source: ArtifactId,
+    provenance: ContentProvenance,
+    revision: String,
+    script: Script,
+    limits: ProbeLimits,
+}
+impl fmt::Debug for TrustedScript {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TrustedScript")
+            .field("identity", &self.identity())
+            .finish_non_exhaustive()
+    }
+}
+impl TrustedScript {
+    /// Authorizes one run-neutral script using independently authenticated host inputs.
+    /// IR hash uses the existing workflow-lock spelling: `sha256:` + 64 lowercase hex.
+    /// Revision must be nonblank and at most 128 UTF-8 bytes. Only host-classified
+    /// UntrustedContent provenance is admitted. Limits are exact, never clamped.
+    pub fn authorize(
+        approved_ir_hash: &str,
+        approved_source: ArtifactId,
+        provenance: ContentProvenance,
+        revision: &str,
+        script: &[u8],
+        limits: ProbeLimits,
+    ) -> Result<Self, ProbeError> {
+        limits.validate()?;
+        if !approved_ir_hash
+            .strip_prefix("sha256:")
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+            || revision.trim().is_empty()
+            || revision.len() > 128
+            || provenance.domain() != crate::TrustDomain::UntrustedContent
+        {
+            return Err(ProbeError::InvalidIdentity);
+        }
+        Ok(Self {
+            approved_ir_hash: approved_ir_hash.to_owned(),
+            approved_source,
+            provenance,
+            revision: revision.to_owned(),
+            script: Script::parse(script)?,
+            limits,
+        })
+    }
+
+    /// Content-free, deterministic identity; copying this string grants no authority.
+    pub fn identity(&self) -> String {
+        format!(
+            "sha256:{}",
+            crate::argument_fingerprint(&serde_json::json!({
+                "admission_version": "sentinel-trusted-script-v1",
+                "trust_origin": "authenticated_host_api_v1",
+                "version": BEHAVIORAL_VERSION, "tools": PROBE_TOOL_CATALOG,
+                "mode": "scripted_simulation", "approved_ir_hash": self.approved_ir_hash,
+                "approved_source": self.approved_source,
+                "provenance": self.provenance.cache_key(self.approved_source.as_str().as_bytes()).as_hex(),
+                "revision": self.revision, "script": self.script, "limits": self.limits,
+            }))
+        )
+    }
+
+    /// Compares a compiler's exact canonical IR and policy limits to this approval.
+    /// Source-content matching belongs to the future prepared invocation boundary.
+    pub fn matches_approval(&self, ir_hash: &str, limits: ProbeLimits) -> bool {
+        self.approved_ir_hash == ir_hash && self.limits == limits
+    }
+}
+
 /// Immutable source/provenance/script binding. No deserializer or production executor setter.
 /// Caller run IDs must be unique per independent simulation, and reused only for replay.
 #[derive(Clone)]
@@ -242,23 +359,11 @@ impl BehavioralProbe {
         limits: ProbeLimits,
     ) -> Result<Self, ProbeError> {
         SentinelProbe::bind(target).map_err(|_| ProbeError::ProductionExecutorForbidden)?;
-        if !(1..=32).contains(&limits.max_steps) || !(1..=1000).contains(&limits.timeout_ms) {
-            return Err(ProbeError::InvalidLimits);
-        }
+        limits.validate()?;
         if run_id.as_str().trim().is_empty() || run_id.as_str().len() > 256 {
             return Err(ProbeError::InvalidIdentity);
         }
-        if script.len() > 32_768 {
-            return Err(ProbeError::InvalidScript);
-        }
-        let script: Script =
-            serde_json::from_slice(script).map_err(|_| ProbeError::InvalidScript)?;
-        if script.schema_version != 1
-            || script.steps.len() > 32
-            || !script.steps.iter().all(Action::valid)
-        {
-            return Err(ProbeError::InvalidScript);
-        }
+        let script = Script::parse(script)?;
         let material = serde_json::json!({
             "version": BEHAVIORAL_VERSION, "schema_version":1, "tools":PROBE_TOOL_CATALOG,
             "mode":"scripted_simulation", "model":null, "provider":null, "prompt":null,

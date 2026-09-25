@@ -543,7 +543,17 @@ impl AgentNodeContract {
     }
 }
 
-/// Versioned, deterministic preparation-only terminal contract.
+/// Explicit opt-in to host-authorized scripted simulation, never execution authority.
+/// V1 requires 1..=32 steps and 1..=1000 milliseconds at compiler admission.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BehavioralPolicy {
+    pub schema_version: u16,
+    pub max_steps: usize,
+    pub timeout_ms: u64,
+}
+
+/// Versioned, deterministic untrusted-text terminal contract.
 /// All language flags are explicit; preparation never authorizes content as Clean.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -553,6 +563,7 @@ pub struct UntrustedTextPreparation {
     pub en: bool,
     pub zh: bool,
     pub ja: bool,
+    pub behavioral: Option<BehavioralPolicy>,
 }
 
 /// A source-level node with its closed kind and optional approval timeout.

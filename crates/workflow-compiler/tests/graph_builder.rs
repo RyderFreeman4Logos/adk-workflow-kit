@@ -5,6 +5,57 @@ use workflow_compiler::{
 };
 use workflow_spec::parse_str;
 
+#[test]
+fn behavioral_policy_cannot_bypass_host_admission_through_graph_builder() {
+    let spec = parse_str(
+        "behavioral.toml",
+        r#"
+schema_version = 1
+edges = []
+[workflow]
+id = "behavioral"
+version = "1"
+entry = "done"
+[[nodes]]
+id = "done"
+kind = "terminal"
+[nodes.untrusted_text]
+schema_version = 1
+max_input_bytes = 65536
+en = true
+zh = true
+ja = true
+[nodes.untrusted_text.behavioral]
+schema_version = 1
+max_steps = 8
+timeout_ms = 100
+"#,
+    )
+    .unwrap();
+    let registry = Registry {
+        id: "registered",
+        version: "1",
+        implementation: (),
+    };
+    assert!(
+        matches!(
+            builder(&registry).build(&spec, []),
+            Err(GraphBuildError::Compile(_))
+        ),
+        "builder must reject opt-in without host authority"
+    );
+    assert!(
+        matches!(
+            builder(&registry).build(
+                &spec,
+                [RegistryBinding::new(RegistryCategory::Tool, "absent", "1")]
+            ),
+            Err(GraphBuildError::Compile(_))
+        ),
+        "admission must precede all registry resolution"
+    );
+}
+
 struct Registry {
     id: &'static str,
     version: &'static str,

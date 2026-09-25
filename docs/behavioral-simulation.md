@@ -1,4 +1,4 @@
-# Behavioral probe: offline simulation milestone (#233)
+# Behavioral probe: offline simulation and host-admission milestones (#233)
 
 `workflow_runtime::behavioral::BehavioralProbe` evaluates a bounded, scripted
 trajectory against a sealed simulation-only tool catalog. It consumes #231
@@ -80,10 +80,57 @@ Retain `to_json()` under that reference if persisting the evidence. The report
 has no deserializer that could mint host authority from untrusted JSON.
 
 Deferred: real-model tool-call observation, independently enforced process/OS
-containment, encoded-canary detection, workflow spec/IR/compiler configuration,
+containment, encoded-canary detection, authored ADK execution,
 live semantic quality/calibration, durable checkpoint/crash recovery and causal
 attribution. This milestone does not close all of #233's acceptance criteria.
 No production action can be authorized by the simulator.
+
+## Host-authorized compilation (not authored execution)
+
+A preparation terminal may opt in with this strict policy-only table:
+
+```toml
+[nodes.untrusted_text.behavioral]
+schema_version = 1
+max_steps = 8
+timeout_ms = 100
+```
+
+All fields are required; v1 is scripted simulation only. Limits must exactly
+match host approval, within 1..=32 steps and 1..=1000ms. No script, revision,
+provenance, report or authority field is accepted here. Canonical IR uses wire
+v12 only when opted in; non-opted workflows retain their earlier bytes/hashes.
+
+The embedding Rust host parses with `workflow_spec::parse_str`, lowers with
+`WorkflowIr::from(&spec)` and obtains `canonical_hash().as_bytes()`. Format that
+IR identity using the existing workflow-lock spelling (`sha256:` followed by
+64 lowercase hex digits). Independently authenticate the exact IR, source
+`ArtifactId`, `TrustPolicy`-classified `UntrustedContent` provenance, revision,
+script and limits, then call `TrustedScript::authorize`. Revisions are nonblank
+and at most 128 UTF-8 bytes. The constructor is an explicit host capability API,
+not a signature verifier or protection from malicious in-process Rust code.
+Never derive approval from workflow text, input, profiles, state or model output.
+
+Call `workflow_compiler::compile_spec_with_sentinel_script(&spec, &script)` to
+check that approval against the single-terminal policy. The capability owns the
+already parsed closed script; it has no Serde implementation, payload Debug,
+raw-script getter or executor binding. Its identity includes host-admission
+version/origin, approved IR/source/provenance, revision, canonical script, limits
+and versioned catalog. The compiled plan exposes only
+`sentinel_script_identity()`: copying or persisting it grants no authority.
+All ordinary string/file/predicate compile entries and `GraphBuilder` reject
+behavioral opt-in without authority, before registry resolution. The CLI has no
+host-authority channel and rejects opt-in. Approval on non-opted workflows and
+mismatched IR/schema/limits are rejected, never silently ignored or clamped.
+
+**Boundary still pending:** compilation does not bind a script to the authored
+ADK terminal. The translator does not yet check/consume this capability; do not
+translate or run opted-in plans as behavioral execution. Source matching after
+preparation, source/run-bound probe identity, model-free preparation, per-run
+typed report handoff, cancellation/deadline plumbing, report retention and
+checkpoint denial remain the next integration milestone. Existing standalone
+simulation APIs do not implicitly gain authored authority. This is not full
+#233 acceptance and supplies no execution or replay authorization.
 
 ## Public ADK path
 
@@ -102,4 +149,11 @@ SSD temp setup. Tests cover every honeytool, benign completion, parameter traps,
 network/filesystem/symlink/process-shaped requests, production-binding refusal,
 canary lifecycle, resource limits, cancellation, expired deadlines and replay.
 Compile-fail examples prove that real executors cannot implement/bind the sealed
-trait; these are API capability tests, not evidence of an OS security boundary.
+trait and that `TrustedScript` cannot be serialized, deserialized or forged by a
+struct literal. `just issue-231-compiler` also covers strict behavioral policy,
+canonical IR roundtrip/hash stability and public compile admission. Run
+`just conformance-contract 'workflow-compiler --test graph_builder behavioral_policy_cannot_bypass_host_admission_through_graph_builder'`
+and
+`just conformance-contract 'workflowctl --test cli_contracts behavioral_opt_in_has_no_cli_authority_channel'`
+for sibling/CLI default denial. These are API capability tests, not evidence of
+an OS security boundary.
