@@ -123,6 +123,10 @@ issue-227-test:
     just issue-227-runtime
     just issue-227-adk
 
+# Focused #289 provider-error envelopes through the public invocation boundary.
+issue-289-adk:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --lib model_invocation::tests:: --locked -- --nocapture
+
 # Focused #228 compact typed-output protocol tests.
 issue-228-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_228_typed_outputs {{test_name}} --locked -- --nocapture

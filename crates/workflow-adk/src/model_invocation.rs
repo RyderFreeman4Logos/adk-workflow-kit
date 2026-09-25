@@ -5,12 +5,16 @@
 
 pub use crate::model_profiles::ModelProfileIdentity;
 use crate::model_profiles::{ModelBinding, ModelProfileErrorKind};
-use adk_rust::{Content, LlmRequest, Part, futures::StreamExt as _};
+use adk_rust::{Content, FinishReason, LlmRequest, Part, futures::StreamExt as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use workflow_runtime::{StructuredOutputError, TrustDomain};
+
+#[cfg(test)]
+#[path = "model_invocation_tests.rs"]
+mod tests;
 
 pub const PROMPT_PROTOCOL_VERSION: &str = "cache-aware-prompt-v1";
 pub const MAX_INVOCATION_RETRIES: u8 = 3;
@@ -859,6 +863,8 @@ impl ModelInvocationSpec {
 
     /// Domain validation runs on raw bounded bytes before Value can collapse duplicate keys.
     /// The route, stream bounds and retry policy are identical to ordinary invocation.
+    /// Provider error fields or non-Stop finish reasons abort before validation, without
+    /// retrying. Partial chunks and absent optional finish/usage metadata remain valid.
     pub async fn invoke_validated(
         &self,
         binding: &ModelBinding,
@@ -880,6 +886,19 @@ impl ModelInvocationSpec {
             while let Some(response) = stream.next().await {
                 let response = response
                     .map_err(|error| ModelInvocationError::model(error.kind(), attempts))?;
+                // An Ok transport envelope can still report provider failure. Check every
+                // chunk (including metadata-only trailers) before admitting any output.
+                if response.error_code.is_some()
+                    || response.error_message.is_some()
+                    || response
+                        .finish_reason
+                        .is_some_and(|reason| reason != FinishReason::Stop)
+                {
+                    return Err(ModelInvocationError::model(
+                        ModelProfileErrorKind::Provider,
+                        attempts,
+                    ));
+                }
                 if let Some(content) = response.content {
                     for part in content.parts {
                         if let Part::Text { text } = part {

@@ -213,6 +213,7 @@ enum Failure {
     ProviderRequestTimeout,
     ProviderStreamTimeout,
     ProviderError,
+    ProviderEnvelope,
     Malformed,
 }
 const PRIVATE_DETAIL: &str = "synthetic-private-provider-detail";
@@ -246,6 +247,19 @@ impl Llm for FailureProbe {
                 Ok(Box::pin(adk_rust::futures::stream::iter([Err(timeout())])))
             }
             Failure::ProviderError => Err(adk_rust::AdkError::agent(PRIVATE_DETAIL)),
+            Failure::ProviderEnvelope => {
+                let valid = LlmResponse::new(Content::new("assistant").with_text(
+                    json!({"schema_version":1,"node":"firewall","completeness":"complete","payload":{"kind":"firewall","decision":"alw","artifacts":[]}}).to_string(),
+                ));
+                let error = LlmResponse {
+                    error_message: Some(PRIVATE_DETAIL.into()),
+                    ..Default::default()
+                };
+                Ok(Box::pin(adk_rust::futures::stream::iter([
+                    Ok(valid),
+                    Ok(error),
+                ])))
+            }
             Failure::Malformed => Ok(Box::pin(adk_rust::futures::stream::iter([Ok(
                 LlmResponse::new(Content::new("assistant").with_text(PRIVATE_DETAIL)),
             )]))),
@@ -381,4 +395,15 @@ async fn observed_malformed_and_provider_error_remain_invalid_or_failed() {
         )
         .await;
     }
+}
+
+#[adk_rust::tokio::test]
+async fn observed_provider_error_envelope_cannot_publish_allow() {
+    observed_failure(
+        Failure::ProviderEnvelope,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        "invalid_or_failed",
+    )
+    .await;
 }
