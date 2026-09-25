@@ -10,6 +10,8 @@ mod dataset;
 mod effect_journal;
 mod event;
 mod execution;
+pub mod firewall;
+mod firewall_types;
 mod hot_reload;
 mod node_cache;
 mod observability;
@@ -19,6 +21,7 @@ mod production_profile;
 mod pure_transform;
 mod sandbox_execution;
 mod security;
+pub mod semantic_firewall;
 mod sentinel_carriers;
 mod sentinel_envelope;
 mod sentinel_language;
@@ -431,7 +434,19 @@ impl<T, D> RunResult<T, D> {
 }
 
 /// A sandbox capability class.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxCapability {
     /// Read access to declared filesystem resources.

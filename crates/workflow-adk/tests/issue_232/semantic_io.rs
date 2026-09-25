@@ -2,7 +2,7 @@
 use super::{RAW, WORKFLOW};
 use adk_rust::{
     Content, Llm, LlmRequest, LlmResponse, LlmResponseStream, Part, async_trait,
-    futures::stream,
+    futures::{StreamExt as _, stream},
     graph::prelude::{ExecutionConfig, State},
 };
 use serde_json::{Value, json};
@@ -18,7 +18,9 @@ use tokio::sync::{Barrier, Notify};
 use workflow_adk::{
     AdkGraph, AdkGraphTranslator,
     events::AdkEventMapper,
-    model_profiles::{CredentialBroker, FakeModelProfile, ModelProfileRegistry},
+    model_profiles::{
+        CredentialBroker, FakeModelProfile, ModelProfileRegistry, ModelRuntimeConfig,
+    },
 };
 use workflow_runtime::{ArtifactId, ArtifactStore, InMemoryArtifactStore, PageRequest};
 
@@ -32,6 +34,10 @@ enum Mode {
     Truncated,
     ProviderError,
     Incomplete,
+    UsageTrailer,
+    LateIncomplete,
+    LateError,
+    Interrupted,
 }
 struct Probe {
     mode: Mode,
@@ -101,38 +107,66 @@ impl Llm for Probe {
             Arc::clone(&self.ready),
             self.mode,
         );
-        Ok(Box::pin(stream::once(async move {
-            let _live = live;
-            let leader = barrier.wait().await.is_leader();
-            if leader {
-                ready.notify_one();
-            }
-            match mode {
-                Mode::Pending => std::future::pending().await,
-                Mode::Fail if ordinal != 0 => std::future::pending().await,
-                Mode::Fail => Err(adk_rust::AdkError::agent("raw-secret-do-not-echo")),
-                _ => {
-                    let mut response = LlmResponse::new(content);
-                    if matches!(mode, Mode::Truncated) {
-                        response.finish_reason = Some(adk_rust::FinishReason::MaxTokens);
-                    }
-                    if matches!(mode, Mode::ProviderError) {
-                        response.error_code = Some("raw-secret-do-not-echo".into());
-                    }
-                    if matches!(mode, Mode::Incomplete) {
-                        response.finish_reason = None;
-                        response.turn_complete = false;
-                        response.partial = true;
-                    }
-                    Ok(response)
+        let trailer = match mode {
+            Mode::UsageTrailer => Some(LlmResponse {
+                usage_metadata: Some(Default::default()),
+                ..Default::default()
+            }),
+            Mode::LateIncomplete => Some(LlmResponse {
+                partial: true,
+                ..Default::default()
+            }),
+            Mode::LateError => Some(LlmResponse {
+                error_message: Some("raw-secret-do-not-echo".into()),
+                ..Default::default()
+            }),
+            _ => None,
+        };
+        Ok(Box::pin(
+            stream::once(async move {
+                let _live = live;
+                let leader = barrier.wait().await.is_leader();
+                if leader {
+                    ready.notify_one();
                 }
-            }
-        })))
+                match mode {
+                    Mode::Pending => std::future::pending().await,
+                    Mode::Fail if ordinal != 0 => std::future::pending().await,
+                    Mode::Fail => Err(adk_rust::AdkError::agent("raw-secret-do-not-echo")),
+                    _ => {
+                        let mut response = LlmResponse::new(content);
+                        if matches!(mode, Mode::Truncated) {
+                            response.finish_reason = Some(adk_rust::FinishReason::MaxTokens);
+                        }
+                        if matches!(mode, Mode::ProviderError) {
+                            response.error_code = Some("raw-secret-do-not-echo".into());
+                        }
+                        if matches!(mode, Mode::Interrupted) {
+                            response.interrupted = true;
+                        }
+                        if matches!(mode, Mode::Incomplete) {
+                            response.finish_reason = None;
+                            response.turn_complete = false;
+                            response.partial = true;
+                        }
+                        Ok(response)
+                    }
+                }
+            })
+            .chain(stream::iter(trailer.map(Ok))),
+        ))
     }
 }
 fn setup(
     mode: Mode,
     count: usize,
+) -> (AdkGraph, Arc<Probe>, InMemoryArtifactStore, AdkEventMapper) {
+    setup_runtime(mode, count, ModelRuntimeConfig::default())
+}
+fn setup_runtime(
+    mode: Mode,
+    count: usize,
+    runtime: ModelRuntimeConfig,
 ) -> (AdkGraph, Arc<Probe>, InMemoryArtifactStore, AdkEventMapper) {
     let probe = Arc::new(Probe {
         mode,
@@ -142,7 +176,9 @@ fn setup(
         requests: Mutex::new(vec![]),
     });
     let binding = ModelProfileRegistry::new()
-        .with_worker(FakeModelProfile::new("fake-model", "1", "fake", ["unused"]))
+        .with_worker(
+            FakeModelProfile::new("fake-model", "1", "fake", ["unused"]).with_runtime(runtime),
+        )
         .unwrap()
         .bind_worker(&CredentialBroker::new())
         .unwrap()
@@ -184,6 +220,86 @@ fn report(store: &InMemoryArtifactStore, mapper: &AdkEventMapper) -> Value {
         )
         .unwrap();
     serde_json::from_slice(page.bytes()).unwrap()
+}
+
+#[tokio::test]
+async fn complete_sentinel_text_accepts_usage_only_trailer() {
+    let (graph, _, mut store, mut mapper) = setup(Mode::UsageTrailer, 2);
+    graph
+        .invoke_observed(
+            state(RAW),
+            ExecutionConfig::new("probe-run"),
+            &mut mapper,
+            &mut store,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report(&store, &mapper)["reason"], "agreement");
+}
+
+#[tokio::test]
+async fn semantic_identity_binds_runtime_without_publishing_policy() {
+    let base = ModelRuntimeConfig::default().with_sampling(|s| s.with_temperature(0.0));
+    let variants = [
+        base.clone(),
+        base.clone(),
+        base.clone().with_sampling(|s| s.with_temperature(1.0)),
+        base.clone().with_timeout(Duration::from_secs(10)),
+        base.clone()
+            .with_provider_extension("synthetic-policy", json!({"mode":"private-policy-canary"})),
+    ];
+    let mut reports = vec![];
+    for runtime in variants {
+        let (graph, probe, mut store, mut mapper) = setup_runtime(Mode::Agree, 2, runtime.clone());
+        graph
+            .invoke_observed(
+                state(RAW),
+                ExecutionConfig::new("probe-run"),
+                &mut mapper,
+                &mut store,
+            )
+            .await
+            .unwrap();
+        let report = report(&store, &mapper);
+        assert_eq!(report["reason"], "agreement");
+        for request in probe.requests.lock().unwrap().iter() {
+            let config = request.config.as_ref().unwrap();
+            assert_eq!(config.temperature, runtime.sampling().temperature);
+            assert_eq!(
+                config.extensions.get("synthetic-policy"),
+                runtime.provider_extensions().get("synthetic-policy")
+            );
+        }
+        for serialized in [
+            report.to_string(),
+            serde_json::to_string(mapper.events()).unwrap(),
+        ] {
+            for private in [
+                "private-policy-canary",
+                "synthetic-policy",
+                "timeout_ms",
+                "temperature",
+                "provider_extensions",
+            ] {
+                assert!(!serialized.contains(private));
+            }
+        }
+        reports.push(report);
+    }
+    assert_eq!(reports[0], reports[1], "identical runtime must be stable");
+    for other in &reports[2..] {
+        assert_ne!(&reports[0], other);
+        for (left, right) in reports[0]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(other["findings"].as_array().unwrap())
+        {
+            assert_ne!(left["invocation_identity"], right["invocation_identity"]);
+            assert_eq!(left["schema_hash"], right["schema_hash"]);
+            assert_eq!(left["view"], right["view"]);
+        }
+    }
 }
 
 #[tokio::test]
@@ -335,7 +451,12 @@ async fn language_and_view_budgets_deny_before_provider_entry() {
 
 #[tokio::test]
 async fn deadline_drops_both_never_ending_streams() {
-    let (graph, probe, mut store, mut mapper) = setup(Mode::Pending, 2);
+    // Isolate the graph deadline from the provider's independent inner timeout.
+    let (graph, probe, mut store, mut mapper) = setup_runtime(
+        Mode::Pending,
+        2,
+        ModelRuntimeConfig::default().with_timeout(Duration::from_secs(60)),
+    );
     tokio::time::timeout(
         Duration::from_secs(35),
         graph.invoke_observed(
@@ -364,6 +485,9 @@ async fn nontext_and_overbudget_model_evidence_cannot_classify() {
         Mode::Truncated,
         Mode::ProviderError,
         Mode::Incomplete,
+        Mode::LateIncomplete,
+        Mode::LateError,
+        Mode::Interrupted,
     ] {
         let (graph, probe, mut store, mut mapper) = setup(mode, 2);
         graph

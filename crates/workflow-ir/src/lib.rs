@@ -25,9 +25,11 @@ pub const CANONICAL_IR_WIRE_VERSION_V8: u16 = 8;
 
 /// The canonical byte-wire version for per-node agent contracts.
 pub const CANONICAL_IR_WIRE_VERSION_V9: u16 = 9;
+/// Wire identity for an explicitly bound deterministic Firewall gate.
+pub const CANONICAL_IR_WIRE_VERSION_V10: u16 = 10;
 
 /// Canonical wire for explicit untrusted-text terminal preparation policy.
-pub const CANONICAL_IR_WIRE_VERSION_V10: u16 = 10;
+pub const CANONICAL_IR_WIRE_VERSION_V11: u16 = 11;
 
 const DOMAIN: &[u8] = b"adk-workflow-kit/workflow-ir\0";
 const IR_SCHEMA_VERSION_V1: u32 = 1;
@@ -249,6 +251,7 @@ pub struct IrNode {
     skills: Vec<IrSkillReference>,
     agent_contract: Option<AgentNodeContract>,
     untrusted_text: Option<workflow_spec::UntrustedTextPreparation>,
+    firewall: Option<workflow_spec::FirewallContract>,
 }
 
 impl IrNode {
@@ -295,6 +298,11 @@ impl IrNode {
     /// Returns the node-owned Skill subset in canonical raw UTF-8 order.
     pub fn skills(&self) -> &[IrSkillReference] {
         &self.skills
+    }
+
+    /// Returns the source-free Firewall schema and invocation identity.
+    pub fn firewall(&self) -> Option<&workflow_spec::FirewallContract> {
+        self.firewall.as_ref()
     }
 
     /// Returns the first-class agent contract, when declared.
@@ -618,6 +626,7 @@ impl From<&WorkflowSpec> for WorkflowIr {
                     },
                     agent_contract: node.agent_contract().cloned(),
                     untrusted_text: node.untrusted_text(),
+                    firewall: node.firewall().cloned(),
                 }
             })
             .collect::<Vec<_>>();
@@ -782,7 +791,7 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
     for node in &ir.nodes {
         write_frame(sink, node.id.as_str());
         sink.write_chunk(&[node.kind.tag()]);
-        if canonical_wire_version(ir) >= CANONICAL_IR_WIRE_VERSION_V10 {
+        if canonical_wire_version(ir) >= CANONICAL_IR_WIRE_VERSION_V11 {
             match node.untrusted_text {
                 Some(policy) => {
                     sink.write_chunk(&[1]);
@@ -867,6 +876,18 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
             }
         }
     }
+    if canonical_wire_version(ir) >= CANONICAL_IR_WIRE_VERSION_V10 {
+        for node in &ir.nodes {
+            match &node.firewall {
+                Some(contract) => {
+                    sink.write_chunk(&[1]);
+                    write_u64(sink, u64::from(contract.schema_version));
+                    write_frame(sink, &contract.identity);
+                }
+                None => sink.write_chunk(&[0]),
+            }
+        }
+    }
     write_u64(sink, u64_from_usize(ir.edges.len()));
     for edge in &ir.edges {
         write_frame(sink, edge.from.as_str());
@@ -930,6 +951,8 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
 
 fn canonical_wire_version(ir: &WorkflowIr) -> u16 {
     if ir.nodes.iter().any(|node| node.untrusted_text.is_some()) {
+        CANONICAL_IR_WIRE_VERSION_V11
+    } else if ir.nodes.iter().any(|node| node.firewall.is_some()) {
         CANONICAL_IR_WIRE_VERSION_V10
     } else if ir.nodes.iter().any(|node| node.agent_contract.is_some()) {
         CANONICAL_IR_WIRE_VERSION_V9

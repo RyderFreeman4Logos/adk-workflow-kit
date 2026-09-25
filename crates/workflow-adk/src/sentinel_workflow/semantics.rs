@@ -2,7 +2,8 @@
 use super::{UntrustedTextState, probes};
 use crate::{
     AdkGraphError, InferenceBudget, ModelInvocationSpec, PromptProtocol, ProviderRouteIdentity,
-    ReasoningEffort, StructuredOutputContract, model_profiles::ModelBinding,
+    ReasoningEffort, StructuredOutputContract, model_invocation::ResponsePolicy,
+    model_profiles::ModelBinding,
 };
 use adk_rust::graph::prelude::{END, ExecutionConfig, GraphAgent, NodeOutput, START, State};
 use adk_rust::tokio::{
@@ -14,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use workflow_runtime::{
     Completeness, SentinelEvidence, SentinelVerdict, StructuredOutputError, TrustDomain,
-    TypedOutput, TypedPayload, admit_for_reducer, parse_typed_output,
+    TypedOutput, TypedPayload, admit_for_reducer, argument_fingerprint, parse_typed_output,
 };
 
 pub(super) const VERSION: &str = "sentinel-semantic-probes-v1";
@@ -103,7 +104,12 @@ pub(super) async fn run(
         expected.push(Finding {
             branch: input.branch,
             view: input.view,
-            invocation_identity: provenance.invocation_identity().to_owned(),
+            // ModelRuntimeConfig contains policy only, never credential/endpoint config.
+            // Reuse the semantic Firewall identity pattern; publish only the digest.
+            invocation_identity: argument_fingerprint(&json!({
+                "invocation": provenance.invocation_identity(),
+                "runtime": binding.runtime(),
+            })),
             schema_hash: provenance.output_schema_hash().to_owned(),
             output: Value::Null,
         });
@@ -119,7 +125,9 @@ pub(super) async fn run(
                     failed.clone(),
                 );
                 async move {
-                    let result = spec.invoke_checked(&binding, validate_wire).await;
+                    let result = spec
+                        .invoke_with_policy(&binding, validate_wire, ResponsePolicy::CompleteText)
+                        .await;
                     let output = match result {
                         Ok(output) => output.into_output(),
                         Err(_) => {

@@ -31,7 +31,7 @@ fn preparation_contract_is_compiled_and_participates_in_ir_identity() {
             .expect("changed policy compiles");
         assert_ne!(plan.ir().canonical_hash(), changed.ir().canonical_hash());
     }
-    assert_eq!(plan.ir().canonical_wire_version(), 10);
+    assert_eq!(plan.ir().canonical_wire_version(), 11);
 }
 
 #[test]

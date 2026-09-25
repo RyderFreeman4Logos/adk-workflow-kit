@@ -4,7 +4,7 @@ This is the bounded #231 admission contract with [#232 semantic evidence](sentin
 schema v1 accepts `nodes.untrusted_text` only on the sole terminal node, with no
 edges or routes. Compiler admission rejects unsupported policy versions,
 unknown/missing/mistyped fields, and byte limits above 65,536. Zero denies input.
-Canonical IR wire v10 binds every policy field; workflows without this contract
+Canonical IR wire v11 binds every policy field (v10 remains the Firewall wire); workflows without this contract
 keep their previous canonical wire.
 
 ```toml

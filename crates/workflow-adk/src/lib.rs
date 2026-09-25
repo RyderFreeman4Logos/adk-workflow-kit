@@ -2,7 +2,9 @@
 
 pub mod events;
 pub mod execution;
+pub mod firewall;
 pub mod model_invocation;
+pub mod semantic_firewall;
 pub use model_invocation::{
     EscalationPolicy, InferenceBudget, InferenceBudgetError, InvocationProvenance,
     MAX_INVOCATION_RETRIES, ModelInvocationError, ModelInvocationErrorKind, ModelInvocationResult,
@@ -286,6 +288,10 @@ pub struct GraphSummary {
 /// Stable failures produced while translating a validated compiler plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranslationError {
+    /// Direct IR failed the same graph admission required by the compiler.
+    InvalidGraph(workflow_compiler::GraphValidationError),
+    /// A Firewall gate was missing its exact trusted invocation binding.
+    FirewallBinding,
     UnknownTarget {
         from: String,
         target: String,
@@ -308,6 +314,8 @@ pub enum TranslationError {
 impl fmt::Display for TranslationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidGraph(error) => write!(f, "graph translation rejected: {error}"),
+            Self::FirewallBinding => write!(f, "Firewall binding missing or mismatched"),
             Self::UnknownTarget { from, target } => {
                 write!(f, "graph translation rejected {from:?} to {target:?}")
             }
@@ -492,6 +500,8 @@ pub struct AdkGraph {
     cache_dispositions: Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
     untrusted_text: Option<sentinel_workflow::PreparationWorkflow>,
     sentinel_model: Option<Arc<model_profiles::ModelBinding>>,
+    firewall_decisions: firewall::Decisions,
+    firewall_entry: Option<String>,
 }
 
 impl AdkGraph {
@@ -511,6 +521,15 @@ impl AdkGraph {
         if self.untrusted_text.is_some() {
             return Err(AdkGraphError::Failed);
         }
+        self.firewall_run(self.invoke_inner(state, config)).await
+    }
+
+    async fn invoke_inner(
+        &self,
+        state: State,
+        config: ExecutionConfig,
+    ) -> Result<State, AdkGraphError> {
+        self.prepare_firewall_run(&config)?;
         let mut state = self.input.map(state);
         state.retain(|key, _| !key.starts_with("visits:"));
         let limit = match self.visit_bound {
@@ -581,6 +600,18 @@ impl AdkGraph {
         mapper: &mut events::AdkEventMapper,
         artifacts: &mut S,
     ) -> Result<State, AdkGraphError> {
+        self.firewall_run(self.invoke_observed_inner(state, config, mapper, artifacts))
+            .await
+    }
+
+    async fn invoke_observed_inner<S: workflow_runtime::ArtifactStore>(
+        &self,
+        state: State,
+        config: ExecutionConfig,
+        mapper: &mut events::AdkEventMapper,
+        artifacts: &mut S,
+    ) -> Result<State, AdkGraphError> {
+        self.prepare_firewall_run(&config)?;
         let mut state = self.input.map(state);
         let preparation = if let Some(workflow) = &self.untrusted_text {
             // v1 is a one-shot terminal; checkpoint admission needs a separate contract.
@@ -621,7 +652,9 @@ impl AdkGraph {
 
         let mut stream = Box::pin(self.graph.stream(state, config, StreamMode::Custom));
         let mut output = None;
+        let mut observed_firewall = BTreeSet::new();
         while let Some(item) = stream.next().await {
+            self.observe_firewall(&mut observed_firewall, mapper, artifacts)?;
             match item.map_err(|error| self.map_observed_error(&error))? {
                 StreamEvent::NodeStart { node, step } => {
                     mapper
@@ -940,7 +973,7 @@ impl AdkGraphTranslator {
     }
 
     pub fn translate(&self, plan: &CompiledPlan) -> Result<AdkGraph, TranslationError> {
-        self.translate_ir(plan.ir(), None, None, None, None)
+        self.translate_ir(plan.ir(), None, None, None, None, None)
     }
 
     /// Translates with exact live agents supplied for every agent node.
@@ -949,7 +982,7 @@ impl AdkGraphTranslator {
         plan: &CompiledPlan,
         agents: &BTreeMap<String, Arc<dyn Agent>>,
     ) -> Result<AdkGraph, TranslationError> {
-        self.translate_ir(plan.ir(), None, Some(agents), None, None)
+        self.translate_ir(plan.ir(), None, Some(agents), None, None, None)
     }
 
     /// Translates a profile graph with WASM-backed non-Agent execution nodes.
@@ -981,6 +1014,7 @@ impl AdkGraphTranslator {
                 input: input.clone(),
             }),
             checkpointer,
+            None,
         )
     }
 
@@ -1047,6 +1081,7 @@ impl AdkGraphTranslator {
             agents,
             profile_backend,
             checkpointer,
+            None,
         )
     }
 
@@ -1066,6 +1101,7 @@ impl AdkGraphTranslator {
         agents: Option<&BTreeMap<String, Arc<dyn Agent>>>,
         profile_backend: Option<ProfileNodeBackend>,
         checkpointer: Option<Arc<dyn Checkpointer>>,
+        firewall: Option<firewall::FirewallInvocation>,
     ) -> Result<AdkGraph, TranslationError> {
         let untrusted_text = ir
             .nodes()
@@ -1085,6 +1121,11 @@ impl AdkGraphTranslator {
         }
         let untrusted_text = untrusted_text
             .map(|(_, policy)| sentinel_workflow::PreparationWorkflow::new(ir, policy));
+        // Resolved-plan callers can supply IR without going through compilation.
+        // Reject reserved control IDs and dangling origins before ADK adds entries.
+        workflow_compiler::validate_graph(ir).map_err(TranslationError::InvalidGraph)?;
+        firewall::validate_binding(ir, firewall.as_ref())?;
+        let firewall_decisions = firewall::Decisions::default();
         let ids: std::collections::BTreeSet<&str> =
             ir.nodes().iter().map(|node| node.id().as_str()).collect();
         let mut incoming = BTreeMap::<String, BTreeSet<String>>::new();
@@ -1269,7 +1310,21 @@ impl AdkGraphTranslator {
         for node in ir.nodes() {
             let id = node.id().as_str().to_owned();
             order.push(id.clone());
-            if node.kind() == IrNodeKind::Agent {
+            if node.firewall().is_some() {
+                let invocation = firewall.clone().ok_or(TranslationError::FirewallBinding)?;
+                builder = builder.node_fn(&id.clone(), move |_context| {
+                    let invocation = invocation.clone();
+                    let node = id.clone();
+                    async move {
+                        #[cfg(test)]
+                        firewall::tests::at_gate(true).await;
+                        let result = firewall::execute(&invocation, &node).await;
+                        #[cfg(test)]
+                        firewall::tests::at_gate(false).await;
+                        result
+                    }
+                });
+            } else if node.kind() == IrNodeKind::Agent {
                 agent_nodes.insert(id.clone());
                 let agent: Arc<dyn Agent> = match agents {
                     Some(agents) => agents
@@ -1586,6 +1641,12 @@ impl AdkGraphTranslator {
             plan_binding,
             cache_dispositions: Arc::new(Mutex::new(BTreeMap::new())),
             untrusted_text,
+            firewall_decisions,
+            firewall_entry: ir
+                .nodes()
+                .iter()
+                .find(|node| node.firewall().is_some())
+                .map(|node| node.id().as_str().to_owned()),
         })
     }
 }

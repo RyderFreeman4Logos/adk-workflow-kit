@@ -5,12 +5,16 @@
 
 pub use crate::model_profiles::ModelProfileIdentity;
 use crate::model_profiles::{ModelBinding, ModelProfileErrorKind};
-use adk_rust::{Content, LlmRequest, Part, futures::StreamExt as _};
+use adk_rust::{Content, FinishReason, LlmRequest, Part, futures::StreamExt as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use workflow_runtime::{StructuredOutputError, TrustDomain};
+
+#[cfg(test)]
+#[path = "model_invocation_tests.rs"]
+mod tests;
 
 pub const PROMPT_PROTOCOL_VERSION: &str = "cache-aware-prompt-v1";
 pub const MAX_INVOCATION_RETRIES: u8 = 3;
@@ -720,6 +724,13 @@ impl fmt::Display for ModelInvocationSpecError {
 
 impl std::error::Error for ModelInvocationSpecError {}
 
+/// Ordinary callers permit optional completion metadata; Sentinel requires complete text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponsePolicy {
+    Ordinary,
+    CompleteText,
+}
+
 impl ModelInvocationSpec {
     pub fn new(
         protocol: PromptProtocol,
@@ -854,14 +865,27 @@ impl ModelInvocationSpec {
         &self,
         binding: &ModelBinding,
     ) -> Result<ModelInvocationResult, ModelInvocationError> {
-        self.invoke_checked(binding, |_| Ok(())).await
+        self.invoke_validated(binding, |_| Ok(())).await
     }
 
     /// Domain validators see bounded raw bytes before Value can collapse duplicate keys.
-    pub(crate) async fn invoke_checked(
+    /// Provider failures abort before validation without retry. Optional completion metadata,
+    /// partial chunks and usage-only trailers retain the ordinary invocation contract.
+    pub async fn invoke_validated(
         &self,
         binding: &ModelBinding,
         validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
+    ) -> Result<ModelInvocationResult, ModelInvocationError> {
+        self.invoke_with_policy(binding, validate, ResponsePolicy::Ordinary)
+            .await
+    }
+
+    /// One bounded collector; strict completion/text-only admission is opt-in.
+    pub(crate) async fn invoke_with_policy(
+        &self,
+        binding: &ModelBinding,
+        validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
+        policy: ResponsePolicy,
     ) -> Result<ModelInvocationResult, ModelInvocationError> {
         if !self.route.matches_binding(binding) {
             return Err(ModelInvocationError::route_mismatch());
@@ -885,16 +909,24 @@ impl ModelInvocationSpec {
                     || response.error_message.is_some()
                     || response
                         .finish_reason
-                        .is_some_and(|reason| reason != adk_rust::FinishReason::Stop)
+                        .is_some_and(|reason| reason != FinishReason::Stop)
                 {
-                    return Err(ModelInvocationError::structured(
-                        StructuredOutputError::InvalidJson,
+                    return Err(ModelInvocationError::model(
+                        ModelProfileErrorKind::Provider,
                         attempts,
                     ));
                 }
-                complete = response.turn_complete
-                    && !response.partial
-                    && response.finish_reason == Some(adk_rust::FinishReason::Stop);
+                // A harmless metadata trailer must not erase terminal evidence. New content
+                // or explicit progress does invalidate it until a fresh complete Stop.
+                if response.content.is_some()
+                    || response.partial
+                    || response.turn_complete
+                    || response.finish_reason.is_some()
+                {
+                    complete = response.turn_complete
+                        && !response.partial
+                        && response.finish_reason == Some(FinishReason::Stop);
+                }
                 if let Some(content) = response.content {
                     for part in content.parts {
                         if let Part::Text { text } = part {
@@ -909,7 +941,7 @@ impl ModelInvocationSpec {
                                 ));
                             }
                             output.push_str(&text);
-                        } else {
+                        } else if policy == ResponsePolicy::CompleteText {
                             return Err(ModelInvocationError::structured(
                                 StructuredOutputError::InvalidJson,
                                 attempts,
@@ -918,7 +950,7 @@ impl ModelInvocationSpec {
                     }
                 }
             }
-            if !complete {
+            if policy == ResponsePolicy::CompleteText && !complete {
                 return Err(ModelInvocationError::structured(
                     StructuredOutputError::InvalidJson,
                     attempts,

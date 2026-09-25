@@ -62,7 +62,10 @@ Adapter identity is `sentinel-workflow-preparation-v4`; the preparation key bind
 both probe versions and fixed budgets, retaining raw-byte, workflow/IR, language
 policy and preparation identities. Each semantic invocation additionally binds
 that key, source view, branch task/schema, prompt, model/provider/tokenizer route,
-trust salt and output budgets through `ModelInvocationSpec`. No semantic cache is
+trust salt and output budgets through `ModelInvocationSpec`. The reported invocation
+identity additionally fingerprints the non-secret runtime policy (sampling, inner
+timeout and provider extensions), following the semantic Firewall identity contract;
+raw runtime policy is never published. No semantic cache is
 read or written. The preparation key alone is **not** a semantic cache key.
 
 ## Executed semantic report v1

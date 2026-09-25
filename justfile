@@ -123,6 +123,10 @@ issue-227-test:
     just issue-227-runtime
     just issue-227-adk
 
+# Focused #289 provider-error envelopes through the public invocation boundary.
+issue-289-adk:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --lib model_invocation::tests:: --locked -- --nocapture
+
 # Focused #228 compact typed-output protocol tests.
 issue-228-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_228_typed_outputs {{test_name}} --locked -- --nocapture
@@ -151,6 +155,28 @@ issue-232-clippy:
 # Focused #232 source-only probe evidence through public ADK execution.
 issue-232-adk:
     {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_232_probes --locked -- --nocapture --test-threads=1
+# Focused #238 deterministic Firewall policy and workflow boundary tests.
+issue-238-runtime test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_238_firewall {{test_name}} --locked -- --nocapture
+
+issue-238-adk test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_238_firewall {{test_name}} --locked -- --nocapture --test-threads=1
+
+issue-238-concurrent:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --lib firewall::tests:: --locked -- --nocapture
+
+# Focused #239 semantic Firewall contracts and production integration.
+issue-239-runtime test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_239_semantic {{test_name}} --locked -- --nocapture
+
+issue-239-adk test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_239_semantic {{test_name}} --locked -- --nocapture --test-threads=1
+
+issue-239-invocation-regression:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_226_prompt_protocol --locked -- --nocapture
+
+issue-239-isolation:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --lib semantic_firewall::tests:: --locked -- --nocapture
 
 # Focused #229 pinned dataset registry tests.
 issue-229-http test_name="dataset::dataset_http::":
