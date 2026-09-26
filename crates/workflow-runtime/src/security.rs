@@ -181,6 +181,10 @@ impl TrustPolicy {
         })
     }
 
+    pub fn allows_author(&self, author: &str) -> bool {
+        self.allowlisted_authors.contains(author)
+    }
+
     pub fn classify(
         &self,
         object: ContentObject<'_>,
