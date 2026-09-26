@@ -13,6 +13,7 @@ mod event;
 mod execution;
 pub mod firewall;
 mod firewall_types;
+mod github_intake;
 mod hot_reload;
 mod node_cache;
 mod observability;
@@ -77,6 +78,12 @@ pub use event::{
 pub use execution::{
     PURE_TRANSFORM_BINDING_ID, PURE_TRANSFORM_BINDING_VERSION, PURE_TRANSFORM_PLAN_VERSION_V1,
     PureTransformBinding, PureTransformExecutionError, PureTransformPlanError, PureTransformPlanV1,
+};
+pub use github_intake::{
+    GitHubContentFetchError, GitHubContentFetcher, GitHubIntakeError, GitHubIntakeErrorKind,
+    GitHubIntakeLimits, GitHubIssueMetadata, GitHubIssueState, GitHubMetadataPage,
+    GitHubMetadataPageRequest, GitHubMetadataProvenance, GitHubMetadataSnapshot,
+    GitHubMetadataSource, GitHubRateLimit, collect_github_metadata, fetch_allowlisted_content,
 };
 pub use hot_reload::{DevelopmentHotReload, HotReloadError, HotReloadErrorKind};
 pub use node_cache::{

@@ -208,6 +208,10 @@ issue-229-live:
 issue-229-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_229_dataset_registry {{test_name}} --locked -- --nocapture
 
+# Focused #249 metadata-first GitHub intake tests.
+issue-249-runtime test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_249_metadata_intake {{test_name}} --locked -- --nocapture
+
 issue-229-test:
     just issue-229-runtime
 
