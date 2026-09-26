@@ -309,13 +309,72 @@ fn terminal_artifact(run_root: &Path) -> (Vec<u8>, Value) {
 }
 
 fn json_stdout(output: &Output) -> Value {
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
         panic!(
-            "stdout must be JSON: {error}; stdout={}; stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "{}",
+            child_failure_diagnostic(output, "stdout must be JSON")
         )
     })
+}
+
+fn child_failure_diagnostic(output: &Output, operation: &'static str) -> String {
+    let diagnostic = format!(
+        "{operation}; {}; stdout_bytes={}; stderr_bytes={}",
+        format_wait_status(output.status),
+        output.stdout.len(),
+        output.stderr.len()
+    );
+    if diagnostic.len() <= CHILD_FAILURE_DIAGNOSTIC_MAX_BYTES {
+        diagnostic
+    } else {
+        "child failure diagnostic exceeded size limit".to_owned()
+    }
+}
+
+fn assert_child_success(output: &Output, operation: &'static str) {
+    if !output.status.success() {
+        panic!("{}", child_failure_diagnostic(output, operation));
+    }
+}
+
+fn assert_child_failure(output: &Output, operation: &'static str) {
+    if output.status.success() {
+        panic!("{}", child_failure_diagnostic(output, operation));
+    }
+}
+
+fn assert_child_exit_code(output: &Output, expected: i32, operation: &'static str) {
+    if output.status.code() != Some(expected) {
+        panic!("{}", child_failure_diagnostic(output, operation));
+    }
+}
+
+#[test]
+fn oracle_child_failure_diagnostic_is_bounded_and_content_free() {
+    use std::os::unix::process::ExitStatusExt;
+
+    const NON_CANARY_MARKER: &str = "synthetic-non-canary-marker";
+    const ENCODED_SYNTHETIC_MARKER: &str = "c3ludGhldGljLWVuY29kZWQtbWFya2Vy";
+
+    let output = Output {
+        status: std::process::ExitStatus::from_raw(1 << 8),
+        stdout: NON_CANARY_MARKER.as_bytes().to_vec(),
+        stderr: ENCODED_SYNTHETIC_MARKER.as_bytes().to_vec(),
+    };
+    let panic = std::panic::catch_unwind(|| {
+        assert_child_success(&output, "oracle child must succeed");
+    })
+    .expect_err("failed child assertion must panic");
+    let rendered = panic
+        .downcast::<String>()
+        .expect("child diagnostic panic must be a String");
+
+    assert!(rendered.len() <= CHILD_FAILURE_DIAGNOSTIC_MAX_BYTES);
+    assert!(rendered.contains("status:exit:1"));
+    assert!(rendered.contains("stdout_bytes="));
+    assert!(rendered.contains("stderr_bytes="));
+    assert!(!rendered.contains(NON_CANARY_MARKER));
+    assert!(!rendered.contains(ENCODED_SYNTHETIC_MARKER));
 }
 
 fn sole_run_root(runs: &Path) -> Result<PathBuf, &'static str> {
@@ -364,6 +423,7 @@ const ORACLE_SOCKET_TIMEOUT: Duration = Duration::from_millis(100);
 const ORACLE_TERMINAL_QUIET_WINDOW: Duration = Duration::from_millis(25);
 const ORACLE_MAX_REQUEST_BYTES: usize = 64 * 1024;
 const ORACLE_MAX_CHILD_OUTPUT_BYTES: usize = 64 * 1024;
+const CHILD_FAILURE_DIAGNOSTIC_MAX_BYTES: usize = 256;
 
 fn oracle_remaining_duration(
     deadline: Instant,
@@ -1142,11 +1202,7 @@ fn command_json(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("workflowctl must start");
-    assert!(
-        output.status.success(),
-        "command must succeed, stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_child_success(&output, "command must succeed");
     output
 }
 
@@ -2059,8 +2115,8 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
     let sentinel_survived = fixture_root.join("sentinel").is_file();
     let _ = owned_tree::remove_dir_all(&fixture_root);
 
-    assert!(!output.status.success(), "unproven reap must abort");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_child_failure(&output, "unproven reap must abort");
+    let stderr = std::str::from_utf8(&output.stderr).expect("abort fixture stderr must be UTF-8");
     assert!(stderr.contains("oracle child terminal reap not proven; aborting"));
     let evidence = stderr
         .lines()
@@ -2068,7 +2124,7 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
         .expect("abort must emit one bounded reap evidence record");
     assert!(
         evidence.contains("operation=fixture-env"),
-        "operation must be the static fixture-env label: {evidence}"
+        "operation must be the static fixture-env label"
     );
     assert!(
         evidence.split(' ').any(
@@ -2076,7 +2132,7 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
                 |value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
             )
         ),
-        "pid must be numeric: {evidence}"
+        "pid must be numeric"
     );
     assert!(
         evidence.split(' ').any(
@@ -2088,7 +2144,7 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
                     || value == "unavailable"
             })
         ),
-        "starttime must be numeric, errno, or unavailable: {evidence}"
+        "starttime must be numeric, errno, or unavailable"
     );
     assert!(
         evidence
@@ -2100,7 +2156,7 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
                     })
                     || value == "unavailable"
             })),
-        "kill must be ok, errno, or unavailable: {evidence}"
+        "kill must be ok, errno, or unavailable"
     );
     assert!(
         evidence
@@ -2115,7 +2171,7 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
                     })
                     || value == "unavailable"
             })),
-        "wait must be status, still-alive, errno, or unavailable: {evidence}"
+        "wait must be status, still-alive, errno, or unavailable"
     );
     assert!(
         evidence.split(' ').any(|field| field.strip_prefix("terminal=").is_some_and(|value| {
@@ -2138,7 +2194,7 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
                     .is_some_and(|errno| !errno.is_empty() && errno.bytes().all(|byte| byte.is_ascii_digit()))
                 || value == "unavailable"
         })),
-        "terminal must be esrch, state+starttime, errno, or unavailable: {evidence}"
+        "terminal must be esrch, state+starttime, errno, or unavailable"
     );
     assert!(sentinel_survived, "abort must not unwind root cleanup");
 }
@@ -2806,34 +2862,51 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
             panic!("oracle child supervision failed: {error}; {server_diagnostic}");
         }
     };
-    assert!(
-        child.status.success(),
-        "oracle child must succeed (stdout={}, stderr={})",
-        String::from_utf8_lossy(&child.stdout).replace(CANARY, "[REDACTED]"),
-        String::from_utf8_lossy(&child.stderr).replace(CANARY, "[REDACTED]")
-    );
+    assert_child_success(&child, "oracle child must succeed");
     assert_no_canary_bytes(&child.stdout, CANARY);
     assert_no_canary_bytes(&child.stderr, CANARY);
     let run_receipt = json_stdout(&child);
-    assert_eq!(run_receipt["status"], "succeeded");
+    assert!(
+        run_receipt["status"] == "succeeded",
+        "oracle run receipt must report success"
+    );
     let observation = server_result
         .expect("oracle server thread")
         .expect("oracle request observation");
-    assert_eq!(observation.method, "POST");
-    assert_eq!(observation.path, "/v1/chat/completions");
-    assert_eq!(observation.authorization_headers, 1);
-    assert_eq!(observation.authorization_canary_occurrences, 1);
-    assert_eq!(observation.request_canary_occurrences, 1);
+    assert!(
+        observation.method == "POST",
+        "oracle request method must be POST"
+    );
+    assert!(
+        observation.path == "/v1/chat/completions",
+        "oracle request path must be the chat endpoint"
+    );
+    assert!(
+        observation.authorization_headers == 1,
+        "oracle request must carry one authorization header"
+    );
+    assert!(
+        observation.authorization_canary_occurrences == 1,
+        "oracle authorization must carry one synthetic credential"
+    );
+    assert!(
+        observation.request_canary_occurrences == 1,
+        "oracle request must carry one synthetic credential"
+    );
 
     let run_root = sole_run_root(&runs).expect("sole oracle run root");
     assert_no_canary_in_run_root(&run_root, CANARY);
     let manifest_bytes = fs::read(run_root.join("run-manifest.json")).expect("run manifest");
     assert_no_canary_bytes(&manifest_bytes, CANARY);
     let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("manifest JSON");
-    assert_eq!(manifest["status"], "succeeded");
-    assert_eq!(
-        manifest["profile_identity"],
-        "worker=oracle-model:1;requested=oracle;resolved=oracle;provider=openai-compatible"
+    assert!(
+        manifest["status"] == "succeeded",
+        "run manifest must report success"
+    );
+    assert!(
+        manifest["profile_identity"]
+            == "worker=oracle-model:1;requested=oracle;resolved=oracle;provider=openai-compatible",
+        "run manifest must retain the resolved profile identity"
     );
     assert!(
         !manifest["plan_hash"]
@@ -2849,17 +2922,29 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     );
 
     let source = fs::read(run_root.join("workflow.toml")).expect("canonical source");
-    assert_eq!(source, expected_source);
+    assert!(
+        source == expected_source,
+        "run root must retain canonical workflow source"
+    );
     assert_no_canary_bytes(&source, CANARY);
 
     let stored_profile = fs::read(run_root.join("execution-profile.json")).expect("stored profile");
     assert_no_canary_bytes(&stored_profile, CANARY);
     let stored_profile: Value = serde_json::from_slice(&stored_profile).expect("profile JSON");
-    assert_eq!(stored_profile["model"]["credential_env"], HANDLE);
-    assert_ne!(stored_profile["model"]["credential_env"], CANARY);
+    assert!(
+        stored_profile["model"]["credential_env"] == HANDLE,
+        "stored profile must retain only the credential selector"
+    );
+    assert!(
+        stored_profile["model"]["credential_env"] != CANARY,
+        "stored profile must not retain the credential value"
+    );
 
     let run_id = manifest["run_id"].as_str().expect("run ID");
-    assert_eq!(run_receipt["run_id"], run_id);
+    assert!(
+        run_receipt["run_id"] == run_id,
+        "run receipt must identify the persisted run"
+    );
     let inspect = run_oracle_operation(
         &root,
         "inspect",
@@ -2876,17 +2961,18 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         "credential-inspect",
     )
     .expect("bounded oracle inspect child");
-    assert!(
-        inspect.status.success(),
-        "oracle inspect must succeed (stdout={}, stderr={})",
-        String::from_utf8_lossy(&inspect.stdout).replace(CANARY, "[REDACTED]"),
-        String::from_utf8_lossy(&inspect.stderr).replace(CANARY, "[REDACTED]")
-    );
+    assert_child_success(&inspect, "oracle inspect must succeed");
     assert_no_canary_bytes(&inspect.stdout, CANARY);
     assert_no_canary_bytes(&inspect.stderr, CANARY);
     let inspected = json_stdout(&inspect);
-    assert_eq!(inspected["status"], "succeeded");
-    assert_eq!(inspected["run_id"], run_id);
+    assert!(
+        inspected["status"] == "succeeded",
+        "inspect receipt must report success"
+    );
+    assert!(
+        inspected["run_id"] == run_id,
+        "inspect receipt must identify the persisted run"
+    );
     assert_no_canary_in_run_root(&run_root, CANARY);
 
     drop(listener);
@@ -2908,18 +2994,24 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         "credential-resume-missing",
     )
     .expect("bounded missing-credential resume child");
-    assert_eq!(missing_resume.status.code(), Some(2));
+    assert_child_exit_code(
+        &missing_resume,
+        2,
+        "missing credential resume must exit with code 2",
+    );
     assert!(
-        String::from_utf8_lossy(&missing_resume.stderr).contains("workflow.run.failed"),
+        std::str::from_utf8(&missing_resume.stderr)
+            .expect("missing credential stderr must be UTF-8")
+            .contains("workflow.run.failed"),
         "missing credential must retain the static workflow failure category"
     );
     assert_no_canary_bytes(&missing_resume.stdout, CANARY);
     assert_no_canary_bytes(&missing_resume.stderr, CANARY);
     assert_no_canary_in_run_root(&run_root, CANARY);
-    assert_eq!(
+    assert!(
         bounded_run_root_snapshot(&run_root, CANARY)
-            .expect("bounded post-failure run-root snapshot"),
-        before_missing_resume,
+            .expect("bounded post-failure run-root snapshot")
+            == before_missing_resume,
         "missing-credential resume must not mutate the run root"
     );
 
@@ -2939,17 +3031,21 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         "credential-resume",
     )
     .expect("bounded credential-backed resume child");
-    assert!(
-        resume.status.success(),
-        "completed resume must succeed without a model request (stdout={}, stderr={})",
-        String::from_utf8_lossy(&resume.stdout).replace(CANARY, "[REDACTED]"),
-        String::from_utf8_lossy(&resume.stderr).replace(CANARY, "[REDACTED]")
+    assert_child_success(
+        &resume,
+        "completed resume must succeed without a model request",
     );
     assert_no_canary_bytes(&resume.stdout, CANARY);
     assert_no_canary_bytes(&resume.stderr, CANARY);
     let resumed = json_stdout(&resume);
-    assert_eq!(resumed["status"], "succeeded");
-    assert_eq!(resumed["run_id"], run_id);
+    assert!(
+        resumed["status"] == "succeeded",
+        "resume receipt must report success"
+    );
+    assert!(
+        resumed["run_id"] == run_id,
+        "resume receipt must identify the persisted run"
+    );
     assert_no_canary_in_run_root(&run_root, CANARY);
     let resumed_events =
         fs::read(run_root.join("events.jsonl")).expect("resume events must be readable");
@@ -2965,7 +3061,10 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     let checkpoint_manifest: CheckpointManifestV1 =
         serde_json::from_value(manifest["checkpoint_manifest"].clone())
             .expect("checkpoint manifest");
-    assert_eq!(checkpoint_manifest.run_id(), run_id);
+    assert!(
+        checkpoint_manifest.run_id() == run_id,
+        "checkpoint manifest must identify the persisted run"
+    );
     assert_no_canary_bytes(
         &serde_json::to_vec(&checkpoint_manifest).expect("checkpoint manifest bytes"),
         CANARY,
@@ -3039,7 +3138,10 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     assert_no_canary_bytes(&replay_bytes, CANARY);
     let replay = workflow_testkit::ReplayBundle::from_json(&replay_bytes)
         .expect("replay-facing data should read back");
-    assert_eq!(replay.replay().events().len(), 2);
+    assert!(
+        replay.replay().events().len() == 2,
+        "replay must retain the expected event count"
+    );
 
     assert_no_canary_in_run_root(&run_root, CANARY);
     root.cleanup().expect("credential oracle root cleanup");
