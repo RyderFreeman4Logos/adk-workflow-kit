@@ -13,6 +13,7 @@ mod event;
 mod execution;
 pub mod firewall;
 mod firewall_types;
+mod github_graphql;
 mod github_intake;
 mod hot_reload;
 mod node_cache;
@@ -79,6 +80,7 @@ pub use execution::{
     PURE_TRANSFORM_BINDING_ID, PURE_TRANSFORM_BINDING_VERSION, PURE_TRANSFORM_PLAN_VERSION_V1,
     PureTransformBinding, PureTransformExecutionError, PureTransformPlanError, PureTransformPlanV1,
 };
+pub use github_graphql::GitHubGraphqlMetadataSource;
 pub use github_intake::{
     GitHubContentFetchError, GitHubContentFetcher, GitHubIntakeError, GitHubIntakeErrorKind,
     GitHubIntakeLimits, GitHubIssueMetadata, GitHubIssueState, GitHubMetadataPage,

@@ -261,7 +261,7 @@ pub struct GitHubIntakeError {
 }
 
 impl GitHubIntakeError {
-    fn invalid_request() -> Self {
+    pub(crate) fn invalid_request() -> Self {
         Self {
             kind: GitHubIntakeErrorKind::InvalidRequest,
             retry_after_seconds: None,
