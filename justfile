@@ -212,6 +212,9 @@ issue-229-runtime test_name="":
 issue-249-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_249_metadata_intake {{test_name}} --locked -- --nocapture
 
+issue-249-graphql test_name="github_graphql::tests::":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --lib {{test_name}} --locked -- --nocapture
+
 issue-229-test:
     just issue-229-runtime
 
