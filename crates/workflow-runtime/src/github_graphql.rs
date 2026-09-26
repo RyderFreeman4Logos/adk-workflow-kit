@@ -7,9 +7,9 @@ use reqwest::{
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::io::Read;
 #[cfg(test)]
 use std::net::SocketAddr;
+use std::{io::Read, time::Duration};
 
 use crate::{
     GitHubIntakeError, GitHubIssueMetadata, GitHubIssueState, GitHubMetadataPage,
@@ -19,6 +19,9 @@ use crate::{
 const GRAPHQL_ENDPOINT: &str = "https://api.github.com/graphql";
 const GRAPHQL_QUERY: &str = "query MetadataOnlyIssues($owner: String!, $name: String!, $first: Int!) { repository(owner: $owner, name: $name) { issues(first: $first) { nodes { id number author { login } authorAssociation state updatedAt } pageInfo { hasNextPage } } } }";
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+const GRAPHQL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const GRAPHQL_FIXTURE_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Metadata-only GitHub GraphQL intake. The response identity is deliberately
 /// labeled as one-page response provenance, not an immutable repository snapshot.
@@ -26,13 +29,18 @@ pub struct GitHubGraphqlMetadataSource {
     client: Client,
     endpoint: String,
     credential: String,
+    request_timeout: Duration,
 }
 
 impl GitHubGraphqlMetadataSource {
     /// Construct the live source with an opaque caller-supplied credential.
     /// Credentials are never read from process configuration or included in errors.
     pub fn new(credential: impl Into<String>) -> Result<Self, GitHubIntakeError> {
-        Self::with_endpoint(GRAPHQL_ENDPOINT.to_owned(), credential)
+        Self::with_endpoint(
+            GRAPHQL_ENDPOINT.to_owned(),
+            credential,
+            GRAPHQL_REQUEST_TIMEOUT,
+        )
     }
 
     #[cfg(test)]
@@ -40,15 +48,29 @@ impl GitHubGraphqlMetadataSource {
         address: SocketAddr,
         credential: impl Into<String>,
     ) -> Result<Self, GitHubIntakeError> {
+        Self::local_fixture_with_timeout(address, credential, GRAPHQL_FIXTURE_REQUEST_TIMEOUT)
+    }
+
+    #[cfg(test)]
+    fn local_fixture_with_timeout(
+        address: SocketAddr,
+        credential: impl Into<String>,
+        request_timeout: Duration,
+    ) -> Result<Self, GitHubIntakeError> {
         if !address.ip().is_loopback() {
             return Err(GitHubIntakeError::invalid_request());
         }
-        Self::with_endpoint(format!("http://{address}/graphql"), credential)
+        Self::with_endpoint(
+            format!("http://{address}/graphql"),
+            credential,
+            request_timeout,
+        )
     }
 
     fn with_endpoint(
         endpoint: String,
         credential: impl Into<String>,
+        request_timeout: Duration,
     ) -> Result<Self, GitHubIntakeError> {
         let credential = credential.into();
         if credential.is_empty() {
@@ -64,6 +86,7 @@ impl GitHubGraphqlMetadataSource {
             client,
             endpoint,
             credential,
+            request_timeout,
         })
     }
 
@@ -101,6 +124,7 @@ impl GitHubGraphqlMetadataSource {
             .header(USER_AGENT, "adk-workflow-kit")
             .bearer_auth(&self.credential)
             .body(body)
+            .timeout(self.request_timeout)
             .send()
             .map_err(|_| GitHubIntakeError::source_unavailable())?;
         let status = response.status();
@@ -119,6 +143,9 @@ impl GitHubGraphqlMetadataSource {
             .headers()
             .get("x-ratelimit-reset")
             .and_then(parse_u64_header);
+        if definitive_rate_limit(status, remaining_header, retry_after) {
+            return Err(GitHubIntakeError::rate_limited(retry_after));
+        }
         let bytes = read_response_body(response)?;
         let envelope = serde_json::from_slice::<GraphqlResponse>(&bytes).ok();
         if should_classify_rate_limit(status, remaining_header, retry_after, envelope.as_ref()) {
@@ -209,6 +236,15 @@ fn read_response_body(mut response: Response) -> Result<Vec<u8>, GitHubIntakeErr
     Ok(bytes)
 }
 
+fn definitive_rate_limit(
+    status: StatusCode,
+    remaining: Option<u64>,
+    retry_after: Option<u64>,
+) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS
+        || (status == StatusCode::FORBIDDEN && (remaining == Some(0) || retry_after.is_some()))
+}
+
 fn should_classify_rate_limit(
     status: StatusCode,
     remaining: Option<u64>,
@@ -221,10 +257,8 @@ fn should_classify_rate_limit(
             .as_ref()
             .is_some_and(|errors| errors.iter().any(GraphqlError::is_rate_limited))
     });
-    status == StatusCode::TOO_MANY_REQUESTS
-        || (status == StatusCode::FORBIDDEN
-            && (structured_rate_error || remaining == Some(0) || retry_after.is_some()))
-        || (status.is_success() && structured_rate_error)
+    definitive_rate_limit(status, remaining, retry_after)
+        || ((status == StatusCode::FORBIDDEN || status.is_success()) && structured_rate_error)
 }
 
 fn valid_graphql_id(value: &str) -> bool {
@@ -411,7 +445,7 @@ mod tests {
     use std::{
         io::{self, Read, Write},
         net::{TcpListener, TcpStream},
-        process::Command,
+        process::{Command, Stdio},
         sync::mpsc::{self, Receiver},
         thread::{self, JoinHandle},
         time::{Duration, Instant},
@@ -419,6 +453,7 @@ mod tests {
 
     const FIXTURE_TIMEOUT: Duration = Duration::from_secs(2);
     const MAX_REQUEST_BYTES: usize = 64 * 1024;
+    type FixtureThread<T> = (Receiver<Result<T, String>>, JoinHandle<()>);
 
     fn graphql_page(has_next_page: bool) -> String {
         format!(
@@ -481,6 +516,159 @@ mod tests {
         (receiver, handle)
     }
 
+    fn spawn_trickle_fixture(listener: TcpListener) -> FixtureThread<String> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let handle = thread::spawn(move || {
+            let result = (|| -> io::Result<String> {
+                listener.set_nonblocking(true)?;
+                let mut stream = accept_fixture(&listener)?;
+                stream.set_read_timeout(Some(FIXTURE_TIMEOUT))?;
+                stream.set_write_timeout(Some(FIXTURE_TIMEOUT))?;
+                let request = read_request(&mut stream)?;
+                stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )?;
+                for _ in 0..8 {
+                    match stream.write_all(b"1\r\nx\r\n") {
+                        Ok(()) => thread::sleep(Duration::from_millis(100)),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                            ) =>
+                        {
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                let _ = stream.write_all(b"0\r\n\r\n");
+                Ok(request)
+            })()
+            .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+        (receiver, handle)
+    }
+
+    fn spawn_incomplete_oversized_fixture(
+        listener: TcpListener,
+        payload: String,
+    ) -> FixtureThread<(String, bool)> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let handle = thread::spawn(move || {
+            let result = (|| -> io::Result<(String, bool)> {
+                listener.set_nonblocking(true)?;
+                let mut stream = accept_fixture(&listener)?;
+                stream.set_read_timeout(Some(FIXTURE_TIMEOUT))?;
+                stream.set_write_timeout(Some(FIXTURE_TIMEOUT))?;
+                let request = read_request(&mut stream)?;
+                stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )?;
+                let mut client_closed = false;
+                for chunk in payload.as_bytes().chunks(8192) {
+                    let write_result = (|| -> io::Result<()> {
+                        write!(stream, "{:x}\r\n", chunk.len())?;
+                        stream.write_all(chunk)?;
+                        stream.write_all(b"\r\n")
+                    })();
+                    match write_result {
+                        Ok(()) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                            ) =>
+                        {
+                            client_closed = true;
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                if !client_closed {
+                    let mut probe = [0_u8; 1];
+                    client_closed = match stream.read(&mut probe) {
+                        Ok(0) => true,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::BrokenPipe
+                                    | io::ErrorKind::ConnectionReset
+                                    | io::ErrorKind::TimedOut
+                                    | io::ErrorKind::WouldBlock
+                            ) =>
+                        {
+                            matches!(
+                                error.kind(),
+                                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                            )
+                        }
+                        Ok(_) => false,
+                        Err(error) => return Err(error),
+                    };
+                }
+                Ok((request, client_closed))
+            })()
+            .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+        (receiver, handle)
+    }
+
+    fn finish_incomplete_fixture(
+        receiver: Receiver<Result<(String, bool), String>>,
+        handle: JoinHandle<()>,
+    ) -> (String, bool) {
+        let report = receiver
+            .recv_timeout(FIXTURE_TIMEOUT)
+            .expect("incomplete fixture thread timed out")
+            .expect("incomplete fixture failed");
+        let deadline = Instant::now() + FIXTURE_TIMEOUT;
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(handle.is_finished(), "incomplete fixture join timed out");
+        handle.join().expect("incomplete fixture thread panicked");
+        report
+    }
+
+    fn wait_for_child_output(mut child: std::process::Child) -> std::process::Output {
+        let deadline = Instant::now() + FIXTURE_TIMEOUT;
+        loop {
+            match child.try_wait().expect("poisoned-proxy child status") {
+                Some(status) => {
+                    let mut stdout = Vec::new();
+                    let mut stderr = Vec::new();
+                    child
+                        .stdout
+                        .take()
+                        .expect("poisoned-proxy child stdout")
+                        .read_to_end(&mut stdout)
+                        .expect("poisoned-proxy child stdout read");
+                    child
+                        .stderr
+                        .take()
+                        .expect("poisoned-proxy child stderr")
+                        .read_to_end(&mut stderr)
+                        .expect("poisoned-proxy child stderr read");
+                    return std::process::Output {
+                        status,
+                        stdout,
+                        stderr,
+                    };
+                }
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("poisoned-proxy child timed out and was reaped");
+                }
+                None => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
+
     fn finish_fixture(
         receiver: Receiver<Result<String, String>>,
         handle: JoinHandle<()>,
@@ -524,7 +712,10 @@ mod tests {
         let mut response = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
         if chunked {
             response.push_str("Transfer-Encoding: chunked\r\n");
-        } else {
+        } else if !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        {
             response.push_str(&format!("Content-Length: {}\r\n", payload.len()));
         }
         for (name, value) in headers {
@@ -619,6 +810,50 @@ mod tests {
         result
     }
 
+    fn collect_trickle_fixture() -> Result<GitHubMetadataSnapshot, GitHubIntakeError> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+        let address = listener.local_addr().expect("fixture address");
+        let (receiver, handle) = spawn_trickle_fixture(listener);
+        let mut source =
+            GitHubGraphqlMetadataSource::local_fixture(address, "opaque-fixture-credential")
+                .expect("fixture source");
+        let result = collect_github_metadata(
+            "acme/widget",
+            &mut source,
+            GitHubIntakeLimits::new(1, 10, 10).expect("limits"),
+        );
+        let _request = finish_fixture(receiver, handle);
+        result
+    }
+
+    fn collect_incomplete_oversized_fixture() -> (
+        Result<GitHubMetadataSnapshot, GitHubIntakeError>,
+        Duration,
+        bool,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+        let address = listener.local_addr().expect("fixture address");
+        let (receiver, handle) = spawn_incomplete_oversized_fixture(
+            listener,
+            padded_graphql_page(MAX_RESPONSE_BYTES + 1),
+        );
+        let mut source = GitHubGraphqlMetadataSource::local_fixture_with_timeout(
+            address,
+            "opaque-fixture-credential",
+            Duration::from_secs(2),
+        )
+        .expect("fixture source");
+        let started = Instant::now();
+        let result = collect_github_metadata(
+            "acme/widget",
+            &mut source,
+            GitHubIntakeLimits::new(1, 10, 10).expect("limits"),
+        );
+        let elapsed = started.elapsed();
+        let (_request, client_closed) = finish_incomplete_fixture(receiver, handle);
+        (result, elapsed, client_closed)
+    }
+
     fn assert_wire_schema_refused(
         label: &str,
         result: Result<GitHubMetadataSnapshot, GitHubIntakeError>,
@@ -637,16 +872,8 @@ mod tests {
 
     fn padded_graphql_page(size: usize) -> String {
         let page = graphql_page(false);
-        let prefix = &page[..page.len() - 1];
-        let field_prefix = ",\"padding\":\"";
-        let field_suffix = "\"}";
-        let padding_length = size
-            .checked_sub(prefix.len() + field_prefix.len() + field_suffix.len())
-            .expect("padded page size");
-        let payload = format!(
-            "{prefix}{field_prefix}{}{field_suffix}",
-            "x".repeat(padding_length)
-        );
+        let padding_length = size.checked_sub(page.len()).expect("padded page size");
+        let payload = format!("{page}{}", " ".repeat(padding_length));
         assert_eq!(payload.len(), size);
         payload
     }
@@ -674,6 +901,58 @@ mod tests {
         assert_eq!(
             result
                 .expect_err("an unknown-length oversized response must be refused")
+                .kind(),
+            GitHubIntakeErrorKind::SourceUnavailable
+        );
+    }
+
+    #[test]
+    fn graphql_source_applies_total_deadline_to_trickling_response() {
+        let started = Instant::now();
+        let result = collect_trickle_fixture();
+        let elapsed = started.elapsed();
+        assert_eq!(
+            result
+                .expect_err("a trickling response must hit the total deadline")
+                .kind(),
+            GitHubIntakeErrorKind::SourceUnavailable
+        );
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "trickling response exceeded the bounded deadline: {elapsed:?}"
+        );
+
+        let control = collect_fixture("200 OK", &[], graphql_page(false), false);
+        assert!(control.is_ok(), "a complete response remains valid");
+    }
+
+    #[test]
+    fn graphql_source_rejects_unknown_length_oversize_before_chunked_eof() {
+        let (result, elapsed, client_closed) = collect_incomplete_oversized_fixture();
+        assert_eq!(
+            result
+                .expect_err("an incomplete oversized response must be refused")
+                .kind(),
+            GitHubIntakeErrorKind::SourceUnavailable
+        );
+        assert!(
+            client_closed,
+            "the client must close after reaching the byte cap"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "oversized chunked response waited for server EOF: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn graphql_source_rejects_declared_oversize_before_body_read() {
+        let declared_length = (MAX_RESPONSE_BYTES + 1).to_string();
+        let headers = [("content-length", declared_length.as_str())];
+        let result = collect_fixture("200 OK", &headers, String::new(), false);
+        assert_eq!(
+            result
+                .expect_err("a declared oversized response must be refused")
                 .kind(),
             GitHubIntakeErrorKind::SourceUnavailable
         );
@@ -741,6 +1020,47 @@ mod tests {
     }
 
     #[test]
+    fn graphql_source_classifies_429_before_oversized_body_read() {
+        let result = collect_fixture(
+            "429 Too Many Requests",
+            &[("retry-after", "12")],
+            padded_graphql_page(MAX_RESPONSE_BYTES + 1),
+            false,
+        );
+        let error = result.expect_err("429 must be classified before body buffering");
+        assert_eq!(error.kind(), GitHubIntakeErrorKind::RateLimited);
+        assert_eq!(error.retry_after_seconds(), Some(12));
+    }
+
+    #[test]
+    fn graphql_source_classifies_truncated_429_before_body_read() {
+        let payload = graphql_error_page("RATE_LIMITED");
+        let declared_length = (payload.len() + 1).to_string();
+        let headers = [
+            ("retry-after", "13"),
+            ("content-length", declared_length.as_str()),
+        ];
+        let result = collect_fixture("429 Too Many Requests", &headers, payload, false);
+        let error = result.expect_err("truncated 429 must be classified before body read");
+        assert_eq!(error.kind(), GitHubIntakeErrorKind::RateLimited);
+        assert_eq!(error.retry_after_seconds(), Some(13));
+    }
+
+    #[test]
+    fn graphql_source_classifies_header_evidenced_403_before_body_read() {
+        let payload = graphql_error_page("FORBIDDEN");
+        let declared_length = (payload.len() + 1).to_string();
+        let headers = [
+            ("retry-after", "14"),
+            ("content-length", declared_length.as_str()),
+        ];
+        let result = collect_fixture("403 Forbidden", &headers, payload, false);
+        let error = result.expect_err("header-evidenced 403 must be classified early");
+        assert_eq!(error.kind(), GitHubIntakeErrorKind::RateLimited);
+        assert_eq!(error.retry_after_seconds(), Some(14));
+    }
+
+    #[test]
     fn graphql_source_accepts_a_complete_page_with_zero_remaining() {
         let result = collect_fixture(
             "200 OK",
@@ -754,9 +1074,9 @@ mod tests {
     #[test]
     fn graphql_source_ignores_ambient_proxy_for_loopback_fixture() {
         if std::env::var_os("ISSUE_249_POISONED_PROXY_CHILD").is_none() {
-            let output = Command::new(std::env::current_exe().expect("test executable"))
+            let child = Command::new(std::env::current_exe().expect("test executable"))
                 .args([
-                    "graphql_source_ignores_ambient_proxy_for_loopback_fixture",
+                    "github_graphql::tests::graphql_source_ignores_ambient_proxy_for_loopback_fixture",
                     "--exact",
                     "--nocapture",
                 ])
@@ -769,12 +1089,31 @@ mod tests {
                 .env("all_proxy", "http://127.0.0.1:1")
                 .env_remove("NO_PROXY")
                 .env_remove("no_proxy")
-                .output()
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
                 .expect("poisoned-proxy child");
+            let output = wait_for_child_output(child);
+            let transcript = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             assert!(
                 output.status.success(),
-                "poisoned-proxy child failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "poisoned-proxy child failed: {transcript}"
+            );
+            assert!(
+                transcript.contains("running 1 test"),
+                "poisoned-proxy child selected an unexpected test set: {transcript}"
+            );
+            assert!(
+                transcript.contains("issue-249-poisoned-proxy-child: fixture-reached"),
+                "poisoned-proxy child did not reach the loopback fixture: {transcript}"
+            );
+            assert!(
+                transcript.contains("test result: ok. 1 passed"),
+                "poisoned-proxy child did not report one passing test: {transcript}"
             );
             return;
         }
@@ -784,6 +1123,7 @@ mod tests {
             result.is_ok(),
             "the loopback fixture must bypass ambient proxies"
         );
+        println!("issue-249-poisoned-proxy-child: fixture-reached");
     }
 
     #[test]
