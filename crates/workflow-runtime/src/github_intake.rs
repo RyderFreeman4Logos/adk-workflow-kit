@@ -250,6 +250,7 @@ pub enum GitHubIntakeErrorKind {
     PageOverflow,
     PageLimitExceeded,
     ItemLimitExceeded,
+    SourceUnavailable,
     RateLimited,
 }
 
@@ -278,6 +279,14 @@ impl GitHubIntakeError {
         Self {
             kind: GitHubIntakeErrorKind::RateLimited,
             retry_after_seconds,
+        }
+    }
+
+    /// Refuses a metadata request when the source cannot provide a page.
+    pub fn source_unavailable() -> Self {
+        Self {
+            kind: GitHubIntakeErrorKind::SourceUnavailable,
+            retry_after_seconds: None,
         }
     }
 

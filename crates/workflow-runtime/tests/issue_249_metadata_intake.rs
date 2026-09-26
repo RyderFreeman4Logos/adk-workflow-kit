@@ -214,3 +214,36 @@ fn source_rate_limit_error_is_returned_without_retrying() {
     assert_eq!(error.retry_after_seconds(), Some(30));
     assert_eq!(source.requests.len(), 1);
 }
+
+#[test]
+fn source_failure_on_later_page_discards_partial_snapshot_and_stops() {
+    let mut source = FakeMetadataSource::new([
+        Ok(page(
+            "snapshot-1",
+            vec![issue(1, "trusted", false)],
+            true,
+            1,
+        )),
+        Err(GitHubIntakeError::source_unavailable()),
+        Ok(page(
+            "snapshot-1",
+            vec![issue(2, "trusted", false)],
+            false,
+            1,
+        )),
+    ]);
+
+    let error = collect_github_metadata(
+        "owner/repository",
+        &mut source,
+        GitHubIntakeLimits::new(3, 1, 3).expect("limits"),
+    )
+    .expect_err("source failure must refuse the partial snapshot");
+
+    assert_eq!(error.kind(), GitHubIntakeErrorKind::SourceUnavailable);
+    assert_eq!(error.retry_after_seconds(), None);
+    assert_eq!(
+        source.requests,
+        vec![(1, None), (2, Some(String::from("snapshot-1")))]
+    );
+}
