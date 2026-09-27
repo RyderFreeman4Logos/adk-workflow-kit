@@ -9,12 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct StateVersion;
 
 impl TryFrom<u32> for StateVersion {
-    type Error = &'static str;
+    type Error = StateError;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
-        (value == 1)
-            .then_some(Self)
-            .ok_or("unsupported compact state version")
+        (value == 1).then_some(Self).ok_or(StateError::Document)
     }
 }
 
@@ -30,18 +28,22 @@ impl From<StateVersion> for u32 {
 pub struct SourceRecord {
     /// Lowercase hexadecimal SHA-256 digest of the retained artifact.
     pub artifact_id: String,
-    /// Exact byte length of the artifact.
+    /// Producer-asserted byte length; external artifact bytes are not available
+    /// to this IR, so callers must verify this assertion against the artifact.
     pub byte_len: u64,
 }
 
-/// Logical source identities and their immutable artifacts.
+/// Logical source identities and their immutable artifacts. Applying a delta
+/// rejects rebinding an existing logical ID to a different record.
 pub type SourceIndex = BTreeMap<String, SourceRecord>;
 
-/// A half-open byte range in a retained source artifact.
+/// A half-open byte range pinned to one retained source artifact.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceRef {
     pub source: String,
+    /// Lowercase digest of the artifact addressed by this range.
+    pub artifact_id: String,
     pub start: u64,
     pub end: u64,
 }
@@ -69,12 +71,20 @@ pub struct StateEntry {
 }
 
 /// An additive delta. There is no delete or winner-selection operation.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateDelta {
     pub schema_version: StateVersion,
     pub sources: SourceIndex,
     pub entries: Vec<StateEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateDeltaWire {
+    schema_version: StateVersion,
+    sources: SourceIndex,
+    entries: Vec<StateEntry>,
 }
 
 /// Closed errors that do not include untrusted source text or identifiers.
@@ -133,6 +143,27 @@ impl From<CompactState> for StateDelta {
     }
 }
 
+impl StateDelta {
+    fn from_wire(wire: StateDeltaWire) -> Self {
+        Self {
+            schema_version: wire.schema_version,
+            sources: wire.sources,
+            entries: wire.entries,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StateDelta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let delta = StateDelta::from_wire(StateDeltaWire::deserialize(deserializer)?);
+        CompactState::try_from(delta.clone()).map_err(<D::Error as serde::de::Error>::custom)?;
+        Ok(delta)
+    }
+}
+
 /// True only for the lowercase hexadecimal SHA-256 form used by entry links.
 pub fn valid_state_digest(value: &str) -> bool {
     value.len() == 64
@@ -141,19 +172,8 @@ pub fn valid_state_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn normalize(entry: &StateEntry) -> StateEntry {
-    let mut normalized = entry.clone();
-    normalized.text = entry
-        .text
-        .split_ascii_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    normalized
-}
-
 /// Stable content identity. Provenance and explicit links are grow-only history.
 pub fn entry_id(entry: &StateEntry) -> Result<String, StateError> {
-    let entry = normalize(entry);
     let bytes = serde_json::to_vec(&(1u32, entry.kind, &entry.scope, &entry.key, &entry.text))
         .map_err(|_| StateError::Document)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -188,7 +208,7 @@ impl CompactState {
         }
 
         for original in &delta.entries {
-            let entry = normalize(original);
+            let entry = original.clone();
             if entry.scope.trim().is_empty()
                 || entry.key.trim().is_empty()
                 || entry.text.is_empty()
@@ -202,6 +222,7 @@ impl CompactState {
                     .get(&provenance.source)
                     .ok_or(StateError::Source)?;
                 if provenance.source.trim().is_empty()
+                    || provenance.artifact_id != source.artifact_id
                     || provenance.start >= provenance.end
                     || provenance.end > source.byte_len
                 {
@@ -244,11 +265,6 @@ impl CompactState {
         self.apply(&StateDelta::from(other.clone()))
     }
 
-    /// Compatibility name for callers that use merge terminology.
-    pub fn merge(&self, other: &Self) -> Result<Self, StateError> {
-        self.union(other)
-    }
-
     /// Stable JSON with source and entry order fixed by B-tree ordering.
     pub fn to_json(&self) -> Result<String, StateError> {
         serde_json::to_string(self).map_err(|_| StateError::Document)
@@ -256,7 +272,9 @@ impl CompactState {
 
     /// Deserialize through the same validating reducer used by [`Self::apply`].
     pub fn from_json(document: &str) -> Result<Self, StateError> {
-        serde_json::from_str(document).map_err(|_| StateError::Document)
+        let wire: StateDeltaWire =
+            serde_json::from_str(document).map_err(|_| StateError::Document)?;
+        Self::try_from(StateDelta::from_wire(wire))
     }
 
     /// Return every explicit link in stable source/kind/target order.
