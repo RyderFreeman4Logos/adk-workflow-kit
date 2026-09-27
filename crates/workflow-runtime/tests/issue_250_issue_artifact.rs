@@ -135,6 +135,10 @@ fn unallowlisted_comment_bytes_are_absent_from_artifact_and_errors() {
 fn invalid_records_fail_before_store_visibility() {
     assert!(OfflineComment::new(" ", "author", 1, 1, false, b"x".to_vec()).is_err());
     assert!(OfflineComment::new("id", "author", 1, 0, false, b"x".to_vec()).is_err());
+}
+
+#[test]
+fn duplicate_ids_are_rejected_even_when_order_increases() {
     assert!(
         OfflineIssueContent::new(
             issue(),
@@ -142,12 +146,16 @@ fn invalid_records_fail_before_store_visibility() {
             b"title".to_vec(),
             b"body".to_vec(),
             vec![
-                comment("same", "trusted-author", 2, 1, b"later"),
-                comment("same", "trusted-author", 1, 1, b"earlier"),
+                comment("same", "trusted-author", 1, 1, b"first"),
+                comment("same", "trusted-author", 2, 1, b"second"),
             ],
         )
         .is_err()
     );
+}
+
+#[test]
+fn non_increasing_orders_are_rejected_for_unique_ids() {
     assert!(
         OfflineIssueContent::new(
             issue(),
@@ -155,7 +163,7 @@ fn invalid_records_fail_before_store_visibility() {
             b"title".to_vec(),
             b"body".to_vec(),
             vec![
-                comment("later", "trusted-author", 1, 1, b"later"),
+                comment("later", "trusted-author", 2, 1, b"later"),
                 comment("earlier", "trusted-author", 1, 1, b"earlier"),
             ],
         )
@@ -165,21 +173,34 @@ fn invalid_records_fail_before_store_visibility() {
 
 #[test]
 fn identical_inputs_reuse_identity_and_policy_change_misses() {
-    let admitted = content(vec![comment("kept", "trusted-author", 1, 1, b"kept-bytes")]);
+    let admitted = content(vec![comment("kept", "other-author", 1, 1, b"kept-bytes")]);
     let mut first_store = store();
     let mut second_store = store();
-    let trusted = policy(&["trusted-author"]);
-    let narrowed = policy(&["trusted-author", "other-author"]);
+    let trusted = policy(&["trusted-author", "other-author"]);
+    let omitting = policy(&["trusted-author"]);
     let first =
         build_canonical_issue_artifact(&trusted, &admitted, &mut first_store).expect("first");
     let second =
         build_canonical_issue_artifact(&trusted, &admitted, &mut second_store).expect("second");
     let retargeted =
-        build_canonical_issue_artifact(&narrowed, &admitted, &mut second_store).expect("policy");
+        build_canonical_issue_artifact(&omitting, &admitted, &mut second_store).expect("policy");
     assert_eq!(first.manifest_bytes(), second.manifest_bytes());
     assert_eq!(first.content_id(), second.content_id());
     assert_ne!(first.policy_digest(), retargeted.policy_digest());
     assert_ne!(first.aggregate_digest(), retargeted.aggregate_digest());
+    assert_eq!(
+        retargeted.omissions(),
+        &[IssueOmission::new("kept", "author_not_allowlisted")]
+    );
+    assert!(
+        retargeted
+            .included()
+            .iter()
+            .all(|object| object.object_id() != "kept")
+    );
+    assert!(retargeted.diff_from(Some(&first)).iter().any(|entry| {
+        entry.object_id() == "kept" && entry.change() == ObjectChange::NewlyOmitted
+    }));
     assert_eq!(
         key(&first, "1", "allowlist"),
         key(&second, "1", "allowlist")
@@ -274,6 +295,48 @@ fn title_is_a_tracked_included_object() {
         )
         .expect("title span");
     assert_eq!(page.bytes(), b"new title");
+}
+
+#[test]
+fn equal_title_and_body_bytes_have_distinct_stable_role_digests() {
+    let admitted = OfflineIssueContent::new(
+        issue(),
+        "snapshot-250",
+        b"same title and body".to_vec(),
+        b"same title and body".to_vec(),
+        Vec::new(),
+    )
+    .expect("content");
+    let trusted = policy(&["trusted-author"]);
+    let mut first_store = store();
+    let mut second_store = store();
+    let first =
+        build_canonical_issue_artifact(&trusted, &admitted, &mut first_store).expect("first");
+    let second =
+        build_canonical_issue_artifact(&trusted, &admitted, &mut second_store).expect("second");
+    let first_title = first
+        .included()
+        .iter()
+        .find(|object| object.object_id() == "issue-title")
+        .expect("first title");
+    let first_body = first
+        .included()
+        .iter()
+        .find(|object| object.object_id() == "issue-body")
+        .expect("first body");
+    let second_title = second
+        .included()
+        .iter()
+        .find(|object| object.object_id() == "issue-title")
+        .expect("second title");
+    let second_body = second
+        .included()
+        .iter()
+        .find(|object| object.object_id() == "issue-body")
+        .expect("second body");
+    assert_ne!(first_title.digest(), first_body.digest());
+    assert_eq!(first_title.digest(), second_title.digest());
+    assert_eq!(first_body.digest(), second_body.digest());
 }
 
 #[test]

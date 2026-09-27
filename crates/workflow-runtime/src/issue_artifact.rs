@@ -81,6 +81,11 @@ impl fmt::Debug for OfflineComment {
 }
 
 impl OfflineComment {
+    /// Creates a validated comment record.
+    ///
+    /// Comment IDs `issue-title` and `issue-body` are reserved. Revisions must
+    /// be nonzero; deleted comments must have empty bytes, and live comments
+    /// must have nonempty bytes.
     pub fn new(
         object_id: impl Into<String>,
         author: impl Into<String>,
@@ -143,6 +148,11 @@ impl fmt::Debug for OfflineIssueContent {
 }
 
 impl OfflineIssueContent {
+    /// Creates a validated offline snapshot.
+    ///
+    /// The nonempty `snapshot` identifier is retained verbatim in the
+    /// manifest. Comment IDs must be unique and their order values strictly
+    /// increasing; each comment revision is validated by [`OfflineComment::new`].
     pub fn new(
         metadata: GitHubIssueMetadata,
         snapshot: impl Into<String>,
@@ -397,6 +407,11 @@ impl CanonicalIssueArtifact {
         &self.aggregate_digest
     }
 
+    /// Binds caller cache material to this canonical artifact.
+    ///
+    /// The artifact content hash is appended to the supplied input hashes;
+    /// the request-input and policy digests are replaced with this artifact's
+    /// aggregate and policy digests. Other cache material is preserved.
     pub fn cache_key(
         &self,
         material: NodeCacheKeyMaterial<'_>,
@@ -411,6 +426,10 @@ impl CanonicalIssueArtifact {
         })
     }
 
+    /// Returns object transitions from `previous`.
+    ///
+    /// On a first inventory, included objects are `Appended` and omitted or
+    /// deleted records are `NewlyOmitted`.
     pub fn diff_from(&self, previous: Option<&Self>) -> Vec<ObjectDiffEntry> {
         let Some(previous) = previous else {
             return self
@@ -519,6 +538,11 @@ struct Classified<'a> {
     digest: String,
 }
 
+/// Builds the canonical artifact for an admitted issue snapshot.
+///
+/// The direct path accepts at most 64 comments; larger inventories return
+/// [`IssueArtifactErrorKind::NotRouted`]. Title and body digests retain their
+/// shared policy provenance while remaining distinct by local object role.
 pub fn build_canonical_issue_artifact(
     policy: &TrustPolicy,
     admitted: &OfflineIssueContent,
@@ -541,8 +565,16 @@ pub fn build_canonical_issue_artifact(
         ));
     }
     let policy_digest = encode_hex(body.policy_digest());
-    let title_digest = digest_object(&body.cache_key(&admitted.title).as_hex(), 1);
-    let body_digest = digest_object(&body.cache_key(&admitted.body).as_hex(), 1);
+    let title_digest = digest_object(
+        &body.cache_key(&admitted.title).as_hex(),
+        Some(TITLE_OBJECT_ID),
+        1,
+    );
+    let body_digest = digest_object(
+        &body.cache_key(&admitted.body).as_hex(),
+        Some(BODY_OBJECT_ID),
+        1,
+    );
     let title = Classified {
         object_id: TITLE_OBJECT_ID,
         kind: "issue_title",
@@ -594,6 +626,7 @@ pub fn build_canonical_issue_artifact(
             .map_err(map_policy)?;
         let digest = digest_object(
             &provenance.cache_key(&comment.bytes).as_hex(),
+            None,
             comment.revision,
         );
         let order = u64::from(comment.order) + 2;
@@ -714,8 +747,14 @@ pub fn build_canonical_issue_artifact(
     })
 }
 
-fn digest_object(content_digest: &str, revision: u64) -> String {
+fn digest_object(content_digest: &str, local_role: Option<&str>, revision: u64) -> String {
     let mut hasher = Sha256::new();
+    if let Some(local_role) = local_role {
+        hasher.update(b"issue-object-role-v1");
+        hasher.update([0]);
+        hasher.update(local_role.as_bytes());
+        hasher.update([0]);
+    }
     hasher.update(content_digest.as_bytes());
     hasher.update(revision.to_be_bytes());
     encode_hex(&hasher.finalize())
