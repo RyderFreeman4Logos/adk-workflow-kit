@@ -10,6 +10,7 @@ use workflow_runtime::{
 struct FakeMetadataSource {
     pages: VecDeque<Result<GitHubMetadataPage, GitHubIntakeError>>,
     requests: Vec<(u32, Option<String>)>,
+    cursors: Vec<Option<String>>,
 }
 
 impl FakeMetadataSource {
@@ -17,6 +18,7 @@ impl FakeMetadataSource {
         Self {
             pages: pages.into_iter().collect(),
             requests: Vec::new(),
+            cursors: Vec::new(),
         }
     }
 }
@@ -28,6 +30,7 @@ impl GitHubMetadataSource for FakeMetadataSource {
     ) -> Result<GitHubMetadataPage, GitHubIntakeError> {
         self.requests
             .push((request.page(), request.snapshot().map(str::to_owned)));
+        self.cursors.push(request.cursor().map(str::to_owned));
         self.pages.pop_front().expect("fake page fixture")
     }
 }
@@ -50,10 +53,27 @@ fn page(
     has_next_page: bool,
     remaining: u32,
 ) -> GitHubMetadataPage {
-    GitHubMetadataPage::new(
+    page_with_cursor(
         snapshot,
         issues,
         has_next_page,
+        has_next_page.then_some("cursor-next"),
+        remaining,
+    )
+}
+
+fn page_with_cursor(
+    snapshot: &str,
+    issues: Vec<GitHubIssueMetadata>,
+    has_next_page: bool,
+    end_cursor: Option<&str>,
+    remaining: u32,
+) -> GitHubMetadataPage {
+    GitHubMetadataPage::with_end_cursor(
+        snapshot,
+        issues,
+        has_next_page,
+        end_cursor.map(str::to_owned),
         GitHubRateLimit::new(remaining, Some(1_800_000_000)),
     )
     .expect("valid metadata page")
@@ -98,6 +118,10 @@ fn metadata_listing_is_bounded_snapshot_pinned_and_excludes_pull_requests() {
     assert_eq!(
         source.requests,
         vec![(1, None), (2, Some(String::from("snapshot-1")))]
+    );
+    assert_eq!(
+        source.cursors,
+        vec![None, Some(String::from("cursor-next"))]
     );
 }
 
@@ -246,4 +270,92 @@ fn source_failure_on_later_page_discards_partial_snapshot_and_stops() {
         source.requests,
         vec![(1, None), (2, Some(String::from("snapshot-1")))]
     );
+}
+
+#[test]
+fn cursor_is_opaque_and_snapshot_remains_pinned_across_pages() {
+    let mut source = FakeMetadataSource::new([
+        Ok(page_with_cursor(
+            "snapshot-1",
+            vec![issue(1, "trusted", false)],
+            true,
+            Some("opaque cursor/+=="),
+            1,
+        )),
+        Ok(page_with_cursor(
+            "snapshot-1",
+            vec![issue(2, "trusted", false)],
+            false,
+            None,
+            1,
+        )),
+    ]);
+
+    let snapshot = collect_github_metadata(
+        "owner/repository",
+        &mut source,
+        GitHubIntakeLimits::new(2, 1, 2).expect("limits"),
+    )
+    .expect("opaque cursor pagination");
+
+    assert_eq!(snapshot.pages(), 2);
+    assert_eq!(snapshot.snapshot(), "snapshot-1");
+    assert_eq!(
+        source.cursors,
+        vec![None, Some(String::from("opaque cursor/+=="))]
+    );
+}
+
+#[test]
+fn invalid_replayed_and_contradictory_cursors_fail_closed() {
+    for cursor in [String::new(), String::from("bad\nvalue"), "x".repeat(513)] {
+        let error = GitHubMetadataPage::with_end_cursor(
+            "snapshot-1",
+            vec![],
+            false,
+            Some(cursor),
+            GitHubRateLimit::new(1, None),
+        )
+        .expect_err("invalid cursor must be rejected");
+        assert_eq!(error.kind(), GitHubIntakeErrorKind::InvalidCursor);
+    }
+
+    let mut replayed = FakeMetadataSource::new([
+        Ok(page_with_cursor(
+            "snapshot-1",
+            vec![issue(1, "trusted", false)],
+            true,
+            Some("cursor-1"),
+            1,
+        )),
+        Ok(page_with_cursor(
+            "snapshot-1",
+            vec![issue(2, "trusted", false)],
+            false,
+            Some("cursor-1"),
+            1,
+        )),
+    ]);
+    let error = collect_github_metadata(
+        "owner/repository",
+        &mut replayed,
+        GitHubIntakeLimits::new(2, 1, 2).expect("limits"),
+    )
+    .expect_err("replayed cursor must be rejected");
+    assert_eq!(error.kind(), GitHubIntakeErrorKind::CursorReplayed);
+
+    let mut contradictory = FakeMetadataSource::new([Ok(GitHubMetadataPage::new(
+        "snapshot-1",
+        vec![issue(1, "trusted", false)],
+        true,
+        GitHubRateLimit::new(1, None),
+    )
+    .expect("valid page shape"))]);
+    let error = collect_github_metadata(
+        "owner/repository",
+        &mut contradictory,
+        GitHubIntakeLimits::new(2, 1, 2).expect("limits"),
+    )
+    .expect_err("hasNextPage without endCursor must be rejected");
+    assert_eq!(error.kind(), GitHubIntakeErrorKind::PageInfoContradiction);
 }

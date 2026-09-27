@@ -17,14 +17,14 @@ use crate::{
 };
 
 const GRAPHQL_ENDPOINT: &str = "https://api.github.com/graphql";
-const GRAPHQL_QUERY: &str = "query MetadataOnlyIssues($owner: String!, $name: String!, $first: Int!) { repository(owner: $owner, name: $name) { issues(first: $first) { nodes { id number author { login } authorAssociation state updatedAt } pageInfo { hasNextPage } } } }";
+const GRAPHQL_QUERY: &str = "query MetadataOnlyIssues($owner: String!, $name: String!, $first: Int!, $after: String) { repository(owner: $owner, name: $name) { issues(first: $first, after: $after) { nodes { id number author { login } authorAssociation state updatedAt } pageInfo { hasNextPage endCursor } } } }";
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const GRAPHQL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const GRAPHQL_FIXTURE_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// Metadata-only GitHub GraphQL intake. The response identity is deliberately
-/// labeled as one-page response provenance, not an immutable repository snapshot.
+/// Metadata-only GitHub GraphQL intake. Response identities are labeled as
+/// observed page/traversal provenance, not immutable repository snapshots.
 pub struct GitHubGraphqlMetadataSource {
     client: Client,
     endpoint: String,
@@ -94,7 +94,14 @@ impl GitHubGraphqlMetadataSource {
         &self,
         request: &GitHubMetadataPageRequest,
     ) -> Result<GitHubMetadataPage, GitHubIntakeError> {
-        if request.page() != 1 || request.snapshot().is_some() || request.per_page() == 0 {
+        if request.page() == 0 || request.per_page() == 0 {
+            return Err(GitHubIntakeError::invalid_request());
+        }
+        if request.page() == 1 {
+            if request.snapshot().is_some() || request.cursor().is_some() {
+                return Err(GitHubIntakeError::invalid_request());
+            }
+        } else if request.snapshot().is_none() || request.cursor().is_none() {
             return Err(GitHubIntakeError::invalid_request());
         }
         let mut repository = request.repository().split('/');
@@ -113,6 +120,7 @@ impl GitHubGraphqlMetadataSource {
                 "owner": owner,
                 "name": name,
                 "first": request.per_page(),
+                "after": request.cursor(),
             },
         }))
         .map_err(|_| GitHubIntakeError::source_unavailable())?;
@@ -165,8 +173,8 @@ impl GitHubGraphqlMetadataSource {
             .ok_or_else(GitHubIntakeError::source_unavailable)?;
         // Repository.issues is the issue connection; pull requests are not selected.
         // See https://docs.github.com/en/graphql/reference/objects#repository.
-        if issues.page_info.has_next_page {
-            return Err(GitHubIntakeError::source_unavailable());
+        if issues.page_info.has_next_page && issues.page_info.end_cursor.is_none() {
+            return Err(GitHubIntakeError::page_info_contradiction());
         }
         let mut metadata = Vec::with_capacity(issues.nodes.len());
         for node in issues.nodes {
@@ -194,13 +202,19 @@ impl GitHubGraphqlMetadataSource {
             metadata.push(issue);
         }
         let digest = Sha256::digest(&bytes);
-        let snapshot = format!("github-graphql-one-page-response:{digest:x}");
-        GitHubMetadataPage::new(
+        let page_identity = format!("github-graphql-page-response:{digest:x}");
+        let snapshot = request
+            .snapshot()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("github-graphql-one-page-response:{digest:x}"));
+        GitHubMetadataPage::with_end_cursor(
             snapshot,
             metadata,
-            false,
+            issues.page_info.has_next_page,
+            issues.page_info.end_cursor,
             GitHubRateLimit::new(remaining, reset),
-        )
+        )?
+        .with_page_identity(page_identity)
     }
 }
 
@@ -381,6 +395,8 @@ struct GraphqlIssues {
 struct GraphqlPageInfo {
     #[serde(rename = "hasNextPage")]
     has_next_page: bool,
+    #[serde(rename = "endCursor")]
+    end_cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -456,20 +472,35 @@ mod tests {
     type FixtureThread<T> = (Receiver<Result<T, String>>, JoinHandle<()>);
 
     fn graphql_page(has_next_page: bool) -> String {
+        graphql_page_with_cursor(
+            7,
+            has_next_page,
+            has_next_page.then_some("opaque-page-cursor"),
+        )
+    }
+
+    fn graphql_page_with_cursor(
+        number: i32,
+        has_next_page: bool,
+        end_cursor: Option<&str>,
+    ) -> String {
+        let end_cursor = end_cursor
+            .map(|cursor| serde_json::to_string(cursor).expect("cursor JSON"))
+            .unwrap_or_else(|| "null".to_owned());
         format!(
             r#"{{
                 "data": {{
                     "repository": {{
                         "issues": {{
                             "nodes": [{{
-                                "id": "I_kwDOfixture",
-                                "number": 7,
+                                "id": "I_kwDOfixture-{number}",
+                                "number": {number},
                                 "author": {{"login": "trusted"}},
                                 "authorAssociation": "MEMBER",
                                 "state": "OPEN",
                                 "updatedAt": "2026-09-26T00:00:00Z"
                             }}],
-                            "pageInfo": {{"hasNextPage": {has_next_page}}}
+                            "pageInfo": {{"hasNextPage": {has_next_page}, "endCursor": {end_cursor}}}
                         }}
                     }}
                 }}
@@ -509,6 +540,34 @@ mod tests {
                     _ => {}
                 }
                 Ok(request)
+            })()
+            .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+        (receiver, handle)
+    }
+
+    fn spawn_paged_fixture(
+        listener: TcpListener,
+        payloads: Vec<String>,
+    ) -> FixtureThread<Vec<String>> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let handle = thread::spawn(move || {
+            let result = (|| -> io::Result<Vec<String>> {
+                listener.set_nonblocking(true)?;
+                let headers = vec![
+                    ("x-ratelimit-remaining".to_owned(), "1".to_owned()),
+                    ("x-ratelimit-reset".to_owned(), "1800000000".to_owned()),
+                ];
+                let mut requests = Vec::with_capacity(payloads.len());
+                for payload in payloads {
+                    let mut stream = accept_fixture(&listener)?;
+                    stream.set_read_timeout(Some(FIXTURE_TIMEOUT))?;
+                    stream.set_write_timeout(Some(FIXTURE_TIMEOUT))?;
+                    requests.push(read_request(&mut stream)?);
+                    write_response(&mut stream, "200 OK", &headers, &payload, false)?;
+                }
+                Ok(requests)
             })()
             .map_err(|error| error.to_string());
             let _ = sender.send(result);
@@ -684,6 +743,41 @@ mod tests {
         assert!(handle.is_finished(), "fixture join timed out");
         handle.join().expect("fixture thread panicked");
         request
+    }
+
+    fn finish_paged_fixture(
+        receiver: Receiver<Result<Vec<String>, String>>,
+        handle: JoinHandle<()>,
+    ) -> Vec<String> {
+        let requests = receiver
+            .recv_timeout(FIXTURE_TIMEOUT)
+            .expect("paged fixture thread timed out")
+            .expect("paged fixture failed");
+        let deadline = Instant::now() + FIXTURE_TIMEOUT;
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(handle.is_finished(), "paged fixture join timed out");
+        handle.join().expect("paged fixture thread panicked");
+        requests
+    }
+
+    fn collect_paged_fixture(payloads: Vec<String>) -> GitHubMetadataSnapshot {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+        let address = listener.local_addr().expect("fixture address");
+        let (receiver, handle) = spawn_paged_fixture(listener, payloads.clone());
+        let mut source =
+            GitHubGraphqlMetadataSource::local_fixture(address, "opaque-fixture-credential")
+                .expect("fixture source");
+        let snapshot = collect_github_metadata(
+            "acme/widget",
+            &mut source,
+            GitHubIntakeLimits::new(payloads.len() as u32, 10, 10).expect("limits"),
+        )
+        .expect("paged metadata snapshot");
+        let requests = finish_paged_fixture(receiver, handle);
+        assert_eq!(requests.len(), payloads.len());
+        snapshot
     }
 
     fn accept_fixture(listener: &TcpListener) -> io::Result<TcpStream> {
@@ -1167,7 +1261,7 @@ mod tests {
             ),
             (
                 "empty GraphQL ID",
-                graphql_page(false).replace("I_kwDOfixture", ""),
+                graphql_page(false).replace("\"id\": \"I_kwDOfixture-7\"", "\"id\": \"\""),
             ),
         ];
         for (label, payload) in invalid_cases {
@@ -1208,6 +1302,8 @@ mod tests {
         assert!(payload.contains("\"owner\":\"acme\""));
         assert!(payload.contains("\"name\":\"widget\""));
         assert!(payload.contains("\"first\":10"));
+        assert!(payload.contains("\"after\":null"));
+        assert!(payload.contains("endCursor"));
         for field in [
             "number",
             "author",
@@ -1232,20 +1328,127 @@ mod tests {
     }
 
     #[test]
-    fn graphql_source_rejects_a_required_second_page() {
+    fn graphql_source_paginates_with_an_opaque_cursor_and_pinned_snapshot() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener");
         let address = listener.local_addr().expect("fixture address");
-        let (receiver, handle) = spawn_fixture(listener, "200 OK", &[], graphql_page(true), false);
+        let (receiver, handle) = spawn_paged_fixture(
+            listener,
+            vec![
+                graphql_page_with_cursor(7, true, Some("opaque cursor/+==")),
+                graphql_page_with_cursor(8, false, None),
+            ],
+        );
         let mut source = GitHubGraphqlMetadataSource::local_fixture(address, "opaque-credential")
             .expect("fixture source");
 
-        let error = collect_github_metadata(
+        let snapshot = collect_github_metadata(
             "acme/widget",
             &mut source,
-            GitHubIntakeLimits::new(3, 10, 10).expect("limits"),
+            GitHubIntakeLimits::new(2, 10, 10).expect("limits"),
         )
-        .expect_err("a second page cannot be called a stable snapshot");
-        assert_eq!(error.kind(), GitHubIntakeErrorKind::SourceUnavailable);
-        let _request = finish_fixture(receiver, handle);
+        .expect("two-page metadata snapshot");
+        let requests = finish_paged_fixture(receiver, handle);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(snapshot.pages(), 2);
+        assert_eq!(snapshot.issues().len(), 2);
+        assert_eq!(snapshot.issues()[0].number(), 7);
+        assert_eq!(snapshot.issues()[1].number(), 8);
+        assert!(
+            snapshot
+                .snapshot()
+                .starts_with("github-observed-traversal:")
+        );
+        let first_payload = requests[0]
+            .split_once("\r\n\r\n")
+            .expect("first request payload")
+            .1;
+        let second_payload = requests[1]
+            .split_once("\r\n\r\n")
+            .expect("second request payload")
+            .1;
+        assert!(first_payload.contains("\"after\":null"));
+        assert!(second_payload.contains("\"after\":\"opaque cursor/+==\""));
+        assert!(!second_payload.contains("\"after\":null"));
+        for payload in [first_payload, second_payload] {
+            for field in ["title", "comments", "body", "pullRequest"] {
+                assert!(!payload.contains(field), "unexpected field {field}");
+            }
+        }
+    }
+
+    #[test]
+    fn graphql_source_binds_observed_provenance_to_every_page() {
+        let first_page = graphql_page_with_cursor(7, true, Some("opaque cursor/+=="));
+        let first_traversal = collect_paged_fixture(vec![
+            first_page.clone(),
+            graphql_page_with_cursor(8, false, None),
+        ]);
+        let second_traversal = collect_paged_fixture(vec![
+            first_page.clone(),
+            graphql_page_with_cursor(9, false, None),
+        ]);
+        let same_input_control =
+            collect_paged_fixture(vec![first_page, graphql_page_with_cursor(8, false, None)]);
+
+        assert_ne!(
+            first_traversal.issues(),
+            second_traversal.issues(),
+            "the fixture traversals must return different terminal metadata"
+        );
+        assert_ne!(
+            first_traversal.snapshot(),
+            second_traversal.snapshot(),
+            "complete traversals must have different observed provenance"
+        );
+        assert_ne!(
+            first_traversal.provenance().snapshot(),
+            second_traversal.provenance().snapshot(),
+            "provenance must include every accepted page"
+        );
+        assert_eq!(first_traversal.snapshot(), same_input_control.snapshot());
+        assert_eq!(
+            first_traversal.provenance(),
+            same_input_control.provenance()
+        );
+    }
+
+    #[test]
+    fn graphql_source_rejects_invalid_or_contradictory_page_info_cursors() {
+        let cases = [
+            (
+                "missing",
+                graphql_page_with_cursor(7, true, None),
+                GitHubIntakeErrorKind::PageInfoContradiction,
+            ),
+            (
+                "empty",
+                graphql_page(true).replace(
+                    "\"endCursor\": \"opaque-page-cursor\"",
+                    "\"endCursor\": \"\"",
+                ),
+                GitHubIntakeErrorKind::InvalidCursor,
+            ),
+            (
+                "control",
+                graphql_page(true).replace(
+                    "\"endCursor\": \"opaque-page-cursor\"",
+                    "\"endCursor\": \"bad\\u0001value\"",
+                ),
+                GitHubIntakeErrorKind::InvalidCursor,
+            ),
+            (
+                "oversized",
+                graphql_page(true).replace(
+                    "\"endCursor\": \"opaque-page-cursor\"",
+                    &format!("\"endCursor\": \"{}\"", "x".repeat(513)),
+                ),
+                GitHubIntakeErrorKind::InvalidCursor,
+            ),
+        ];
+        for (label, payload, expected_kind) in cases {
+            let error = collect_fixture("200 OK", &[], payload, false)
+                .expect_err("invalid pageInfo cursor must fail closed");
+            assert_eq!(error.kind(), expected_kind, "{label}");
+        }
     }
 }
