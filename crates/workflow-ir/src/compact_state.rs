@@ -70,7 +70,9 @@ pub struct StateEntry {
     pub contradicts: BTreeSet<String>,
 }
 
-/// An additive delta. There is no delete or winner-selection operation.
+/// An additive, self-contained delta. Every source referenced by provenance
+/// must be repeated in `sources`; there is no delete or winner-selection
+/// operation.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateDelta {
@@ -190,7 +192,7 @@ impl CompactState {
         &self.sources
     }
 
-    /// Atomically apply an additive delta; no input is mutated on rejection.
+    /// Atomically apply a self-contained additive delta; no input is mutated on rejection.
     pub fn apply(&self, delta: &StateDelta) -> Result<Self, StateError> {
         let mut next = self.clone();
         for (source_id, source) in &delta.sources {
@@ -217,6 +219,9 @@ impl CompactState {
                 return Err(StateError::Entry);
             }
             for provenance in &entry.provenance {
+                if !delta.sources.contains_key(&provenance.source) {
+                    return Err(StateError::Source);
+                }
                 let source = next
                     .sources
                     .get(&provenance.source)

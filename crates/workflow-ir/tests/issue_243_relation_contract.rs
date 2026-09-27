@@ -6,6 +6,12 @@ use workflow_ir::compact_state::{
 };
 
 const ARTIFACT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const LINK_ONE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const LINK_TWO: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const LINK_THREE: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const LINK_FOUR: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const LINK_FIVE: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+const LINK_SIX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 fn sources() -> SourceIndex {
     BTreeMap::from([(
@@ -44,6 +50,154 @@ fn delta(entries: Vec<StateEntry>) -> StateDelta {
 
 fn serialized_delta(entry: StateEntry) -> serde_json::Value {
     serde_json::to_value(delta(vec![entry])).expect("serialize fixture")
+}
+
+fn history_entry(start: u64, supersedes: &str, contradicts: &str) -> StateEntry {
+    let mut entry = entry(EntryKind::Fact, "task", "plan", "same text");
+    entry.provenance = BTreeSet::from([SourceRef {
+        source: "notes".to_owned(),
+        artifact_id: ARTIFACT.to_owned(),
+        start,
+        end: start + 16,
+    }]);
+    entry.supersedes.insert(supersedes.to_owned());
+    entry.contradicts.insert(contradicts.to_owned());
+    entry
+}
+
+#[test]
+fn self_contained_delta_roundtrips_and_applies_to_existing_source() {
+    let base = CompactState::default()
+        .apply(&delta(vec![entry(
+            EntryKind::Fact,
+            "task",
+            "plan",
+            "ship now",
+        )]))
+        .expect("base state");
+    let addition = entry(EntryKind::Fact, "task", "plan", "ship later");
+    let encoded = serde_json::to_string(&delta(vec![addition])).expect("serialize delta");
+    let decoded: StateDelta = serde_json::from_str(&encoded).expect("deserialize delta");
+
+    let updated = base
+        .apply(&decoded)
+        .expect("self-contained delta applies with an existing source");
+    assert_eq!(updated.entries().len(), 2);
+    assert_eq!(updated.sources(), &sources());
+}
+
+#[test]
+fn apply_rejects_delta_with_omitted_preexisting_source() {
+    let base = CompactState::default()
+        .apply(&delta(vec![entry(
+            EntryKind::Fact,
+            "task",
+            "plan",
+            "ship now",
+        )]))
+        .expect("base state");
+    let addition = entry(EntryKind::Fact, "task", "plan", "ship later");
+    let mut omitted_source = delta(vec![addition]);
+    omitted_source.sources.clear();
+
+    assert_eq!(base.apply(&omitted_source), Err(StateError::Source));
+
+    let encoded = serde_json::to_string(&omitted_source).expect("serialize invalid delta");
+    let direct_error =
+        serde_json::from_str::<StateDelta>(&encoded).expect_err("missing source must not decode");
+    assert!(
+        direct_error
+            .to_string()
+            .contains(&StateError::Source.to_string())
+    );
+}
+
+#[test]
+fn same_identity_union_retains_exact_history_in_any_order() {
+    let first = history_entry(0, LINK_ONE, LINK_TWO);
+    let second = history_entry(16, LINK_THREE, LINK_FOUR);
+    let third = history_entry(32, LINK_FIVE, LINK_SIX);
+    let first_id = entry_id(&first).expect("identity");
+
+    let first_state = CompactState::default()
+        .apply(&delta(vec![first.clone()]))
+        .expect("first state");
+    let second_state = CompactState::default()
+        .apply(&delta(vec![second.clone()]))
+        .expect("second state");
+    let third_state = CompactState::default()
+        .apply(&delta(vec![third.clone()]))
+        .expect("third state");
+
+    let assert_exact_history = |state: &CompactState, expected: &[&StateEntry]| {
+        let retained = state.entries().get(&first_id).expect("same identity");
+        let expected_provenance = expected
+            .iter()
+            .flat_map(|entry| entry.provenance.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let expected_supersedes = expected
+            .iter()
+            .flat_map(|entry| entry.supersedes.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let expected_contradicts = expected
+            .iter()
+            .flat_map(|entry| entry.contradicts.iter().cloned())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(state.entries().len(), 1);
+        assert_eq!(retained.provenance, expected_provenance);
+        assert_eq!(retained.supersedes, expected_supersedes);
+        assert_eq!(retained.contradicts, expected_contradicts);
+    };
+
+    let forward = first_state.union(&second_state).expect("forward union");
+    let reverse = second_state.union(&first_state).expect("reverse union");
+    assert_exact_history(&forward, &[&first, &second]);
+    assert_exact_history(&reverse, &[&first, &second]);
+    assert_eq!(forward, reverse);
+    assert_eq!(
+        forward.to_json().expect("forward JSON"),
+        reverse.to_json().expect("reverse JSON")
+    );
+
+    let idempotent = forward.union(&forward).expect("idempotent union");
+    assert_eq!(idempotent, forward);
+    assert_eq!(
+        idempotent.to_json().expect("idempotent JSON"),
+        forward.to_json().expect("forward JSON")
+    );
+
+    let left_associated = forward.union(&third_state).expect("left association");
+    let right_associated = first_state
+        .union(&second_state.union(&third_state).expect("inner union"))
+        .expect("right association");
+    assert_exact_history(&left_associated, &[&first, &second, &third]);
+    assert_exact_history(&right_associated, &[&first, &second, &third]);
+    assert_eq!(left_associated, right_associated);
+    assert_eq!(
+        left_associated.to_json().expect("left JSON"),
+        right_associated.to_json().expect("right JSON")
+    );
+}
+
+#[test]
+fn scope_and_key_each_contribute_to_identity() {
+    let base = entry(EntryKind::Fact, "task", "plan", "ship now");
+    let different_scope = entry(EntryKind::Fact, "other", "plan", "ship now");
+    let different_key = entry(EntryKind::Fact, "task", "other", "ship now");
+    let base_id = entry_id(&base).expect("base identity");
+    let scope_id = entry_id(&different_scope).expect("scope identity");
+    let key_id = entry_id(&different_key).expect("key identity");
+
+    let state = CompactState::default()
+        .apply(&delta(vec![base, different_scope, different_key]))
+        .expect("independent identity dimensions");
+
+    assert_eq!(state.entries().len(), 3);
+    assert_ne!(base_id, scope_id);
+    assert_ne!(base_id, key_id);
+    assert_ne!(scope_id, key_id);
+    assert!(state.relations().is_empty(), "relations must be explicit");
 }
 
 #[test]
