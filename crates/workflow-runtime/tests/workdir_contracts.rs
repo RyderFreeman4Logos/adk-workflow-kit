@@ -127,7 +127,8 @@ fn successful_allocation_has_the_exact_private_layout() {
         id.bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     );
-    assert_eq!(workdir.root(), base.path().join(id));
+    let canonical_base = fs::canonicalize(base.path()).expect("test base must canonicalize");
+    assert_eq!(workdir.root(), canonical_base.join(id));
     assert_eq!(
         workdir.manifest_path(),
         workdir.root().join("manifest.json")
