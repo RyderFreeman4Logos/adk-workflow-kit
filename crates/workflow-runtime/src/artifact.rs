@@ -22,6 +22,23 @@ fn next_capability() -> NonZeroU64 {
         .expect("artifact instance capability must not wrap")
 }
 
+#[cfg(test)]
+static FAIL_TEMPORARY_UNLINK: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+fn remove_temporary(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let mut injected = FAIL_TEMPORARY_UNLINK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if injected.as_deref() == Some(path) {
+            injected.take();
+            return Err(io::Error::other("injected temporary unlink failure"));
+        }
+    }
+    fs::remove_file(path)
+}
+
 /// An opaque content identifier derived from stored bytes.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -164,7 +181,9 @@ impl std::error::Error for ArtifactError {}
 /// work; committing performs only the atomic visibility transition. Dropping
 /// an uncommitted staged artifact removes any staged filesystem state, so a
 /// run rejected after preparation can never leave a partial or visible
-/// artifact behind.
+/// artifact behind. Once the final path is visible, cleanup of its private
+/// temporary link is best effort: a cleanup error does not turn a successful
+/// publication into a failed commit, and the leftover link is safe to reclaim.
 pub struct StagedArtifact {
     id: ArtifactId,
     state: Option<StagedState>,
@@ -228,7 +247,7 @@ impl fmt::Debug for StagedArtifact {
 impl Drop for StagedArtifact {
     fn drop(&mut self) {
         if let Some(StagedState::File { temporary }) = self.state.take() {
-            let _ = fs::remove_file(temporary);
+            let _ = remove_temporary(&temporary);
         }
     }
 }
@@ -244,7 +263,9 @@ pub trait ArtifactStore {
     fn stage(&mut self, bytes: &[u8]) -> Result<StagedArtifact, ArtifactError>;
 
     /// Atomically commits a staged artifact, making exactly one final path
-    /// visible. The staged artifact is consumed exactly once.
+    /// visible. The staged artifact is consumed exactly once. If the final
+    /// path is visible, cleanup of its temporary link is best effort and
+    /// cannot make the commit fail.
     fn commit(&mut self, staged: StagedArtifact) -> Result<ArtifactId, ArtifactError>;
 
     /// Stores `bytes` as one stage-then-commit sequence for callers without a
@@ -409,8 +430,9 @@ impl ArtifactStore for InMemoryArtifactStore {
 ///
 /// Each stored artifact is one file named by its lowercase hex SHA-256 ID,
 /// so hostile bytes never reach the filesystem path. Writes are atomic
-/// (temp + fsync + no-replace link); retention is metadata kept alongside the store
-/// and never triggers deletion.
+/// (temp + fsync + no-replace link); post-publication temporary-link cleanup is
+/// best effort; retention is metadata kept alongside the store and never
+/// triggers deletion.
 pub struct FilesystemArtifactStore {
     root: PathBuf,
     retention: HashMap<ArtifactId, RetentionPolicy>,
@@ -520,14 +542,16 @@ impl ArtifactStore for FilesystemArtifactStore {
             StagedState::File { temporary } => {
                 let final_path = self.path_for(&id);
                 match fs::hard_link(temporary, &final_path) {
-                    Ok(()) => fs::remove_file(temporary).map_err(Self::storage_error)?,
+                    Ok(()) => {
+                        let _ = remove_temporary(temporary);
+                    }
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                         let existing = fs::read(&final_path).map_err(Self::storage_error)?;
                         let staged_bytes = fs::read(temporary).map_err(Self::storage_error)?;
                         if existing != staged_bytes {
                             return Err(ArtifactError::new(ArtifactErrorKind::ContentIdCollision));
                         }
-                        fs::remove_file(temporary).map_err(Self::storage_error)?;
+                        let _ = remove_temporary(temporary);
                     }
                     Err(error) => return Err(Self::storage_error(error)),
                 }
@@ -609,14 +633,45 @@ impl ArtifactStore for FilesystemArtifactStore {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
+    use std::{
+        fs,
+        num::NonZeroU64,
+        path::{Path, PathBuf},
+        sync::{Arc, Barrier},
+    };
 
     use sha2::{Digest, Sha256};
 
     use super::{
-        ArtifactErrorKind, ArtifactId, ArtifactStore, Entry, InMemoryArtifactStore, RetentionPolicy,
+        ArtifactErrorKind, ArtifactId, ArtifactStore, Entry, FilesystemArtifactStore,
+        InMemoryArtifactStore, RetentionPolicy,
     };
     use crate::encode_hex;
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "workflow-runtime-artifact-{}-{}",
+                std::process::id(),
+                super::next_capability().get()
+            ));
+            fs::create_dir(&path).expect("artifact test root must be created");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn filesystem_store(root: &Path) -> FilesystemArtifactStore {
+        let limit = NonZeroU64::new(64 * 1024).expect("positive test limit");
+        FilesystemArtifactStore::new(root, limit, limit)
+    }
 
     #[test]
     fn content_id_collisions_fail_closed_without_replacing_bytes() {
@@ -646,6 +701,80 @@ mod tests {
                 .expect("the colliding entry must remain")
                 .bytes,
             b"existing"
+        );
+    }
+
+    #[test]
+    fn post_publish_cleanup_failure_still_commits_visible_content() {
+        let root = TestRoot::new();
+        let mut store = filesystem_store(&root.0);
+        let staged = store
+            .stage(b"published after cleanup failure")
+            .expect("staging must succeed");
+        let id = staged.id().clone();
+        let temporary = match staged.state.as_ref().expect("staged state") {
+            super::StagedState::File { temporary } => temporary.clone(),
+            super::StagedState::Memory { .. } => panic!("filesystem staging must use a file"),
+        };
+        super::FAIL_TEMPORARY_UNLINK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(temporary);
+
+        let committed = store
+            .commit(staged)
+            .expect("publication makes commit successful even if cleanup fails");
+        assert_eq!(committed, id);
+        assert_eq!(
+            fs::read(root.0.join(id.as_str())).unwrap(),
+            b"published after cleanup failure"
+        );
+        assert_eq!(store.put(b"published after cleanup failure").unwrap(), id);
+    }
+
+    #[test]
+    fn before_publication_collision_remains_an_error() {
+        let root = TestRoot::new();
+        let mut store = filesystem_store(&root.0);
+        let staged = store.stage(b"new content").expect("staging must succeed");
+        let id = staged.id().clone();
+        let final_path = root.0.join(id.as_str());
+        fs::write(&final_path, b"different content").expect("collision fixture must write");
+
+        let error = store
+            .commit(staged)
+            .expect_err("a pre-publication content collision must remain an error");
+        assert_eq!(error.kind(), ArtifactErrorKind::ContentIdCollision);
+        assert_eq!(fs::read(final_path).unwrap(), b"different content");
+    }
+
+    #[test]
+    fn concurrent_same_digest_writers_both_commit_idempotently() {
+        let root = TestRoot::new();
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let root = root.0.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut store = filesystem_store(&root);
+                    let staged = store.stage(b"same concurrent content").expect("staging");
+                    barrier.wait();
+                    store
+                        .commit(staged)
+                        .expect("same content must be idempotent")
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("writer must not panic"))
+            .collect::<Vec<ArtifactId>>();
+
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(
+            fs::read(root.0.join(ids[0].as_str())).unwrap(),
+            b"same concurrent content"
         );
     }
 }
