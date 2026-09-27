@@ -2,6 +2,8 @@
 
 use std::collections::BTreeSet;
 
+use sha2::{Digest, Sha256};
+
 use crate::security::TrustPolicy;
 
 const MAX_REPOSITORY_LENGTH: usize = 256;
@@ -101,6 +103,7 @@ impl GitHubRateLimit {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitHubMetadataPage {
     snapshot: String,
+    page_identity: Option<String>,
     issues: Vec<GitHubIssueMetadata>,
     has_next_page: bool,
     end_cursor: Option<String>,
@@ -126,11 +129,20 @@ impl GitHubMetadataPage {
     ) -> Result<Self, GitHubIntakeError> {
         Ok(Self {
             snapshot: valid_text(snapshot.into(), MAX_SNAPSHOT_LENGTH)?,
+            page_identity: None,
             issues,
             has_next_page,
             end_cursor: valid_cursor(end_cursor)?,
             rate_limit,
         })
+    }
+
+    pub fn with_page_identity(
+        mut self,
+        page_identity: impl Into<String>,
+    ) -> Result<Self, GitHubIntakeError> {
+        self.page_identity = Some(valid_text(page_identity.into(), MAX_SNAPSHOT_LENGTH)?);
+        Ok(self)
     }
 
     pub fn end_cursor(&self) -> Option<&str> {
@@ -356,6 +368,7 @@ where
     let repository = valid_text(repository.into(), MAX_REPOSITORY_LENGTH)?;
     let mut page_number = 1;
     let mut expected_snapshot = None;
+    let mut page_identities = Some(Vec::new());
     let mut cursor = None;
     let mut seen_cursors = BTreeSet::new();
     let mut issues = Vec::new();
@@ -400,6 +413,11 @@ where
         } else {
             expected_snapshot = Some(page.snapshot.clone());
         }
+        match (&mut page_identities, page.page_identity) {
+            (Some(identities), Some(identity)) => identities.push(identity),
+            (Some(_), None) => page_identities = None,
+            (None, _) => {}
+        }
 
         for issue in page.issues {
             if issue.is_pull_request {
@@ -421,7 +439,19 @@ where
         }
 
         if !page.has_next_page {
-            let snapshot = expected_snapshot.expect("a source page always establishes a snapshot");
+            let snapshot = match page_identities {
+                Some(identities) if identities.len() > 1 => {
+                    let mut digest = Sha256::new();
+                    for identity in identities {
+                        digest.update((identity.len() as u64).to_be_bytes());
+                        digest.update(identity.as_bytes());
+                    }
+                    format!("github-observed-traversal:{:x}", digest.finalize())
+                }
+                Some(_) | None => {
+                    expected_snapshot.expect("a source page always establishes a snapshot")
+                }
+            };
             return Ok(GitHubMetadataSnapshot {
                 repository: repository.clone(),
                 snapshot: snapshot.clone(),

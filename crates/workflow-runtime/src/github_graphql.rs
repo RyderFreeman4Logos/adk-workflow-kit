@@ -23,8 +23,8 @@ const GRAPHQL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const GRAPHQL_FIXTURE_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// Metadata-only GitHub GraphQL intake. The response identity is deliberately
-/// labeled as one-page response provenance, not an immutable repository snapshot.
+/// Metadata-only GitHub GraphQL intake. Response identities are labeled as
+/// observed page/traversal provenance, not immutable repository snapshots.
 pub struct GitHubGraphqlMetadataSource {
     client: Client,
     endpoint: String,
@@ -201,17 +201,20 @@ impl GitHubGraphqlMetadataSource {
             .map_err(|_| GitHubIntakeError::source_unavailable())?;
             metadata.push(issue);
         }
-        let snapshot = request.snapshot().map(str::to_owned).unwrap_or_else(|| {
-            let digest = Sha256::digest(&bytes);
-            format!("github-graphql-one-page-response:{digest:x}")
-        });
+        let digest = Sha256::digest(&bytes);
+        let page_identity = format!("github-graphql-page-response:{digest:x}");
+        let snapshot = request
+            .snapshot()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("github-graphql-one-page-response:{digest:x}"));
         GitHubMetadataPage::with_end_cursor(
             snapshot,
             metadata,
             issues.page_info.has_next_page,
             issues.page_info.end_cursor,
             GitHubRateLimit::new(remaining, reset),
-        )
+        )?
+        .with_page_identity(page_identity)
     }
 }
 
@@ -757,6 +760,24 @@ mod tests {
         assert!(handle.is_finished(), "paged fixture join timed out");
         handle.join().expect("paged fixture thread panicked");
         requests
+    }
+
+    fn collect_paged_fixture(payloads: Vec<String>) -> GitHubMetadataSnapshot {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+        let address = listener.local_addr().expect("fixture address");
+        let (receiver, handle) = spawn_paged_fixture(listener, payloads.clone());
+        let mut source =
+            GitHubGraphqlMetadataSource::local_fixture(address, "opaque-fixture-credential")
+                .expect("fixture source");
+        let snapshot = collect_github_metadata(
+            "acme/widget",
+            &mut source,
+            GitHubIntakeLimits::new(payloads.len() as u32, 10, 10).expect("limits"),
+        )
+        .expect("paged metadata snapshot");
+        let requests = finish_paged_fixture(receiver, handle);
+        assert_eq!(requests.len(), payloads.len());
+        snapshot
     }
 
     fn accept_fixture(listener: &TcpListener) -> io::Result<TcpStream> {
@@ -1335,7 +1356,7 @@ mod tests {
         assert!(
             snapshot
                 .snapshot()
-                .starts_with("github-graphql-one-page-response:")
+                .starts_with("github-observed-traversal:")
         );
         let first_payload = requests[0]
             .split_once("\r\n\r\n")
@@ -1353,6 +1374,42 @@ mod tests {
                 assert!(!payload.contains(field), "unexpected field {field}");
             }
         }
+    }
+
+    #[test]
+    fn graphql_source_binds_observed_provenance_to_every_page() {
+        let first_page = graphql_page_with_cursor(7, true, Some("opaque cursor/+=="));
+        let first_traversal = collect_paged_fixture(vec![
+            first_page.clone(),
+            graphql_page_with_cursor(8, false, None),
+        ]);
+        let second_traversal = collect_paged_fixture(vec![
+            first_page.clone(),
+            graphql_page_with_cursor(9, false, None),
+        ]);
+        let same_input_control =
+            collect_paged_fixture(vec![first_page, graphql_page_with_cursor(8, false, None)]);
+
+        assert_ne!(
+            first_traversal.issues(),
+            second_traversal.issues(),
+            "the fixture traversals must return different terminal metadata"
+        );
+        assert_ne!(
+            first_traversal.snapshot(),
+            second_traversal.snapshot(),
+            "complete traversals must have different observed provenance"
+        );
+        assert_ne!(
+            first_traversal.provenance().snapshot(),
+            second_traversal.provenance().snapshot(),
+            "provenance must include every accepted page"
+        );
+        assert_eq!(first_traversal.snapshot(), same_input_control.snapshot());
+        assert_eq!(
+            first_traversal.provenance(),
+            same_input_control.provenance()
+        );
     }
 
     #[test]
