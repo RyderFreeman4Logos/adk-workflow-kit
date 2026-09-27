@@ -7,6 +7,7 @@ use crate::security::TrustPolicy;
 const MAX_REPOSITORY_LENGTH: usize = 256;
 const MAX_SNAPSHOT_LENGTH: usize = 256;
 const MAX_METADATA_TEXT_LENGTH: usize = 512;
+const MAX_CURSOR_LENGTH: usize = 512;
 const MAX_PAGES: u32 = 1_000;
 const MAX_PER_PAGE: u16 = 100;
 const MAX_ITEMS: usize = 100_000;
@@ -102,6 +103,7 @@ pub struct GitHubMetadataPage {
     snapshot: String,
     issues: Vec<GitHubIssueMetadata>,
     has_next_page: bool,
+    end_cursor: Option<String>,
     rate_limit: GitHubRateLimit,
 }
 
@@ -112,12 +114,27 @@ impl GitHubMetadataPage {
         has_next_page: bool,
         rate_limit: GitHubRateLimit,
     ) -> Result<Self, GitHubIntakeError> {
+        Self::with_end_cursor(snapshot, issues, has_next_page, None, rate_limit)
+    }
+
+    pub fn with_end_cursor(
+        snapshot: impl Into<String>,
+        issues: Vec<GitHubIssueMetadata>,
+        has_next_page: bool,
+        end_cursor: Option<String>,
+        rate_limit: GitHubRateLimit,
+    ) -> Result<Self, GitHubIntakeError> {
         Ok(Self {
             snapshot: valid_text(snapshot.into(), MAX_SNAPSHOT_LENGTH)?,
             issues,
             has_next_page,
+            end_cursor: valid_cursor(end_cursor)?,
             rate_limit,
         })
+    }
+
+    pub fn end_cursor(&self) -> Option<&str> {
+        self.end_cursor.as_deref()
     }
 }
 
@@ -127,6 +144,7 @@ pub struct GitHubMetadataPageRequest {
     page: u32,
     per_page: u16,
     snapshot: Option<String>,
+    cursor: Option<String>,
 }
 
 impl GitHubMetadataPageRequest {
@@ -144,6 +162,10 @@ impl GitHubMetadataPageRequest {
 
     pub fn snapshot(&self) -> Option<&str> {
         self.snapshot.as_deref()
+    }
+
+    pub fn cursor(&self) -> Option<&str> {
+        self.cursor.as_deref()
     }
 }
 
@@ -245,6 +267,9 @@ impl GitHubMetadataSnapshot {
 pub enum GitHubIntakeErrorKind {
     InvalidRequest,
     InvalidMetadata,
+    InvalidCursor,
+    CursorReplayed,
+    PageInfoContradiction,
     SnapshotChanged,
     DuplicateIssue,
     PageOverflow,
@@ -271,6 +296,27 @@ impl GitHubIntakeError {
     fn invalid_metadata() -> Self {
         Self {
             kind: GitHubIntakeErrorKind::InvalidMetadata,
+            retry_after_seconds: None,
+        }
+    }
+
+    fn invalid_cursor() -> Self {
+        Self {
+            kind: GitHubIntakeErrorKind::InvalidCursor,
+            retry_after_seconds: None,
+        }
+    }
+
+    fn cursor_replayed() -> Self {
+        Self {
+            kind: GitHubIntakeErrorKind::CursorReplayed,
+            retry_after_seconds: None,
+        }
+    }
+
+    pub(crate) fn page_info_contradiction() -> Self {
+        Self {
+            kind: GitHubIntakeErrorKind::PageInfoContradiction,
             retry_after_seconds: None,
         }
     }
@@ -310,6 +356,8 @@ where
     let repository = valid_text(repository.into(), MAX_REPOSITORY_LENGTH)?;
     let mut page_number = 1;
     let mut expected_snapshot = None;
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
     let mut issues = Vec::new();
     let mut seen_numbers = BTreeSet::new();
 
@@ -319,6 +367,7 @@ where
             page: page_number,
             per_page: limits.per_page,
             snapshot: expected_snapshot.clone(),
+            cursor: cursor.clone(),
         };
         let page = source.list_page(&request)?;
         if page.issues.len() > limits.per_page as usize {
@@ -326,6 +375,19 @@ where
                 kind: GitHubIntakeErrorKind::PageOverflow,
                 retry_after_seconds: None,
             });
+        }
+
+        if page.has_next_page && page.end_cursor.is_none() {
+            return Err(GitHubIntakeError::page_info_contradiction());
+        }
+        let cursor_replayed = page.end_cursor.as_ref().is_some_and(|end_cursor| {
+            cursor.as_deref() == Some(end_cursor) || seen_cursors.contains(end_cursor)
+        });
+        if cursor_replayed {
+            return Err(GitHubIntakeError::cursor_replayed());
+        }
+        if let Some(end_cursor) = &page.end_cursor {
+            seen_cursors.insert(end_cursor.clone());
         }
 
         if let Some(expected) = &expected_snapshot {
@@ -380,6 +442,7 @@ where
                 retry_after_seconds: None,
             });
         }
+        cursor = page.end_cursor;
         page_number += 1;
     }
 }
@@ -425,4 +488,18 @@ fn valid_text(value: String, max_length: usize) -> Result<String, GitHubIntakeEr
         return Err(GitHubIntakeError::invalid_metadata());
     }
     Ok(value)
+}
+
+fn valid_cursor(cursor: Option<String>) -> Result<Option<String>, GitHubIntakeError> {
+    cursor
+        .map(|cursor| {
+            if cursor.is_empty()
+                || cursor.len() > MAX_CURSOR_LENGTH
+                || cursor.chars().any(char::is_control)
+            {
+                return Err(GitHubIntakeError::invalid_cursor());
+            }
+            Ok(cursor)
+        })
+        .transpose()
 }
