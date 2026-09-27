@@ -1,7 +1,11 @@
 //! Deterministic, source-addressed continuation state with explicit history links.
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{MapAccess, Visitor},
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 /// The only wire version admitted by this reducer.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -26,7 +30,8 @@ impl From<StateVersion> for u32 {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceRecord {
-    /// Lowercase hexadecimal SHA-256 digest of the retained artifact.
+    /// Caller-asserted lowercase hexadecimal SHA-256 digest of the retained
+    /// artifact; this IR does not verify it against external artifact bytes.
     pub artifact_id: String,
     /// Producer-asserted byte length; external artifact bytes are not available
     /// to this IR, so callers must verify this assertion against the artifact.
@@ -85,8 +90,46 @@ pub struct StateDelta {
 #[serde(deny_unknown_fields)]
 struct StateDeltaWire {
     schema_version: StateVersion,
-    sources: SourceIndex,
+    #[serde(deserialize_with = "deserialize_source_index")]
+    sources: SourceIndexWire,
     entries: Vec<StateEntry>,
+}
+
+struct SourceIndexWire {
+    sources: SourceIndex,
+    has_duplicate: bool,
+}
+
+fn deserialize_source_index<'de, D>(deserializer: D) -> Result<SourceIndexWire, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct SourceIndexVisitor;
+
+    impl<'de> Visitor<'de> for SourceIndexVisitor {
+        type Value = SourceIndexWire;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a source object with unique logical IDs")
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut sources = BTreeMap::new();
+            let mut has_duplicate = false;
+            while let Some((source_id, source)) = map.next_entry::<String, SourceRecord>()? {
+                has_duplicate |= sources.insert(source_id, source).is_some();
+            }
+            Ok(SourceIndexWire {
+                sources,
+                has_duplicate,
+            })
+        }
+    }
+
+    deserializer.deserialize_map(SourceIndexVisitor)
 }
 
 /// Closed errors that do not include untrusted source text or identifiers.
@@ -146,12 +189,15 @@ impl From<CompactState> for StateDelta {
 }
 
 impl StateDelta {
-    fn from_wire(wire: StateDeltaWire) -> Self {
-        Self {
-            schema_version: wire.schema_version,
-            sources: wire.sources,
-            entries: wire.entries,
+    fn from_wire(wire: StateDeltaWire) -> Result<Self, StateError> {
+        if wire.sources.has_duplicate {
+            return Err(StateError::Source);
         }
+        Ok(Self {
+            schema_version: wire.schema_version,
+            sources: wire.sources.sources,
+            entries: wire.entries,
+        })
     }
 }
 
@@ -160,7 +206,8 @@ impl<'de> Deserialize<'de> for StateDelta {
     where
         D: serde::Deserializer<'de>,
     {
-        let delta = StateDelta::from_wire(StateDeltaWire::deserialize(deserializer)?);
+        let delta = StateDelta::from_wire(StateDeltaWire::deserialize(deserializer)?)
+            .map_err(<D::Error as serde::de::Error>::custom)?;
         CompactState::try_from(delta.clone()).map_err(<D::Error as serde::de::Error>::custom)?;
         Ok(delta)
     }
@@ -279,7 +326,7 @@ impl CompactState {
     pub fn from_json(document: &str) -> Result<Self, StateError> {
         let wire: StateDeltaWire =
             serde_json::from_str(document).map_err(|_| StateError::Document)?;
-        Self::try_from(StateDelta::from_wire(wire))
+        Self::try_from(StateDelta::from_wire(wire)?)
     }
 
     /// Return every explicit link in stable source/kind/target order.

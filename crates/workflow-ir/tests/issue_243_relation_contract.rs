@@ -75,9 +75,16 @@ fn self_contained_delta_roundtrips_and_applies_to_existing_source() {
             "ship now",
         )]))
         .expect("base state");
-    let addition = entry(EntryKind::Fact, "task", "plan", "ship later");
-    let encoded = serde_json::to_string(&delta(vec![addition])).expect("serialize delta");
+    let mut addition = entry(EntryKind::Fact, "task", "plan", "ship later");
+    addition.supersedes.insert(LINK_ONE.to_owned());
+    addition.contradicts.insert(LINK_TWO.to_owned());
+    let expected = delta(vec![addition]);
+    let encoded = serde_json::to_string(&expected).expect("serialize delta");
     let decoded: StateDelta = serde_json::from_str(&encoded).expect("deserialize delta");
+    assert_eq!(
+        decoded, expected,
+        "direct wire decode preserves the full delta"
+    );
 
     let updated = base
         .apply(&decoded)
@@ -282,6 +289,42 @@ fn exact_whitespace_history_is_retained() {
                 .any(|retained| retained.text == second)
         );
     }
+}
+
+#[test]
+fn duplicate_source_ids_are_rejected_by_both_wire_entrypoints() {
+    let encoded = format!(
+        r#"{{
+            "schema_version": 1,
+            "sources": {{
+                "notes": {{"artifact_id": "{ARTIFACT}", "byte_len": 1}},
+                "notes": {{"artifact_id": "{LINK_ONE}", "byte_len": 1}}
+            }},
+            "entries": [{{
+                "kind": "fact",
+                "scope": "task",
+                "key": "plan",
+                "text": "x",
+                "provenance": [{{
+                    "source": "notes",
+                    "artifact_id": "{LINK_ONE}",
+                    "start": 0,
+                    "end": 1
+                }}],
+                "supersedes": [],
+                "contradicts": []
+            }}]
+        }}"#
+    );
+
+    assert_eq!(CompactState::from_json(&encoded), Err(StateError::Source));
+    let direct_error = serde_json::from_str::<StateDelta>(&encoded)
+        .expect_err("duplicate source IDs must not decode")
+        .to_string();
+    assert!(
+        direct_error.contains(&StateError::Source.to_string()),
+        "unexpected direct error: {direct_error}"
+    );
 }
 
 #[test]
