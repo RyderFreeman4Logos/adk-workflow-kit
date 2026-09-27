@@ -26,7 +26,7 @@ const MAX_DELTA_BYTES: usize = 4 * 1024 * 1024;
 /// The publication boundary reached before a compact-state exchange failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompactStatePublicationPhase {
-    /// The canonical delta is visible, but the typed envelope is not.
+    /// The canonical delta commit boundary was reached; envelope visibility is unknown.
     PostDeltaCommit,
 }
 
@@ -64,7 +64,7 @@ impl fmt::Debug for CompactStatePartialPublication {
 pub enum CompactStateExchangeError {
     /// The artifact store rejected a read or write.
     Artifact,
-    /// The delta was committed, but the envelope was not published.
+    /// The delta commit boundary was reached; envelope visibility is not established.
     PartialPublication(CompactStatePartialPublication),
     /// The typed envelope failed structural or admission validation.
     InvalidEnvelope,
@@ -197,8 +197,8 @@ impl SourcePage {
 /// Both artifacts are staged before either is committed. `ArtifactStore` does
 /// not provide a transaction spanning the two commits, so a failure after the
 /// delta commit intentionally retains that content-addressed delta. Callers
-/// own retrying the same delta; its stable ID makes the retry idempotent. An
-/// Any failure after the delta commit returns that canonical ID in
+/// own retrying the same delta; its stable ID makes the retry idempotent. Any
+/// failure after the delta commit returns that canonical ID in
 /// `PartialPublication`, including a store that reports the wrong ID after
 /// making content visible. Staging and previsibility commit failures remain
 /// `Artifact` under the store's commit-error contract.
@@ -208,6 +208,9 @@ pub fn publish_compact_state_delta<S: ArtifactStore>(
     to: WorkflowExchange,
     delta: &StateDelta,
 ) -> Result<CompactStateReceipt, CompactStateExchangeError> {
+    CompactState::default()
+        .apply(delta)
+        .map_err(|_| CompactStateExchangeError::InvalidStateDelta)?;
     let bytes =
         serde_json::to_vec(delta).map_err(|_| CompactStateExchangeError::InvalidStateDelta)?;
     if bytes.is_empty() || bytes.len() > MAX_DELTA_BYTES {
@@ -274,14 +277,12 @@ pub fn consume_compact_state_delta<S: ArtifactStore>(
     expected_op: &str,
     state: &mut CompactState,
 ) -> Result<CompactStateReceipt, CompactStateExchangeError> {
-    let payload = to
-        .consume(from, store, envelope_artifact)
-        .map_err(map_typed_error)?;
+    let envelope = read_artifact(store, envelope_artifact, MAX_EXCHANGE_BYTES)?;
+    let payload = to.consume_bytes(from, &envelope).map_err(map_typed_error)?;
     if !matches!(payload, TypedPayload::CompactState(_)) {
         return Err(CompactStateExchangeError::WrongPayload);
     }
 
-    let envelope = read_artifact(store, envelope_artifact, MAX_EXCHANGE_BYTES)?;
     let (key, op, delta_artifact) = extract_compact_state_ref(&envelope)?;
     if key != expected_key {
         return Err(CompactStateExchangeError::WrongKey);
@@ -333,7 +334,6 @@ pub fn read_source_ref_page<S: ArtifactStore>(
     if ArtifactId::parse(source_ref.artifact_id.clone()).is_none() {
         return Err(CompactStateExchangeError::SourceBinding);
     }
-    verify_artifact(store, &artifact_id, record.byte_len)?;
 
     let span_len = source_ref
         .end
@@ -342,54 +342,42 @@ pub fn read_source_ref_page<S: ArtifactStore>(
     if relative_offset > span_len {
         return Err(CompactStateExchangeError::InvalidSpan);
     }
+    let absolute_offset = source_ref
+        .start
+        .checked_add(relative_offset)
+        .ok_or(CompactStateExchangeError::InvalidSpan)?;
     if relative_offset == span_len {
+        verify_artifact(
+            store,
+            &artifact_id,
+            record.byte_len,
+            absolute_offset,
+            absolute_offset,
+        )?;
         return Ok(SourcePage {
             bytes: Vec::new(),
             next_offset: None,
         });
     }
-    let absolute_offset = source_ref
-        .start
-        .checked_add(relative_offset)
-        .ok_or(CompactStateExchangeError::InvalidSpan)?;
     let remaining = span_len - relative_offset;
-    let request_limit = NonZeroU64::new(limit.get().min(remaining))
+    let request_limit = limit.get().min(remaining);
+    let requested_end = absolute_offset
+        .checked_add(request_limit)
         .ok_or(CompactStateExchangeError::InvalidSpan)?;
-    let page = store
-        .read_page(
-            &artifact_id,
-            PageRequest::new(absolute_offset, request_limit),
-        )
-        .map_err(|_| CompactStateExchangeError::Artifact)?;
+    let bytes = verify_artifact(
+        store,
+        &artifact_id,
+        record.byte_len,
+        absolute_offset,
+        requested_end,
+    )?;
     let length =
-        u64::try_from(page.bytes().len()).map_err(|_| CompactStateExchangeError::LengthMismatch)?;
-    if length == 0 || length > request_limit.get() || length > remaining {
-        return Err(CompactStateExchangeError::PageProgress);
-    }
+        u64::try_from(bytes.len()).map_err(|_| CompactStateExchangeError::LengthMismatch)?;
     let expected_next = absolute_offset
         .checked_add(length)
         .ok_or(CompactStateExchangeError::PageProgress)?;
-    match page.next_offset() {
-        Some(next) if next != expected_next || next <= absolute_offset || next > source_ref.end => {
-            Err(CompactStateExchangeError::PageProgress)
-        }
-        Some(next) if next < source_ref.end => Ok(SourcePage {
-            bytes: page.into_bytes(),
-            next_offset: Some(next - source_ref.start),
-        }),
-        Some(_) if expected_next == source_ref.end => Ok(SourcePage {
-            bytes: page.into_bytes(),
-            next_offset: None,
-        }),
-        None if expected_next == source_ref.end && source_ref.end == record.byte_len => {
-            Ok(SourcePage {
-                bytes: page.into_bytes(),
-                next_offset: None,
-            })
-        }
-        None => Err(CompactStateExchangeError::LengthMismatch),
-        Some(_) => Err(CompactStateExchangeError::PageProgress),
-    }
+    let next_offset = (expected_next < source_ref.end).then_some(expected_next - source_ref.start);
+    Ok(SourcePage { bytes, next_offset })
 }
 
 fn map_typed_error(error: TypedOutputError) -> CompactStateExchangeError {
@@ -452,8 +440,14 @@ fn verify_artifact<S: ArtifactStore>(
     store: &S,
     artifact_id: &ArtifactId,
     expected_len: u64,
-) -> Result<(), CompactStateExchangeError> {
+    retain_start: u64,
+    retain_end: u64,
+) -> Result<Vec<u8>, CompactStateExchangeError> {
+    if retain_start > retain_end || retain_end > expected_len {
+        return Err(CompactStateExchangeError::InvalidSpan);
+    }
     let mut hasher = Sha256::new();
+    let mut retained = Vec::new();
     let mut offset = 0_u64;
     let mut length = 0_u64;
     loop {
@@ -478,6 +472,15 @@ fn verify_artifact<S: ArtifactStore>(
         let expected_next = offset
             .checked_add(page_len)
             .ok_or(CompactStateExchangeError::PageProgress)?;
+        let overlap_start = retain_start.max(offset);
+        let overlap_end = retain_end.min(expected_next);
+        if overlap_start < overlap_end {
+            let local_start = usize::try_from(overlap_start - offset)
+                .map_err(|_| CompactStateExchangeError::LengthMismatch)?;
+            let local_end = usize::try_from(overlap_end - offset)
+                .map_err(|_| CompactStateExchangeError::LengthMismatch)?;
+            retained.extend_from_slice(&page.bytes()[local_start..local_end]);
+        }
         match page.next_offset() {
             Some(next) if next == expected_next && next > offset => offset = next,
             Some(_) => return Err(CompactStateExchangeError::PageProgress),
@@ -489,7 +492,10 @@ fn verify_artifact<S: ArtifactStore>(
                 if digest != artifact_id.as_str() {
                     return Err(CompactStateExchangeError::DigestMismatch);
                 }
-                return Ok(());
+                if u64::try_from(retained.len()).ok() != Some(retain_end - retain_start) {
+                    return Err(CompactStateExchangeError::LengthMismatch);
+                }
+                return Ok(retained);
             }
         }
     }

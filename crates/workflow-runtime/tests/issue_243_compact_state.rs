@@ -12,6 +12,9 @@ use workflow_runtime::{
     read_source_ref_page,
 };
 
+#[path = "support/issue_243_compact_state_exchange_regressions.rs"]
+mod issue_243_compact_state_exchange_regressions;
+
 fn source_bytes() -> &'static [u8] {
     b"compact state source bytes"
 }

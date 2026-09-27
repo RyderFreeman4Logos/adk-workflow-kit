@@ -1129,8 +1129,16 @@ impl WorkflowExchange {
         artifact_id: &ArtifactId,
     ) -> Result<TypedPayload, TypedOutputError> {
         let bytes = read_exchange_bytes(store, artifact_id)?;
+        self.consume_bytes(from, &bytes)
+    }
+
+    pub(crate) fn consume_bytes(
+        self,
+        from: Self,
+        bytes: &[u8],
+    ) -> Result<TypedPayload, TypedOutputError> {
         let value: Value =
-            serde_json::from_slice(&bytes).map_err(|_| TypedOutputError::InvalidJson)?;
+            serde_json::from_slice(bytes).map_err(|_| TypedOutputError::InvalidJson)?;
         let object = value.as_object().ok_or(TypedOutputError::InvalidJson)?;
         if object.contains_key("rationale") {
             return Err(TypedOutputError::RationaleNotEnabled);
