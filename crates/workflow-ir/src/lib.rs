@@ -6,6 +6,8 @@ use workflow_spec::{
     RouteOperator, SchemaVersion, WorkflowSpec,
 };
 
+pub mod compact_state;
+
 /// The canonical byte-wire version used for content identity.
 pub const CANONICAL_IR_WIRE_VERSION_V1: u16 = 1;
 /// The canonical byte-wire version for IR containing registered-predicate routes.
