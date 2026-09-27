@@ -92,7 +92,7 @@ pub use hot_reload::{DevelopmentHotReload, HotReloadError, HotReloadErrorKind};
 pub use issue_artifact::{
     CanonicalIssueArtifact, ISSUE_ARTIFACT_SCHEMA_VERSION, IncludedObject, IssueArtifactError,
     IssueArtifactErrorKind, IssueOmission, ObjectChange, ObjectDiffEntry, OfflineComment,
-    OfflineIssueContent, build_canonical_issue_artifact, refuse_long_thread,
+    OfflineIssueContent, build_canonical_issue_artifact,
 };
 pub use node_cache::{
     CacheDisposition, CacheProvenance, NODE_CACHE_SCHEMA_VERSION, NodeCacheEntry, NodeCacheError,

@@ -3,7 +3,7 @@ use std::num::NonZeroU64;
 use workflow_runtime::{
     ArtifactStore, GitHubIssueMetadata, GitHubIssueState, InMemoryArtifactStore, IssueOmission,
     NodeCacheKey, NodeCacheKeyMaterial, ObjectChange, OfflineComment, OfflineIssueContent,
-    PageRequest, TrustPolicy, build_canonical_issue_artifact, refuse_long_thread,
+    PageRequest, TrustPolicy, build_canonical_issue_artifact,
 };
 
 const OMITTED: &[u8] = b"OMITTED-COMMENT-BYTES-250";
@@ -66,30 +66,21 @@ fn issue() -> GitHubIssueMetadata {
 }
 
 #[test]
+fn raw_input_debug_never_exposes_decimal_payload_bytes() {
+    let payload = b"raw-payload-debug-250".to_vec();
+    let comment = comment("hidden", "stranger", 1, 1, &payload);
+    let admitted = content(vec![comment.clone()]);
+    let raw_bytes = format!("{payload:?}");
+
+    assert!(!format!("{comment:?}").contains(&raw_bytes));
+    assert!(!format!("{admitted:?}").contains(&raw_bytes));
+}
+
+#[test]
 fn unallowlisted_comment_bytes_are_absent_from_artifact_and_errors() {
     let policy = TrustPolicy::new("owner/repo", ["trusted-author"]).expect("policy");
-    let mut store = InMemoryArtifactStore::new(
-        NonZeroU64::new(65_536).unwrap(),
-        NonZeroU64::new(65_536).unwrap(),
-    );
-    let content = workflow_runtime::OfflineIssueContent::new(
-        issue(),
-        "snapshot-250",
-        b"trusted title".to_vec(),
-        b"trusted body".to_vec(),
-        vec![
-            workflow_runtime::OfflineComment::new(
-                "comment-omitted",
-                "stranger",
-                1,
-                1,
-                false,
-                OMITTED.to_vec(),
-            )
-            .expect("comment"),
-        ],
-    )
-    .expect("content");
+    let mut store = store();
+    let content = content(vec![comment("comment-omitted", "stranger", 1, 1, OMITTED)]);
 
     let built = build_canonical_issue_artifact(&policy, &content, &mut store);
     let rendered = format!("{built:?}");
@@ -105,7 +96,7 @@ fn unallowlisted_comment_bytes_are_absent_from_artifact_and_errors() {
     let page = store
         .read_page(
             artifact.content_id(),
-            workflow_runtime::PageRequest::new(0, NonZeroU64::new(65_536).unwrap()),
+            PageRequest::new(0, NonZeroU64::new(65_536).unwrap()),
         )
         .expect("stored content");
     assert!(
@@ -122,7 +113,12 @@ fn unallowlisted_comment_bytes_are_absent_from_artifact_and_errors() {
             "author_not_allowlisted"
         )]
     );
-    let span = artifact.included()[0].span();
+    let span = artifact
+        .included()
+        .iter()
+        .find(|object| object.object_id() == "issue-body")
+        .expect("body object")
+        .span();
     let spanned = store
         .read_page(
             artifact.content_id(),
@@ -152,6 +148,19 @@ fn invalid_records_fail_before_store_visibility() {
         )
         .is_err()
     );
+    assert!(
+        OfflineIssueContent::new(
+            issue(),
+            "snapshot-250",
+            b"title".to_vec(),
+            b"body".to_vec(),
+            vec![
+                comment("later", "trusted-author", 1, 1, b"later"),
+                comment("earlier", "trusted-author", 1, 1, b"earlier"),
+            ],
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -160,12 +169,17 @@ fn identical_inputs_reuse_identity_and_policy_change_misses() {
     let mut first_store = store();
     let mut second_store = store();
     let trusted = policy(&["trusted-author"]);
+    let narrowed = policy(&["trusted-author", "other-author"]);
     let first =
         build_canonical_issue_artifact(&trusted, &admitted, &mut first_store).expect("first");
     let second =
         build_canonical_issue_artifact(&trusted, &admitted, &mut second_store).expect("second");
+    let retargeted =
+        build_canonical_issue_artifact(&narrowed, &admitted, &mut second_store).expect("policy");
     assert_eq!(first.manifest_bytes(), second.manifest_bytes());
     assert_eq!(first.content_id(), second.content_id());
+    assert_ne!(first.policy_digest(), retargeted.policy_digest());
+    assert_ne!(first.aggregate_digest(), retargeted.aggregate_digest());
     assert_eq!(
         key(&first, "1", "allowlist"),
         key(&second, "1", "allowlist")
@@ -193,25 +207,214 @@ fn append_preserves_unchanged_digest_and_edit_does_not() {
         build_canonical_issue_artifact(&trusted, &appended, &mut artifact_store).expect("append");
     let changed =
         build_canonical_issue_artifact(&trusted, &edited, &mut artifact_store).expect("edit");
-    assert_eq!(before.included()[0].digest(), after.included()[0].digest());
+    let unchanged_before = before
+        .included()
+        .iter()
+        .find(|object| object.object_id() == "kept")
+        .expect("unchanged before");
+    let unchanged_after = after
+        .included()
+        .iter()
+        .find(|object| object.object_id() == "kept")
+        .expect("unchanged after");
+    assert_eq!(unchanged_before.digest(), unchanged_after.digest());
     assert_ne!(before.aggregate_digest(), after.aggregate_digest());
     assert!(
         after.diff_from(Some(&before)).iter().any(|entry| {
             entry.object_id() == "added" && entry.change() == ObjectChange::Appended
         })
     );
-    assert_ne!(
-        before.included()[1].digest(),
-        changed.included()[1].digest()
+    let changed_kept = changed
+        .included()
+        .iter()
+        .find(|object| object.object_id() == "kept")
+        .expect("changed kept");
+    assert_ne!(unchanged_before.digest(), changed_kept.digest());
+}
+
+#[test]
+fn title_is_a_tracked_included_object() {
+    let old = content(vec![comment("kept", "trusted-author", 1, 1, b"kept")]);
+    let new = OfflineIssueContent::new(
+        issue(),
+        "snapshot-250",
+        b"new title".to_vec(),
+        b"trusted body".to_vec(),
+        vec![comment("kept", "trusted-author", 1, 1, b"kept")],
+    )
+    .expect("content");
+    let trusted = policy(&["trusted-author"]);
+    let mut store = store();
+    let before = build_canonical_issue_artifact(&trusted, &old, &mut store).expect("old");
+    let after = build_canonical_issue_artifact(&trusted, &new, &mut store).expect("new");
+    let old_title = before
+        .included()
+        .iter()
+        .find(|object| object.object_id() == "issue-title")
+        .expect("title object");
+    let new_title = after
+        .included()
+        .iter()
+        .find(|object| object.object_id() == "issue-title")
+        .expect("title object");
+    assert_ne!(old_title.digest(), new_title.digest());
+    assert_ne!(before.manifest_bytes(), after.manifest_bytes());
+    assert_ne!(before.aggregate_digest(), after.aggregate_digest());
+    assert!(after.diff_from(Some(&before)).iter().any(|entry| {
+        entry.object_id() == "issue-title" && entry.change() == ObjectChange::Edited
+    }));
+    let span = new_title.span();
+    let page = store
+        .read_page(
+            after.content_id(),
+            PageRequest::new(
+                span.start(),
+                NonZeroU64::new(span.end() - span.start()).unwrap(),
+            ),
+        )
+        .expect("title span");
+    assert_eq!(page.bytes(), b"new title");
+}
+
+#[test]
+fn mixed_permitted_and_omitted_source_order_changes_identity() {
+    let first = content(vec![
+        comment("permitted", "trusted-author", 1, 1, b"kept"),
+        comment("omitted", "stranger", 2, 1, b"hidden"),
+    ]);
+    let second = content(vec![
+        comment("omitted", "stranger", 1, 1, b"hidden"),
+        comment("permitted", "trusted-author", 2, 1, b"kept"),
+    ]);
+    let trusted = policy(&["trusted-author"]);
+    let mut store = store();
+    let before = build_canonical_issue_artifact(&trusted, &first, &mut store).expect("first");
+    let after = build_canonical_issue_artifact(&trusted, &second, &mut store).expect("second");
+    assert_ne!(before.manifest_bytes(), after.manifest_bytes());
+    assert_ne!(before.aggregate_digest(), after.aggregate_digest());
+}
+
+#[test]
+fn reserved_object_ids_and_unbounded_input_strings_are_rejected() {
+    assert!(
+        OfflineComment::new("issue-body", "trusted-author", 1, 1, false, b"x".to_vec()).is_err()
+    );
+    assert!(
+        OfflineComment::new("issue-title", "trusted-author", 1, 1, false, b"x".to_vec()).is_err()
+    );
+    assert!(OfflineComment::new("x".repeat(257), "author", 1, 1, false, b"x".to_vec()).is_err());
+    assert!(OfflineComment::new("id", "author".repeat(257), 1, 1, false, b"x".to_vec()).is_err());
+    assert!(
+        OfflineIssueContent::new(
+            issue(),
+            "s".repeat(257),
+            b"title".to_vec(),
+            b"body".to_vec(),
+            Vec::new(),
+        )
+        .is_err()
     );
 }
 
 #[test]
-fn long_thread_request_is_not_routed() {
-    let error = refuse_long_thread().expect_err("distiller route is absent");
+fn bounded_pages_do_not_reject_valid_content() {
+    let trusted = policy(&["trusted-author"]);
+    let admitted = content(vec![comment(
+        "kept",
+        "trusted-author",
+        1,
+        1,
+        b"body larger than one page",
+    )]);
+    let mut store = InMemoryArtifactStore::new(
+        NonZeroU64::new(65_536).unwrap(),
+        NonZeroU64::new(1).unwrap(),
+    );
+    let artifact = build_canonical_issue_artifact(&trusted, &admitted, &mut store)
+        .expect("valid content must not depend on one-page readback");
+    assert!(
+        artifact
+            .included()
+            .iter()
+            .any(|object| object.object_id() == "kept")
+    );
+    assert!(store.retention(artifact.content_id()).is_ok());
+}
+
+#[test]
+fn deleted_comments_are_payload_free_and_diff_as_deleted() {
+    assert!(OfflineComment::new("deleted", "trusted-author", 1, 1, true, Vec::new()).is_ok());
+    assert!(OfflineComment::new("deleted", "trusted-author", 1, 1, true, b"old".to_vec()).is_err());
+
+    let trusted = policy(&["trusted-author"]);
+    let previous = content(vec![comment("deleted", "trusted-author", 1, 1, b"old")]);
+    let current = OfflineIssueContent::new(
+        issue(),
+        "snapshot-250",
+        b"trusted title".to_vec(),
+        b"trusted body".to_vec(),
+        vec![
+            OfflineComment::new("deleted", "trusted-author", 1, 2, true, Vec::new())
+                .expect("tombstone"),
+        ],
+    )
+    .expect("content");
+    let omitted = content(vec![comment("vanished", "stranger", 1, 1, b"old omitted")]);
+    let disappeared = content(Vec::new());
+    let mut store = store();
+    let before = build_canonical_issue_artifact(&trusted, &previous, &mut store).expect("before");
+    let after = build_canonical_issue_artifact(&trusted, &current, &mut store).expect("after");
+    let omitted_before =
+        build_canonical_issue_artifact(&trusted, &omitted, &mut store).expect("omitted before");
+    let disappeared_after = build_canonical_issue_artifact(&trusted, &disappeared, &mut store)
+        .expect("disappeared after");
+    assert!(after.diff_from(Some(&before)).iter().any(|entry| {
+        entry.object_id() == "deleted" && entry.change() == ObjectChange::Deleted
+    }));
+    assert!(disappeared_after
+        .diff_from(Some(&omitted_before))
+        .iter()
+        .any(|entry| entry.object_id() == "vanished" && entry.change() == ObjectChange::Deleted));
+
+    let omitted_current = OfflineIssueContent::new(
+        issue(),
+        "snapshot-250",
+        b"trusted title".to_vec(),
+        b"trusted body".to_vec(),
+        vec![
+            OfflineComment::new("vanished", "stranger", 1, 2, true, Vec::new()).expect("tombstone"),
+        ],
+    )
+    .expect("content");
+    let deleted_after = build_canonical_issue_artifact(&trusted, &omitted_current, &mut store)
+        .expect("deleted after omission");
+    assert!(deleted_after
+        .diff_from(Some(&omitted_before))
+        .iter()
+        .any(|entry| entry.object_id() == "vanished" && entry.change() == ObjectChange::Deleted));
+    assert!(!format!("{after:?}").contains("old"));
+}
+
+#[test]
+fn long_thread_is_not_routed_by_the_builder() {
+    let comments = (0..65)
+        .map(|index| {
+            comment(
+                &format!("comment-{index}"),
+                "trusted-author",
+                index + 1,
+                1,
+                b"comment",
+            )
+        })
+        .collect();
+    let admitted = content(comments);
+    let trusted = policy(&["trusted-author"]);
+    let mut store = store();
+    let error = build_canonical_issue_artifact(&trusted, &admitted, &mut store)
+        .expect_err("large threads must not use the direct path");
     assert_eq!(
         error.kind(),
         workflow_runtime::IssueArtifactErrorKind::NotRouted
     );
-    assert!(!error.to_string().contains("trusted body"));
 }

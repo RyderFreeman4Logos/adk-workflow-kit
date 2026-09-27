@@ -193,6 +193,10 @@ impl StagedArtifact {
         self.capability == capability
     }
 
+    pub(crate) fn id(&self) -> &ArtifactId {
+        &self.id
+    }
+
     fn take_state(&mut self) -> StagedState {
         self.state
             .take()
