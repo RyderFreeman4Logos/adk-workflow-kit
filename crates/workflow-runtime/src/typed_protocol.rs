@@ -1091,7 +1091,11 @@ impl WorkflowExchange {
         Ok(Some(from.envelope_bytes(from.successor(), &output)?))
     }
 
-    fn envelope_bytes(self, to: Self, output: &TypedOutput) -> Result<Vec<u8>, TypedOutputError> {
+    pub(crate) fn envelope_bytes(
+        self,
+        to: Self,
+        output: &TypedOutput,
+    ) -> Result<Vec<u8>, TypedOutputError> {
         admit_for_reducer(output)?;
         let mut envelope = Map::new();
         envelope.insert("from".to_owned(), Value::String(self.as_str().to_owned()));

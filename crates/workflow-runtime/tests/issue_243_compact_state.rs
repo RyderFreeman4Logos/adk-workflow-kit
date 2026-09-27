@@ -5,8 +5,9 @@ use workflow_ir::compact_state::{
     CompactState, EntryKind, SourceRecord, SourceRef, StateDelta, StateEntry, StateVersion,
 };
 use workflow_runtime::{
-    ArtifactId, ArtifactRef, ArtifactStore, CompactStateDelta, Completeness, InMemoryArtifactStore,
-    TypedOutput, TypedPayload, WorkflowExchange, consume_compact_state_delta,
+    ArtifactError, ArtifactErrorKind, ArtifactId, ArtifactPage, ArtifactRef, ArtifactStore,
+    CompactStateDelta, Completeness, InMemoryArtifactStore, PageRequest, RetentionPolicy,
+    StagedArtifact, TypedOutput, TypedPayload, WorkflowExchange, consume_compact_state_delta,
     publish_compact_state_delta, read_source_ref_page,
 };
 
@@ -96,6 +97,8 @@ fn publishes_and_consumes_artifact_backed_delta_and_pages_source() {
     .unwrap();
     assert_eq!(page.bytes(), b"com");
     assert_eq!(page.next_offset(), Some(3));
+    let page_debug = format!("{page:?}");
+    assert!(!page_debug.contains("[99, 111, 109]"));
     let tail = read_source_ref_page(
         &store,
         state.sources(),
@@ -294,4 +297,147 @@ fn returned_delta_artifact_is_content_addressed() {
     let expected = ArtifactId::parse(format!("{:x}", Sha256::digest(&bytes))).unwrap();
     assert_eq!(receipt.delta_artifact(), &expected);
     assert_eq!(receipt.byte_len(), bytes.len() as u64);
+}
+
+struct FaultInjectingStore {
+    inner: InMemoryArtifactStore,
+    fail_stage_on: Option<usize>,
+    fail_commit_on: Option<usize>,
+    stage_calls: usize,
+    commit_calls: usize,
+    events: Vec<&'static str>,
+}
+
+impl FaultInjectingStore {
+    fn new(fail_stage_on: Option<usize>, fail_commit_on: Option<usize>) -> Self {
+        Self {
+            inner: InMemoryArtifactStore::new(
+                NonZeroU64::new(1 << 20).unwrap(),
+                NonZeroU64::new(7).unwrap(),
+            ),
+            fail_stage_on,
+            fail_commit_on,
+            stage_calls: 0,
+            commit_calls: 0,
+            events: Vec::new(),
+        }
+    }
+}
+
+fn injected_artifact_error() -> ArtifactError {
+    match InMemoryArtifactStore::new(NonZeroU64::new(1).unwrap(), NonZeroU64::new(1).unwrap())
+        .stage(&[])
+    {
+        Ok(_) => unreachable!("empty artifact staging must fail"),
+        Err(error) => error,
+    }
+}
+
+impl ArtifactStore for FaultInjectingStore {
+    fn stage(&mut self, bytes: &[u8]) -> Result<StagedArtifact, ArtifactError> {
+        self.stage_calls += 1;
+        self.events.push("stage");
+        if self.fail_stage_on == Some(self.stage_calls) {
+            self.fail_stage_on = None;
+            return Err(injected_artifact_error());
+        }
+        self.inner.stage(bytes)
+    }
+
+    fn commit(&mut self, staged: StagedArtifact) -> Result<ArtifactId, ArtifactError> {
+        self.commit_calls += 1;
+        self.events.push("commit");
+        if self.fail_commit_on == Some(self.commit_calls) {
+            self.fail_commit_on = None;
+            return Err(injected_artifact_error());
+        }
+        self.inner.commit(staged)
+    }
+
+    fn read_page(
+        &self,
+        id: &ArtifactId,
+        request: PageRequest,
+    ) -> Result<ArtifactPage, ArtifactError> {
+        self.inner.read_page(id, request)
+    }
+
+    fn set_retention(
+        &mut self,
+        id: &ArtifactId,
+        policy: RetentionPolicy,
+    ) -> Result<(), ArtifactError> {
+        self.inner.set_retention(id, policy)
+    }
+
+    fn retention(&self, id: &ArtifactId) -> Result<RetentionPolicy, ArtifactError> {
+        self.inner.retention(id)
+    }
+}
+
+fn canonical_delta_artifact() -> ArtifactId {
+    let bytes = serde_json::to_vec(&delta()).unwrap();
+    ArtifactId::parse(format!("{:x}", Sha256::digest(bytes))).unwrap()
+}
+
+#[test]
+fn prepares_both_artifacts_before_visibility_on_stage_failure() {
+    let mut store = FaultInjectingStore::new(Some(2), None);
+    assert_eq!(
+        publish_compact_state_delta(
+            &mut store,
+            WorkflowExchange::CodeInvestigation,
+            WorkflowExchange::GroundedAnswer,
+            &delta(),
+        )
+        .unwrap_err(),
+        workflow_runtime::CompactStateExchangeError::Artifact
+    );
+    assert_eq!(store.events, ["stage", "stage"]);
+    assert!(matches!(
+        store.read_page(
+            &canonical_delta_artifact(),
+            PageRequest::new(0, NonZeroU64::new(1).unwrap()),
+        ),
+        Err(error) if error.kind() == ArtifactErrorKind::NotFound
+    ));
+}
+
+#[test]
+fn retains_committed_delta_for_idempotent_retry_after_envelope_commit_failure() {
+    let mut store = FaultInjectingStore::new(None, Some(2));
+    assert_eq!(
+        publish_compact_state_delta(
+            &mut store,
+            WorkflowExchange::CodeInvestigation,
+            WorkflowExchange::GroundedAnswer,
+            &delta(),
+        )
+        .unwrap_err(),
+        workflow_runtime::CompactStateExchangeError::Artifact
+    );
+    assert_eq!(store.events, ["stage", "stage", "commit", "commit"]);
+    assert!(
+        store
+            .read_page(
+                &canonical_delta_artifact(),
+                PageRequest::new(0, NonZeroU64::new(1).unwrap()),
+            )
+            .is_ok()
+    );
+
+    let receipt = publish_compact_state_delta(
+        &mut store,
+        WorkflowExchange::CodeInvestigation,
+        WorkflowExchange::GroundedAnswer,
+        &delta(),
+    )
+    .unwrap();
+    assert_eq!(receipt.delta_artifact(), &canonical_delta_artifact());
+    assert_eq!(
+        store.events,
+        [
+            "stage", "stage", "commit", "commit", "stage", "stage", "commit", "commit"
+        ]
+    );
 }

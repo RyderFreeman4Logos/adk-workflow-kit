@@ -113,10 +113,20 @@ impl fmt::Debug for CompactStateReceipt {
 }
 
 /// A bounded page relative to one source range.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SourcePage {
     bytes: Vec<u8>,
     next_offset: Option<u64>,
+}
+
+impl fmt::Debug for SourcePage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SourcePage")
+            .field("byte_len", &self.bytes.len())
+            .field("next_offset", &self.next_offset)
+            .finish()
+    }
 }
 
 impl SourcePage {
@@ -132,6 +142,11 @@ impl SourcePage {
 }
 
 /// Publishes one canonical state delta and an admitted compact-state envelope.
+///
+/// Both artifacts are staged before either is committed. `ArtifactStore` does
+/// not provide a transaction spanning the two commits, so a failure after the
+/// delta commit intentionally retains that content-addressed delta. Callers
+/// own retrying the same delta; its stable ID makes the retry idempotent.
 pub fn publish_compact_state_delta<S: ArtifactStore>(
     store: &mut S,
     from: WorkflowExchange,
@@ -144,17 +159,8 @@ pub fn publish_compact_state_delta<S: ArtifactStore>(
         return Err(CompactStateExchangeError::Oversized);
     }
     let expected = content_id(&bytes).ok_or(CompactStateExchangeError::DigestMismatch)?;
-    let delta_artifact = store
-        .put(&bytes)
-        .map_err(|_| CompactStateExchangeError::Artifact)?;
-    if delta_artifact != expected {
-        return Err(CompactStateExchangeError::DigestMismatch);
-    }
-    let artifact_ref = ArtifactRef::new(
-        delta_artifact.as_str(),
-        format!("sha256:{}", delta_artifact.as_str()),
-    )
-    .map_err(|_| CompactStateExchangeError::InvalidEnvelope)?;
+    let artifact_ref = ArtifactRef::new(expected.as_str(), format!("sha256:{}", expected.as_str()))
+        .map_err(|_| CompactStateExchangeError::InvalidEnvelope)?;
     let output = TypedOutput::new(
         TypedPayload::CompactState(CompactStateDelta::new(
             COMPACT_STATE_KEY,
@@ -164,7 +170,22 @@ pub fn publish_compact_state_delta<S: ArtifactStore>(
         Completeness::Complete,
     )
     .map_err(|_| CompactStateExchangeError::InvalidEnvelope)?;
-    let envelope_artifact = from.publish(to, store, &output).map_err(map_typed_error)?;
+    let delta_staged = store
+        .stage(&bytes)
+        .map_err(|_| CompactStateExchangeError::Artifact)?;
+    let envelope_bytes = from.envelope_bytes(to, &output).map_err(map_typed_error)?;
+    let envelope_staged = store
+        .stage(&envelope_bytes)
+        .map_err(|_| CompactStateExchangeError::Artifact)?;
+    let delta_artifact = store
+        .commit(delta_staged)
+        .map_err(|_| CompactStateExchangeError::Artifact)?;
+    if delta_artifact != expected {
+        return Err(CompactStateExchangeError::DigestMismatch);
+    }
+    let envelope_artifact = store
+        .commit(envelope_staged)
+        .map_err(|_| CompactStateExchangeError::Artifact)?;
     Ok(CompactStateReceipt {
         delta_artifact,
         envelope_artifact,
