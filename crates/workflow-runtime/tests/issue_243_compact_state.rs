@@ -304,6 +304,7 @@ struct FaultInjectingStore {
     inner: InMemoryArtifactStore,
     fail_stage_on: Option<usize>,
     fail_commit_on: Option<usize>,
+    wrong_id_on: Option<usize>,
     stage_calls: usize,
     commit_calls: usize,
     events: Vec<&'static str>,
@@ -318,6 +319,7 @@ impl FaultInjectingStore {
             ),
             fail_stage_on,
             fail_commit_on,
+            wrong_id_on: None,
             stage_calls: 0,
             commit_calls: 0,
             events: Vec::new(),
@@ -352,7 +354,12 @@ impl ArtifactStore for FaultInjectingStore {
             self.fail_commit_on = None;
             return Err(injected_artifact_error());
         }
-        self.inner.commit(staged)
+        let committed = self.inner.commit(staged)?;
+        if self.wrong_id_on == Some(self.commit_calls) {
+            self.wrong_id_on = None;
+            return Ok(wrong_artifact_id());
+        }
+        Ok(committed)
     }
 
     fn read_page(
@@ -379,6 +386,103 @@ impl ArtifactStore for FaultInjectingStore {
 fn canonical_delta_artifact() -> ArtifactId {
     let bytes = serde_json::to_vec(&delta()).unwrap();
     ArtifactId::parse(format!("{:x}", Sha256::digest(bytes))).unwrap()
+}
+
+fn wrong_artifact_id() -> ArtifactId {
+    ArtifactId::parse("f".repeat(64)).unwrap()
+}
+
+#[test]
+fn post_visibility_wrong_delta_id_exposes_canonical_recovery_handle() {
+    let mut store = FaultInjectingStore::new(None, None);
+    store.wrong_id_on = Some(1);
+    let error = publish_compact_state_delta(
+        &mut store,
+        WorkflowExchange::CodeInvestigation,
+        WorkflowExchange::GroundedAnswer,
+        &delta(),
+    )
+    .unwrap_err();
+    let recovery_id = error
+        .partial_publication()
+        .expect("post-visibility wrong ID must expose a recovery handle")
+        .delta_artifact()
+        .clone();
+
+    assert_eq!(recovery_id, canonical_delta_artifact());
+    assert_ne!(recovery_id, wrong_artifact_id());
+    assert_eq!(store.events, ["stage", "stage", "commit"]);
+    assert!(
+        store
+            .read_page(
+                &recovery_id,
+                PageRequest::new(0, NonZeroU64::new(1).unwrap())
+            )
+            .is_ok()
+    );
+    assert!(matches!(
+        store.read_page(
+            &wrong_artifact_id(),
+            PageRequest::new(0, NonZeroU64::new(1).unwrap()),
+        ),
+        Err(error) if error.kind() == ArtifactErrorKind::NotFound
+    ));
+    assert!(!format!("{error:?}").contains(recovery_id.as_str()));
+    assert!(!error.to_string().contains(recovery_id.as_str()));
+}
+
+#[test]
+fn post_visibility_wrong_envelope_id_preserves_delta_recovery_handle() {
+    let mut store = FaultInjectingStore::new(None, None);
+    store.wrong_id_on = Some(2);
+    let error = publish_compact_state_delta(
+        &mut store,
+        WorkflowExchange::CodeInvestigation,
+        WorkflowExchange::GroundedAnswer,
+        &delta(),
+    )
+    .unwrap_err();
+    let recovery_id = error
+        .partial_publication()
+        .expect("post-visibility wrong ID must expose a recovery handle")
+        .delta_artifact()
+        .clone();
+
+    assert_eq!(recovery_id, canonical_delta_artifact());
+    assert_eq!(store.events, ["stage", "stage", "commit", "commit"]);
+    assert!(
+        store
+            .read_page(
+                &recovery_id,
+                PageRequest::new(0, NonZeroU64::new(1).unwrap())
+            )
+            .is_ok()
+    );
+    assert!(!format!("{error:?}").contains(recovery_id.as_str()));
+    assert!(!error.to_string().contains(recovery_id.as_str()));
+}
+
+#[test]
+fn precommit_delta_error_remains_without_partial_recovery_handle() {
+    let mut store = FaultInjectingStore::new(None, Some(1));
+    let error = publish_compact_state_delta(
+        &mut store,
+        WorkflowExchange::CodeInvestigation,
+        WorkflowExchange::GroundedAnswer,
+        &delta(),
+    )
+    .unwrap_err();
+
+    assert_eq!(error, CompactStateExchangeError::Artifact);
+    assert!(error.partial_publication().is_none());
+    assert_eq!(store.events, ["stage", "stage", "commit"]);
+    assert!(matches!(
+        store.read_page(
+            &canonical_delta_artifact(),
+            PageRequest::new(0, NonZeroU64::new(1).unwrap()),
+        ),
+        Err(error) if error.kind() == ArtifactErrorKind::NotFound
+    ));
 }
 
 #[test]

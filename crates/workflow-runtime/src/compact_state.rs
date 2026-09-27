@@ -198,9 +198,10 @@ impl SourcePage {
 /// not provide a transaction spanning the two commits, so a failure after the
 /// delta commit intentionally retains that content-addressed delta. Callers
 /// own retrying the same delta; its stable ID makes the retry idempotent. An
-/// envelope commit failure returns that ID in `PartialPublication`, while
-/// staging and delta-commit failures remain `Artifact` under the store's
-/// previsibility commit-error contract.
+/// Any failure after the delta commit returns that canonical ID in
+/// `PartialPublication`, including a store that reports the wrong ID after
+/// making content visible. Staging and previsibility commit failures remain
+/// `Artifact` under the store's commit-error contract.
 pub fn publish_compact_state_delta<S: ArtifactStore>(
     store: &mut S,
     from: WorkflowExchange,
@@ -228,21 +229,34 @@ pub fn publish_compact_state_delta<S: ArtifactStore>(
         .stage(&bytes)
         .map_err(|_| CompactStateExchangeError::Artifact)?;
     let envelope_bytes = from.envelope_bytes(to, &output).map_err(map_typed_error)?;
+    let expected_envelope =
+        content_id(&envelope_bytes).ok_or(CompactStateExchangeError::DigestMismatch)?;
     let envelope_staged = store
         .stage(&envelope_bytes)
         .map_err(|_| CompactStateExchangeError::Artifact)?;
-    let delta_artifact = store
-        .commit(delta_staged)
-        .map_err(|_| CompactStateExchangeError::Artifact)?;
-    if delta_artifact != expected {
-        return Err(CompactStateExchangeError::DigestMismatch);
-    }
-    let envelope_artifact = store.commit(envelope_staged).map_err(|_| {
-        CompactStateExchangeError::PartialPublication(CompactStatePartialPublication {
-            delta_artifact: delta_artifact.clone(),
-            phase: CompactStatePublicationPhase::PostDeltaCommit,
-        })
-    })?;
+    let delta_artifact = match store.commit(delta_staged) {
+        Ok(artifact) if artifact == expected => artifact,
+        Ok(_) => {
+            return Err(CompactStateExchangeError::PartialPublication(
+                CompactStatePartialPublication {
+                    delta_artifact: expected,
+                    phase: CompactStatePublicationPhase::PostDeltaCommit,
+                },
+            ));
+        }
+        Err(_) => return Err(CompactStateExchangeError::Artifact),
+    };
+    let envelope_artifact = match store.commit(envelope_staged) {
+        Ok(artifact) if artifact == expected_envelope => artifact,
+        Ok(_) | Err(_) => {
+            return Err(CompactStateExchangeError::PartialPublication(
+                CompactStatePartialPublication {
+                    delta_artifact: delta_artifact.clone(),
+                    phase: CompactStatePublicationPhase::PostDeltaCommit,
+                },
+            ));
+        }
+    };
     Ok(CompactStateReceipt {
         delta_artifact,
         envelope_artifact,
