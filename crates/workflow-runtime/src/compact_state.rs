@@ -1,0 +1,471 @@
+//! Artifact-backed exchange for validated compact-state deltas.
+
+use std::{fmt, num::NonZeroU64};
+
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use workflow_ir::compact_state::{CompactState, SourceIndex, SourceRef, StateDelta};
+
+use crate::{
+    ArtifactId, ArtifactRef, ArtifactStore, CompactStateDelta, Completeness, PageRequest,
+    TypedOutput, TypedOutputError, TypedPayload, WorkflowExchange, encode_hex,
+};
+
+/// The typed envelope key used by the compact-state exchange.
+pub const COMPACT_STATE_KEY: &str = "compact_state";
+/// The typed envelope operation used by the compact-state exchange.
+pub const COMPACT_STATE_OPERATION: &str = "add";
+
+const PAGE_LIMIT: NonZeroU64 = match NonZeroU64::new(65_536) {
+    Some(limit) => limit,
+    None => unreachable!(),
+};
+const MAX_EXCHANGE_BYTES: usize = (crate::COMPACT_STATE_OUTPUT_TOKEN_BUDGET as usize) * 4 + 256;
+const MAX_DELTA_BYTES: usize = 4 * 1024 * 1024;
+
+/// Payload-free failures at the compact-state artifact boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompactStateExchangeError {
+    /// The artifact store rejected a read or write.
+    Artifact,
+    /// The typed envelope failed structural or admission validation.
+    InvalidEnvelope,
+    /// The state delta was not canonical, valid, or reducible.
+    InvalidStateDelta,
+    /// A content digest did not match its artifact identity or reference.
+    DigestMismatch,
+    /// An indexed artifact length did not match the stored bytes.
+    LengthMismatch,
+    /// A source logical identity was not present in the state index.
+    MissingSource,
+    /// A source reference did not match its indexed artifact binding.
+    SourceBinding,
+    /// A source range was not a valid half-open span.
+    InvalidSpan,
+    /// A store returned a page that could not make bounded progress.
+    PageProgress,
+    /// The compact-state envelope key did not match the expected key.
+    WrongKey,
+    /// The compact-state envelope operation did not match the expected operation.
+    WrongOperation,
+    /// The typed envelope payload was not compact state.
+    WrongPayload,
+    /// The artifact exceeded the bounded exchange or delta limit.
+    Oversized,
+}
+
+impl fmt::Display for CompactStateExchangeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Artifact => "artifact store rejected the operation",
+            Self::InvalidEnvelope => "compact-state envelope is invalid",
+            Self::InvalidStateDelta => "compact-state delta is invalid",
+            Self::DigestMismatch => "artifact digest does not match its content",
+            Self::LengthMismatch => "artifact length does not match its index",
+            Self::MissingSource => "compact-state source is missing",
+            Self::SourceBinding => "compact-state source binding is invalid",
+            Self::InvalidSpan => "compact-state source span is invalid",
+            Self::PageProgress => "artifact page made no bounded progress",
+            Self::WrongKey => "compact-state envelope key is not admitted",
+            Self::WrongOperation => "compact-state envelope operation is not admitted",
+            Self::WrongPayload => "typed envelope payload is not compact state",
+            Self::Oversized => "compact-state artifact exceeds its bounded limit",
+        })
+    }
+}
+
+impl std::error::Error for CompactStateExchangeError {}
+
+/// Identifiers returned after publishing a state delta and its typed envelope.
+#[derive(Clone, Eq, PartialEq)]
+pub struct CompactStateReceipt {
+    delta_artifact: ArtifactId,
+    envelope_artifact: ArtifactId,
+    byte_len: u64,
+}
+
+impl CompactStateReceipt {
+    /// Returns the content ID of the canonical state-delta artifact.
+    pub fn delta_artifact(&self) -> &ArtifactId {
+        &self.delta_artifact
+    }
+
+    /// Returns the content ID of the admitted typed transport envelope.
+    pub fn envelope_artifact(&self) -> &ArtifactId {
+        &self.envelope_artifact
+    }
+
+    /// Returns the canonical state-delta byte length.
+    pub fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+}
+
+impl fmt::Debug for CompactStateReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompactStateReceipt")
+            .field("delta_artifact", &"<redacted>")
+            .field("envelope_artifact", &"<redacted>")
+            .field("byte_len", &self.byte_len)
+            .finish()
+    }
+}
+
+/// A bounded page relative to one source range.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourcePage {
+    bytes: Vec<u8>,
+    next_offset: Option<u64>,
+}
+
+impl SourcePage {
+    /// Returns opaque bytes from the cited source range.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the next offset relative to the cited range start, if any bytes remain.
+    pub fn next_offset(&self) -> Option<u64> {
+        self.next_offset
+    }
+}
+
+/// Publishes one canonical state delta and an admitted compact-state envelope.
+pub fn publish_compact_state_delta<S: ArtifactStore>(
+    store: &mut S,
+    from: WorkflowExchange,
+    to: WorkflowExchange,
+    delta: &StateDelta,
+) -> Result<CompactStateReceipt, CompactStateExchangeError> {
+    let bytes =
+        serde_json::to_vec(delta).map_err(|_| CompactStateExchangeError::InvalidStateDelta)?;
+    if bytes.is_empty() || bytes.len() > MAX_DELTA_BYTES {
+        return Err(CompactStateExchangeError::Oversized);
+    }
+    let expected = content_id(&bytes).ok_or(CompactStateExchangeError::DigestMismatch)?;
+    let delta_artifact = store
+        .put(&bytes)
+        .map_err(|_| CompactStateExchangeError::Artifact)?;
+    if delta_artifact != expected {
+        return Err(CompactStateExchangeError::DigestMismatch);
+    }
+    let artifact_ref = ArtifactRef::new(
+        delta_artifact.as_str(),
+        format!("sha256:{}", delta_artifact.as_str()),
+    )
+    .map_err(|_| CompactStateExchangeError::InvalidEnvelope)?;
+    let output = TypedOutput::new(
+        TypedPayload::CompactState(CompactStateDelta::new(
+            COMPACT_STATE_KEY,
+            COMPACT_STATE_OPERATION,
+            vec![artifact_ref],
+        )),
+        Completeness::Complete,
+    )
+    .map_err(|_| CompactStateExchangeError::InvalidEnvelope)?;
+    let envelope_artifact = from.publish(to, store, &output).map_err(map_typed_error)?;
+    Ok(CompactStateReceipt {
+        delta_artifact,
+        envelope_artifact,
+        byte_len: bytes.len() as u64,
+    })
+}
+
+/// Admits, verifies, and atomically applies one compact-state delta envelope.
+pub fn consume_compact_state_delta<S: ArtifactStore>(
+    store: &S,
+    from: WorkflowExchange,
+    to: WorkflowExchange,
+    envelope_artifact: &ArtifactId,
+    expected_key: &str,
+    expected_op: &str,
+    state: &mut CompactState,
+) -> Result<CompactStateReceipt, CompactStateExchangeError> {
+    let payload = to
+        .consume(from, store, envelope_artifact)
+        .map_err(map_typed_error)?;
+    if !matches!(payload, TypedPayload::CompactState(_)) {
+        return Err(CompactStateExchangeError::WrongPayload);
+    }
+
+    let envelope = read_artifact(store, envelope_artifact, MAX_EXCHANGE_BYTES)?;
+    let (key, op, delta_artifact) = extract_compact_state_ref(&envelope)?;
+    if key != expected_key {
+        return Err(CompactStateExchangeError::WrongKey);
+    }
+    if op != expected_op {
+        return Err(CompactStateExchangeError::WrongOperation);
+    }
+    let delta_bytes = read_artifact(store, &delta_artifact, MAX_DELTA_BYTES)?;
+    let delta = serde_json::from_slice::<StateDelta>(&delta_bytes)
+        .map_err(|_| CompactStateExchangeError::InvalidStateDelta)?;
+    let canonical =
+        serde_json::to_vec(&delta).map_err(|_| CompactStateExchangeError::InvalidStateDelta)?;
+    if canonical != delta_bytes {
+        return Err(CompactStateExchangeError::InvalidStateDelta);
+    }
+    let next = state
+        .apply(&delta)
+        .map_err(|_| CompactStateExchangeError::InvalidStateDelta)?;
+    *state = next;
+    Ok(CompactStateReceipt {
+        delta_artifact,
+        envelope_artifact: envelope_artifact.clone(),
+        byte_len: delta_bytes.len() as u64,
+    })
+}
+
+/// Reads one source range page after checking its indexed length and digest.
+pub fn read_source_ref_page<S: ArtifactStore>(
+    store: &S,
+    sources: &SourceIndex,
+    source_ref: &SourceRef,
+    relative_offset: u64,
+    limit: NonZeroU64,
+) -> Result<SourcePage, CompactStateExchangeError> {
+    let record = sources
+        .get(&source_ref.source)
+        .ok_or(CompactStateExchangeError::MissingSource)?;
+    if source_ref.source.trim().is_empty()
+        || source_ref.start >= source_ref.end
+        || source_ref.end > record.byte_len
+    {
+        return Err(CompactStateExchangeError::InvalidSpan);
+    }
+    if source_ref.artifact_id != record.artifact_id {
+        return Err(CompactStateExchangeError::SourceBinding);
+    }
+    let artifact_id = ArtifactId::parse(record.artifact_id.clone())
+        .ok_or(CompactStateExchangeError::SourceBinding)?;
+    if ArtifactId::parse(source_ref.artifact_id.clone()).is_none() {
+        return Err(CompactStateExchangeError::SourceBinding);
+    }
+    verify_artifact(store, &artifact_id, record.byte_len)?;
+
+    let span_len = source_ref
+        .end
+        .checked_sub(source_ref.start)
+        .ok_or(CompactStateExchangeError::InvalidSpan)?;
+    if relative_offset > span_len {
+        return Err(CompactStateExchangeError::InvalidSpan);
+    }
+    if relative_offset == span_len {
+        return Ok(SourcePage {
+            bytes: Vec::new(),
+            next_offset: None,
+        });
+    }
+    let absolute_offset = source_ref
+        .start
+        .checked_add(relative_offset)
+        .ok_or(CompactStateExchangeError::InvalidSpan)?;
+    let remaining = span_len - relative_offset;
+    let request_limit = NonZeroU64::new(limit.get().min(remaining))
+        .ok_or(CompactStateExchangeError::InvalidSpan)?;
+    let page = store
+        .read_page(
+            &artifact_id,
+            PageRequest::new(absolute_offset, request_limit),
+        )
+        .map_err(|_| CompactStateExchangeError::Artifact)?;
+    let length =
+        u64::try_from(page.bytes().len()).map_err(|_| CompactStateExchangeError::LengthMismatch)?;
+    if length == 0 || length > request_limit.get() || length > remaining {
+        return Err(CompactStateExchangeError::PageProgress);
+    }
+    let expected_next = absolute_offset
+        .checked_add(length)
+        .ok_or(CompactStateExchangeError::PageProgress)?;
+    match page.next_offset() {
+        Some(next) if next != expected_next || next <= absolute_offset || next > source_ref.end => {
+            Err(CompactStateExchangeError::PageProgress)
+        }
+        Some(next) if next < source_ref.end => Ok(SourcePage {
+            bytes: page.into_bytes(),
+            next_offset: Some(next - source_ref.start),
+        }),
+        Some(_) if expected_next == source_ref.end => Ok(SourcePage {
+            bytes: page.into_bytes(),
+            next_offset: None,
+        }),
+        None if expected_next == source_ref.end && source_ref.end == record.byte_len => {
+            Ok(SourcePage {
+                bytes: page.into_bytes(),
+                next_offset: None,
+            })
+        }
+        None => Err(CompactStateExchangeError::LengthMismatch),
+        Some(_) => Err(CompactStateExchangeError::PageProgress),
+    }
+}
+
+fn map_typed_error(error: TypedOutputError) -> CompactStateExchangeError {
+    match error {
+        TypedOutputError::Truncated | TypedOutputError::OverBudget => {
+            CompactStateExchangeError::Oversized
+        }
+        _ => CompactStateExchangeError::InvalidEnvelope,
+    }
+}
+
+fn content_id(bytes: &[u8]) -> Option<ArtifactId> {
+    ArtifactId::parse(encode_hex(&Sha256::digest(bytes)))
+}
+
+fn read_artifact<S: ArtifactStore>(
+    store: &S,
+    artifact_id: &ArtifactId,
+    max_bytes: usize,
+) -> Result<Vec<u8>, CompactStateExchangeError> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(PAGE_LIMIT.get() as usize));
+    let mut offset = 0_u64;
+    loop {
+        let page = store
+            .read_page(artifact_id, PageRequest::new(offset, PAGE_LIMIT))
+            .map_err(|_| CompactStateExchangeError::Artifact)?;
+        if page.bytes().is_empty() {
+            return Err(CompactStateExchangeError::PageProgress);
+        }
+        if page.bytes().len() > PAGE_LIMIT.get() as usize {
+            return Err(CompactStateExchangeError::PageProgress);
+        }
+        let next_len = bytes
+            .len()
+            .checked_add(page.bytes().len())
+            .ok_or(CompactStateExchangeError::Oversized)?;
+        if next_len > max_bytes {
+            return Err(CompactStateExchangeError::Oversized);
+        }
+        bytes.extend_from_slice(page.bytes());
+        let page_len = u64::try_from(page.bytes().len())
+            .map_err(|_| CompactStateExchangeError::LengthMismatch)?;
+        let expected_next = offset
+            .checked_add(page_len)
+            .ok_or(CompactStateExchangeError::PageProgress)?;
+        match page.next_offset() {
+            Some(next) if next == expected_next && next > offset => offset = next,
+            Some(_) => return Err(CompactStateExchangeError::PageProgress),
+            None => {
+                if content_id(&bytes).as_ref() != Some(artifact_id) {
+                    return Err(CompactStateExchangeError::DigestMismatch);
+                }
+                return Ok(bytes);
+            }
+        }
+    }
+}
+
+fn verify_artifact<S: ArtifactStore>(
+    store: &S,
+    artifact_id: &ArtifactId,
+    expected_len: u64,
+) -> Result<(), CompactStateExchangeError> {
+    let mut hasher = Sha256::new();
+    let mut offset = 0_u64;
+    let mut length = 0_u64;
+    loop {
+        let page = store
+            .read_page(artifact_id, PageRequest::new(offset, PAGE_LIMIT))
+            .map_err(|_| CompactStateExchangeError::Artifact)?;
+        if page.bytes().is_empty() {
+            return Err(CompactStateExchangeError::PageProgress);
+        }
+        let page_len = u64::try_from(page.bytes().len())
+            .map_err(|_| CompactStateExchangeError::LengthMismatch)?;
+        if page_len > PAGE_LIMIT.get() {
+            return Err(CompactStateExchangeError::PageProgress);
+        }
+        length = length
+            .checked_add(page_len)
+            .ok_or(CompactStateExchangeError::LengthMismatch)?;
+        if length > expected_len {
+            return Err(CompactStateExchangeError::LengthMismatch);
+        }
+        hasher.update(page.bytes());
+        let expected_next = offset
+            .checked_add(page_len)
+            .ok_or(CompactStateExchangeError::PageProgress)?;
+        match page.next_offset() {
+            Some(next) if next == expected_next && next > offset => offset = next,
+            Some(_) => return Err(CompactStateExchangeError::PageProgress),
+            None => {
+                if length != expected_len {
+                    return Err(CompactStateExchangeError::LengthMismatch);
+                }
+                let digest = encode_hex(&hasher.finalize());
+                if digest != artifact_id.as_str() {
+                    return Err(CompactStateExchangeError::DigestMismatch);
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn extract_compact_state_ref(
+    envelope: &[u8],
+) -> Result<(String, String, ArtifactId), CompactStateExchangeError> {
+    let root = serde_json::from_slice::<Value>(envelope)
+        .map_err(|_| CompactStateExchangeError::InvalidEnvelope)?;
+    let root = exact_object(&root, &["from", "to", "output"])?;
+    let output = root
+        .get("output")
+        .ok_or(CompactStateExchangeError::InvalidEnvelope)?;
+    let output = exact_object(
+        output,
+        &["schema_version", "node", "completeness", "payload"],
+    )?;
+    let payload = output
+        .get("payload")
+        .ok_or(CompactStateExchangeError::InvalidEnvelope)?;
+    let payload = exact_object(payload, &["kind", "key", "op", "artifacts"])?;
+    if payload.get("kind").and_then(Value::as_str) != Some("compact_state") {
+        return Err(CompactStateExchangeError::WrongPayload);
+    }
+    let key = payload
+        .get("key")
+        .and_then(Value::as_str)
+        .ok_or(CompactStateExchangeError::InvalidEnvelope)?
+        .to_owned();
+    let op = payload
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or(CompactStateExchangeError::InvalidEnvelope)?
+        .to_owned();
+    let artifacts = payload
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .ok_or(CompactStateExchangeError::InvalidEnvelope)?;
+    if artifacts.len() != 1 {
+        return Err(CompactStateExchangeError::InvalidEnvelope);
+    }
+    let artifact = exact_object(&artifacts[0], &["artifact_id", "sha256"])?;
+    let artifact_id = artifact
+        .get("artifact_id")
+        .and_then(Value::as_str)
+        .ok_or(CompactStateExchangeError::InvalidEnvelope)?;
+    let artifact_id = ArtifactId::parse(artifact_id.to_owned())
+        .ok_or(CompactStateExchangeError::InvalidEnvelope)?;
+    let digest = artifact
+        .get("sha256")
+        .and_then(Value::as_str)
+        .ok_or(CompactStateExchangeError::InvalidEnvelope)?;
+    if digest != format!("sha256:{}", artifact_id.as_str()) {
+        return Err(CompactStateExchangeError::DigestMismatch);
+    }
+    Ok((key, op, artifact_id))
+}
+
+fn exact_object<'a>(
+    value: &'a Value,
+    keys: &[&str],
+) -> Result<&'a serde_json::Map<String, Value>, CompactStateExchangeError> {
+    let object = value
+        .as_object()
+        .ok_or(CompactStateExchangeError::InvalidEnvelope)?;
+    if object.len() != keys.len() || keys.iter().any(|key| !object.contains_key(*key)) {
+        return Err(CompactStateExchangeError::InvalidEnvelope);
+    }
+    Ok(object)
+}

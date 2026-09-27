@@ -6,6 +6,7 @@ pub mod behavioral;
 mod bridge;
 mod bubblewrap;
 mod checkpoint;
+mod compact_state;
 mod controller;
 mod dataset;
 mod effect_journal;
@@ -57,6 +58,10 @@ pub use checkpoint::{
     Checkpoint, CheckpointBackend, CheckpointCompatibilityManifestV1, CheckpointError,
     CheckpointErrorKind, CheckpointManifestV1, DurableCheckpointV1, SqliteCheckpointBackend,
     SqliteCheckpointStore,
+};
+pub use compact_state::{
+    COMPACT_STATE_KEY, COMPACT_STATE_OPERATION, CompactStateExchangeError, CompactStateReceipt,
+    SourcePage, consume_compact_state_delta, publish_compact_state_delta, read_source_ref_page,
 };
 pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
