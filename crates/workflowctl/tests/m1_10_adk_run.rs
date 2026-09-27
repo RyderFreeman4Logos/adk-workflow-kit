@@ -308,14 +308,163 @@ fn terminal_artifact(run_root: &Path) -> (Vec<u8>, Value) {
     (bytes, value)
 }
 
+fn checkpoint_manifest_from_value(value: Value) -> CheckpointManifestV1 {
+    match serde_json::from_value(value) {
+        Ok(manifest) => manifest,
+        Err(_) => panic!("{}", "checkpoint manifest"),
+    }
+}
+
+fn workflow_events_from_bytes(bytes: &[u8]) -> Vec<WorkflowRuntimeEventV1> {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => panic!("{}", "events UTF-8"),
+    };
+    match text
+        .lines()
+        .map(serde_json::from_str::<WorkflowRuntimeEventV1>)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(events) => events,
+        Err(_) => panic!("{}", "events structurally readable"),
+    }
+}
+
 fn json_stdout(output: &Output) -> Value {
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
         panic!(
-            "stdout must be JSON: {error}; stdout={}; stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "{}",
+            child_failure_diagnostic(output, "stdout must be JSON")
         )
     })
+}
+
+fn child_failure_diagnostic(output: &Output, operation: &'static str) -> String {
+    let diagnostic = format!(
+        "{operation}; {}; stdout_bytes={}; stderr_bytes={}",
+        format_wait_status(output.status),
+        output.stdout.len(),
+        output.stderr.len()
+    );
+    if diagnostic.len() <= CHILD_FAILURE_DIAGNOSTIC_MAX_BYTES {
+        diagnostic
+    } else {
+        "child failure diagnostic exceeded size limit".to_owned()
+    }
+}
+
+fn assert_child_success(output: &Output, operation: &'static str) {
+    if !output.status.success() {
+        panic!("{}", child_failure_diagnostic(output, operation));
+    }
+}
+
+fn assert_child_failure(output: &Output, operation: &'static str) {
+    if output.status.success() {
+        panic!("{}", child_failure_diagnostic(output, operation));
+    }
+}
+
+fn assert_child_stderr_contains(output: &Output, expected: &'static str, operation: &'static str) {
+    let contains_expected =
+        std::str::from_utf8(&output.stderr).is_ok_and(|stderr| stderr.contains(expected));
+    if !contains_expected {
+        panic!("{}", child_failure_diagnostic(output, operation));
+    }
+}
+
+fn assert_child_exit_code(output: &Output, expected: i32, operation: &'static str) {
+    if output.status.code() != Some(expected) {
+        panic!("{}", child_failure_diagnostic(output, operation));
+    }
+}
+
+#[test]
+fn oracle_child_failure_diagnostic_is_bounded_and_content_free() {
+    use std::os::unix::process::ExitStatusExt;
+
+    const NON_CANARY_MARKER: &str = "synthetic-non-canary-marker";
+    const ENCODED_SYNTHETIC_MARKER: &str = "c3ludGhldGljLWVuY29kZWQtbWFya2Vy";
+
+    let output = Output {
+        status: std::process::ExitStatus::from_raw(1 << 8),
+        stdout: NON_CANARY_MARKER.as_bytes().to_vec(),
+        stderr: ENCODED_SYNTHETIC_MARKER.as_bytes().to_vec(),
+    };
+    let panic = std::panic::catch_unwind(|| {
+        assert_child_success(&output, "oracle child must succeed");
+    })
+    .expect_err("failed child assertion must panic");
+    let rendered = panic
+        .downcast::<String>()
+        .expect("child diagnostic panic must be a String");
+
+    assert!(rendered.len() <= CHILD_FAILURE_DIAGNOSTIC_MAX_BYTES);
+    assert!(rendered.contains("status:exit:1"));
+    assert!(rendered.contains("stdout_bytes="));
+    assert!(rendered.contains("stderr_bytes="));
+    assert!(!rendered.contains(NON_CANARY_MARKER));
+    assert!(!rendered.contains(ENCODED_SYNTHETIC_MARKER));
+}
+
+#[test]
+fn oracle_readback_diagnostics_are_content_free_for_controlled_malformed_inputs() {
+    use std::os::unix::process::ExitStatusExt;
+
+    const NON_CANARY_MARKER: &str = "synthetic-readback-marker";
+    const ENCODED_SYNTHETIC_MARKER: &str = "c3ludGhldGljLXJlYWRiYWNrLWVuY29kZWQ=";
+
+    let invalid_json = Output {
+        status: std::process::ExitStatus::from_raw(0),
+        stdout: format!("{{\"{NON_CANARY_MARKER}\":").into_bytes(),
+        stderr: ENCODED_SYNTHETIC_MARKER.as_bytes().to_vec(),
+    };
+    let json_panic = std::panic::catch_unwind(|| json_stdout(&invalid_json))
+        .expect_err("malformed JSON must panic at the readback boundary");
+    let json_diagnostic = *json_panic
+        .downcast::<String>()
+        .expect("JSON diagnostic panic must be a String");
+    assert_eq!(
+        json_diagnostic,
+        format!(
+            "stdout must be JSON; status:exit:0; stdout_bytes={}; stderr_bytes={}",
+            invalid_json.stdout.len(),
+            invalid_json.stderr.len()
+        )
+    );
+    assert!(!json_diagnostic.contains(NON_CANARY_MARKER));
+    assert!(!json_diagnostic.contains(ENCODED_SYNTHETIC_MARKER));
+
+    let mut checkpoint_object = serde_json::Map::new();
+    checkpoint_object.insert(NON_CANARY_MARKER.to_owned(), json!(true));
+    let checkpoint_fixture = Value::Object(checkpoint_object);
+    let checkpoint_error =
+        serde_json::from_value::<CheckpointManifestV1>(checkpoint_fixture.clone())
+            .expect_err("checkpoint fixture must be malformed");
+    assert!(checkpoint_error.to_string().contains(NON_CANARY_MARKER));
+    let checkpoint_panic = std::panic::catch_unwind(|| {
+        checkpoint_manifest_from_value(checkpoint_fixture);
+    })
+    .expect_err("malformed checkpoint manifest must panic at the readback boundary");
+    let checkpoint_diagnostic = *checkpoint_panic
+        .downcast::<String>()
+        .expect("checkpoint diagnostic panic must be a String");
+    assert_eq!(checkpoint_diagnostic, "checkpoint manifest");
+    assert!(!checkpoint_diagnostic.contains(NON_CANARY_MARKER));
+
+    let event_fixture = format!(r#"{{"{ENCODED_SYNTHETIC_MARKER}":true}}"#);
+    let event_error = serde_json::from_str::<WorkflowRuntimeEventV1>(&event_fixture)
+        .expect_err("event fixture must be malformed");
+    assert!(event_error.to_string().contains(ENCODED_SYNTHETIC_MARKER));
+    let event_panic = std::panic::catch_unwind(|| {
+        workflow_events_from_bytes(event_fixture.as_bytes());
+    })
+    .expect_err("malformed events must panic at the readback boundary");
+    let event_diagnostic = *event_panic
+        .downcast::<String>()
+        .expect("event diagnostic panic must be a String");
+    assert_eq!(event_diagnostic, "events structurally readable");
+    assert!(!event_diagnostic.contains(ENCODED_SYNTHETIC_MARKER));
 }
 
 fn sole_run_root(runs: &Path) -> Result<PathBuf, &'static str> {
@@ -364,6 +513,7 @@ const ORACLE_SOCKET_TIMEOUT: Duration = Duration::from_millis(100);
 const ORACLE_TERMINAL_QUIET_WINDOW: Duration = Duration::from_millis(25);
 const ORACLE_MAX_REQUEST_BYTES: usize = 64 * 1024;
 const ORACLE_MAX_CHILD_OUTPUT_BYTES: usize = 64 * 1024;
+const CHILD_FAILURE_DIAGNOSTIC_MAX_BYTES: usize = 256;
 
 fn oracle_remaining_duration(
     deadline: Instant,
@@ -1142,11 +1292,7 @@ fn command_json(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("workflowctl must start");
-    assert!(
-        output.status.success(),
-        "command must succeed, stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_child_success(&output, "command must succeed");
     output
 }
 
@@ -1156,13 +1302,12 @@ fn subprocess_adk_run_needs_no_transform_module_and_persists_state() {
     let (workflow, profile, runs) = write_fixture(&root, fake_profile());
 
     let output = run_adk(&workflow, &profile, &runs);
-    assert!(
-        output.status.success(),
-        "ADK run must succeed without --module, stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_child_success(&output, "ADK run must succeed without --module");
     let receipt = json_stdout(&output);
-    assert_eq!(receipt["status"], "succeeded");
+    assert!(
+        receipt["status"] == "succeeded",
+        "successful run receipt must have succeeded status"
+    );
     assert!(receipt["run_id"].as_str().is_some_and(|id| !id.is_empty()));
 
     let run_root = run_root(&runs);
@@ -1184,7 +1329,7 @@ fn fake_model_and_tool_execute_end_to_end_through_adk_events() {
     let (workflow, profile, runs) = write_fixture(&root, fake_profile());
 
     let output = run_adk(&workflow, &profile, &runs);
-    assert!(output.status.success());
+    assert_child_success(&output, "fake model and tool run must succeed");
     let events =
         fs::read_to_string(run_root(&runs).join("events.jsonl")).expect("events must be persisted");
     assert!(events.contains("\"kind\":\"model_request_completed\""));
@@ -1202,11 +1347,7 @@ fn profile_graph_runs_non_agent_nodes_through_the_wasm_backend() {
     fs::write(&workflow, HETEROGENEOUS_WORKFLOW).expect("workflow fixture must write");
 
     let output = run_adk(&workflow, &profile, &runs);
-    assert!(
-        output.status.success(),
-        "heterogeneous ADK run must succeed, stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_child_success(&output, "heterogeneous ADK run must succeed");
     let run_root = run_root(&runs);
     let (_, terminal) = terminal_artifact(&run_root);
     let node_outputs = terminal["node_output_refs"]
@@ -1221,10 +1362,9 @@ fn profile_graph_runs_non_agent_nodes_through_the_wasm_backend() {
                 .expect("referenced node output must be readable"),
         )
         .expect("node output artifact must be JSON");
-        assert_eq!(
-            output,
-            json!({"value": 7}),
-            "{node} must preserve the WASM transform output instead of a true placeholder"
+        assert!(
+            output == json!({"value": 7}),
+            "WASM transform output must retain the expected value"
         );
     }
 }
@@ -1239,11 +1379,7 @@ fn large_non_agent_outputs_are_individually_persisted_and_inspectable() {
     let (input_value, input) = large_input();
 
     let output = run_adk_with_input(&workflow, &profile, &runs, &input);
-    assert!(
-        output.status.success(),
-        "large multi-node run must succeed, stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_child_success(&output, "large multi-node run must succeed");
     let receipt = json_stdout(&output);
     let run_id = receipt["run_id"].as_str().expect("run ID must be text");
     let inspect = command_json(&[
@@ -1254,7 +1390,10 @@ fn large_non_agent_outputs_are_individually_persisted_and_inspectable() {
         "--workdir",
         runs.to_str().expect("UTF-8 run base"),
     ]);
-    assert_eq!(json_stdout(&inspect), receipt);
+    assert!(
+        json_stdout(&inspect) == receipt,
+        "inspect receipt must equal run receipt"
+    );
 
     let run_root = run_root(&runs);
     let (terminal_bytes, terminal) = terminal_artifact(&run_root);
@@ -1263,14 +1402,20 @@ fn large_non_agent_outputs_are_individually_persisted_and_inspectable() {
     let refs = terminal["node_output_refs"]
         .as_object()
         .expect("terminal artifact must contain node output references");
-    assert_eq!(refs.len(), 2);
+    assert!(
+        refs.len() == 2,
+        "large run must persist two node references"
+    );
     let mut combined_bytes = 0_u64;
     for node in ["node-0", "node-1"] {
         let reference = &refs[node];
         let artifact_id = reference["artifact_id"]
             .as_str()
             .expect("reference must contain an artifact ID");
-        assert_eq!(reference["sha256"], format!("sha256:{artifact_id}"));
+        assert!(
+            reference["sha256"] == format!("sha256:{artifact_id}"),
+            "node reference digest must match its artifact ID"
+        );
         combined_bytes += reference["byte_len"]
             .as_u64()
             .expect("reference must contain a byte length");
@@ -1279,7 +1424,10 @@ fn large_non_agent_outputs_are_individually_persisted_and_inspectable() {
                 .expect("node artifact must be readable"),
         )
         .expect("node artifact must be JSON");
-        assert_eq!(persisted, input_value);
+        assert!(
+            persisted == input_value,
+            "persisted node output must match the input fixture"
+        );
     }
     assert!(combined_bytes > 64 * 1024);
 }
@@ -1293,13 +1441,12 @@ fn oversized_node_output_reference_aggregate_remains_bounded_and_inspectable() {
     fs::write(&workflow, non_agent_workflow(350)).expect("workflow fixture must write");
 
     let output = run_adk(&workflow, &profile, &runs);
-    assert!(
-        !output.status.success(),
-        "large reference aggregate must fail closed, stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_child_failure(&output, "large reference aggregate must fail closed");
     let receipt = json_stdout(&output);
-    assert_eq!(receipt["status"], "failed");
+    assert!(
+        receipt["status"] == "failed",
+        "oversized reference aggregate must report failed status"
+    );
     let run_id = receipt["run_id"].as_str().expect("run ID must be text");
     let inspect = command_json(&[
         "--json",
@@ -1309,13 +1456,24 @@ fn oversized_node_output_reference_aggregate_remains_bounded_and_inspectable() {
         "--workdir",
         runs.to_str().expect("UTF-8 run base"),
     ]);
-    assert_eq!(json_stdout(&inspect), receipt);
+    assert!(
+        json_stdout(&inspect) == receipt,
+        "inspect receipt must equal run receipt"
+    );
 
     let run_root = run_root(&runs);
     let (terminal_bytes, terminal) = terminal_artifact(&run_root);
     assert!(terminal_bytes.len() <= 64 * 1024);
-    assert_eq!(terminal["node_output_refs"], json!({}));
-    assert_eq!(terminal["node_output_refs_summary"]["count"], 350);
+    assert!(
+        terminal["node_output_refs"]
+            .as_object()
+            .is_some_and(|refs| refs.is_empty()),
+        "oversized reference aggregate must omit individual references"
+    );
+    assert!(
+        terminal["node_output_refs_summary"]["count"] == 350,
+        "oversized reference aggregate must retain its count"
+    );
     assert!(
         terminal["node_output_refs_summary"]["sha256"]
             .as_str()
@@ -1383,11 +1541,19 @@ fn post_execution_artifact_failure_still_persists_the_returned_receipt() {
     let failed = child
         .wait_with_output()
         .expect("workflowctl run must finish after persistence failure");
-    assert_eq!(failed.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&failed.stderr).contains("workflow.run.failed"));
+    assert_child_exit_code(
+        &failed,
+        2,
+        "artifact persistence failure must exit with code 2",
+    );
+    assert_child_stderr_contains(
+        &failed,
+        "workflow.run.failed",
+        "artifact persistence failure must report the stable category",
+    );
     let failed_receipt = json_stdout(&failed);
-    assert_eq!(
-        failed_receipt["status"], "succeeded",
+    assert!(
+        failed_receipt["status"] == "succeeded",
         "artifact persistence failure must occur after graph execution"
     );
     let run_id = failed_receipt["run_id"]
@@ -1401,7 +1567,10 @@ fn post_execution_artifact_failure_still_persists_the_returned_receipt() {
         "--workdir",
         runs.to_str().expect("UTF-8 run base"),
     ]);
-    assert_eq!(json_stdout(&inspect), failed_receipt);
+    assert!(
+        json_stdout(&inspect) == failed_receipt,
+        "inspect receipt must equal persisted failure receipt"
+    );
 }
 
 #[test]
@@ -1415,8 +1584,12 @@ fn invalid_profile_fails_closed_with_stable_exit_code() {
     let (workflow, profile, runs) = write_fixture(&root, invalid);
 
     let output = run_adk(&workflow, &profile, &runs);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("workflow.run.unsupported_input"));
+    assert_child_exit_code(&output, 2, "invalid profile must exit with code 2");
+    assert_child_stderr_contains(
+        &output,
+        "workflow.run.unsupported_input",
+        "invalid profile must report the stable category",
+    );
     assert!(
         fs::read_dir(&runs)
             .expect("run base must be readable")
@@ -1434,8 +1607,12 @@ fn sandbox_denial_fails_before_backend_spawn() {
     let (workflow, profile, runs) = write_fixture(&root, profile_value);
 
     let output = run_adk(&workflow, &profile, &runs);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("workflow.run.failed"));
+    assert_child_exit_code(&output, 2, "sandbox denial must exit with code 2");
+    assert_child_stderr_contains(
+        &output,
+        "workflow.run.failed",
+        "sandbox denial must report the stable category",
+    );
     assert!(
         fs::read_dir(&runs)
             .expect("run base must be readable")
@@ -1457,13 +1634,20 @@ fn failed_profile_run_persists_and_remains_inspectable() {
     fs::write(&workflow, HETEROGENEOUS_WORKFLOW).expect("workflow fixture must write");
 
     let failed = run_adk(&workflow, &profile, &runs);
-    assert_eq!(failed.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&failed.stderr).contains("workflow.run.failed"));
+    assert_child_exit_code(&failed, 2, "failed profile must exit with code 2");
+    assert_child_stderr_contains(
+        &failed,
+        "workflow.run.failed",
+        "failed profile must report the stable category",
+    );
     let failed_receipt = json_stdout(&failed);
     let run_id = failed_receipt["run_id"]
         .as_str()
         .expect("failed receipt must carry the allocated run ID");
-    assert_eq!(failed_receipt["status"], "failed");
+    assert!(
+        failed_receipt["status"] == "failed",
+        "failed profile receipt must report failed status"
+    );
 
     let inspect = command_json(&[
         "--json",
@@ -1474,8 +1658,14 @@ fn failed_profile_run_persists_and_remains_inspectable() {
         runs.to_str().expect("UTF-8 run base"),
     ]);
     let inspected = json_stdout(&inspect);
-    assert_eq!(inspected["run_id"], run_id);
-    assert_eq!(inspected["status"], "failed");
+    assert!(
+        inspected["run_id"] == run_id,
+        "inspected failed receipt must retain the run ID"
+    );
+    assert!(
+        inspected["status"] == "failed",
+        "inspected failed receipt must retain the failed status"
+    );
     let events = fs::read_to_string(run_root(&runs).join("events.jsonl"))
         .expect("failed events must be persisted");
     assert!(events.contains("\"kind\":\"workflow_failed\""));
@@ -1496,8 +1686,12 @@ fn oversized_agent_only_profile_input_fails_before_run_allocation() {
         .expect("oversized input must serialize");
 
     let output = run_adk_with_input(&workflow, &profile, &runs, &input);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("workflow.run.unsupported_input"));
+    assert_child_exit_code(&output, 2, "oversized input must exit with code 2");
+    assert_child_stderr_contains(
+        &output,
+        "workflow.run.unsupported_input",
+        "oversized input must report the stable category",
+    );
     assert!(
         fs::read_dir(&runs)
             .expect("run base must be readable")
@@ -1512,7 +1706,7 @@ fn resume_and_inspect_reuse_the_original_run_identity() {
     let root = temp_root("resume-inspect");
     let (workflow, profile, runs) = write_fixture(&root, fake_profile());
     let run = run_adk(&workflow, &profile, &runs);
-    assert!(run.status.success());
+    assert_child_success(&run, "resume fixture run must succeed");
     let run_receipt = json_stdout(&run);
     let run_id = run_receipt["run_id"].as_str().expect("run ID must be text");
     let runs_text = runs.to_str().expect("UTF-8 run base");
@@ -1526,8 +1720,14 @@ fn resume_and_inspect_reuse_the_original_run_identity() {
         runs_text,
     ]);
     let inspected = json_stdout(&inspect);
-    assert_eq!(inspected["run_id"], run_id);
-    assert_eq!(inspected["status"], "succeeded");
+    assert!(
+        inspected["run_id"] == run_id,
+        "inspected receipt must retain the run ID"
+    );
+    assert!(
+        inspected["status"] == "succeeded",
+        "inspected receipt must retain the succeeded status"
+    );
 
     let resume = command_json(&[
         "--json",
@@ -1538,8 +1738,14 @@ fn resume_and_inspect_reuse_the_original_run_identity() {
         runs_text,
     ]);
     let resumed = json_stdout(&resume);
-    assert_eq!(resumed["run_id"], run_id);
-    assert_eq!(resumed["status"], "succeeded");
+    assert!(
+        resumed["run_id"] == run_id,
+        "resumed receipt must retain the run ID"
+    );
+    assert!(
+        resumed["status"] == "succeeded",
+        "resumed receipt must retain the succeeded status"
+    );
 
     let events = fs::read_to_string(run_root(&runs).join("events.jsonl"))
         .expect("resumed events must be readable");
@@ -2059,8 +2265,8 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
     let sentinel_survived = fixture_root.join("sentinel").is_file();
     let _ = owned_tree::remove_dir_all(&fixture_root);
 
-    assert!(!output.status.success(), "unproven reap must abort");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_child_failure(&output, "unproven reap must abort");
+    let stderr = std::str::from_utf8(&output.stderr).expect("abort fixture stderr must be UTF-8");
     assert!(stderr.contains("oracle child terminal reap not proven; aborting"));
     let evidence = stderr
         .lines()
@@ -2068,7 +2274,7 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
         .expect("abort must emit one bounded reap evidence record");
     assert!(
         evidence.contains("operation=fixture-env"),
-        "operation must be the static fixture-env label: {evidence}"
+        "operation must be the static fixture-env label"
     );
     assert!(
         evidence.split(' ').any(
@@ -2076,7 +2282,7 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
                 |value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
             )
         ),
-        "pid must be numeric: {evidence}"
+        "pid must be numeric"
     );
     assert!(
         evidence.split(' ').any(
@@ -2088,7 +2294,7 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
                     || value == "unavailable"
             })
         ),
-        "starttime must be numeric, errno, or unavailable: {evidence}"
+        "starttime must be numeric, errno, or unavailable"
     );
     assert!(
         evidence
@@ -2100,7 +2306,7 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
                     })
                     || value == "unavailable"
             })),
-        "kill must be ok, errno, or unavailable: {evidence}"
+        "kill must be ok, errno, or unavailable"
     );
     assert!(
         evidence
@@ -2115,7 +2321,7 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
                     })
                     || value == "unavailable"
             })),
-        "wait must be status, still-alive, errno, or unavailable: {evidence}"
+        "wait must be status, still-alive, errno, or unavailable"
     );
     assert!(
         evidence.split(' ').any(|field| field.strip_prefix("terminal=").is_some_and(|value| {
@@ -2138,7 +2344,7 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
                     .is_some_and(|errno| !errno.is_empty() && errno.bytes().all(|byte| byte.is_ascii_digit()))
                 || value == "unavailable"
         })),
-        "terminal must be esrch, state+starttime, errno, or unavailable: {evidence}"
+        "terminal must be esrch, state+starttime, errno, or unavailable"
     );
     assert!(sentinel_survived, "abort must not unwind root cleanup");
 }
@@ -2238,14 +2444,16 @@ fn oracle_child_timeout_is_primary_and_directly_reaped() {
         }
         thread::yield_now();
     }
-    let error = wait_bounded_child(
+    let error = match wait_bounded_child(
         child,
         &stdout_path,
         &stderr_path,
         Instant::now() + Duration::from_millis(100),
         "timeout-reap",
-    )
-    .expect_err("fixture child must time out");
+    ) {
+        Ok(_) => panic!("fixture child must time out"),
+        Err(error) => error,
+    };
     assert!(error.starts_with("oracle child timed out"));
     assert!(error.contains("oracle child reaped after kill"));
     assert!(error.contains("oracle child output exceeded size limit"));
@@ -2806,34 +3014,51 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
             panic!("oracle child supervision failed: {error}; {server_diagnostic}");
         }
     };
-    assert!(
-        child.status.success(),
-        "oracle child must succeed (stdout={}, stderr={})",
-        String::from_utf8_lossy(&child.stdout).replace(CANARY, "[REDACTED]"),
-        String::from_utf8_lossy(&child.stderr).replace(CANARY, "[REDACTED]")
-    );
+    assert_child_success(&child, "oracle child must succeed");
     assert_no_canary_bytes(&child.stdout, CANARY);
     assert_no_canary_bytes(&child.stderr, CANARY);
     let run_receipt = json_stdout(&child);
-    assert_eq!(run_receipt["status"], "succeeded");
+    assert!(
+        run_receipt["status"] == "succeeded",
+        "oracle run receipt must report success"
+    );
     let observation = server_result
         .expect("oracle server thread")
         .expect("oracle request observation");
-    assert_eq!(observation.method, "POST");
-    assert_eq!(observation.path, "/v1/chat/completions");
-    assert_eq!(observation.authorization_headers, 1);
-    assert_eq!(observation.authorization_canary_occurrences, 1);
-    assert_eq!(observation.request_canary_occurrences, 1);
+    assert!(
+        observation.method == "POST",
+        "oracle request method must be POST"
+    );
+    assert!(
+        observation.path == "/v1/chat/completions",
+        "oracle request path must be the chat endpoint"
+    );
+    assert!(
+        observation.authorization_headers == 1,
+        "oracle request must carry one authorization header"
+    );
+    assert!(
+        observation.authorization_canary_occurrences == 1,
+        "oracle authorization must carry one synthetic credential"
+    );
+    assert!(
+        observation.request_canary_occurrences == 1,
+        "oracle request must carry one synthetic credential"
+    );
 
     let run_root = sole_run_root(&runs).expect("sole oracle run root");
     assert_no_canary_in_run_root(&run_root, CANARY);
     let manifest_bytes = fs::read(run_root.join("run-manifest.json")).expect("run manifest");
     assert_no_canary_bytes(&manifest_bytes, CANARY);
     let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("manifest JSON");
-    assert_eq!(manifest["status"], "succeeded");
-    assert_eq!(
-        manifest["profile_identity"],
-        "worker=oracle-model:1;requested=oracle;resolved=oracle;provider=openai-compatible"
+    assert!(
+        manifest["status"] == "succeeded",
+        "run manifest must report success"
+    );
+    assert!(
+        manifest["profile_identity"]
+            == "worker=oracle-model:1;requested=oracle;resolved=oracle;provider=openai-compatible",
+        "run manifest must retain the resolved profile identity"
     );
     assert!(
         !manifest["plan_hash"]
@@ -2849,17 +3074,29 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     );
 
     let source = fs::read(run_root.join("workflow.toml")).expect("canonical source");
-    assert_eq!(source, expected_source);
+    assert!(
+        source == expected_source,
+        "run root must retain canonical workflow source"
+    );
     assert_no_canary_bytes(&source, CANARY);
 
     let stored_profile = fs::read(run_root.join("execution-profile.json")).expect("stored profile");
     assert_no_canary_bytes(&stored_profile, CANARY);
     let stored_profile: Value = serde_json::from_slice(&stored_profile).expect("profile JSON");
-    assert_eq!(stored_profile["model"]["credential_env"], HANDLE);
-    assert_ne!(stored_profile["model"]["credential_env"], CANARY);
+    assert!(
+        stored_profile["model"]["credential_env"] == HANDLE,
+        "stored profile must retain only the credential selector"
+    );
+    assert!(
+        stored_profile["model"]["credential_env"] != CANARY,
+        "stored profile must not retain the credential value"
+    );
 
     let run_id = manifest["run_id"].as_str().expect("run ID");
-    assert_eq!(run_receipt["run_id"], run_id);
+    assert!(
+        run_receipt["run_id"] == run_id,
+        "run receipt must identify the persisted run"
+    );
     let inspect = run_oracle_operation(
         &root,
         "inspect",
@@ -2876,17 +3113,18 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         "credential-inspect",
     )
     .expect("bounded oracle inspect child");
-    assert!(
-        inspect.status.success(),
-        "oracle inspect must succeed (stdout={}, stderr={})",
-        String::from_utf8_lossy(&inspect.stdout).replace(CANARY, "[REDACTED]"),
-        String::from_utf8_lossy(&inspect.stderr).replace(CANARY, "[REDACTED]")
-    );
+    assert_child_success(&inspect, "oracle inspect must succeed");
     assert_no_canary_bytes(&inspect.stdout, CANARY);
     assert_no_canary_bytes(&inspect.stderr, CANARY);
     let inspected = json_stdout(&inspect);
-    assert_eq!(inspected["status"], "succeeded");
-    assert_eq!(inspected["run_id"], run_id);
+    assert!(
+        inspected["status"] == "succeeded",
+        "inspect receipt must report success"
+    );
+    assert!(
+        inspected["run_id"] == run_id,
+        "inspect receipt must identify the persisted run"
+    );
     assert_no_canary_in_run_root(&run_root, CANARY);
 
     drop(listener);
@@ -2908,18 +3146,24 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         "credential-resume-missing",
     )
     .expect("bounded missing-credential resume child");
-    assert_eq!(missing_resume.status.code(), Some(2));
+    assert_child_exit_code(
+        &missing_resume,
+        2,
+        "missing credential resume must exit with code 2",
+    );
     assert!(
-        String::from_utf8_lossy(&missing_resume.stderr).contains("workflow.run.failed"),
+        std::str::from_utf8(&missing_resume.stderr)
+            .expect("missing credential stderr must be UTF-8")
+            .contains("workflow.run.failed"),
         "missing credential must retain the static workflow failure category"
     );
     assert_no_canary_bytes(&missing_resume.stdout, CANARY);
     assert_no_canary_bytes(&missing_resume.stderr, CANARY);
     assert_no_canary_in_run_root(&run_root, CANARY);
-    assert_eq!(
+    assert!(
         bounded_run_root_snapshot(&run_root, CANARY)
-            .expect("bounded post-failure run-root snapshot"),
-        before_missing_resume,
+            .expect("bounded post-failure run-root snapshot")
+            == before_missing_resume,
         "missing-credential resume must not mutate the run root"
     );
 
@@ -2939,17 +3183,21 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
         "credential-resume",
     )
     .expect("bounded credential-backed resume child");
-    assert!(
-        resume.status.success(),
-        "completed resume must succeed without a model request (stdout={}, stderr={})",
-        String::from_utf8_lossy(&resume.stdout).replace(CANARY, "[REDACTED]"),
-        String::from_utf8_lossy(&resume.stderr).replace(CANARY, "[REDACTED]")
+    assert_child_success(
+        &resume,
+        "completed resume must succeed without a model request",
     );
     assert_no_canary_bytes(&resume.stdout, CANARY);
     assert_no_canary_bytes(&resume.stderr, CANARY);
     let resumed = json_stdout(&resume);
-    assert_eq!(resumed["status"], "succeeded");
-    assert_eq!(resumed["run_id"], run_id);
+    assert!(
+        resumed["status"] == "succeeded",
+        "resume receipt must report success"
+    );
+    assert!(
+        resumed["run_id"] == run_id,
+        "resume receipt must identify the persisted run"
+    );
     assert_no_canary_in_run_root(&run_root, CANARY);
     let resumed_events =
         fs::read(run_root.join("events.jsonl")).expect("resume events must be readable");
@@ -2962,10 +3210,12 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     );
     assert_no_canary_in_run_root(&run_root, CANARY);
 
-    let checkpoint_manifest: CheckpointManifestV1 =
-        serde_json::from_value(manifest["checkpoint_manifest"].clone())
-            .expect("checkpoint manifest");
-    assert_eq!(checkpoint_manifest.run_id(), run_id);
+    let checkpoint_manifest =
+        checkpoint_manifest_from_value(manifest["checkpoint_manifest"].clone());
+    assert!(
+        checkpoint_manifest.run_id() == run_id,
+        "checkpoint manifest must identify the persisted run"
+    );
     assert_no_canary_bytes(
         &serde_json::to_vec(&checkpoint_manifest).expect("checkpoint manifest bytes"),
         CANARY,
@@ -2984,12 +3234,7 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
 
     let events_bytes = fs::read(run_root.join("events.jsonl")).expect("events");
     assert_no_canary_bytes(&events_bytes, CANARY);
-    let events = std::str::from_utf8(&events_bytes)
-        .expect("events UTF-8")
-        .lines()
-        .map(serde_json::from_str::<WorkflowRuntimeEventV1>)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("events structurally readable");
+    let events = workflow_events_from_bytes(&events_bytes);
     assert!(!events.is_empty());
     for event in &events {
         assert_no_canary(event.payload(), CANARY);
@@ -3039,7 +3284,10 @@ fn credential_value_is_absent_from_production_run_readback_surfaces() {
     assert_no_canary_bytes(&replay_bytes, CANARY);
     let replay = workflow_testkit::ReplayBundle::from_json(&replay_bytes)
         .expect("replay-facing data should read back");
-    assert_eq!(replay.replay().events().len(), 2);
+    assert!(
+        replay.replay().events().len() == 2,
+        "replay must retain the expected event count"
+    );
 
     assert_no_canary_in_run_root(&run_root, CANARY);
     root.cleanup().expect("credential oracle root cleanup");
