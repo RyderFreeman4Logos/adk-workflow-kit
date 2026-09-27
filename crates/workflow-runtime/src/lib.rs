@@ -60,8 +60,9 @@ pub use checkpoint::{
     SqliteCheckpointStore,
 };
 pub use compact_state::{
-    COMPACT_STATE_KEY, COMPACT_STATE_OPERATION, CompactStateExchangeError, CompactStateReceipt,
-    SourcePage, consume_compact_state_delta, publish_compact_state_delta, read_source_ref_page,
+    COMPACT_STATE_KEY, COMPACT_STATE_OPERATION, CompactStateExchangeError,
+    CompactStatePartialPublication, CompactStatePublicationPhase, CompactStateReceipt, SourcePage,
+    consume_compact_state_delta, publish_compact_state_delta, read_source_ref_page,
 };
 pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,

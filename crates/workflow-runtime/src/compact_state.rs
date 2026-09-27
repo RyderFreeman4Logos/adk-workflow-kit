@@ -23,11 +23,49 @@ const PAGE_LIMIT: NonZeroU64 = match NonZeroU64::new(65_536) {
 const MAX_EXCHANGE_BYTES: usize = (crate::COMPACT_STATE_OUTPUT_TOKEN_BUDGET as usize) * 4 + 256;
 const MAX_DELTA_BYTES: usize = 4 * 1024 * 1024;
 
-/// Payload-free failures at the compact-state artifact boundary.
+/// The publication boundary reached before a compact-state exchange failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompactStatePublicationPhase {
+    /// The canonical delta is visible, but the typed envelope is not.
+    PostDeltaCommit,
+}
+
+/// The public recovery handle for a partially published compact-state exchange.
+#[derive(Clone, Eq, PartialEq)]
+pub struct CompactStatePartialPublication {
+    delta_artifact: ArtifactId,
+    phase: CompactStatePublicationPhase,
+}
+
+impl CompactStatePartialPublication {
+    /// Returns the committed canonical delta artifact that can be recovered or retried.
+    pub fn delta_artifact(&self) -> &ArtifactId {
+        &self.delta_artifact
+    }
+
+    /// Returns the publication boundary reached by the failed exchange.
+    pub fn phase(&self) -> CompactStatePublicationPhase {
+        self.phase
+    }
+}
+
+impl fmt::Debug for CompactStatePartialPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompactStatePartialPublication")
+            .field("delta_artifact", &"<redacted>")
+            .field("phase", &self.phase)
+            .finish()
+    }
+}
+
+/// Payload-free failures at the compact-state artifact boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CompactStateExchangeError {
     /// The artifact store rejected a read or write.
     Artifact,
+    /// The delta was committed, but the envelope was not published.
+    PartialPublication(CompactStatePartialPublication),
     /// The typed envelope failed structural or admission validation.
     InvalidEnvelope,
     /// The state delta was not canonical, valid, or reducible.
@@ -58,6 +96,9 @@ impl fmt::Display for CompactStateExchangeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Artifact => "artifact store rejected the operation",
+            Self::PartialPublication(_) => {
+                "compact-state publication is partial after the delta commit"
+            }
             Self::InvalidEnvelope => "compact-state envelope is invalid",
             Self::InvalidStateDelta => "compact-state delta is invalid",
             Self::DigestMismatch => "artifact digest does not match its content",
@@ -75,6 +116,16 @@ impl fmt::Display for CompactStateExchangeError {
 }
 
 impl std::error::Error for CompactStateExchangeError {}
+
+impl CompactStateExchangeError {
+    /// Returns the recovery handle when the delta crossed the visibility boundary.
+    pub fn partial_publication(&self) -> Option<&CompactStatePartialPublication> {
+        match self {
+            Self::PartialPublication(partial) => Some(partial),
+            _ => None,
+        }
+    }
+}
 
 /// Identifiers returned after publishing a state delta and its typed envelope.
 #[derive(Clone, Eq, PartialEq)]
@@ -146,7 +197,10 @@ impl SourcePage {
 /// Both artifacts are staged before either is committed. `ArtifactStore` does
 /// not provide a transaction spanning the two commits, so a failure after the
 /// delta commit intentionally retains that content-addressed delta. Callers
-/// own retrying the same delta; its stable ID makes the retry idempotent.
+/// own retrying the same delta; its stable ID makes the retry idempotent. An
+/// envelope commit failure returns that ID in `PartialPublication`, while
+/// staging and delta-commit failures remain `Artifact` under the store's
+/// previsibility commit-error contract.
 pub fn publish_compact_state_delta<S: ArtifactStore>(
     store: &mut S,
     from: WorkflowExchange,
@@ -183,9 +237,12 @@ pub fn publish_compact_state_delta<S: ArtifactStore>(
     if delta_artifact != expected {
         return Err(CompactStateExchangeError::DigestMismatch);
     }
-    let envelope_artifact = store
-        .commit(envelope_staged)
-        .map_err(|_| CompactStateExchangeError::Artifact)?;
+    let envelope_artifact = store.commit(envelope_staged).map_err(|_| {
+        CompactStateExchangeError::PartialPublication(CompactStatePartialPublication {
+            delta_artifact: delta_artifact.clone(),
+            phase: CompactStatePublicationPhase::PostDeltaCommit,
+        })
+    })?;
     Ok(CompactStateReceipt {
         delta_artifact,
         envelope_artifact,

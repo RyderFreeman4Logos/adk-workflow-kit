@@ -6,9 +6,10 @@ use workflow_ir::compact_state::{
 };
 use workflow_runtime::{
     ArtifactError, ArtifactErrorKind, ArtifactId, ArtifactPage, ArtifactRef, ArtifactStore,
-    CompactStateDelta, Completeness, InMemoryArtifactStore, PageRequest, RetentionPolicy,
-    StagedArtifact, TypedOutput, TypedPayload, WorkflowExchange, consume_compact_state_delta,
-    publish_compact_state_delta, read_source_ref_page,
+    CompactStateDelta, CompactStateExchangeError, CompactStatePublicationPhase, Completeness,
+    InMemoryArtifactStore, PageRequest, RetentionPolicy, StagedArtifact, TypedOutput, TypedPayload,
+    WorkflowExchange, consume_compact_state_delta, publish_compact_state_delta,
+    read_source_ref_page,
 };
 
 fn source_bytes() -> &'static [u8] {
@@ -383,16 +384,15 @@ fn canonical_delta_artifact() -> ArtifactId {
 #[test]
 fn prepares_both_artifacts_before_visibility_on_stage_failure() {
     let mut store = FaultInjectingStore::new(Some(2), None);
-    assert_eq!(
-        publish_compact_state_delta(
-            &mut store,
-            WorkflowExchange::CodeInvestigation,
-            WorkflowExchange::GroundedAnswer,
-            &delta(),
-        )
-        .unwrap_err(),
-        workflow_runtime::CompactStateExchangeError::Artifact
-    );
+    let error = publish_compact_state_delta(
+        &mut store,
+        WorkflowExchange::CodeInvestigation,
+        WorkflowExchange::GroundedAnswer,
+        &delta(),
+    )
+    .unwrap_err();
+    assert_eq!(error, CompactStateExchangeError::Artifact);
+    assert!(error.partial_publication().is_none());
     assert_eq!(store.events, ["stage", "stage"]);
     assert!(matches!(
         store.read_page(
@@ -406,24 +406,35 @@ fn prepares_both_artifacts_before_visibility_on_stage_failure() {
 #[test]
 fn retains_committed_delta_for_idempotent_retry_after_envelope_commit_failure() {
     let mut store = FaultInjectingStore::new(None, Some(2));
+    let error = publish_compact_state_delta(
+        &mut store,
+        WorkflowExchange::CodeInvestigation,
+        WorkflowExchange::GroundedAnswer,
+        &delta(),
+    )
+    .unwrap_err();
+    let partial = error
+        .partial_publication()
+        .expect("post-delta failure must expose a recovery handle");
     assert_eq!(
-        publish_compact_state_delta(
-            &mut store,
-            WorkflowExchange::CodeInvestigation,
-            WorkflowExchange::GroundedAnswer,
-            &delta(),
-        )
-        .unwrap_err(),
-        workflow_runtime::CompactStateExchangeError::Artifact
+        partial.phase(),
+        CompactStatePublicationPhase::PostDeltaCommit
     );
+    let recovery_id = partial.delta_artifact().clone();
+    assert!(!format!("{error:?}").contains(recovery_id.as_str()));
+    assert!(!error.to_string().contains(recovery_id.as_str()));
     assert_eq!(store.events, ["stage", "stage", "commit", "commit"]);
     assert!(
         store
             .read_page(
-                &canonical_delta_artifact(),
-                PageRequest::new(0, NonZeroU64::new(1).unwrap()),
+                &recovery_id,
+                PageRequest::new(0, NonZeroU64::new(1).unwrap())
             )
             .is_ok()
+    );
+    assert_eq!(
+        store.retention(&recovery_id).unwrap(),
+        RetentionPolicy::Retain
     );
 
     let receipt = publish_compact_state_delta(
@@ -433,7 +444,7 @@ fn retains_committed_delta_for_idempotent_retry_after_envelope_commit_failure() 
         &delta(),
     )
     .unwrap();
-    assert_eq!(receipt.delta_artifact(), &canonical_delta_artifact());
+    assert_eq!(receipt.delta_artifact(), &recovery_id);
     assert_eq!(
         store.events,
         [
