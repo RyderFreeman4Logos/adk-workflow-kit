@@ -53,13 +53,35 @@ pub struct SourceRef {
     pub end: u64,
 }
 
-/// The minimal identity-bearing categories needed by the relation contract.
+/// Categories are identity-bearing. A proposal, alternative, or failed approach
+/// never becomes a decision, and completion stays distinct from pending work.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
+    /// Current desired outcome.
+    Objective,
+    /// Reported fact, not independently verified truth.
     Fact,
-    Proposal,
+    /// An explicitly recorded commitment.
     Decision,
+    /// A restriction on future actions.
+    Constraint,
+    /// Work not yet completed.
+    PendingTask,
+    /// Work explicitly recorded as completed.
+    CompletedTask,
+    /// Attempt that failed; never a completed task.
+    FailedApproach,
+    /// An artifact reference; its bytes remain external.
+    Artifact,
+    /// An unresolved question.
+    OpenQuestion,
+    /// An exact environment value; never executed by this library.
+    EnvironmentBinding,
+    /// A proposal, not a commitment.
+    Proposal,
+    /// An alternative, not a commitment.
+    Alternative,
 }
 
 /// A source-addressed assertion whose relations are always explicit.
@@ -358,4 +380,50 @@ impl CompactState {
         });
         relations
     }
+
+    /// Trusted continuation view: sorted identities, relations, and source refs.
+    /// Entry text and source bytes are never copied into the document.
+    pub fn render(&self) -> Result<String, StateError> {
+        let mut lines = vec!["CompactState v1".to_owned()];
+        for (source_id, source) in &self.sources {
+            lines.push(format!(
+                "source {} {} {}",
+                display_token(source_id),
+                source.artifact_id,
+                source.byte_len
+            ));
+        }
+        for (id, entry) in &self.entries {
+            lines.push(format!(
+                "entry {} {}",
+                id,
+                serde_json::to_string(&entry.kind).map_err(|_| StateError::Document)?
+            ));
+            for source in &entry.provenance {
+                lines.push(format!(
+                    "ref {} {}#{}-{}",
+                    id,
+                    display_token(&source.source),
+                    source.start,
+                    source.end
+                ));
+            }
+            for relation in &self.relations() {
+                if relation.source == *id {
+                    lines.push(format!(
+                        "link {} {} {} {}",
+                        id,
+                        serde_json::to_string(&relation.kind).map_err(|_| StateError::Document)?,
+                        relation.target,
+                        u8::from(relation.target_present)
+                    ));
+                }
+            }
+        }
+        Ok(format!("    {}", lines.join("\n    ")))
+    }
+}
+
+fn display_token(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
 }
