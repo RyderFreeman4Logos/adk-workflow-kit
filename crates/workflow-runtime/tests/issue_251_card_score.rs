@@ -253,7 +253,7 @@ fn renderer_is_stable_escaped_and_collection_framing_is_unambiguous() {
     assert!(rendered.contains("schema: issue-card-v1"));
     assert!(rendered.contains("actionability: \"actionable\""));
     assert!(rendered.contains("priority_score: \"not\\_calibrated\""));
-    assert!(rendered.contains("components: [\"compiler\", \"compiler, runtime\", \"runtime\"]"));
+    assert!(rendered.contains("components: [\"compiler\", \"compiler\\, runtime\", \"runtime\"]"));
     assert!(rendered.contains("risks: [\"uncalibrated\\_priority\"]"));
 
     let dangerous = card_from(
@@ -264,8 +264,37 @@ fn renderer_is_stable_escaped_and_collection_framing_is_unambiguous() {
     )
     .render_markdown()
     .expect("render");
-    assert!(dangerous.contains("\\!\\[objective\\]\\(javascript:alert\\(2\\)\\) \\<img src=x\\>"));
+    assert!(
+        dangerous.contains("\\!\\[objective\\]\\(javascript\\:alert\\(2\\)\\) \\<img src\\=x\\>")
+    );
     assert!(!dangerous.contains("<img src=x>"));
+}
+
+#[test]
+fn public_renderer_keeps_free_text_literal_for_gfm_and_lists_framed() {
+    let objective = r#"~~do not deploy~~; see https://example.invalid/item; a*b _c_ [d](e) `f` #g +h -i !j <k> |l ^m ~n"#;
+    let rendered = card_from(&artifact(), "issue-251", objective, PriorityImpact::High)
+        .with_components([ComponentId::new("compiler, runtime").expect("component")])
+        .expect("components")
+        .render_markdown()
+        .expect("render");
+
+    assert!(rendered.contains(r#"\~\~do not deploy\~\~"#));
+    assert!(rendered.contains(r#"see https\:\/\/example\.invalid\/item"#));
+    assert!(rendered.contains(r#"a\*b \_c\_ \[d\]\(e\) \`f\` \#g \+h \-i \!j \<k\> \|l \^m \~n"#));
+    assert!(!rendered.contains("~~do not deploy~~"));
+    assert!(!rendered.contains("https://example.invalid/item"));
+    assert!(rendered.contains(r#"components: ["compiler\, runtime"]"#));
+
+    let backslashes = card_from(
+        &artifact(),
+        "issue-251",
+        r#"literal \* and \\ path"#,
+        PriorityImpact::High,
+    )
+    .render_markdown()
+    .expect("render");
+    assert!(backslashes.contains(r#"objective: "literal \\\* and \\\\ path""#));
 }
 
 #[test]
