@@ -115,6 +115,7 @@ pub struct WorkflowSpec {
     edges: Vec<Edge>,
     routes: Vec<PredicateRoute>,
     state: Option<StateSpec>,
+    compact_state_exchange: Option<CompactStateExchange>,
     resources: Vec<ResourceReference>,
 }
 
@@ -147,6 +148,11 @@ impl WorkflowSpec {
     /// Returns the parsed v1 state declaration, when the document declares one.
     pub fn state(&self) -> Option<&StateSpec> {
         self.state.as_ref()
+    }
+
+    /// Returns the optional v1 compact-state exchange declaration.
+    pub fn compact_state_exchange(&self) -> Option<&CompactStateExchange> {
+        self.compact_state_exchange.as_ref()
     }
 
     /// Returns semantic resources declared by the workflow.
@@ -813,6 +819,42 @@ impl StateKey {
     }
 }
 
+/// The closed v1 compact-state exchange endpoint vocabulary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub enum CompactStateEndpoint {
+    /// The code-investigation workflow endpoint.
+    #[serde(rename = "code.investigation")]
+    CodeInvestigation,
+    /// The grounded-answer workflow endpoint.
+    #[serde(rename = "grounded.answer")]
+    GroundedAnswer,
+    /// The multi-hop workflow endpoint.
+    #[serde(rename = "multi.hop")]
+    MultiHop,
+    /// The review workflow endpoint.
+    #[serde(rename = "review")]
+    Review,
+}
+
+/// One optional authored compact-state exchange declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompactStateExchange {
+    from: CompactStateEndpoint,
+    to: CompactStateEndpoint,
+}
+
+impl CompactStateExchange {
+    /// Returns the source workflow endpoint.
+    pub fn from(&self) -> CompactStateEndpoint {
+        self.from
+    }
+
+    /// Returns the destination workflow endpoint.
+    pub fn to(&self) -> CompactStateEndpoint {
+        self.to
+    }
+}
+
 impl Edge {
     /// Returns the edge origin identifier.
     pub fn from(&self) -> &NodeId {
@@ -1007,6 +1049,12 @@ pub fn parse_str(source: impl Into<SourcePath>, toml: &str) -> Result<WorkflowSp
                 })
                 .collect(),
         }),
+        compact_state_exchange: raw
+            .compact_state_exchange
+            .map(|exchange| CompactStateExchange {
+                from: exchange.from,
+                to: exchange.to,
+            }),
         resources: raw.resources.into_iter().map(resource).collect(),
     })
 }
@@ -1165,6 +1213,8 @@ struct RawWorkflowSpec {
     #[serde(default)]
     state: Option<RawState>,
     #[serde(default)]
+    compact_state_exchange: Option<RawCompactStateExchange>,
+    #[serde(default)]
     resources: Vec<RawResource>,
 }
 
@@ -1310,4 +1360,11 @@ struct RawStateKey {
     schema_version: String,
     #[serde(default)]
     handle: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCompactStateExchange {
+    from: CompactStateEndpoint,
+    to: CompactStateEndpoint,
 }

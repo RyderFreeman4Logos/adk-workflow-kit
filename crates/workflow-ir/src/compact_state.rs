@@ -6,6 +6,73 @@ use serde::{
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use workflow_spec::CompactStateEndpoint;
+
+/// The normalized compact-state exchange endpoint vocabulary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrCompactStateEndpoint {
+    /// The code-investigation workflow endpoint.
+    CodeInvestigation,
+    /// The grounded-answer workflow endpoint.
+    GroundedAnswer,
+    /// The multi-hop workflow endpoint.
+    MultiHop,
+    /// The review workflow endpoint.
+    Review,
+}
+
+impl IrCompactStateEndpoint {
+    /// Returns the canonical endpoint identity used by the runtime protocol.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CodeInvestigation => "code.investigation",
+            Self::GroundedAnswer => "grounded.answer",
+            Self::MultiHop => "multi.hop",
+            Self::Review => "review",
+        }
+    }
+}
+
+impl From<CompactStateEndpoint> for IrCompactStateEndpoint {
+    fn from(endpoint: CompactStateEndpoint) -> Self {
+        match endpoint {
+            CompactStateEndpoint::CodeInvestigation => Self::CodeInvestigation,
+            CompactStateEndpoint::GroundedAnswer => Self::GroundedAnswer,
+            CompactStateEndpoint::MultiHop => Self::MultiHop,
+            CompactStateEndpoint::Review => Self::Review,
+        }
+    }
+}
+
+/// A typed, normalized compact-state exchange configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IrCompactStateExchange {
+    from: IrCompactStateEndpoint,
+    to: IrCompactStateEndpoint,
+}
+
+impl IrCompactStateExchange {
+    /// Creates a normalized exchange between two workflow endpoints.
+    pub const fn new(from: IrCompactStateEndpoint, to: IrCompactStateEndpoint) -> Self {
+        Self { from, to }
+    }
+
+    /// Returns the source endpoint.
+    pub fn from(self) -> IrCompactStateEndpoint {
+        self.from
+    }
+
+    /// Returns the destination endpoint.
+    pub fn to(self) -> IrCompactStateEndpoint {
+        self.to
+    }
+}
+
+impl From<&workflow_spec::CompactStateExchange> for IrCompactStateExchange {
+    fn from(exchange: &workflow_spec::CompactStateExchange) -> Self {
+        Self::new(exchange.from().into(), exchange.to().into())
+    }
+}
 
 /// The only wire version admitted by this reducer.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

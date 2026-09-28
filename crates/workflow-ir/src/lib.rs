@@ -39,6 +39,9 @@ pub const CANONICAL_IR_WIRE_VERSION_V12: u16 = 12;
 /// Canonical wire for default-off offline trajectory policy, never host authority.
 pub const CANONICAL_IR_WIRE_VERSION_V13: u16 = 13;
 
+/// Canonical wire for a normalized compact-state exchange declaration.
+pub const CANONICAL_IR_WIRE_VERSION_V14: u16 = 14;
+
 const DOMAIN: &[u8] = b"adk-workflow-kit/workflow-ir\0";
 const IR_SCHEMA_VERSION_V1: u32 = 1;
 
@@ -502,6 +505,7 @@ pub struct WorkflowIr {
     edges: Vec<IrEdge>,
     routes: Vec<IrPredicateRoute>,
     state: Option<IrState>,
+    compact_state_exchange: Option<compact_state::IrCompactStateExchange>,
     resources: Vec<IrResource>,
 }
 
@@ -544,6 +548,11 @@ impl WorkflowIr {
     /// Returns the normalized state declaration, when the source declared one.
     pub fn state(&self) -> Option<&IrState> {
         self.state.as_ref()
+    }
+
+    /// Returns the normalized compact-state exchange configuration.
+    pub fn compact_state_exchange(&self) -> Option<&compact_state::IrCompactStateExchange> {
+        self.compact_state_exchange.as_ref()
     }
 
     /// Returns semantic resources in canonical path/hash order.
@@ -747,6 +756,11 @@ impl From<&WorkflowSpec> for WorkflowIr {
                             .map(str::to_owned),
                     })
                     .collect(),
+            }),
+            compact_state_exchange: spec.compact_state_exchange().map(|exchange| {
+                <compact_state::IrCompactStateExchange as From<
+                    &workflow_spec::CompactStateExchange,
+                >>::from(exchange)
             }),
             resources,
         }
@@ -968,6 +982,10 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
             }
         }
     }
+    if let Some(exchange) = ir.compact_state_exchange {
+        write_frame(sink, exchange.from().as_str());
+        write_frame(sink, exchange.to().as_str());
+    }
     if !ir.resources.is_empty() {
         write_u64(sink, u64_from_usize(ir.resources.len()));
         for resource in &ir.resources {
@@ -978,7 +996,9 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
 }
 
 fn canonical_wire_version(ir: &WorkflowIr) -> u16 {
-    if ir.nodes.iter().any(|node| {
+    if ir.compact_state_exchange.is_some() {
+        CANONICAL_IR_WIRE_VERSION_V14
+    } else if ir.nodes.iter().any(|node| {
         node.untrusted_text
             .and_then(|p| p.behavioral)
             .is_some_and(|p| p.trajectory.is_some())

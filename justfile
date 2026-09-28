@@ -142,6 +142,10 @@ issue-243-ir test_name="":
 issue-243-ir-continuation test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-ir --test issue_243_continuation_categories {{test_name}} --locked -- --nocapture
 
+# Focused #243 authored compact-state exchange -> typed compiler IR tests.
+issue-243-compiler test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-compiler --test issue_243_compact_state_ir {{test_name}} --locked -- --nocapture
+
 # Focused #243 runtime artifact-backed compact-state exchange tests.
 issue-243-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_243_compact_state {{test_name}} --locked -- --nocapture
