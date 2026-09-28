@@ -271,6 +271,10 @@ fn public_cards_with_the_same_artifact_model_and_prompt_do_not_share_cache_ident
         &artifact,
         high.source().clone(),
         high.cache_identity().clone(),
+        high.components().to_vec(),
+        high.prerequisites().to_vec(),
+        high.capabilities().to_vec(),
+        high.risks().to_vec(),
     )
     .expect("rehydrate matching card");
     assert_eq!(
@@ -285,9 +289,94 @@ fn public_cards_with_the_same_artifact_model_and_prompt_do_not_share_cache_ident
         &artifact,
         high.source().clone(),
         high.cache_identity().clone(),
+        low.components().to_vec(),
+        low.prerequisites().to_vec(),
+        low.capabilities().to_vec(),
+        low.risks().to_vec(),
     );
     assert_eq!(
         rejected.expect_err("stale card cache"),
+        IssueCardError::InvalidIdentity
+    );
+}
+
+#[test]
+fn cache_digest_frames_collection_boundaries_through_public_card_builders() {
+    let artifact = artifact();
+    let components = card_from(&artifact, "issue-251", "objective", PriorityImpact::High)
+        .with_components([
+            ComponentId::new("a").expect("component"),
+            ComponentId::new("b").expect("component"),
+        ])
+        .expect("components");
+    let split = card_from(&artifact, "issue-251", "objective", PriorityImpact::High)
+        .with_components([ComponentId::new("a").expect("component")])
+        .expect("components")
+        .with_prerequisites([ComponentId::new("b").expect("component")])
+        .expect("prerequisites");
+
+    assert_ne!(
+        components.cache_identity().digest(),
+        split.cache_identity().digest(),
+        "different typed collections must not share cache identity"
+    );
+}
+
+#[test]
+fn public_rehydrate_preserves_enriched_collections_and_rejects_stale_digest() {
+    let artifact = artifact();
+    let card = card_from(&artifact, "issue-251", "objective", PriorityImpact::High)
+        .with_components([ComponentId::new("component-a").expect("component")])
+        .expect("components")
+        .with_prerequisites([ComponentId::new("prerequisite-a").expect("prerequisite")])
+        .expect("prerequisites")
+        .with_capabilities([CapabilityId::new("capability-a").expect("capability")])
+        .expect("capabilities")
+        .with_risks([RiskCode::ExternalDependency])
+        .expect("risks");
+    let rehydrated = IssueCardV1::rehydrate(
+        card.id(),
+        card.objective(),
+        card.actionability(),
+        card.priority_inputs(),
+        &artifact,
+        card.source().clone(),
+        card.cache_identity().clone(),
+        card.components().to_vec(),
+        card.prerequisites().to_vec(),
+        card.capabilities().to_vec(),
+        card.risks().to_vec(),
+    )
+    .expect("enriched card must rehydrate");
+
+    assert_eq!(rehydrated.components(), card.components());
+    assert_eq!(rehydrated.prerequisites(), card.prerequisites());
+    assert_eq!(rehydrated.capabilities(), card.capabilities());
+    assert_eq!(rehydrated.risks(), card.risks());
+    assert_eq!(
+        rehydrated.cache_identity().digest(),
+        card.cache_identity().digest()
+    );
+
+    let stale = card
+        .clone()
+        .with_components([ComponentId::new("component-b").expect("component")])
+        .expect("component");
+    assert_eq!(
+        IssueCardV1::rehydrate(
+            card.id(),
+            card.objective(),
+            card.actionability(),
+            card.priority_inputs(),
+            &artifact,
+            card.source().clone(),
+            stale.cache_identity().clone(),
+            card.components().to_vec(),
+            card.prerequisites().to_vec(),
+            card.capabilities().to_vec(),
+            card.risks().to_vec(),
+        )
+        .expect_err("digest mismatch must reject tampered collection"),
         IssueCardError::InvalidIdentity
     );
 }
@@ -317,6 +406,10 @@ fn rehydration_rejects_cross_artifact_policy_material() {
         &artifact_a,
         card_b.source().clone(),
         card_b.cache_identity().clone(),
+        card_b.components().to_vec(),
+        card_b.prerequisites().to_vec(),
+        card_b.capabilities().to_vec(),
+        card_b.risks().to_vec(),
     )
     .expect_err("cross-artifact source must be rejected");
     assert_eq!(error, IssueCardError::InvalidIdentity);
@@ -329,6 +422,10 @@ fn rehydration_rejects_cross_artifact_policy_material() {
         &artifact_a,
         card_a.source().clone(),
         card_b.cache_identity().clone(),
+        card_a.components().to_vec(),
+        card_a.prerequisites().to_vec(),
+        card_a.capabilities().to_vec(),
+        card_a.risks().to_vec(),
     )
     .expect_err("mismatched policy cache must be rejected");
     assert_eq!(error, IssueCardError::InvalidIdentity);
@@ -466,6 +563,59 @@ fn public_card_path_rejects_oversized_objectives_and_collection_growth() {
         .with_components(too_many)
         .expect_err("collection growth must be rejected");
     assert_eq!(error, IssueCardError::CollectionTooLarge);
+}
+
+#[test]
+fn public_card_path_accepts_existing_items_at_the_collection_limit() {
+    let components = (0..ISSUE_CARD_MAX_COLLECTION_ITEMS)
+        .map(|index| ComponentId::new(format!("component-{index}")).expect("component"))
+        .collect::<Vec<_>>();
+    let component = card("issue-251", PriorityImpact::High)
+        .with_components(components)
+        .expect("64 components");
+    let component = component
+        .clone()
+        .with_components([ComponentId::new("component-0").expect("component")])
+        .expect("existing component at limit");
+    assert_eq!(
+        component.components().len(),
+        ISSUE_CARD_MAX_COLLECTION_ITEMS
+    );
+
+    let prerequisites = (0..ISSUE_CARD_MAX_COLLECTION_ITEMS)
+        .map(|index| ComponentId::new(format!("prerequisite-{index}")).expect("prerequisite"))
+        .collect::<Vec<_>>();
+    let prerequisite = card("issue-251", PriorityImpact::High)
+        .with_prerequisites(prerequisites)
+        .expect("64 prerequisites")
+        .with_prerequisites([ComponentId::new("prerequisite-0").expect("prerequisite")])
+        .expect("existing prerequisite at limit");
+    assert_eq!(
+        prerequisite.prerequisites().len(),
+        ISSUE_CARD_MAX_COLLECTION_ITEMS
+    );
+
+    let capabilities = (0..ISSUE_CARD_MAX_COLLECTION_ITEMS)
+        .map(|index| CapabilityId::new(format!("capability-{index}")).expect("capability"))
+        .collect::<Vec<_>>();
+    let capability = card("issue-251", PriorityImpact::High)
+        .with_capabilities(capabilities)
+        .expect("64 capabilities")
+        .with_capabilities([CapabilityId::new("capability-0").expect("capability")])
+        .expect("existing capability at limit");
+    assert_eq!(
+        capability.capabilities().len(),
+        ISSUE_CARD_MAX_COLLECTION_ITEMS
+    );
+
+    let risk = card("issue-251", PriorityImpact::High)
+        .with_risks([RiskCode::ExternalDependency])
+        .expect("risk");
+    let risk = risk
+        .with_risks([RiskCode::ExternalDependency])
+        .expect("duplicate risk");
+    assert_eq!(risk.risks().len(), 2);
+    assert!(risk.risks().contains(&RiskCode::ExternalDependency));
 }
 
 #[test]

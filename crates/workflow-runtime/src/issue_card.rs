@@ -81,14 +81,19 @@ fn append_bounded<T: Ord>(
     target: &mut Vec<T>,
     values: impl IntoIterator<Item = T>,
 ) -> Result<(), IssueCardError> {
-    for value in values {
-        if target.len() >= ISSUE_CARD_MAX_COLLECTION_ITEMS {
+    for (incoming, value) in values.into_iter().enumerate() {
+        if incoming == ISSUE_CARD_MAX_COLLECTION_ITEMS {
+            return Err(IssueCardError::CollectionTooLarge);
+        }
+        if target.contains(&value) {
+            continue;
+        }
+        if target.len() == ISSUE_CARD_MAX_COLLECTION_ITEMS {
             return Err(IssueCardError::CollectionTooLarge);
         }
         target.push(value);
     }
     target.sort();
-    target.dedup();
     Ok(())
 }
 
@@ -805,13 +810,20 @@ impl IssueCardV1 {
             priority_inputs,
             source,
             cache_identity,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![RiskCode::UncalibratedPriority],
         )
     }
 
     /// Rehydrates serialized parts only after validating them against an artifact.
     ///
-    /// This is the sole public path for callers that already have source and
-    /// cache fields; the caller cannot declare replacement hashes or policy.
+    /// This is the sole public path for callers that already have source,
+    /// cache, and typed collection fields; the caller cannot declare replacement
+    /// hashes or policy. Collections are bounded, sorted, and deduplicated before
+    /// their complete card digest is compared with the supplied cache identity.
+    #[allow(clippy::too_many_arguments)]
     pub fn rehydrate(
         id: impl Into<String>,
         objective: impl Into<String>,
@@ -820,11 +832,12 @@ impl IssueCardV1 {
         artifact: &CanonicalIssueArtifact,
         source: TrustedSourceBinding,
         cache_identity: IssueCardCacheIdentity,
+        components: Vec<ComponentId>,
+        prerequisites: Vec<ComponentId>,
+        capabilities: Vec<CapabilityId>,
+        risks: Vec<RiskCode>,
     ) -> Result<Self, IssueCardError> {
         let expected_source = TrustedSourceBinding::from_artifact(artifact)?;
-        if source != expected_source {
-            return Err(IssueCardError::InvalidIdentity);
-        }
         let expected = Self::assemble(
             id,
             objective,
@@ -832,13 +845,18 @@ impl IssueCardV1 {
             priority_inputs,
             source,
             cache_identity.clone(),
+            components,
+            prerequisites,
+            capabilities,
+            risks,
         )?;
-        if cache_identity != expected.cache_identity {
+        if expected.source != expected_source || cache_identity != expected.cache_identity {
             return Err(IssueCardError::InvalidIdentity);
         }
         Ok(expected)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assemble(
         id: impl Into<String>,
         objective: impl Into<String>,
@@ -846,11 +864,23 @@ impl IssueCardV1 {
         priority_inputs: PriorityInputs,
         source: TrustedSourceBinding,
         cache_identity: IssueCardCacheIdentity,
+        component_values: Vec<ComponentId>,
+        prerequisite_values: Vec<ComponentId>,
+        capability_values: Vec<CapabilityId>,
+        risk_values: Vec<RiskCode>,
     ) -> Result<Self, IssueCardError> {
         let id = id.into();
         let objective = objective.into();
         validate_field(&id)?;
         validate_bounded_field(&objective, ISSUE_CARD_MAX_OBJECTIVE_BYTES)?;
+        let mut components = Vec::new();
+        append_bounded(&mut components, component_values)?;
+        let mut prerequisites = Vec::new();
+        append_bounded(&mut prerequisites, prerequisite_values)?;
+        let mut capabilities = Vec::new();
+        append_bounded(&mut capabilities, capability_values)?;
+        let mut risks = Vec::new();
+        append_bounded(&mut risks, risk_values)?;
         if source.evidence().len() > ISSUE_CARD_MAX_SOURCE_EVIDENCE
             || source.aggregate_digest() != cache_identity.aggregate_digest()
             || source.content_hash() != cache_identity.trusted_content_hash()
@@ -868,10 +898,10 @@ impl IssueCardV1 {
             priority_score: PriorityScore::NotCalibrated,
             priority_reasons,
             priority_order: PriorityOrderKey::new(&id, actionability, priority_inputs),
-            components: Vec::new(),
-            prerequisites: Vec::new(),
-            capabilities: Vec::new(),
-            risks: vec![RiskCode::UncalibratedPriority],
+            components,
+            prerequisites,
+            capabilities,
+            risks,
             source,
             cache_identity,
         };
@@ -1098,40 +1128,58 @@ impl IssueCardV1 {
     }
 
     fn canonical_content(&self) -> String {
-        let mut lines = vec![
-            self.id.clone(),
-            self.objective.clone(),
-            actionability_code(self.actionability),
-            format!(
-                "{}:{}:{}:{}",
-                impact_code(self.priority_inputs.impact),
-                urgency_code(self.priority_inputs.urgency),
-                effort_code(self.priority_inputs.effort),
-                dependency_code(self.priority_inputs.dependency),
-            ),
-        ];
-        lines.extend(
-            self.components
-                .iter()
-                .map(|value| value.as_str().to_owned()),
-        );
-        lines.extend(
-            self.prerequisites
-                .iter()
-                .map(|value| value.as_str().to_owned()),
-        );
-        lines.extend(
-            self.capabilities
-                .iter()
-                .map(|value| value.as_str().to_owned()),
-        );
-        lines.extend(
-            self.risks
-                .iter()
-                .copied()
-                .map(|value| risk_code(value).to_owned()),
-        );
-        lines.join("\n")
+        // Bind every serialized field except the self-referential cache digest.
+        #[derive(Serialize)]
+        struct CanonicalCard<'a> {
+            canonicalization_version: u16,
+            schema_version: u16,
+            id: &'a str,
+            objective: &'a str,
+            actionability: Actionability,
+            priority_inputs: PriorityInputs,
+            priority_score: PriorityScore,
+            priority_reasons: &'a [PriorityReasonCode],
+            priority_order: &'a PriorityOrderKey,
+            components: &'a [ComponentId],
+            prerequisites: &'a [ComponentId],
+            capabilities: &'a [CapabilityId],
+            risks: &'a [RiskCode],
+            source: &'a TrustedSourceBinding,
+            cache_schema_version: u16,
+            aggregate_digest: &'a str,
+            trusted_content_hash: &'a str,
+            policy_digest: &'a str,
+            model_id: &'a str,
+            prompt_version: &'a str,
+            identity_schema_version: u16,
+            priority_order_version: u16,
+        }
+
+        serde_json::to_string(&CanonicalCard {
+            canonicalization_version: 1,
+            schema_version: self.schema_version,
+            id: &self.id,
+            objective: &self.objective,
+            actionability: self.actionability,
+            priority_inputs: self.priority_inputs,
+            priority_score: self.priority_score,
+            priority_reasons: &self.priority_reasons,
+            priority_order: &self.priority_order,
+            components: &self.components,
+            prerequisites: &self.prerequisites,
+            capabilities: &self.capabilities,
+            risks: &self.risks,
+            source: &self.source,
+            cache_schema_version: self.cache_identity.cache_schema_version,
+            aggregate_digest: &self.cache_identity.aggregate_digest,
+            trusted_content_hash: &self.cache_identity.trusted_content_hash,
+            policy_digest: &self.cache_identity.policy_digest,
+            model_id: &self.cache_identity.model_id,
+            prompt_version: &self.cache_identity.prompt_version,
+            identity_schema_version: self.cache_identity.schema_version,
+            priority_order_version: self.cache_identity.priority_order_version,
+        })
+        .expect("canonical IssueCard payload is serializable")
     }
 
     fn ensure_render_budget(&self) -> Result<(), IssueCardError> {
