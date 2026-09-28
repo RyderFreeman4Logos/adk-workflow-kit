@@ -3,9 +3,10 @@ use std::num::NonZeroU64;
 use serde_json::Value;
 use workflow_runtime::{
     Actionability, ComponentId, ExplicitIssueEdge, GitHubIssueMetadata, GitHubIssueState,
-    ISSUE_PLAN_MAX_CARDS, InMemoryArtifactStore, IssueCardV1, IssuePlanError, IssuePlanTitle,
-    OfflineComment, OfflineIssueContent, PriorityDependency, PriorityEffort, PriorityImpact,
-    PriorityInputs, PriorityUrgency, TrustPolicy, build_canonical_issue_artifact, build_todo_plan,
+    ISSUE_PLAN_MAX_CARDS, ISSUE_PLAN_MAX_EDGES, InMemoryArtifactStore, IssueCardV1, IssuePlanError,
+    IssuePlanTitle, OfflineComment, OfflineIssueContent, PriorityDependency, PriorityEffort,
+    PriorityImpact, PriorityInputs, PriorityUrgency, TrustPolicy, build_canonical_issue_artifact,
+    build_todo_plan,
 };
 
 fn issue(number: u64) -> GitHubIssueMetadata {
@@ -186,7 +187,7 @@ fn duplicate_unknown_and_title_key_errors_are_fail_closed() {
     let generic_prerequisite = [card_with_prerequisites(
         "issue-42",
         PriorityImpact::Low,
-        &["Issue-42", "unmatched-capability"],
+        &["issue-42", "unmatched-capability"],
     )];
     let generic_plan = build_todo_plan(&generic_prerequisite, &[], &titles(&["issue-42"]))
         .expect("generic prerequisites are not issue edges")
@@ -204,6 +205,18 @@ fn duplicate_unknown_and_title_key_errors_are_fail_closed() {
     assert_eq!(
         build_todo_plan(&cards, &unknown_edge, &titles(&["a"])),
         Err(IssuePlanError::UnknownEdgeEndpoint("missing".to_owned()))
+    );
+    let unknown_predecessor = [edge("missing", "a")];
+    assert_eq!(
+        build_todo_plan(&cards, &unknown_predecessor, &titles(&["a"])),
+        Err(IssuePlanError::UnknownEdgeEndpoint("missing".to_owned()))
+    );
+    let too_many_edges = (0..=ISSUE_PLAN_MAX_EDGES)
+        .map(|_| edge("a", "a"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        build_todo_plan(&cards, &too_many_edges, &titles(&["a"])),
+        Err(IssuePlanError::TooManyEdges)
     );
     assert_eq!(
         build_todo_plan(&cards, &[], &[]),
@@ -240,6 +253,20 @@ fn ready_selection_uses_highest_priority_without_crossing_edges() {
     .expect_resolved();
 
     assert_eq!(plan.item_ids(), ["root", "blocked-high", "independent"]);
+}
+
+#[test]
+fn priority_only_ready_choice_prefers_high_priority_over_lexical_order() {
+    let cards = [
+        card("a-low", PriorityImpact::Low),
+        card("z-high", PriorityImpact::Critical),
+    ];
+    let plan = build_todo_plan(&cards, &[], &titles(&["a-low", "z-high"]))
+        .expect("plan")
+        .expect_resolved();
+
+    assert!("a-low" < "z-high");
+    assert_eq!(plan.item_ids(), ["z-high", "a-low"]);
 }
 
 #[test]
