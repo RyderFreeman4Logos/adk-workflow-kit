@@ -167,7 +167,7 @@ fn cache_identity_binds_the_canonical_aggregate_and_execution_inputs() {
             .expect("cache identity");
 
     assert_eq!(first, same);
-    assert_eq!(first.cache_schema_version(), 2);
+    assert_eq!(first.cache_schema_version(), 3);
     assert_eq!(first.schema_version(), 1);
     assert_eq!(first.priority_order_version(), 1);
     assert_eq!(first.aggregate_digest(), artifact.aggregate_digest());
@@ -175,6 +175,121 @@ fn cache_identity_binds_the_canonical_aggregate_and_execution_inputs() {
     assert_ne!(first.digest(), other_prompt.digest());
     assert_ne!(first.aggregate_digest(), other_aggregate.aggregate_digest());
     assert_ne!(first.digest(), other_aggregate.digest());
+}
+
+#[test]
+fn public_cards_with_the_same_artifact_model_and_prompt_do_not_share_cache_identity() {
+    let artifact = artifact();
+    let low = card_from(&artifact, "issue-low", "objective-low", PriorityImpact::Low);
+    let high = card_from(
+        &artifact,
+        "issue-high",
+        "objective-high",
+        PriorityImpact::Critical,
+    );
+    let same = card_from(&artifact, "issue-low", "objective-low", PriorityImpact::Low);
+
+    assert_eq!(
+        low.cache_identity().digest(),
+        same.cache_identity().digest()
+    );
+    assert_ne!(
+        low.cache_identity().digest(),
+        high.cache_identity().digest()
+    );
+    assert_ne!(
+        serde_json::to_string(low.cache_identity()).expect("serialize cache"),
+        serde_json::to_string(high.cache_identity()).expect("serialize cache")
+    );
+
+    let reordered = low
+        .clone()
+        .with_components([
+            ComponentId::new("runtime").expect("component"),
+            ComponentId::new("compiler").expect("component"),
+        ])
+        .expect("components");
+    let ordered = low
+        .clone()
+        .with_components([ComponentId::new("compiler").expect("component")])
+        .expect("components")
+        .with_components([ComponentId::new("runtime").expect("component")])
+        .expect("components");
+    assert_eq!(
+        reordered.cache_identity().digest(),
+        ordered.cache_identity().digest()
+    );
+    let other_collection = low
+        .clone()
+        .with_components([ComponentId::new("runtime").expect("component")])
+        .expect("components");
+    assert_ne!(
+        reordered.cache_identity().digest(),
+        other_collection.cache_identity().digest()
+    );
+
+    let ambiguous = IssueCardV1::from_artifact(
+        "issue-low",
+        "objective-low",
+        Actionability::ambiguous(AmbiguityReasonCode::ConflictingSignals),
+        inputs(PriorityImpact::Low),
+        &artifact,
+        "model:none",
+        "prompt-v1",
+    )
+    .expect("card");
+    assert_ne!(
+        low.cache_identity().digest(),
+        ambiguous.cache_identity().digest()
+    );
+
+    let other_inputs = IssueCardV1::from_artifact(
+        "issue-low",
+        "objective-low",
+        Actionability::Actionable,
+        PriorityInputs::new(
+            PriorityImpact::Low,
+            PriorityUrgency::Unknown,
+            PriorityEffort::Large,
+            PriorityDependency::None,
+        ),
+        &artifact,
+        "model:none",
+        "prompt-v1",
+    )
+    .expect("card");
+    assert_ne!(
+        low.cache_identity().digest(),
+        other_inputs.cache_identity().digest()
+    );
+
+    let rehydrated = IssueCardV1::rehydrate(
+        high.id(),
+        high.objective(),
+        high.actionability(),
+        high.priority_inputs(),
+        &artifact,
+        high.source().clone(),
+        high.cache_identity().clone(),
+    )
+    .expect("rehydrate matching card");
+    assert_eq!(
+        rehydrated.cache_identity().digest(),
+        high.cache_identity().digest()
+    );
+    let rejected = IssueCardV1::rehydrate(
+        low.id(),
+        low.objective(),
+        low.actionability(),
+        low.priority_inputs(),
+        &artifact,
+        high.source().clone(),
+        high.cache_identity().clone(),
+    );
+    assert_eq!(
+        rejected.expect_err("stale card cache"),
+        IssueCardError::InvalidIdentity
+    );
 }
 
 #[test]

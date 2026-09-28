@@ -18,8 +18,8 @@ pub const ISSUE_CARD_SCHEMA_VERSION_V1: u16 = 1;
 pub const ISSUE_CARD_PRIORITY_ORDER_VERSION_V1: u16 = 1;
 /// Legacy cache schema version retained for decoding older records.
 pub const ISSUE_CARD_CACHE_SCHEMA_VERSION_V1: u16 = 1;
-/// Cache schema version that binds the card to the artifact aggregate digest.
-pub const ISSUE_CARD_CACHE_SCHEMA_VERSION_V2: u16 = 2;
+/// Cache schema version that binds the complete canonical card response.
+pub const ISSUE_CARD_CACHE_SCHEMA_VERSION_V3: u16 = 3;
 /// Maximum UTF-8 byte length of identifiers, hashes, model IDs, and prompts.
 pub const ISSUE_CARD_MAX_IDENTIFIER_BYTES: usize = 256;
 /// Maximum UTF-8 byte length of a card objective.
@@ -666,7 +666,7 @@ impl IssueCardCacheIdentity {
         validate_field(&trusted_content_hash)?;
         validate_field(&policy_digest)?;
         let mut identity = Self {
-            cache_schema_version: ISSUE_CARD_CACHE_SCHEMA_VERSION_V2,
+            cache_schema_version: ISSUE_CARD_CACHE_SCHEMA_VERSION_V3,
             aggregate_digest,
             trusted_content_hash,
             policy_digest,
@@ -676,11 +676,11 @@ impl IssueCardCacheIdentity {
             priority_order_version: ISSUE_CARD_PRIORITY_ORDER_VERSION_V1,
             digest: String::new(),
         };
-        identity.digest = identity.compute_digest();
+        identity.digest = identity.compute_digest("");
         Ok(identity)
     }
 
-    fn compute_digest(&self) -> String {
+    fn compute_digest(&self, card: &str) -> String {
         let framed = [
             self.cache_schema_version.to_string(),
             self.aggregate_digest.clone(),
@@ -690,6 +690,7 @@ impl IssueCardCacheIdentity {
             self.prompt_version.clone(),
             self.schema_version.to_string(),
             self.priority_order_version.to_string(),
+            card.to_owned(),
         ]
         .join("\n");
         encode_hex(Sha256::digest(framed.as_bytes()).as_slice())
@@ -821,22 +822,21 @@ impl IssueCardV1 {
         cache_identity: IssueCardCacheIdentity,
     ) -> Result<Self, IssueCardError> {
         let expected_source = TrustedSourceBinding::from_artifact(artifact)?;
-        let expected_cache = IssueCardCacheIdentity::from_artifact(
-            artifact,
-            cache_identity.model_id(),
-            cache_identity.prompt_version(),
-        )?;
-        if source != expected_source || cache_identity != expected_cache {
+        if source != expected_source {
             return Err(IssueCardError::InvalidIdentity);
         }
-        Self::assemble(
+        let expected = Self::assemble(
             id,
             objective,
             actionability,
             priority_inputs,
             source,
-            cache_identity,
-        )
+            cache_identity.clone(),
+        )?;
+        if cache_identity != expected.cache_identity {
+            return Err(IssueCardError::InvalidIdentity);
+        }
+        Ok(expected)
     }
 
     fn assemble(
@@ -859,7 +859,7 @@ impl IssueCardV1 {
             return Err(IssueCardError::InvalidIdentity);
         }
         let priority_reasons = priority_inputs.reason_codes();
-        let card = Self {
+        let mut card = Self {
             schema_version: ISSUE_CARD_SCHEMA_VERSION_V1,
             id: id.clone(),
             objective,
@@ -875,6 +875,9 @@ impl IssueCardV1 {
             source,
             cache_identity,
         };
+        card.cache_identity.digest = card
+            .cache_identity
+            .compute_digest(&card.canonical_content());
         card.ensure_render_budget()?;
         Ok(card)
     }
@@ -885,7 +888,7 @@ impl IssueCardV1 {
         values: impl IntoIterator<Item = ComponentId>,
     ) -> Result<Self, IssueCardError> {
         append_bounded(&mut self.components, values)?;
-        self.ensure_render_budget()?;
+        self.reseal()?;
         Ok(self)
     }
 
@@ -895,7 +898,7 @@ impl IssueCardV1 {
         values: impl IntoIterator<Item = ComponentId>,
     ) -> Result<Self, IssueCardError> {
         append_bounded(&mut self.prerequisites, values)?;
-        self.ensure_render_budget()?;
+        self.reseal()?;
         Ok(self)
     }
 
@@ -905,7 +908,7 @@ impl IssueCardV1 {
         values: impl IntoIterator<Item = CapabilityId>,
     ) -> Result<Self, IssueCardError> {
         append_bounded(&mut self.capabilities, values)?;
-        self.ensure_render_budget()?;
+        self.reseal()?;
         Ok(self)
     }
 
@@ -915,7 +918,7 @@ impl IssueCardV1 {
         values: impl IntoIterator<Item = RiskCode>,
     ) -> Result<Self, IssueCardError> {
         append_bounded(&mut self.risks, values)?;
-        self.ensure_render_budget()?;
+        self.reseal()?;
         Ok(self)
     }
 
@@ -1084,6 +1087,51 @@ impl IssueCardV1 {
         } else {
             Ok(rendered)
         }
+    }
+
+    fn reseal(&mut self) -> Result<(), IssueCardError> {
+        self.cache_identity.digest = String::new();
+        self.cache_identity.digest = self
+            .cache_identity
+            .compute_digest(&self.canonical_content());
+        self.ensure_render_budget()
+    }
+
+    fn canonical_content(&self) -> String {
+        let mut lines = vec![
+            self.id.clone(),
+            self.objective.clone(),
+            actionability_code(self.actionability),
+            format!(
+                "{}:{}:{}:{}",
+                impact_code(self.priority_inputs.impact),
+                urgency_code(self.priority_inputs.urgency),
+                effort_code(self.priority_inputs.effort),
+                dependency_code(self.priority_inputs.dependency),
+            ),
+        ];
+        lines.extend(
+            self.components
+                .iter()
+                .map(|value| value.as_str().to_owned()),
+        );
+        lines.extend(
+            self.prerequisites
+                .iter()
+                .map(|value| value.as_str().to_owned()),
+        );
+        lines.extend(
+            self.capabilities
+                .iter()
+                .map(|value| value.as_str().to_owned()),
+        );
+        lines.extend(
+            self.risks
+                .iter()
+                .copied()
+                .map(|value| risk_code(value).to_owned()),
+        );
+        lines.join("\n")
     }
 
     fn ensure_render_budget(&self) -> Result<(), IssueCardError> {

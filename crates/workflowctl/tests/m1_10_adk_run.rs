@@ -438,6 +438,41 @@ fn oracle_failure_boundary_sink_is_bounded_content_free_and_opt_in() {
     ) & 0o777;
     assert_eq!(mode, 0o600);
 
+    let prior = b"primary-evidence\n";
+    let regular = root.join("existing-regular");
+    fs::write(&regular, prior).expect("primary evidence");
+    fs::hard_link(&regular, root.join("existing-link")).expect("primary hardlink");
+    let fifo = root.join("existing-fifo");
+    let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo path");
+    // SAFETY: the path is a fresh NUL-terminated fixture name; mkfifo only creates the inode.
+    assert_eq!(
+        unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) },
+        0,
+        "fifo fixture"
+    );
+    for path in [&regular, &fifo] {
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "oracle_failure_boundary_sink_fixture",
+                "--nocapture",
+            ])
+            .env(ORACLE_FAILURE_BOUNDARY_SINK_ENV, path)
+            .env(ORACLE_FAILURE_BOUNDARY_FIXTURE_ENV, "1")
+            .env(UNPROVEN_REAP_FIXTURE_ENV, "1")
+            .output()
+            .expect("adverse boundary fixture");
+        assert_child_failure(&output, "adverse boundary fixture must still fail");
+    }
+    assert_eq!(fs::read(&regular).expect("regular preserved"), prior);
+    assert_eq!(
+        fs::read(root.join("existing-link")).expect("link preserved"),
+        prior
+    );
+    assert!(std::os::unix::fs::FileTypeExt::is_fifo(
+        &fifo.metadata().expect("fifo metadata").file_type()
+    ));
+
     fs::remove_file(&sink_path).expect("remove opt-in boundary sink");
     let output = Command::new(std::env::current_exe().expect("test binary"))
         .args([
@@ -586,17 +621,16 @@ struct RequestObservation {
 
 const ORACLE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn write_oracle_failure_boundary() {
-    let Some(path) = std::env::var_os(ORACLE_FAILURE_BOUNDARY_SINK_ENV) else {
-        return;
-    };
+fn record_oracle_failure_boundary() -> Option<std::ffi::OsString> {
+    std::env::var_os(ORACLE_FAILURE_BOUNDARY_SINK_ENV)
+}
+fn write_oracle_failure_boundary(path: std::ffi::OsString) {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let Ok(mut file) = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
         .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     else {
         return;
@@ -1239,6 +1273,9 @@ fn clean_up_child(mut child: Child, operation: &'static str) -> Vec<&'static str
             Ok(None) => "still-alive".to_string(),
             Err(error) => format_wait_error(&error),
         };
+        if let Some(path) = record_oracle_failure_boundary() {
+            write_oracle_failure_boundary(path);
+        }
         abort_unproven_reap(
             operation,
             pid,
@@ -1315,13 +1352,17 @@ fn wait_bounded_child(
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::yield_now(),
             Ok(None) => {
-                // This is the observed wait boundary; cleanup may fail separately.
-                write_oracle_failure_boundary();
+                // Record the boundary locally; emit only after containment so
+                // a refused or blocking sink cannot delay cleanup.
+                let boundary = record_oracle_failure_boundary();
                 let diagnostics = diagnostics_after_cleanup(
                     clean_up_child(child, operation),
                     stdout_path,
                     stderr_path,
                 );
+                if let Some(path) = boundary {
+                    write_oracle_failure_boundary(path);
+                }
                 return Err(format!(
                     "oracle child timed out; {}",
                     diagnostics.join("; ")
