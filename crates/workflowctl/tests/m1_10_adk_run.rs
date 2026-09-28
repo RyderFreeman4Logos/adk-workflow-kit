@@ -463,12 +463,14 @@ fn oracle_failure_boundary_sink_is_bounded_content_free_and_opt_in() {
             .output()
             .expect("adverse boundary fixture");
         assert_child_failure(&output, "adverse boundary fixture must still fail");
+        if path == &regular {
+            assert_eq!(fs::read(&regular).expect("regular preserved"), prior);
+            assert_eq!(
+                fs::read(root.join("existing-link")).expect("link preserved"),
+                prior
+            );
+        }
     }
-    assert_eq!(fs::read(&regular).expect("regular preserved"), prior);
-    assert_eq!(
-        fs::read(root.join("existing-link")).expect("link preserved"),
-        prior
-    );
     assert!(std::os::unix::fs::FileTypeExt::is_fifo(
         &fifo.metadata().expect("fifo metadata").file_type()
     ));
