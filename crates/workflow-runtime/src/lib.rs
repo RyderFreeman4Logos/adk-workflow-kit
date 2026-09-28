@@ -103,11 +103,13 @@ pub use issue_artifact::{
 };
 pub use issue_card::{
     Actionability, AmbiguityReasonCode, CapabilityId, ComponentId,
-    ISSUE_CARD_CACHE_SCHEMA_VERSION_V1, ISSUE_CARD_PRIORITY_ORDER_VERSION_V1,
-    ISSUE_CARD_SCHEMA_VERSION_V1, IssueCardCacheIdentity, IssueCardError, IssueCardV1,
-    PriorityDependency, PriorityEffort, PriorityImpact, PriorityInputs, PriorityOrderKey,
-    PriorityReasonCode, PriorityScore, PriorityUrgency, RiskCode, SourceEvidence,
-    TrustedSourceBinding, UnableReasonCode,
+    ISSUE_CARD_CACHE_SCHEMA_VERSION_V1, ISSUE_CARD_CACHE_SCHEMA_VERSION_V2,
+    ISSUE_CARD_MAX_COLLECTION_ITEMS, ISSUE_CARD_MAX_IDENTIFIER_BYTES,
+    ISSUE_CARD_MAX_OBJECTIVE_BYTES, ISSUE_CARD_MAX_RENDERED_BYTES, ISSUE_CARD_MAX_SOURCE_EVIDENCE,
+    ISSUE_CARD_PRIORITY_ORDER_VERSION_V1, ISSUE_CARD_SCHEMA_VERSION_V1, IssueCardCacheIdentity,
+    IssueCardError, IssueCardV1, PriorityDependency, PriorityEffort, PriorityImpact,
+    PriorityInputs, PriorityOrderKey, PriorityReasonCode, PriorityScore, PriorityUrgency, RiskCode,
+    SourceEvidence, TrustedSourceBinding, UnableReasonCode,
 };
 pub use node_cache::{
     CacheDisposition, CacheProvenance, NODE_CACHE_SCHEMA_VERSION, NodeCacheEntry, NodeCacheError,

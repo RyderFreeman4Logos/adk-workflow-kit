@@ -2,15 +2,16 @@ use std::num::NonZeroU64;
 
 use workflow_runtime::{
     Actionability, AmbiguityReasonCode, CapabilityId, ComponentId, GitHubIssueMetadata,
-    GitHubIssueState, InMemoryArtifactStore, IssueCardCacheIdentity, IssueCardV1, OfflineComment,
-    OfflineIssueContent, PriorityDependency, PriorityEffort, PriorityImpact, PriorityInputs,
-    PriorityReasonCode, PriorityScore, PriorityUrgency, RiskCode, TrustPolicy, UnableReasonCode,
-    build_canonical_issue_artifact,
+    GitHubIssueState, ISSUE_CARD_MAX_COLLECTION_ITEMS, ISSUE_CARD_MAX_OBJECTIVE_BYTES,
+    ISSUE_CARD_MAX_RENDERED_BYTES, InMemoryArtifactStore, IssueCardCacheIdentity, IssueCardError,
+    IssueCardV1, OfflineComment, OfflineIssueContent, PriorityDependency, PriorityEffort,
+    PriorityImpact, PriorityInputs, PriorityReasonCode, PriorityScore, PriorityUrgency, RiskCode,
+    TrustPolicy, UnableReasonCode, build_canonical_issue_artifact,
 };
 
-fn issue() -> GitHubIssueMetadata {
+fn issue(number: u64) -> GitHubIssueMetadata {
     GitHubIssueMetadata::new(
-        251,
+        number,
         "trusted-author",
         "MEMBER",
         GitHubIssueState::Open,
@@ -20,10 +21,14 @@ fn issue() -> GitHubIssueMetadata {
     .expect("metadata")
 }
 
-fn artifact() -> workflow_runtime::CanonicalIssueArtifact {
+fn artifact_for(
+    number: u64,
+    snapshot: &str,
+    repository: &str,
+) -> workflow_runtime::CanonicalIssueArtifact {
     let content = OfflineIssueContent::new(
-        issue(),
-        "snapshot-251",
+        issue(number),
+        snapshot,
         b"trusted title".to_vec(),
         b"trusted body".to_vec(),
         vec![
@@ -39,12 +44,16 @@ fn artifact() -> workflow_runtime::CanonicalIssueArtifact {
         ],
     )
     .expect("content");
-    let policy = TrustPolicy::new("owner/repo", ["trusted-author"]).expect("policy");
+    let policy = TrustPolicy::new(repository, ["trusted-author"]).expect("policy");
     let mut store = InMemoryArtifactStore::new(
         NonZeroU64::new(65_536).expect("page size"),
         NonZeroU64::new(65_536).expect("artifact size"),
     );
     build_canonical_issue_artifact(&policy, &content, &mut store).expect("artifact")
+}
+
+fn artifact() -> workflow_runtime::CanonicalIssueArtifact {
+    artifact_for(251, "snapshot-251", "owner/repo")
 }
 
 fn inputs(impact: PriorityImpact) -> PriorityInputs {
@@ -56,39 +65,49 @@ fn inputs(impact: PriorityImpact) -> PriorityInputs {
     )
 }
 
-fn card(id: &str, impact: PriorityImpact) -> IssueCardV1 {
+fn card_from(
+    artifact: &workflow_runtime::CanonicalIssueArtifact,
+    id: &str,
+    objective: &str,
+    impact: PriorityImpact,
+) -> IssueCardV1 {
     IssueCardV1::from_artifact(
         id,
-        "runtime-foundation",
+        objective,
         Actionability::Actionable,
         inputs(impact),
-        &artifact(),
+        artifact,
         "model:none",
         "prompt-v1",
     )
     .expect("card")
 }
 
+fn card(id: &str, impact: PriorityImpact) -> IssueCardV1 {
+    card_from(&artifact(), id, "runtime-foundation", impact)
+}
+
 #[test]
 fn source_binding_preserves_only_included_spans() {
     let artifact = artifact();
-    let card = IssueCardV1::from_artifact(
+    let card = card_from(
+        &artifact,
         "issue-251",
         "runtime-foundation",
-        Actionability::Actionable,
-        inputs(PriorityImpact::High),
-        &artifact,
-        "model:none",
-        "prompt-v1",
-    )
-    .expect("card");
+        PriorityImpact::High,
+    );
 
     assert_eq!(
         card.source().content_hash(),
         artifact.content_ref().sha256()
     );
+    assert_eq!(
+        card.source().aggregate_digest(),
+        artifact.aggregate_digest()
+    );
     assert_eq!(card.source().policy_digest(), artifact.policy_digest());
     assert_eq!(card.source().evidence().len(), artifact.included().len());
+    assert_eq!(card.references(), card.source().evidence());
     assert!(
         card.source()
             .evidence()
@@ -125,12 +144,14 @@ fn priority_is_inspectable_but_not_claimed_calibrated() {
     assert_eq!(low.priority_score(), PriorityScore::NotCalibrated);
     assert_eq!(high.priority_score(), PriorityScore::NotCalibrated);
     assert_eq!(low.priority_reasons(), &[PriorityReasonCode::NotCalibrated]);
+    assert_eq!(high.priority_inputs().impact(), PriorityImpact::Critical);
     assert!(high.priority_order_key() > low.priority_order_key());
     assert_eq!(high.priority_order_key().version(), 1);
+    assert_eq!(high.priority_order_key().impact_rank(), 4);
 }
 
 #[test]
-fn cache_identity_binds_all_execution_inputs() {
+fn cache_identity_binds_the_canonical_aggregate_and_execution_inputs() {
     let artifact = artifact();
     let first = IssueCardCacheIdentity::from_artifact(&artifact, "model:none", "prompt-v1")
         .expect("cache identity");
@@ -140,38 +161,177 @@ fn cache_identity_binds_all_execution_inputs() {
         .expect("cache identity");
     let other_prompt = IssueCardCacheIdentity::from_artifact(&artifact, "model:none", "prompt-v2")
         .expect("cache identity");
+    let other_issue = artifact_for(252, "snapshot-252", "owner/repo");
+    let other_aggregate =
+        IssueCardCacheIdentity::from_artifact(&other_issue, "model:none", "prompt-v1")
+            .expect("cache identity");
 
     assert_eq!(first, same);
+    assert_eq!(first.cache_schema_version(), 2);
     assert_eq!(first.schema_version(), 1);
     assert_eq!(first.priority_order_version(), 1);
+    assert_eq!(first.aggregate_digest(), artifact.aggregate_digest());
     assert_ne!(first.digest(), other_model.digest());
     assert_ne!(first.digest(), other_prompt.digest());
+    assert_ne!(first.aggregate_digest(), other_aggregate.aggregate_digest());
+    assert_ne!(first.digest(), other_aggregate.digest());
 }
 
 #[test]
-fn renderer_is_stable_field_only_and_sorts_identifiers() {
+fn rehydration_rejects_cross_artifact_policy_material() {
+    let artifact_a = artifact();
+    let artifact_b = artifact_for(251, "snapshot-251", "other/repo");
+    let card_a = card_from(
+        &artifact_a,
+        "issue-251",
+        "runtime-foundation",
+        PriorityImpact::High,
+    );
+    let card_b = card_from(
+        &artifact_b,
+        "issue-251",
+        "runtime-foundation",
+        PriorityImpact::High,
+    );
+
+    let error = IssueCardV1::rehydrate(
+        "issue-251",
+        "runtime-foundation",
+        Actionability::Actionable,
+        inputs(PriorityImpact::High),
+        &artifact_a,
+        card_b.source().clone(),
+        card_b.cache_identity().clone(),
+    )
+    .expect_err("cross-artifact source must be rejected");
+    assert_eq!(error, IssueCardError::InvalidIdentity);
+
+    let error = IssueCardV1::rehydrate(
+        "issue-251",
+        "runtime-foundation",
+        Actionability::Actionable,
+        inputs(PriorityImpact::High),
+        &artifact_a,
+        card_a.source().clone(),
+        card_b.cache_identity().clone(),
+    )
+    .expect_err("mismatched policy cache must be rejected");
+    assert_eq!(error, IssueCardError::InvalidIdentity);
+}
+
+#[test]
+fn renderer_is_stable_escaped_and_collection_framing_is_unambiguous() {
     let first = card("issue-251", PriorityImpact::High)
         .with_components([
             ComponentId::new("runtime").expect("component"),
             ComponentId::new("compiler").expect("component"),
+            ComponentId::new("compiler, runtime").expect("component"),
         ])
+        .expect("components")
         .with_prerequisites([ComponentId::new("trusted-intake").expect("component")])
+        .expect("prerequisites")
         .with_capabilities([CapabilityId::new("read-source").expect("capability")])
-        .with_risks([RiskCode::UncalibratedPriority]);
+        .expect("capabilities")
+        .with_risks([RiskCode::UncalibratedPriority])
+        .expect("risks");
     let second = card("issue-251", PriorityImpact::High)
         .with_components([ComponentId::new("compiler").expect("component")])
+        .expect("components")
         .with_components([ComponentId::new("runtime").expect("component")])
+        .expect("components")
+        .with_components([ComponentId::new("compiler, runtime").expect("component")])
+        .expect("components")
         .with_prerequisites([ComponentId::new("trusted-intake").expect("component")])
+        .expect("prerequisites")
         .with_capabilities([CapabilityId::new("read-source").expect("capability")])
-        .with_risks([RiskCode::UncalibratedPriority]);
+        .expect("capabilities")
+        .with_risks([RiskCode::UncalibratedPriority])
+        .expect("risks");
 
-    let rendered = first.render_markdown();
-    assert_eq!(rendered, second.render_markdown());
+    let rendered = first.render_markdown().expect("render");
+    assert_eq!(rendered, second.render_markdown().expect("render"));
     assert!(rendered.contains("schema: issue-card-v1"));
-    assert!(rendered.contains("actionability: actionable"));
-    assert!(rendered.contains("priority_score: not_calibrated"));
-    assert!(rendered.contains("components: [compiler, runtime]"));
-    assert!(rendered.contains("risks: [uncalibrated_priority]"));
-    assert!(!rendered.contains("because"));
-    assert!(!rendered.contains("omitted comment"));
+    assert!(rendered.contains("actionability: \"actionable\""));
+    assert!(rendered.contains("priority_score: \"not\\_calibrated\""));
+    assert!(rendered.contains("components: [\"compiler\", \"compiler, runtime\", \"runtime\"]"));
+    assert!(rendered.contains("risks: [\"uncalibrated\\_priority\"]"));
+
+    let dangerous = card_from(
+        &artifact(),
+        "![card](javascript:alert(1))",
+        "![objective](javascript:alert(2)) <img src=x>",
+        PriorityImpact::High,
+    )
+    .render_markdown()
+    .expect("render");
+    assert!(dangerous.contains("\\!\\[objective\\]\\(javascript:alert\\(2\\)\\) \\<img src=x\\>"));
+    assert!(!dangerous.contains("<img src=x>"));
+}
+
+#[test]
+fn debug_output_redacts_semantic_text_and_nested_identity_material() {
+    let card = card_from(
+        &artifact(),
+        "issue-secret-id",
+        "objective-secret-text",
+        PriorityImpact::High,
+    )
+    .with_components([ComponentId::new("component-secret").expect("component")])
+    .expect("components");
+    let debug = format!("{card:?}");
+    let source_debug = format!("{:?}", card.source());
+    let cache_debug = format!("{:?}", card.cache_identity());
+
+    for secret in [
+        "issue-secret-id",
+        "objective-secret-text",
+        "component-secret",
+        "model:none",
+        "prompt-v1",
+    ] {
+        assert!(!debug.contains(secret), "card debug leaked {secret}");
+        assert!(
+            !source_debug.contains(secret),
+            "source debug leaked {secret}"
+        );
+        assert!(!cache_debug.contains(secret), "cache debug leaked {secret}");
+    }
+    assert!(debug.contains("component_count: 1"));
+    assert!(source_debug.contains("evidence_count"));
+    assert!(cache_debug.contains("<redacted>"));
+}
+
+#[test]
+fn public_card_path_rejects_oversized_objectives_and_collection_growth() {
+    let oversized = "x".repeat(ISSUE_CARD_MAX_OBJECTIVE_BYTES + 1);
+    let error = IssueCardV1::from_artifact(
+        "issue-251",
+        oversized,
+        Actionability::Actionable,
+        inputs(PriorityImpact::High),
+        &artifact(),
+        "model:none",
+        "prompt-v1",
+    )
+    .expect_err("oversized objective must be rejected");
+    assert_eq!(error, IssueCardError::FieldTooLong);
+
+    let too_many = (0..=ISSUE_CARD_MAX_COLLECTION_ITEMS)
+        .map(|index| ComponentId::new(format!("component-{index}")).expect("component"));
+    let error = card("issue-251", PriorityImpact::High)
+        .with_components(too_many)
+        .expect_err("collection growth must be rejected");
+    assert_eq!(error, IssueCardError::CollectionTooLarge);
+}
+
+#[test]
+fn public_card_rendering_stays_within_the_offline_bound() {
+    let card = card_from(
+        &artifact(),
+        "issue-251",
+        &"objective ".repeat(ISSUE_CARD_MAX_OBJECTIVE_BYTES / 10),
+        PriorityImpact::High,
+    );
+    let rendered = card.render_markdown().expect("bounded render");
+    assert!(rendered.len() <= ISSUE_CARD_MAX_RENDERED_BYTES);
 }

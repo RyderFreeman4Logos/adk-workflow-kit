@@ -1005,11 +1005,12 @@ fn push_artifacts(lines: &mut Vec<String>, artifacts: &[ArtifactRef]) {
     }
 }
 
-fn escape_markdown(value: &str) -> String {
+pub(crate) fn escape_markdown(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
-            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')' | '#' | '+' | '!' | '|' => {
+            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')' | '#' | '+' | '!' | '|'
+            | '<' | '>' | '&' | '"' => {
                 escaped.push('\\');
                 escaped.push(ch);
             }
