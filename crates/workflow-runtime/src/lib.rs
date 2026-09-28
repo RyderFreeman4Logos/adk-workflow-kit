@@ -19,6 +19,7 @@ mod github_intake;
 mod hot_reload;
 mod issue_artifact;
 mod issue_card;
+mod issue_plan;
 mod node_cache;
 mod observability;
 mod podman;
@@ -110,6 +111,9 @@ pub use issue_card::{
     IssueCardError, IssueCardV1, PriorityDependency, PriorityEffort, PriorityImpact,
     PriorityInputs, PriorityOrderKey, PriorityReasonCode, PriorityScore, PriorityUrgency, RiskCode,
     SourceEvidence, TrustedSourceBinding, UnableReasonCode,
+};
+pub use issue_plan::{
+    ISSUE_PLAN_MAX_CARDS, IssuePlanError, IssuePlanTitle, TodoItem, TodoPlan, build_todo_plan,
 };
 pub use node_cache::{
     CacheDisposition, CacheProvenance, NODE_CACHE_SCHEMA_VERSION, NodeCacheEntry, NodeCacheError,
