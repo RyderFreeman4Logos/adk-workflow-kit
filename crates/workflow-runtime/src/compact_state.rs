@@ -4,7 +4,9 @@ use std::{fmt, num::NonZeroU64};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use workflow_ir::compact_state::{CompactState, SourceIndex, SourceRef, StateDelta};
+use workflow_ir::compact_state::{
+    CompactState, IrCompactStateEndpoint, SourceIndex, SourceRef, StateDelta,
+};
 
 use crate::{
     ArtifactId, ArtifactRef, ArtifactStore, CompactStateDelta, Completeness, PageRequest,
@@ -15,6 +17,17 @@ use crate::{
 pub const COMPACT_STATE_KEY: &str = "compact_state";
 /// The typed envelope operation used by the compact-state exchange.
 pub const COMPACT_STATE_OPERATION: &str = "add";
+
+impl From<IrCompactStateEndpoint> for WorkflowExchange {
+    fn from(endpoint: IrCompactStateEndpoint) -> Self {
+        match endpoint {
+            IrCompactStateEndpoint::CodeInvestigation => Self::CodeInvestigation,
+            IrCompactStateEndpoint::GroundedAnswer => Self::GroundedAnswer,
+            IrCompactStateEndpoint::MultiHop => Self::MultiHop,
+            IrCompactStateEndpoint::Review => Self::Review,
+        }
+    }
+}
 
 const PAGE_LIMIT: NonZeroU64 = match NonZeroU64::new(65_536) {
     Some(limit) => limit,
@@ -202,12 +215,19 @@ impl SourcePage {
 /// `PartialPublication`, including a store that reports the wrong ID after
 /// making content visible. Staging and previsibility commit failures remain
 /// `Artifact` under the store's commit-error contract.
-pub fn publish_compact_state_delta<S: ArtifactStore>(
+pub fn publish_compact_state_delta<S, F, T>(
     store: &mut S,
-    from: WorkflowExchange,
-    to: WorkflowExchange,
+    from: F,
+    to: T,
     delta: &StateDelta,
-) -> Result<CompactStateReceipt, CompactStateExchangeError> {
+) -> Result<CompactStateReceipt, CompactStateExchangeError>
+where
+    S: ArtifactStore,
+    F: Into<WorkflowExchange>,
+    T: Into<WorkflowExchange>,
+{
+    let from = from.into();
+    let to = to.into();
     CompactState::default()
         .apply(delta)
         .map_err(|_| CompactStateExchangeError::InvalidStateDelta)?;
@@ -268,15 +288,22 @@ pub fn publish_compact_state_delta<S: ArtifactStore>(
 }
 
 /// Admits, verifies, and atomically applies one compact-state delta envelope.
-pub fn consume_compact_state_delta<S: ArtifactStore>(
+pub fn consume_compact_state_delta<S, F, T>(
     store: &S,
-    from: WorkflowExchange,
-    to: WorkflowExchange,
+    from: F,
+    to: T,
     envelope_artifact: &ArtifactId,
     expected_key: &str,
     expected_op: &str,
     state: &mut CompactState,
-) -> Result<CompactStateReceipt, CompactStateExchangeError> {
+) -> Result<CompactStateReceipt, CompactStateExchangeError>
+where
+    S: ArtifactStore,
+    F: Into<WorkflowExchange>,
+    T: Into<WorkflowExchange>,
+{
+    let from = from.into();
+    let to = to.into();
     let envelope = read_artifact(store, envelope_artifact, MAX_EXCHANGE_BYTES)?;
     let payload = to.consume_bytes(from, &envelope).map_err(map_typed_error)?;
     if !matches!(payload, TypedPayload::CompactState(_)) {

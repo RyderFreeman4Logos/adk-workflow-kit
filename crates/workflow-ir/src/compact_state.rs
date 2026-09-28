@@ -6,6 +6,78 @@ use serde::{
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use workflow_spec::CompactStateEndpoint;
+
+#[cfg(test)]
+static RELATIONS_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// The normalized compact-state exchange endpoint vocabulary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrCompactStateEndpoint {
+    /// The code-investigation workflow endpoint.
+    CodeInvestigation,
+    /// The grounded-answer workflow endpoint.
+    GroundedAnswer,
+    /// The multi-hop workflow endpoint.
+    MultiHop,
+    /// The review workflow endpoint.
+    Review,
+}
+
+impl IrCompactStateEndpoint {
+    /// Returns the canonical endpoint identity used by the runtime protocol.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CodeInvestigation => "code.investigation",
+            Self::GroundedAnswer => "grounded.answer",
+            Self::MultiHop => "multi.hop",
+            Self::Review => "review",
+        }
+    }
+}
+
+impl From<CompactStateEndpoint> for IrCompactStateEndpoint {
+    fn from(endpoint: CompactStateEndpoint) -> Self {
+        match endpoint {
+            CompactStateEndpoint::CodeInvestigation => Self::CodeInvestigation,
+            CompactStateEndpoint::GroundedAnswer => Self::GroundedAnswer,
+            CompactStateEndpoint::MultiHop => Self::MultiHop,
+            CompactStateEndpoint::Review => Self::Review,
+        }
+    }
+}
+
+/// A typed, normalized compact-state exchange configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IrCompactStateExchange {
+    from: IrCompactStateEndpoint,
+    to: IrCompactStateEndpoint,
+}
+
+impl IrCompactStateExchange {
+    /// Creates a normalized exchange between two workflow endpoints.
+    pub const fn new(from: IrCompactStateEndpoint, to: IrCompactStateEndpoint) -> Self {
+        Self { from, to }
+    }
+
+    /// Returns the source endpoint.
+    pub fn from(self) -> IrCompactStateEndpoint {
+        self.from
+    }
+
+    /// Returns the destination endpoint.
+    pub fn to(self) -> IrCompactStateEndpoint {
+        self.to
+    }
+}
+
+impl From<&workflow_spec::CompactStateExchange> for IrCompactStateExchange {
+    fn from(exchange: &workflow_spec::CompactStateExchange) -> Self {
+        Self::new(exchange.from().into(), exchange.to().into())
+    }
+}
 
 /// The only wire version admitted by this reducer.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -53,13 +125,35 @@ pub struct SourceRef {
     pub end: u64,
 }
 
-/// The minimal identity-bearing categories needed by the relation contract.
+/// Categories are identity-bearing. A proposal, alternative, or failed approach
+/// never becomes a decision, and completion stays distinct from pending work.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
+    /// Current desired outcome.
+    Objective,
+    /// Reported fact, not independently verified truth.
     Fact,
-    Proposal,
+    /// An explicitly recorded commitment.
     Decision,
+    /// A restriction on future actions.
+    Constraint,
+    /// Work not yet completed.
+    PendingTask,
+    /// Work explicitly recorded as completed.
+    CompletedTask,
+    /// Attempt that failed; never a completed task.
+    FailedApproach,
+    /// An artifact reference; its bytes remain external.
+    Artifact,
+    /// An unresolved question.
+    OpenQuestion,
+    /// An exact environment value; never executed by this library.
+    EnvironmentBinding,
+    /// A proposal, not a commitment.
+    Proposal,
+    /// An alternative, not a commitment.
+    Alternative,
 }
 
 /// A source-addressed assertion whose relations are always explicit.
@@ -331,6 +425,9 @@ impl CompactState {
 
     /// Return every explicit link in stable source/kind/target order.
     pub fn relations(&self) -> Vec<StateRelation> {
+        #[cfg(test)]
+        RELATIONS_CALLS.fetch_add(1, Ordering::Relaxed);
+
         let mut relations = Vec::new();
         for (source, entry) in &self.entries {
             for target in &entry.contradicts {
@@ -357,5 +454,115 @@ impl CompactState {
                 .then(left.target.cmp(&right.target))
         });
         relations
+    }
+
+    /// Trusted continuation view: sorted identities, relations, and source refs.
+    /// Entry text and source bytes are never copied into the document.
+    pub fn render(&self) -> Result<String, StateError> {
+        let mut lines = vec!["CompactState v1".to_owned()];
+        for (source_id, source) in &self.sources {
+            lines.push(format!(
+                "source {} {} {}",
+                display_token(source_id),
+                source.artifact_id,
+                source.byte_len
+            ));
+        }
+        for (id, entry) in &self.entries {
+            lines.push(format!(
+                "entry {} {}",
+                id,
+                serde_json::to_string(&entry.kind).map_err(|_| StateError::Document)?
+            ));
+            for source in &entry.provenance {
+                lines.push(format!(
+                    "ref {} {}#{}-{}",
+                    id,
+                    display_token(&source.source),
+                    source.start,
+                    source.end
+                ));
+            }
+            for (kind, targets) in [
+                (RelationKind::Contradicts, &entry.contradicts),
+                (RelationKind::Supersedes, &entry.supersedes),
+            ] {
+                for target in targets {
+                    lines.push(format!(
+                        "link {} {} {} {}",
+                        id,
+                        serde_json::to_string(&kind).map_err(|_| StateError::Document)?,
+                        target,
+                        u8::from(self.entries.contains_key(target))
+                    ));
+                }
+            }
+        }
+        Ok(format!("    {}", lines.join("\n    ")))
+    }
+}
+
+fn display_token(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ARTIFACT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ENTRY_COUNT: usize = 256;
+    const MISSING: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    fn entry(index: usize) -> StateEntry {
+        StateEntry {
+            kind: EntryKind::Fact,
+            scope: "scale".to_owned(),
+            key: format!("entry-{index}"),
+            text: format!("text-{index}"),
+            provenance: BTreeSet::from([SourceRef {
+                source: "notes".to_owned(),
+                artifact_id: ARTIFACT.to_owned(),
+                start: 0,
+                end: 16,
+            }]),
+            supersedes: BTreeSet::new(),
+            contradicts: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn render_does_not_rebuild_relations_for_sparse_history() {
+        let mut entries = (0..ENTRY_COUNT).map(entry).collect::<Vec<_>>();
+        let source_id = entry_id(&entries[0]).expect("source identity");
+        let target_id = entry_id(&entries[1]).expect("target identity");
+        entries[0].contradicts.insert(target_id.clone());
+        entries[0].supersedes.insert(MISSING.to_owned());
+
+        let state = CompactState::default()
+            .apply(&StateDelta {
+                schema_version: StateVersion,
+                sources: BTreeMap::from([(
+                    "notes".to_owned(),
+                    SourceRecord {
+                        artifact_id: ARTIFACT.to_owned(),
+                        byte_len: 128,
+                    },
+                )]),
+                entries,
+            })
+            .expect("sparse history");
+
+        RELATIONS_CALLS.store(0, Ordering::Relaxed);
+        let rendered = state.render().expect("renderer");
+
+        assert_eq!(
+            RELATIONS_CALLS.load(Ordering::Relaxed),
+            0,
+            "render must not rebuild the complete relation graph per entry"
+        );
+        assert_eq!(rendered.matches("link ").count(), 2);
+        assert!(rendered.contains(&format!("link {source_id} \"contradicts\" {target_id} 1")));
+        assert!(rendered.contains(&format!("link {source_id} \"supersedes\" {MISSING} 0")));
     }
 }

@@ -138,6 +138,22 @@ issue-228-test:
 issue-243-ir test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-ir --test issue_243_relation_contract {{test_name}} --locked -- --nocapture
 
+# Focused #243 renderer work-bound regression.
+issue-243-ir-renderer:
+    {{_io}} cargo +1.98.0 test -p workflow-ir --lib compact_state::tests::render_does_not_rebuild_relations_for_sparse_history --locked -- --exact --nocapture
+
+# Focused #243 continuation categories and trusted renderer tests.
+issue-243-ir-continuation test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-ir --test issue_243_continuation_categories {{test_name}} --locked -- --nocapture
+
+# Focused #243 authored compact-state exchange -> typed compiler IR tests.
+issue-243-compiler test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-compiler --test issue_243_compact_state_ir {{test_name}} --locked -- --nocapture
+
+# Focused #243 compiled-IR-driven runtime artifact exchange integration test.
+issue-243-compiler-runtime test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-compiler --test issue_243_compact_state_runtime {{test_name}} --locked -- --nocapture
+
 # Focused #243 runtime artifact-backed compact-state exchange tests.
 issue-243-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_243_compact_state {{test_name}} --locked -- --nocapture
