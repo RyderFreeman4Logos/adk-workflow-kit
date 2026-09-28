@@ -6,11 +6,12 @@ use workflow_ir::compact_state::{
 };
 
 const ARTIFACT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const HOSTILE_SOURCE: &str = "notes\n```\"\\\u{0007}";
 const SOURCE_BYTES: &str = "SECRET-SOURCE-BYTES-must-stay-outside-the-renderer";
 
 fn sources() -> SourceIndex {
     BTreeMap::from([(
-        "notes".to_owned(),
+        HOSTILE_SOURCE.to_owned(),
         SourceRecord {
             artifact_id: ARTIFACT.to_owned(),
             byte_len: 128,
@@ -25,7 +26,7 @@ fn entry(kind: EntryKind, key: &str, text: &str) -> StateEntry {
         key: key.to_owned(),
         text: text.to_owned(),
         provenance: BTreeSet::from([SourceRef {
-            source: "notes".to_owned(),
+            source: HOSTILE_SOURCE.to_owned(),
             artifact_id: ARTIFACT.to_owned(),
             start: 0,
             end: 16,
@@ -107,6 +108,17 @@ fn trusted_renderer_is_order_invariant_and_keeps_untrusted_text_inert() {
     );
 
     let rendered = forward.render().expect("trusted renderer");
+    let expected = r##"    CompactState v1
+    source "notes\n```\"\\\u0007" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 128
+    entry 4b45fd2ebb1e1d3e974f7f5b1f7379393edfc90a3a9f55995e986a35829785ba "decision"
+    ref 4b45fd2ebb1e1d3e974f7f5b1f7379393edfc90a3a9f55995e986a35829785ba "notes\n```\"\\\u0007"#0-16
+    link 4b45fd2ebb1e1d3e974f7f5b1f7379393edfc90a3a9f55995e986a35829785ba "supersedes" fb3a6f09bab66aa7ac183351938f96d4c07a3a1f2a7c48f6869393c23c098d6f 1
+    entry afc7965c01d4df3775494d59257abf92a94185fe3c4cabae10b77fb64210fb74 "pending_task"
+    ref afc7965c01d4df3775494d59257abf92a94185fe3c4cabae10b77fb64210fb74 "notes\n```\"\\\u0007"#0-16
+    link afc7965c01d4df3775494d59257abf92a94185fe3c4cabae10b77fb64210fb74 "contradicts" 4b45fd2ebb1e1d3e974f7f5b1f7379393edfc90a3a9f55995e986a35829785ba 1
+    entry fb3a6f09bab66aa7ac183351938f96d4c07a3a1f2a7c48f6869393c23c098d6f "failed_approach"
+    ref fb3a6f09bab66aa7ac183351938f96d4c07a3a1f2a7c48f6869393c23c098d6f "notes\n```\"\\\u0007"#0-16"##;
+    assert_eq!(rendered, expected);
     assert_eq!(rendered, reversed.render().expect("stable renderer"));
     assert!(rendered.contains(&failed_id));
     assert!(rendered.contains(&decision_id));
@@ -115,7 +127,6 @@ fn trusted_renderer_is_order_invariant_and_keeps_untrusted_text_inert() {
     assert!(rendered.contains("supersedes"));
     assert!(rendered.contains("contradicts"));
     assert!(rendered.contains(ARTIFACT));
-    assert!(rendered.contains("\"notes\"#0-16"));
     assert!(
         !rendered.contains(SOURCE_BYTES),
         "renderer must not copy source bytes or entry prose: {rendered}"
