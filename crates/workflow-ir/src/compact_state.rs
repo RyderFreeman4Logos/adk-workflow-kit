@@ -6,7 +6,12 @@ use serde::{
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use workflow_spec::CompactStateEndpoint;
+
+#[cfg(test)]
+static RELATIONS_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// The normalized compact-state exchange endpoint vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -420,6 +425,9 @@ impl CompactState {
 
     /// Return every explicit link in stable source/kind/target order.
     pub fn relations(&self) -> Vec<StateRelation> {
+        #[cfg(test)]
+        RELATIONS_CALLS.fetch_add(1, Ordering::Relaxed);
+
         let mut relations = Vec::new();
         for (source, entry) in &self.entries {
             for target in &entry.contradicts {
@@ -475,14 +483,17 @@ impl CompactState {
                     source.end
                 ));
             }
-            for relation in &self.relations() {
-                if relation.source == *id {
+            for (kind, targets) in [
+                (RelationKind::Contradicts, &entry.contradicts),
+                (RelationKind::Supersedes, &entry.supersedes),
+            ] {
+                for target in targets {
                     lines.push(format!(
                         "link {} {} {} {}",
                         id,
-                        serde_json::to_string(&relation.kind).map_err(|_| StateError::Document)?,
-                        relation.target,
-                        u8::from(relation.target_present)
+                        serde_json::to_string(&kind).map_err(|_| StateError::Document)?,
+                        target,
+                        u8::from(self.entries.contains_key(target))
                     ));
                 }
             }
@@ -493,4 +504,65 @@ impl CompactState {
 
 fn display_token(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ARTIFACT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ENTRY_COUNT: usize = 256;
+    const MISSING: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    fn entry(index: usize) -> StateEntry {
+        StateEntry {
+            kind: EntryKind::Fact,
+            scope: "scale".to_owned(),
+            key: format!("entry-{index}"),
+            text: format!("text-{index}"),
+            provenance: BTreeSet::from([SourceRef {
+                source: "notes".to_owned(),
+                artifact_id: ARTIFACT.to_owned(),
+                start: 0,
+                end: 16,
+            }]),
+            supersedes: BTreeSet::new(),
+            contradicts: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn render_does_not_rebuild_relations_for_sparse_history() {
+        let mut entries = (0..ENTRY_COUNT).map(entry).collect::<Vec<_>>();
+        let source_id = entry_id(&entries[0]).expect("source identity");
+        let target_id = entry_id(&entries[1]).expect("target identity");
+        entries[0].contradicts.insert(target_id.clone());
+        entries[0].supersedes.insert(MISSING.to_owned());
+
+        let state = CompactState::default()
+            .apply(&StateDelta {
+                schema_version: StateVersion,
+                sources: BTreeMap::from([(
+                    "notes".to_owned(),
+                    SourceRecord {
+                        artifact_id: ARTIFACT.to_owned(),
+                        byte_len: 128,
+                    },
+                )]),
+                entries,
+            })
+            .expect("sparse history");
+
+        RELATIONS_CALLS.store(0, Ordering::Relaxed);
+        let rendered = state.render().expect("renderer");
+
+        assert_eq!(
+            RELATIONS_CALLS.load(Ordering::Relaxed),
+            0,
+            "render must not rebuild the complete relation graph per entry"
+        );
+        assert_eq!(rendered.matches("link ").count(), 2);
+        assert!(rendered.contains(&format!("link {source_id} \"contradicts\" {target_id} 1")));
+        assert!(rendered.contains(&format!("link {source_id} \"supersedes\" {MISSING} 0")));
+    }
 }

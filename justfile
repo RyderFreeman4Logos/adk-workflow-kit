@@ -138,6 +138,10 @@ issue-228-test:
 issue-243-ir test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-ir --test issue_243_relation_contract {{test_name}} --locked -- --nocapture
 
+# Focused #243 renderer work-bound regression.
+issue-243-ir-renderer:
+    {{_io}} cargo +1.98.0 test -p workflow-ir --lib compact_state::tests::render_does_not_rebuild_relations_for_sparse_history --locked -- --exact --nocapture
+
 # Focused #243 continuation categories and trusted renderer tests.
 issue-243-ir-continuation test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-ir --test issue_243_continuation_categories {{test_name}} --locked -- --nocapture
