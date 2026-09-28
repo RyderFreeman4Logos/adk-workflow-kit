@@ -44,6 +44,30 @@ fn authored_exchange_normalizes_into_typed_ir() {
 }
 
 #[test]
+fn non_exchange_trajectory_identity_stays_at_v13_beside_exchange_v14() {
+    let source = format!(
+        "{}\n[nodes.untrusted_text]\nschema_version = 1\nmax_input_bytes = 65536\nen = true\nzh = true\nja = true\n[nodes.untrusted_text.behavioral]\nschema_version = 1\nmax_steps = 8\ntimeout_ms = 100\n[nodes.untrusted_text.behavioral.trajectory]\nschema_version = 1\n",
+        WORKFLOW
+            .split_once("\n[compact_state_exchange]")
+            .expect("exchange fixture should have a removable section")
+            .0
+    );
+    let non_exchange = workflow_ir::WorkflowIr::from(
+        &workflow_spec::parse_str("non-exchange-v13.workflow.toml", &source)
+            .expect("non-exchange v13 fixture should parse"),
+    );
+    let exchange = compile_str("compact-state.workflow.toml", WORKFLOW)
+        .expect("exchange fixture should compile");
+
+    assert_eq!(non_exchange.canonical_wire_version(), 13);
+    assert_eq!(exchange.ir().canonical_wire_version(), 14);
+    assert_ne!(
+        non_exchange.canonical_hash(),
+        exchange.ir().canonical_hash()
+    );
+}
+
+#[test]
 fn unknown_exchange_field_is_rejected_by_the_existing_strict_parser() {
     let source = WORKFLOW.replace(
         "to = \"grounded.answer\"",
@@ -70,6 +94,7 @@ fn invalid_exchange_endpoint_preserves_source_anchor() {
                 Path::new("invalid-compact-state.workflow.toml")
             );
             assert_eq!(location.field.as_str(), "compact_state_exchange.from");
+            assert_eq!(location.span, Some(167..195));
         }
         other => panic!("expected source-anchored endpoint rejection, got {other:?}"),
     }
