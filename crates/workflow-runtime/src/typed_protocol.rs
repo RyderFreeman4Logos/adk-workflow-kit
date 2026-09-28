@@ -1091,7 +1091,11 @@ impl WorkflowExchange {
         Ok(Some(from.envelope_bytes(from.successor(), &output)?))
     }
 
-    fn envelope_bytes(self, to: Self, output: &TypedOutput) -> Result<Vec<u8>, TypedOutputError> {
+    pub(crate) fn envelope_bytes(
+        self,
+        to: Self,
+        output: &TypedOutput,
+    ) -> Result<Vec<u8>, TypedOutputError> {
         admit_for_reducer(output)?;
         let mut envelope = Map::new();
         envelope.insert("from".to_owned(), Value::String(self.as_str().to_owned()));
@@ -1125,8 +1129,16 @@ impl WorkflowExchange {
         artifact_id: &ArtifactId,
     ) -> Result<TypedPayload, TypedOutputError> {
         let bytes = read_exchange_bytes(store, artifact_id)?;
+        self.consume_bytes(from, &bytes)
+    }
+
+    pub(crate) fn consume_bytes(
+        self,
+        from: Self,
+        bytes: &[u8],
+    ) -> Result<TypedPayload, TypedOutputError> {
         let value: Value =
-            serde_json::from_slice(&bytes).map_err(|_| TypedOutputError::InvalidJson)?;
+            serde_json::from_slice(bytes).map_err(|_| TypedOutputError::InvalidJson)?;
         let object = value.as_object().ok_or(TypedOutputError::InvalidJson)?;
         if object.contains_key("rationale") {
             return Err(TypedOutputError::RationaleNotEnabled);

@@ -265,7 +265,9 @@ pub trait ArtifactStore {
     /// Atomically commits a staged artifact, making exactly one final path
     /// visible. The staged artifact is consumed exactly once. If the final
     /// path is visible, cleanup of its temporary link is best effort and
-    /// cannot make the commit fail.
+    /// cannot make the commit fail. A returned error guarantees that this
+    /// call did not make the final path visible; implementations must not
+    /// surface post-visibility cleanup failures as commit errors.
     fn commit(&mut self, staged: StagedArtifact) -> Result<ArtifactId, ArtifactError>;
 
     /// Stores `bytes` as one stage-then-commit sequence for callers without a

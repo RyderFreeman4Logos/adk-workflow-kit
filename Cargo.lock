@@ -3427,6 +3427,7 @@ dependencies = [
  "sha2",
  "toml",
  "wasmi",
+ "workflow-ir",
 ]
 
 [[package]]
