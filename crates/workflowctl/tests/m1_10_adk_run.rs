@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -407,6 +407,70 @@ fn oracle_child_failure_diagnostic_is_bounded_and_content_free() {
     assert!(!rendered.contains(ENCODED_SYNTHETIC_MARKER));
 }
 
+const ORACLE_FAILURE_PHASE_SINK_ENV: &str = "WORKFLOWCTL_ORACLE_FAILURE_PHASE_SINK";
+const ORACLE_FAILURE_PHASE_FIXTURE_ENV: &str = "WORKFLOWCTL_ORACLE_FAILURE_PHASE_FIXTURE";
+
+#[test]
+fn oracle_failure_phase_sink_is_bounded_and_content_free() {
+    let root = temp_root("oracle-phase-sink");
+    let sink_path = root.join("phase-sink");
+    let output = Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "oracle_failure_phase_sink_fixture",
+            "--nocapture",
+        ])
+        .env(ORACLE_FAILURE_PHASE_SINK_ENV, &sink_path)
+        .env(ORACLE_FAILURE_PHASE_FIXTURE_ENV, "1")
+        .output()
+        .expect("phase sink fixture child");
+    assert_child_failure(&output, "phase sink fixture must fail");
+    let sink = fs::read(&sink_path).expect("failed phase sink must be present");
+    assert!(sink.len() <= 256);
+    assert_eq!(sink, b"phase=deadline\n");
+    assert!(!sink.windows(2).any(|window| window == b"{\""));
+    assert!(!sink.windows(1).any(|byte| byte[0] == b'/'));
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &fs::metadata(&sink_path)
+            .expect("phase sink metadata")
+            .permissions(),
+    ) & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[test]
+fn oracle_failure_phase_sink_fixture() {
+    if std::env::var_os(ORACLE_FAILURE_PHASE_FIXTURE_ENV).is_none() {
+        return;
+    }
+    let root = temp_root("oracle-phase-sink-fixture");
+    let stdout_path = root.join("stdout");
+    let stderr_path = root.join("stderr");
+    reset_oracle_failure_phase();
+    record_oracle_failure_phase(OracleFailurePhase::Spawn);
+    let child = Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", "oracle_supervisor_fixture_blocks", "--nocapture"])
+        .env(SUPERVISOR_FIXTURE_ENV, "1")
+        .stdout(Stdio::from(
+            fs::File::create(&stdout_path).expect("fixture stdout"),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(&stderr_path).expect("fixture stderr"),
+        ))
+        .spawn()
+        .expect("fixture child");
+    let _ = wait_bounded_child(
+        child,
+        &stdout_path,
+        &stderr_path,
+        Instant::now() + ORACLE_TIMEOUT,
+        "phase-sink-fixture",
+    )
+    .expect_err("fixture child must miss ORACLE_TIMEOUT");
+    root.cleanup().expect("phase sink fixture cleanup");
+    std::process::exit(1);
+}
+
 #[test]
 fn oracle_readback_diagnostics_are_content_free_for_controlled_malformed_inputs() {
     use std::os::unix::process::ExitStatusExt;
@@ -507,9 +571,94 @@ struct RequestObservation {
 }
 
 const ORACLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+static ORACLE_FAILURE_PHASE: AtomicU8 = AtomicU8::new(0);
+
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum OracleFailurePhase {
+    Spawn = 1,
+    Accept,
+    Readback,
+    Done,
+    TerminalQuiet,
+    Reap,
+    Deadline,
+}
+
+impl OracleFailurePhase {
+    fn from_u8(value: u8) -> Option<Self> {
+        Some(match value {
+            1 => Self::Spawn,
+            2 => Self::Accept,
+            3 => Self::Readback,
+            4 => Self::Done,
+            5 => Self::TerminalQuiet,
+            6 => Self::Reap,
+            7 => Self::Deadline,
+            _ => return None,
+        })
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawn => "spawn",
+            Self::Accept => "accept",
+            Self::Readback => "readback",
+            Self::Done => "done",
+            Self::TerminalQuiet => "terminal_quiet",
+            Self::Reap => "reap",
+            Self::Deadline => "deadline",
+        }
+    }
+}
+
+fn reset_oracle_failure_phase() {
+    ORACLE_FAILURE_PHASE.store(0, Ordering::Relaxed);
+}
+
+fn record_oracle_failure_phase(phase: OracleFailurePhase) {
+    if std::env::var_os(ORACLE_FAILURE_PHASE_SINK_ENV).is_some() {
+        ORACLE_FAILURE_PHASE.store(phase as u8, Ordering::Relaxed);
+    }
+}
+
+fn oracle_phase_failure<T>(
+    phase: OracleFailurePhase,
+    error: &'static str,
+) -> Result<T, &'static str> {
+    record_oracle_failure_phase(phase);
+    flush_oracle_failure_phase();
+    Err(error)
+}
+
+fn flush_oracle_failure_phase() {
+    let Some(phase) = OracleFailurePhase::from_u8(ORACLE_FAILURE_PHASE.load(Ordering::Relaxed))
+    else {
+        return;
+    };
+    let Some(path) = std::env::var_os(ORACLE_FAILURE_PHASE_SINK_ENV) else {
+        return;
+    };
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    let _ = writeln!(file, "phase={}", phase.as_str());
+    let _ = file.flush();
+}
+
+const ORACLE_SOCKET_TIMEOUT: Duration = Duration::from_millis(100);
 const ORACLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const ORACLE_D_STATE_TIMEOUT: Duration = Duration::from_secs(30);
-const ORACLE_SOCKET_TIMEOUT: Duration = Duration::from_millis(100);
 const ORACLE_TERMINAL_QUIET_WINDOW: Duration = Duration::from_millis(25);
 const ORACLE_MAX_REQUEST_BYTES: usize = 64 * 1024;
 const ORACLE_MAX_CHILD_OUTPUT_BYTES: usize = 64 * 1024;
@@ -745,9 +894,12 @@ fn serve_oracle_request_until_child_done(
     deadline: Instant,
     child_identity: Option<mpsc::Receiver<OracleChildIdentity>>,
 ) -> Result<RequestObservation, &'static str> {
-    listener
-        .set_nonblocking(true)
-        .map_err(|_| "oracle listener setup failed")?;
+    listener.set_nonblocking(true).map_err(|_| {
+        record_oracle_failure_phase(OracleFailurePhase::Accept);
+        flush_oracle_failure_phase();
+        "oracle listener setup failed"
+    })?;
+    record_oracle_failure_phase(OracleFailurePhase::Accept);
     let mut expected_identity = None;
     let mut child_observed_at = None;
     let (mut socket, _) = loop {
@@ -758,7 +910,10 @@ fn serve_oracle_request_until_child_done(
                     match child_identity.as_ref().map(|rx| rx.try_recv()) {
                         Some(Ok(identity)) => expected_identity = Some(identity),
                         Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                            return Err("oracle listener accept timed out");
+                            return oracle_phase_failure(
+                                OracleFailurePhase::Accept,
+                                "oracle listener accept timed out",
+                            );
                         }
                         Some(Err(mpsc::TryRecvError::Empty)) | None => {}
                     }
@@ -772,42 +927,73 @@ fn serve_oracle_request_until_child_done(
                 }
                 match oracle_accept_progress(false, child_observed_at, Instant::now(), deadline) {
                     OracleAcceptProgress::TimedOut => {
-                        return Err("oracle listener accept timed out");
+                        return oracle_phase_failure(
+                            OracleFailurePhase::Deadline,
+                            "oracle listener accept timed out",
+                        );
                     }
                     OracleAcceptProgress::Wait => thread::yield_now(),
                     OracleAcceptProgress::Accepted => unreachable!(),
                 }
             }
-            Err(_) => return Err("oracle listener accept failed"),
+            Err(_) => {
+                return oracle_phase_failure(
+                    OracleFailurePhase::Accept,
+                    "oracle listener accept failed",
+                );
+            }
         }
     };
+    record_oracle_failure_phase(OracleFailurePhase::Readback);
     let deadline = child_observed_at
         .map(|observed| observed + ORACLE_TIMEOUT)
         .unwrap_or(deadline);
-    let observation = read_model_request(&mut socket, deadline, canary)?;
+    let observation = read_model_request(&mut socket, deadline, canary).inspect_err(|error| {
+        let phase = if error.ends_with("timed out") {
+            OracleFailurePhase::Deadline
+        } else {
+            OracleFailurePhase::Readback
+        };
+        record_oracle_failure_phase(phase);
+        flush_oracle_failure_phase();
+    })?;
     let body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"status\":\"finished\",\"output\":\"oracle-ok\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
         body.len(),
         body
     );
-    socket
-        .set_write_timeout(Some(oracle_remaining_duration(
-            deadline,
-            Instant::now(),
-            ORACLE_SOCKET_TIMEOUT,
-            "oracle response write timed out",
-        )?))
-        .map_err(|_| "oracle socket write timeout setup failed")?;
-    socket
-        .write_all(response.as_bytes())
-        .map_err(|_| "oracle response write failed")?;
+    let remaining = oracle_remaining_duration(
+        deadline,
+        Instant::now(),
+        ORACLE_SOCKET_TIMEOUT,
+        "oracle response write timed out",
+    )
+    .inspect_err(|_| {
+        record_oracle_failure_phase(OracleFailurePhase::Deadline);
+        flush_oracle_failure_phase();
+    })?;
+    socket.set_write_timeout(Some(remaining)).map_err(|_| {
+        record_oracle_failure_phase(OracleFailurePhase::Readback);
+        flush_oracle_failure_phase();
+        "oracle socket write timeout setup failed"
+    })?;
+    socket.write_all(response.as_bytes()).map_err(|_| {
+        record_oracle_failure_phase(OracleFailurePhase::Readback);
+        flush_oracle_failure_phase();
+        "oracle response write failed"
+    })?;
     if Instant::now() >= deadline {
-        return Err("oracle response write timed out");
+        return oracle_phase_failure(
+            OracleFailurePhase::Deadline,
+            "oracle response write timed out",
+        );
     }
-    socket
-        .set_nonblocking(true)
-        .map_err(|_| "oracle socket nonblocking setup failed")?;
+    socket.set_nonblocking(true).map_err(|_| {
+        record_oracle_failure_phase(OracleFailurePhase::Readback);
+        flush_oracle_failure_phase();
+        "oracle socket nonblocking setup failed"
+    })?;
 
     let mut quiet_deadline = None;
     loop {
@@ -816,52 +1002,92 @@ fn serve_oracle_request_until_child_done(
                 Ok(()) => true,
                 Err(mpsc::TryRecvError::Empty) => false,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    return Err("oracle child completion unavailable");
+                    return oracle_phase_failure(
+                        OracleFailurePhase::Done,
+                        "oracle child completion unavailable",
+                    );
                 }
             }
         } else {
             false
         };
         match listener.accept() {
-            Ok(_) => return Err("oracle request count rejected"),
+            Ok(_) => {
+                return oracle_phase_failure(
+                    OracleFailurePhase::Readback,
+                    "oracle request count rejected",
+                );
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => return Err("oracle listener accept failed"),
+            Err(_) => {
+                return oracle_phase_failure(
+                    OracleFailurePhase::Readback,
+                    "oracle listener accept failed",
+                );
+            }
         }
         let mut trailing = [0_u8; 1];
         match socket.read(&mut trailing) {
             Ok(0) => {}
-            Ok(_) => return Err("oracle request trailing bytes rejected"),
+            Ok(_) => {
+                return oracle_phase_failure(
+                    OracleFailurePhase::Readback,
+                    "oracle request trailing bytes rejected",
+                );
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => return Err("oracle request trailing read failed"),
+            Err(_) => {
+                return oracle_phase_failure(
+                    OracleFailurePhase::Readback,
+                    "oracle request trailing read failed",
+                );
+            }
         }
         if child_complete {
+            record_oracle_failure_phase(OracleFailurePhase::Done);
             if let Some((observed, release)) = &terminal_probe {
-                observed
-                    .send(())
-                    .map_err(|_| "oracle terminal probe unavailable")?;
-                release
-                    .recv_timeout(oracle_remaining_duration(
-                        deadline,
-                        Instant::now(),
-                        ORACLE_TIMEOUT,
-                        "oracle terminal probe timed out",
-                    )?)
-                    .map_err(|_| "oracle terminal probe timed out")?;
+                observed.send(()).map_err(|_| {
+                    record_oracle_failure_phase(OracleFailurePhase::TerminalQuiet);
+                    flush_oracle_failure_phase();
+                    "oracle terminal probe unavailable"
+                })?;
+                let remaining = oracle_remaining_duration(
+                    deadline,
+                    Instant::now(),
+                    ORACLE_TIMEOUT,
+                    "oracle terminal probe timed out",
+                )
+                .inspect_err(|_| {
+                    record_oracle_failure_phase(OracleFailurePhase::Deadline);
+                    flush_oracle_failure_phase();
+                })?;
+                release.recv_timeout(remaining).map_err(|_| {
+                    record_oracle_failure_phase(OracleFailurePhase::TerminalQuiet);
+                    flush_oracle_failure_phase();
+                    "oracle terminal probe timed out"
+                })?;
             }
             let now = Instant::now();
             quiet_deadline = now
                 .checked_add(ORACLE_TERMINAL_QUIET_WINDOW)
                 .filter(|quiet_deadline| *quiet_deadline <= deadline);
             if quiet_deadline.is_none() {
-                return Err("oracle child completion timed out");
+                return oracle_phase_failure(
+                    OracleFailurePhase::Deadline,
+                    "oracle child completion timed out",
+                );
             }
+            record_oracle_failure_phase(OracleFailurePhase::TerminalQuiet);
         }
         let now = Instant::now();
         if quiet_deadline.is_some_and(|quiet_deadline| now >= quiet_deadline) {
             return Ok(observation);
         }
         if now >= deadline {
-            return Err("oracle child completion timed out");
+            return oracle_phase_failure(
+                OracleFailurePhase::Deadline,
+                "oracle child completion timed out",
+            );
         }
         thread::yield_now();
     }
@@ -1130,11 +1356,14 @@ fn clean_up_child(mut child: Child, operation: &'static str) -> Vec<&'static str
     let (kill_ok, kill) = match child.kill() {
         Ok(()) => (true, format_kill(None)),
         Err(error) => {
+            record_oracle_failure_phase(OracleFailurePhase::Reap);
             diagnostics.push("oracle child kill failed");
             (false, format_kill(Some(&error)))
         }
     };
     if std::env::var_os(UNPROVEN_REAP_FIXTURE_ENV).is_some() {
+        record_oracle_failure_phase(OracleFailurePhase::Reap);
+        flush_oracle_failure_phase();
         let wait = match child.try_wait() {
             Ok(Some(status)) => format_wait_status(status),
             Ok(None) => "still-alive".to_string(),
@@ -1159,6 +1388,7 @@ fn clean_up_child(mut child: Child, operation: &'static str) -> Vec<&'static str
             }
             Ok(None) => (OracleWait::StillAlive, "still-alive".to_string()),
             Err(error) => {
+                record_oracle_failure_phase(OracleFailurePhase::Reap);
                 if !diagnostics.contains(&"oracle child reap check failed") {
                     diagnostics.push("oracle child reap check failed");
                 }
@@ -1192,14 +1422,18 @@ fn clean_up_child(mut child: Child, operation: &'static str) -> Vec<&'static str
                         .min(Duration::from_millis(10)),
                 );
             }
-            OracleReapProgress::AbortUnproven => abort_unproven_reap(
-                operation,
-                pid,
-                &starttime,
-                &kill,
-                &wait,
-                &format_terminal(pid),
-            ),
+            OracleReapProgress::AbortUnproven => {
+                record_oracle_failure_phase(OracleFailurePhase::Reap);
+                flush_oracle_failure_phase();
+                abort_unproven_reap(
+                    operation,
+                    pid,
+                    &starttime,
+                    &kill,
+                    &wait,
+                    &format_terminal(pid),
+                )
+            }
         }
     }
 }
@@ -1216,31 +1450,45 @@ fn wait_bounded_child(
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::yield_now(),
             Ok(None) => {
+                record_oracle_failure_phase(OracleFailurePhase::Deadline);
                 let diagnostics = diagnostics_after_cleanup(
                     clean_up_child(child, operation),
                     stdout_path,
                     stderr_path,
                 );
-                return Err(format!(
-                    "oracle child timed out; {}",
-                    diagnostics.join("; ")
-                ));
+                let error = format!("oracle child timed out; {}", diagnostics.join("; "));
+                flush_oracle_failure_phase();
+                return Err(error);
             }
             Err(_) => {
+                record_oracle_failure_phase(OracleFailurePhase::Reap);
                 let diagnostics = diagnostics_after_cleanup(
                     clean_up_child(child, operation),
                     stdout_path,
                     stderr_path,
                 );
-                return Err(format!(
-                    "oracle child wait failed; {}",
-                    diagnostics.join("; ")
-                ));
+                let error = format!("oracle child wait failed; {}", diagnostics.join("; "));
+                flush_oracle_failure_phase();
+                return Err(error);
             }
         }
     };
-    let stdout = read_child_output(stdout_path).map_err(str::to_owned)?;
-    let stderr = read_child_output(stderr_path).map_err(str::to_owned)?;
+    let stdout = match read_child_output(stdout_path) {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            record_oracle_failure_phase(OracleFailurePhase::Readback);
+            flush_oracle_failure_phase();
+            return Err(error.to_owned());
+        }
+    };
+    let stderr = match read_child_output(stderr_path) {
+        Ok(stderr) => stderr,
+        Err(error) => {
+            record_oracle_failure_phase(OracleFailurePhase::Readback);
+            flush_oracle_failure_phase();
+            return Err(error.to_owned());
+        }
+    };
     Ok(Output {
         status,
         stdout,
@@ -1256,6 +1504,8 @@ fn run_oracle_operation(
     spawned: Option<&mpsc::SyncSender<OracleChildIdentity>>,
     operation: &'static str,
 ) -> Result<Output, String> {
+    reset_oracle_failure_phase();
+    record_oracle_failure_phase(OracleFailurePhase::Spawn);
     let stdout_path = root.join(format!("workflowctl-{label}.stdout"));
     let stderr_path = root.join(format!("workflowctl-{label}.stderr"));
     let mut command = binary();
@@ -1266,14 +1516,23 @@ fn run_oracle_operation(
         command.env_remove(credential.0);
     }
     let child = command
-        .stdout(Stdio::from(
-            fs::File::create(&stdout_path).map_err(|_| "oracle child stdout create failed")?,
-        ))
-        .stderr(Stdio::from(
-            fs::File::create(&stderr_path).map_err(|_| "oracle child stderr create failed")?,
-        ))
+        .stdout(Stdio::from(fs::File::create(&stdout_path).map_err(
+            |_| {
+                flush_oracle_failure_phase();
+                "oracle child stdout create failed"
+            },
+        )?))
+        .stderr(Stdio::from(fs::File::create(&stderr_path).map_err(
+            |_| {
+                flush_oracle_failure_phase();
+                "oracle child stderr create failed"
+            },
+        )?))
         .spawn()
-        .map_err(|_| "oracle child spawn failed")?;
+        .map_err(|_| {
+            flush_oracle_failure_phase();
+            "oracle child spawn failed"
+        })?;
     if let Some(tx) = spawned {
         let pid = child.id();
         match owned_child_stat(pid) {
