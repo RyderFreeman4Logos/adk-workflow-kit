@@ -113,7 +113,8 @@ pub use issue_card::{
     SourceEvidence, TrustedSourceBinding, UnableReasonCode,
 };
 pub use issue_plan::{
-    ISSUE_PLAN_MAX_CARDS, IssuePlanError, IssuePlanTitle, TodoItem, TodoPlan, build_todo_plan,
+    ExplicitIssueEdge, ISSUE_PLAN_MAX_CARDS, ISSUE_PLAN_MAX_EDGES, IssuePlanError, IssuePlanTitle,
+    TodoItem, TodoPlan, build_todo_plan,
 };
 pub use node_cache::{
     CacheDisposition, CacheProvenance, NODE_CACHE_SCHEMA_VERSION, NodeCacheEntry, NodeCacheError,

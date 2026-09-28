@@ -12,6 +12,8 @@ use crate::{ComponentId, IssueCardV1, PriorityOrderKey, typed_protocol::escape_m
 
 /// Maximum admitted cards. Graph work is rejected before it begins.
 pub const ISSUE_PLAN_MAX_CARDS: usize = 64;
+/// Maximum explicit edges admitted for one plan.
+pub const ISSUE_PLAN_MAX_EDGES: usize = ISSUE_PLAN_MAX_CARDS * ISSUE_PLAN_MAX_CARDS;
 const ISSUE_PLAN_MAX_RENDERED_BYTES: usize = 32 * 1024;
 
 /// Caller-supplied title keyed by an admitted card identifier.
@@ -37,20 +39,54 @@ impl IssuePlanTitle {
     }
 }
 
+/// A caller-supplied issue edge; generic card prerequisites are not issue edges.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExplicitIssueEdge {
+    predecessor_id: String,
+    dependent_id: String,
+}
+
+impl ExplicitIssueEdge {
+    /// Admits one bounded, caller-supplied predecessor-to-dependent edge.
+    pub fn new(
+        predecessor_id: impl Into<String>,
+        dependent_id: impl Into<String>,
+    ) -> Result<Self, IssuePlanError> {
+        let predecessor_id = predecessor_id.into();
+        let dependent_id = dependent_id.into();
+        ComponentId::new(predecessor_id.clone())
+            .map_err(|_| IssuePlanError::InvalidEdgeEndpoint)?;
+        ComponentId::new(dependent_id.clone()).map_err(|_| IssuePlanError::InvalidEdgeEndpoint)?;
+        Ok(Self {
+            predecessor_id,
+            dependent_id,
+        })
+    }
+
+    /// Returns the explicit predecessor card identifier.
+    pub fn predecessor_id(&self) -> &str {
+        &self.predecessor_id
+    }
+
+    /// Returns the explicit dependent card identifier.
+    pub fn dependent_id(&self) -> &str {
+        &self.dependent_id
+    }
+}
+
 /// Fail-closed input errors for an explicit dependency plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IssuePlanError {
     /// More cards were supplied than the planner admits.
     TooManyCards,
+    /// More explicit edges were supplied than the planner admits.
+    TooManyEdges,
     /// Two cards use the same identifier.
     DuplicateCardId(String),
-    /// A prerequisite does not name an admitted card.
-    UnknownPrerequisite {
-        /// Card declaring the prerequisite.
-        card_id: String,
-        /// Prerequisite absent from the admitted set.
-        prerequisite_id: String,
-    },
+    /// An explicit edge endpoint does not name an admitted card.
+    UnknownEdgeEndpoint(String),
+    /// An explicit edge endpoint is empty, contains a control character, or exceeds its bound.
+    InvalidEdgeEndpoint,
     /// An admitted card has no title.
     MissingTitle(String),
     /// A title names a card that was not admitted.
@@ -67,14 +103,14 @@ impl fmt::Display for IssuePlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TooManyCards => formatter.write_str("issue plan exceeds its card bound"),
+            Self::TooManyEdges => formatter.write_str("issue plan exceeds its explicit edge bound"),
             Self::DuplicateCardId(id) => write!(formatter, "duplicate issue-card id: {id}"),
-            Self::UnknownPrerequisite {
-                card_id,
-                prerequisite_id,
-            } => write!(
-                formatter,
-                "card {card_id} names unknown prerequisite {prerequisite_id}"
-            ),
+            Self::UnknownEdgeEndpoint(id) => {
+                write!(formatter, "explicit issue edge names unknown card {id}")
+            }
+            Self::InvalidEdgeEndpoint => {
+                formatter.write_str("explicit issue edge endpoint is invalid")
+            }
             Self::MissingTitle(id) => write!(formatter, "missing title for card {id}"),
             Self::ExtraTitle(id) => write!(formatter, "extra title for unknown card {id}"),
             Self::DuplicateTitle(id) => write!(formatter, "duplicate title for card {id}"),
@@ -211,13 +247,17 @@ impl TodoPlan {
     }
 }
 
-/// Builds a deterministic plan from explicit card prerequisites and titles.
+/// Builds a deterministic plan from explicit issue edges and caller-supplied titles.
 pub fn build_todo_plan(
     cards: &[IssueCardV1],
+    edges: &[ExplicitIssueEdge],
     titles: &[IssuePlanTitle],
 ) -> Result<TodoPlan, IssuePlanError> {
     if cards.len() > ISSUE_PLAN_MAX_CARDS || titles.len() > ISSUE_PLAN_MAX_CARDS {
         return Err(IssuePlanError::TooManyCards);
+    }
+    if edges.len() > ISSUE_PLAN_MAX_EDGES {
+        return Err(IssuePlanError::TooManyEdges);
     }
     let mut by_id = BTreeMap::<String, &IssueCardV1>::new();
     for card in cards {
@@ -248,24 +288,25 @@ pub fn build_todo_plan(
         predecessors.insert(id.clone(), BTreeSet::new());
         successors.insert(id.clone(), BTreeSet::new());
     }
-    for card in by_id.values() {
-        for prerequisite in card.prerequisites() {
-            let predecessor = prerequisite.as_str();
-            if !by_id.contains_key(predecessor) {
-                return Err(IssuePlanError::UnknownPrerequisite {
-                    card_id: card.id().to_owned(),
-                    prerequisite_id: predecessor.to_owned(),
-                });
-            }
-            predecessors
-                .get_mut(card.id())
-                .expect("card")
-                .insert(predecessor.to_owned());
-            successors
-                .get_mut(predecessor)
-                .expect("prerequisite")
-                .insert(card.id().to_owned());
+    for edge in edges {
+        if !by_id.contains_key(edge.predecessor_id()) {
+            return Err(IssuePlanError::UnknownEdgeEndpoint(
+                edge.predecessor_id().to_owned(),
+            ));
         }
+        if !by_id.contains_key(edge.dependent_id()) {
+            return Err(IssuePlanError::UnknownEdgeEndpoint(
+                edge.dependent_id().to_owned(),
+            ));
+        }
+        predecessors
+            .get_mut(edge.dependent_id())
+            .expect("dependent")
+            .insert(edge.predecessor_id().to_owned());
+        successors
+            .get_mut(edge.predecessor_id())
+            .expect("predecessor")
+            .insert(edge.dependent_id().to_owned());
     }
     let cycles = strongly_connected(&successors);
     let reduced = if cycles.is_empty() {
@@ -274,7 +315,7 @@ pub fn build_todo_plan(
         predecessors.clone()
     };
     let mut items = Vec::new();
-    for id in ordered_ids(&successors, cycles.is_empty()) {
+    for id in ordered_ids(&successors, &by_id, cycles.is_empty()) {
         items.push(TodoItem {
             title: title_by_id[&id].clone(),
             prerequisites: reduced[&id].iter().cloned().collect(),
@@ -292,7 +333,11 @@ pub fn build_todo_plan(
     Ok(plan)
 }
 
-fn ordered_ids(successors: &BTreeMap<String, BTreeSet<String>>, acyclic: bool) -> Vec<String> {
+fn ordered_ids(
+    successors: &BTreeMap<String, BTreeSet<String>>,
+    cards: &BTreeMap<String, &IssueCardV1>,
+    acyclic: bool,
+) -> Vec<String> {
     if !acyclic {
         return successors.keys().cloned().collect();
     }
@@ -311,7 +356,19 @@ fn ordered_ids(successors: &BTreeMap<String, BTreeSet<String>>, acyclic: bool) -
         .map(|(id, _)| id.clone())
         .collect::<BTreeSet<_>>();
     let mut ordered = Vec::new();
-    while let Some(id) = ready.pop_first() {
+    while !ready.is_empty() {
+        let id = ready
+            .iter()
+            .max_by(|left, right| {
+                cards
+                    .get(*left)
+                    .expect("card")
+                    .priority_order_key()
+                    .cmp(cards.get(*right).expect("card").priority_order_key())
+            })
+            .expect("ready card")
+            .clone();
+        ready.remove(&id);
         ordered.push(id.clone());
         for dependent in &successors[&id] {
             let degree = indegree.get_mut(dependent).expect("dependent");
