@@ -142,6 +142,10 @@ issue-227-test:
 issue-289-adk:
     {{_io}} cargo +1.98.0 test -p workflow-adk --lib model_invocation::tests:: --locked -- --nocapture
 
+# Focused #311 offline ordered model-route snapshot and fallback boundary.
+issue-311-adk test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_311_model_routes {{test_name}} --locked -- --nocapture --test-threads=1
+
 # Focused #228 compact typed-output protocol tests.
 issue-228-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_228_typed_outputs {{test_name}} --locked -- --nocapture

@@ -15,7 +15,9 @@ use std::time::Duration;
 use adk_rust::async_trait;
 use adk_rust::futures::{Stream, StreamExt, stream};
 use adk_rust::model::{OpenAICompatible, OpenAICompatibleConfig, RetryConfig};
-use adk_rust::{AdkError, Content, ErrorCategory, Llm, LlmRequest, LlmResponse, Part};
+use adk_rust::{
+    AdkError, Content, ErrorCategory, ErrorComponent, Llm, LlmRequest, LlmResponse, Part,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use workflow_compiler::{ModelRegistry, RegistryCategory, RegistryEntry, RegistryNotFound};
@@ -602,6 +604,19 @@ impl ModelProfile {
         {
             return Err(ModelProfileError::invalid());
         }
+        let sampling = self.runtime().sampling();
+        if [
+            sampling.temperature,
+            sampling.top_p,
+            sampling.frequency_penalty,
+            sampling.presence_penalty,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_finite())
+        {
+            return Err(ModelProfileError::invalid());
+        }
         Ok(())
     }
 }
@@ -682,6 +697,23 @@ impl ModelProfileRegistry {
         }
         Ok(())
     }
+    pub fn validate(&self) -> Result<(), ModelProfileError> {
+        for profile in self.profiles.values() {
+            profile.validate()?;
+        }
+        for identity in [self.worker.as_ref(), self.reviewer.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if !self.profiles.contains_key(identity) {
+                return Err(ModelProfileError::missing());
+            }
+        }
+        Ok(())
+    }
+    pub fn contains(&self, identity: &ModelProfileIdentity) -> bool {
+        self.profiles.contains_key(identity)
+    }
     /// Rejects non-finite sampling policy before creating any live model binding.
     pub fn bind(
         &self,
@@ -706,6 +738,14 @@ impl ModelProfileRegistry {
         broker: &CredentialBroker,
     ) -> Result<ModelBinding, ModelProfileError> {
         self.bind(ModelRole::Reviewer, broker)
+    }
+    pub fn bind_candidate(
+        &self,
+        role: ModelRole,
+        identity: &ModelProfileIdentity,
+        broker: &CredentialBroker,
+    ) -> Result<ModelBinding, ModelProfileError> {
+        self.bind_identity(role, identity, broker)
     }
     fn bind_identity(
         &self,
@@ -1013,6 +1053,9 @@ fn map_adk_error(profile: &ModelProfileIdentity, error: AdkError) -> ModelProfil
     let kind = match error.category {
         ErrorCategory::Timeout => ModelProfileErrorKind::Timeout,
         ErrorCategory::InvalidInput => ModelProfileErrorKind::InvalidRequest,
+        ErrorCategory::RateLimited | ErrorCategory::Unavailable => {
+            ModelProfileErrorKind::RetryableProvider
+        }
         _ => ModelProfileErrorKind::Provider,
     };
     ModelProfileError {
@@ -1030,6 +1073,7 @@ pub enum ModelProfileErrorKind {
     Credential,
     InvalidRequest,
     Provider,
+    RetryableProvider,
     Timeout,
 }
 
@@ -1215,7 +1259,12 @@ fn provider_adk_error(error: AdkError) -> AdkError {
     if error.category == ErrorCategory::Timeout {
         error
     } else {
-        AdkError::agent("model.profile.unreachable")
+        AdkError::new(
+            ErrorComponent::Model,
+            error.category,
+            "model.profile.unreachable",
+            "model.profile.unreachable",
+        )
     }
 }
 
