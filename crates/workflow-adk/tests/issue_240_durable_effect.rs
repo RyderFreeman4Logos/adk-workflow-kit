@@ -24,6 +24,9 @@ use workflow_runtime::{
     firewall::{FirewallPolicy, ToolProposal, TrustedGoal},
 };
 
+#[path = "issue_240_durable_effect/resume.rs"]
+mod resume;
+
 static NEXT_PRODUCTION_ROOT: AtomicU64 = AtomicU64::new(0);
 
 struct CounterExecutor {

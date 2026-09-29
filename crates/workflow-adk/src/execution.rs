@@ -70,6 +70,9 @@ use crate::{
     tool_bridge::AdkToolBridge,
 };
 
+mod resume_approvals;
+pub use resume_approvals::PendingToolApproval;
+
 const MAX_STATE_BYTES: usize = 1024 * 1024;
 const ARTIFACT_LIMIT: u64 = 64 * 1024;
 const SKILL_RESOURCE_READ_LIMIT: u64 = 64 * 1024;
@@ -5278,6 +5281,7 @@ impl ExecutionBackend {
             run_id,
             Arc::new(AtomicBool::new(false)),
             Some(implementations),
+            None,
         )
     }
 
@@ -5286,7 +5290,7 @@ impl ExecutionBackend {
         run_id: &str,
         cancellation: Arc<AtomicBool>,
     ) -> Result<ExecutionReceipt, ExecutionError> {
-        Self::resume_bound(workdir_base, run_id, cancellation, None)
+        Self::resume_bound(workdir_base, run_id, cancellation, None, None)
     }
 
     fn resume_bound(
@@ -5294,6 +5298,7 @@ impl ExecutionBackend {
         run_id: &str,
         cancellation: Arc<AtomicBool>,
         implementations: Option<&ToolImplementationRegistry>,
+        approvals: Option<ApprovalLedger>,
     ) -> Result<ExecutionReceipt, ExecutionError> {
         let (root, mut manifest) = find_run(workdir_base.as_ref(), run_id)?;
         if !matches!(manifest.status.as_str(), "running" | "succeeded") {
@@ -5352,6 +5357,7 @@ impl ExecutionBackend {
         let mut profile =
             ExecutionProfileV1::parse(&bounded_read(&root.join("execution-profile.json"))?)?;
         profile.restore_skill_snapshot(&root)?;
+        profile.approvals = approvals;
         if let Some(implementations) = implementations {
             profile.tool_implementations = Some(Arc::new(implementations.clone()));
         }
@@ -5522,6 +5528,10 @@ impl ExecutionBackend {
                 )
             })
         {
+            // Missing fresh authority leaves the checkpoint resumable, not terminal.
+            if error.kind() == ExecutionErrorKind::AuthorizationDenied {
+                return Err(error.with_receipt(manifest.receipt(root)));
+            }
             return Err(resume_failure(
                 &root,
                 &events_path,
