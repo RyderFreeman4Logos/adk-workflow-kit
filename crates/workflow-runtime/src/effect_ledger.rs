@@ -16,10 +16,15 @@ pub use executor::{
 };
 
 use std::{
+    collections::HashSet,
     fmt,
     fs::{self, File, OpenOptions},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::{
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        io::AsRawFd,
+    },
     path::{Component, Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 /// Trusted application context; expiry is absolute Unix milliseconds, not process uptime.
@@ -142,7 +147,7 @@ impl From<rusqlite::Error> for LedgerError {
 /// The caller must provide a private, trusted directory and keep it in place.
 pub struct EffectLedger {
     connection: Connection,
-    _lease: File,
+    _lease: Lease,
 }
 impl EffectLedger {
     /// Opens an on-disk ledger. Another owner fails closed rather than racing a request.
@@ -154,7 +159,7 @@ impl EffectLedger {
         let lock = path.with_extension("effect-lock");
         // ponytail: one owner per ledger, shard ledgers if independent-effect throughput matters.
         let lease = private_file(&lock, &metadata)?;
-        lease.try_lock().map_err(|_| LedgerError::Busy)?;
+        let lease = Lease::acquire(lease, lock)?;
         let database = private_file(&path, &metadata)?;
         for suffix in ["-wal", "-shm", "-journal"] {
             let mut name = path.as_os_str().to_os_string();
@@ -502,4 +507,53 @@ fn private_file(path: &Path, directory: &fs::Metadata) -> Result<File, LedgerErr
         return Err(LedgerError::InvalidInput);
     }
     Ok(file)
+}
+
+static LEASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+struct Lease {
+    _file: File,
+    path: PathBuf,
+}
+
+impl Lease {
+    fn acquire(file: File, path: PathBuf) -> Result<Self, LedgerError> {
+        let leases = LEASES.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut held = leases.lock().map_err(|_| LedgerError::Storage)?;
+        if !held.insert(path.clone()) {
+            return Err(LedgerError::Busy);
+        }
+        let mut lock = libc::flock {
+            l_type: libc::F_WRLCK as libc::c_short,
+            l_whence: libc::SEEK_SET as libc::c_short,
+            l_start: 0,
+            l_len: 0,
+            l_pid: 0,
+        };
+        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &mut lock) };
+        if result == -1 {
+            held.remove(&path);
+            return Err(
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES)
+                    || std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+                {
+                    LedgerError::Busy
+                } else {
+                    LedgerError::Storage
+                },
+            );
+        }
+        drop(held);
+        Ok(Self { _file: file, path })
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if let Some(leases) = LEASES.get() {
+            let _ = leases.lock().map(|mut held| {
+                held.remove(&self.path);
+            });
+        }
+    }
 }

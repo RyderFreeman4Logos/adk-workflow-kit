@@ -7,6 +7,72 @@ use std::{
 };
 
 #[test]
+fn lease_release_is_not_delayed_by_a_forked_pre_exec_child() {
+    let root = TestDir::new();
+    let path = root.0.join("ledger.db");
+    let ledger = EffectLedger::open(&path).unwrap();
+    let mut ready = [0; 2];
+    let mut release = [0; 2];
+    unsafe {
+        assert_eq!(libc::pipe(ready.as_mut_ptr()), 0);
+        assert_eq!(libc::pipe(release.as_mut_ptr()), 0);
+    }
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        unsafe {
+            libc::close(ready[0]);
+            libc::close(release[1]);
+            libc::write(ready[1], b"ready".as_ptr().cast(), 5);
+            let mut byte = [0; 1];
+            libc::read(release[0], byte.as_mut_ptr().cast(), 1);
+            libc::_exit(0);
+        }
+    }
+    unsafe {
+        libc::close(ready[1]);
+        libc::close(release[0]);
+    }
+    let mut child = ForkChild(pid);
+    let mut byte = [0; 5];
+    assert_eq!(
+        unsafe { libc::read(ready[0], byte.as_mut_ptr().cast(), 5) },
+        5
+    );
+    drop(ledger);
+    let reopened = EffectLedger::open(&path).unwrap();
+    drop(reopened);
+    assert_eq!(
+        unsafe { libc::write(release[1], b"x".as_ptr().cast(), 1) },
+        1
+    );
+    unsafe {
+        libc::close(ready[0]);
+    }
+    unsafe {
+        libc::close(release[1]);
+    }
+    child.wait();
+}
+
+struct ForkChild(libc::pid_t);
+impl ForkChild {
+    fn wait(&mut self) {
+        unsafe {
+            libc::waitpid(self.0, std::ptr::null_mut(), 0);
+        }
+    }
+}
+impl Drop for ForkChild {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.0, libc::SIGKILL);
+            libc::waitpid(self.0, std::ptr::null_mut(), 0);
+        }
+    }
+}
+
+#[test]
 #[ignore = "subprocess entry point, invoked only by path admission test"]
 fn path_child() {
     let path = std::env::var("ISSUE_240_LEDGER").unwrap();

@@ -3417,6 +3417,7 @@ dependencies = [
  "base64",
  "bytes",
  "jsonschema 0.45.1",
+ "libc",
  "parquet",
  "regex-syntax",
  "reqwest 0.12.28",
