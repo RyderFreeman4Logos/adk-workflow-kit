@@ -10,6 +10,7 @@ mod compact_state;
 mod controller;
 mod dataset;
 mod effect_journal;
+pub mod effect_ledger;
 mod event;
 mod execution;
 pub mod firewall;
