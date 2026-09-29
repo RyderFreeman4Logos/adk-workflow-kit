@@ -18,6 +18,8 @@ mod github_graphql;
 mod github_intake;
 mod hot_reload;
 mod issue_artifact;
+mod issue_card;
+mod issue_plan;
 mod node_cache;
 mod observability;
 mod podman;
@@ -99,6 +101,20 @@ pub use issue_artifact::{
     CanonicalIssueArtifact, ISSUE_ARTIFACT_SCHEMA_VERSION, IncludedObject, IssueArtifactError,
     IssueArtifactErrorKind, IssueOmission, ObjectChange, ObjectDiffEntry, OfflineComment,
     OfflineIssueContent, build_canonical_issue_artifact,
+};
+pub use issue_card::{
+    Actionability, AmbiguityReasonCode, CapabilityId, ComponentId,
+    ISSUE_CARD_CACHE_SCHEMA_VERSION_V1, ISSUE_CARD_CACHE_SCHEMA_VERSION_V3,
+    ISSUE_CARD_MAX_COLLECTION_ITEMS, ISSUE_CARD_MAX_IDENTIFIER_BYTES,
+    ISSUE_CARD_MAX_OBJECTIVE_BYTES, ISSUE_CARD_MAX_RENDERED_BYTES, ISSUE_CARD_MAX_SOURCE_EVIDENCE,
+    ISSUE_CARD_PRIORITY_ORDER_VERSION_V1, ISSUE_CARD_SCHEMA_VERSION_V1, IssueCardCacheIdentity,
+    IssueCardCollectionInputs, IssueCardError, IssueCardV1, PriorityDependency, PriorityEffort,
+    PriorityImpact, PriorityInputs, PriorityOrderKey, PriorityReasonCode, PriorityScore,
+    PriorityUrgency, RiskCode, SourceEvidence, TrustedSourceBinding, UnableReasonCode,
+};
+pub use issue_plan::{
+    ExplicitIssueEdge, ISSUE_PLAN_MAX_CARDS, ISSUE_PLAN_MAX_EDGES, IssuePlanError, IssuePlanTitle,
+    TodoItem, TodoPlan, build_todo_plan,
 };
 pub use node_cache::{
     CacheDisposition, CacheProvenance, NODE_CACHE_SCHEMA_VERSION, NodeCacheEntry, NodeCacheError,

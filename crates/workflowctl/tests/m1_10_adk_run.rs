@@ -407,6 +407,121 @@ fn oracle_child_failure_diagnostic_is_bounded_and_content_free() {
     assert!(!rendered.contains(ENCODED_SYNTHETIC_MARKER));
 }
 
+const ORACLE_FAILURE_BOUNDARY_SINK_ENV: &str = "WORKFLOWCTL_ORACLE_FAILURE_BOUNDARY_SINK";
+const ORACLE_FAILURE_BOUNDARY_FIXTURE_ENV: &str = "WORKFLOWCTL_ORACLE_FAILURE_BOUNDARY_FIXTURE";
+
+#[test]
+fn oracle_failure_boundary_sink_is_bounded_content_free_and_opt_in() {
+    let root = temp_root("oracle-boundary-sink");
+    let sink_path = root.join("boundary-sink");
+    let output = Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "oracle_failure_boundary_sink_fixture",
+            "--nocapture",
+        ])
+        .env(ORACLE_FAILURE_BOUNDARY_SINK_ENV, &sink_path)
+        .env(ORACLE_FAILURE_BOUNDARY_FIXTURE_ENV, "1")
+        .env(UNPROVEN_REAP_FIXTURE_ENV, "1")
+        .output()
+        .expect("boundary sink fixture child");
+    assert_child_failure(&output, "boundary sink fixture must fail");
+    let sink = fs::read(&sink_path).expect("failed boundary sink must be present");
+    assert!(sink.len() <= 256);
+    assert_eq!(sink, b"boundary=wait_deadline\n");
+    assert!(!sink.windows(2).any(|window| window == b"{\""));
+    assert!(!sink.windows(1).any(|byte| byte[0] == b'/'));
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &fs::metadata(&sink_path)
+            .expect("boundary sink metadata")
+            .permissions(),
+    ) & 0o777;
+    assert_eq!(mode, 0o600);
+
+    let prior = b"primary-evidence\n";
+    let regular = root.join("existing-regular");
+    fs::write(&regular, prior).expect("primary evidence");
+    fs::hard_link(&regular, root.join("existing-link")).expect("primary hardlink");
+    let fifo = root.join("existing-fifo");
+    let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo path");
+    // SAFETY: the path is a fresh NUL-terminated fixture name; mkfifo only creates the inode.
+    assert_eq!(
+        unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) },
+        0,
+        "fifo fixture"
+    );
+    for path in [&regular, &fifo] {
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "oracle_failure_boundary_sink_fixture",
+                "--nocapture",
+            ])
+            .env(ORACLE_FAILURE_BOUNDARY_SINK_ENV, path)
+            .env(ORACLE_FAILURE_BOUNDARY_FIXTURE_ENV, "1")
+            .env(UNPROVEN_REAP_FIXTURE_ENV, "1")
+            .output()
+            .expect("adverse boundary fixture");
+        assert_child_failure(&output, "adverse boundary fixture must still fail");
+        if path == &regular {
+            assert_eq!(fs::read(&regular).expect("regular preserved"), prior);
+            assert_eq!(
+                fs::read(root.join("existing-link")).expect("link preserved"),
+                prior
+            );
+        }
+    }
+    assert!(std::os::unix::fs::FileTypeExt::is_fifo(
+        &fifo.metadata().expect("fifo metadata").file_type()
+    ));
+
+    fs::remove_file(&sink_path).expect("remove opt-in boundary sink");
+    let output = Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "oracle_failure_boundary_sink_fixture",
+            "--nocapture",
+        ])
+        .env_remove(ORACLE_FAILURE_BOUNDARY_SINK_ENV)
+        .env(ORACLE_FAILURE_BOUNDARY_FIXTURE_ENV, "1")
+        .env(UNPROVEN_REAP_FIXTURE_ENV, "1")
+        .output()
+        .expect("opt-out boundary sink fixture child");
+    assert_child_failure(&output, "opt-out boundary fixture must fail");
+    assert!(!sink_path.exists(), "opt-out must not create a sink");
+}
+
+#[test]
+fn oracle_failure_boundary_sink_fixture() {
+    if std::env::var_os(ORACLE_FAILURE_BOUNDARY_FIXTURE_ENV).is_none() {
+        return;
+    }
+    let root = temp_root("oracle-boundary-sink-fixture");
+    let stdout_path = root.join("stdout");
+    let stderr_path = root.join("stderr");
+    let child = Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", "oracle_supervisor_fixture_blocks", "--nocapture"])
+        .env(SUPERVISOR_FIXTURE_ENV, "1")
+        .stdout(Stdio::from(
+            fs::File::create(&stdout_path).expect("fixture stdout"),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(&stderr_path).expect("fixture stderr"),
+        ))
+        .spawn()
+        .expect("fixture child");
+    let _ = wait_bounded_child(
+        child,
+        &stdout_path,
+        &stderr_path,
+        Instant::now() + ORACLE_TIMEOUT,
+        "boundary-sink-fixture",
+    )
+    .expect_err("fixture child must miss ORACLE_TIMEOUT");
+    root.cleanup().expect("boundary sink fixture cleanup");
+    std::process::exit(1);
+}
+
 #[test]
 fn oracle_readback_diagnostics_are_content_free_for_controlled_malformed_inputs() {
     use std::os::unix::process::ExitStatusExt;
@@ -507,6 +622,26 @@ struct RequestObservation {
 }
 
 const ORACLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn record_oracle_failure_boundary() -> Option<std::ffi::OsString> {
+    std::env::var_os(ORACLE_FAILURE_BOUNDARY_SINK_ENV)
+}
+fn write_oracle_failure_boundary(path: std::ffi::OsString) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    let _ = file.write_all(b"boundary=wait_deadline\n");
+    let _ = file.flush();
+}
+
 const ORACLE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const ORACLE_D_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 const ORACLE_SOCKET_TIMEOUT: Duration = Duration::from_millis(100);
@@ -1140,6 +1275,9 @@ fn clean_up_child(mut child: Child, operation: &'static str) -> Vec<&'static str
             Ok(None) => "still-alive".to_string(),
             Err(error) => format_wait_error(&error),
         };
+        if let Some(path) = record_oracle_failure_boundary() {
+            write_oracle_failure_boundary(path);
+        }
         abort_unproven_reap(
             operation,
             pid,
@@ -1216,11 +1354,17 @@ fn wait_bounded_child(
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::yield_now(),
             Ok(None) => {
+                // Record the boundary locally; emit only after containment so
+                // a refused or blocking sink cannot delay cleanup.
+                let boundary = record_oracle_failure_boundary();
                 let diagnostics = diagnostics_after_cleanup(
                     clean_up_child(child, operation),
                     stdout_path,
                     stderr_path,
                 );
+                if let Some(path) = boundary {
+                    write_oracle_failure_boundary(path);
+                }
                 return Err(format!(
                     "oracle child timed out; {}",
                     diagnostics.join("; ")

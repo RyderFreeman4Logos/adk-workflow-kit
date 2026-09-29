@@ -50,6 +50,14 @@ m3-02-compiler test_name:
 m3-02-adk test_name:
     {{_io}} cargo +1.98.0 test -p workflow-adk --test m3_02_node_bindings {{test_name}} --locked -- --exact --nocapture
 
+# Focused #251 deterministic IssueCard foundation tests.
+issue-251-runtime test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_251_card_score {{test_name}} --locked -- --nocapture
+
+# Focused #252 explicit dependency-plan tests.
+issue-252-runtime test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_252_dependency_plan {{test_name}} --locked -- --nocapture
+
 # Focused #265 tool implementation registry tests.
 issue-265-runtime test_name:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_265_tool_registry {{test_name}} --locked -- --exact --nocapture
