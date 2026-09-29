@@ -27,6 +27,12 @@ struct PendingProbe {
     started: Arc<adk_rust::tokio::sync::Notify>,
 }
 
+struct GateSuccessProbe {
+    started: Arc<adk_rust::tokio::sync::Notify>,
+    release: Arc<adk_rust::tokio::sync::Notify>,
+    calls: AtomicUsize,
+}
+
 #[adk_rust::async_trait]
 impl Llm for SuccessProbe {
     fn name(&self) -> &str {
@@ -79,6 +85,26 @@ impl Llm for PendingProbe {
     ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
         self.started.notify_one();
         std::future::pending().await
+    }
+}
+
+#[adk_rust::async_trait]
+impl Llm for GateSuccessProbe {
+    fn name(&self) -> &str {
+        "issue-311-gated-success-probe"
+    }
+
+    async fn generate_content(
+        &self,
+        _request: LlmRequest,
+        _stream: bool,
+    ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(Box::pin(adk_rust::futures::stream::iter([Ok(
+            LlmResponse::new(Content::new("assistant").with_text(r#"{"answer":"first"}"#)),
+        )])))
     }
 }
 
@@ -223,6 +249,217 @@ async fn retryable_provider_failure_advances_in_order() {
 }
 
 #[tokio::test]
+async fn terminal_provider_failure_stops_before_next_candidate() {
+    let first = ModelRouteCandidate::new(ModelRole::Worker, "terminal-secret", "1");
+    let second = ModelRouteCandidate::new(ModelRole::Worker, "must-not-run", "1");
+    let first_probe = Arc::new(ErrorProbe {
+        calls: AtomicUsize::new(0),
+        category: ErrorCategory::Internal,
+    });
+    let second_probe = Arc::new(SuccessProbe {
+        calls: AtomicUsize::new(0),
+    });
+    let mut registry = ModelProfileRegistry::new()
+        .with_worker(FakeModelProfile::new(
+            "terminal-secret",
+            "1",
+            "first-model",
+            ["unused"],
+        ))
+        .unwrap();
+    registry
+        .register(FakeModelProfile::new(
+            "must-not-run",
+            "1",
+            "second-model",
+            ["unused"],
+        ))
+        .unwrap();
+    let spec = invocation(&registry);
+    let snapshot = ModelRouteSnapshot::new(
+        registry,
+        [first.clone(), second.clone()],
+        ModelRouteAuthorization::new([first.clone(), second.clone()]),
+    )
+    .unwrap()
+    .with_test_llm(first.clone(), first_probe.clone())
+    .unwrap()
+    .with_test_llm(second.clone(), second_probe.clone())
+    .unwrap();
+    let error = ModelRoutePublisher::new(snapshot)
+        .policy(Instant::now() + Duration::from_secs(1))
+        .invoke(
+            &spec,
+            &CredentialBroker::new(),
+            &ModelRouteCancellation::new(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        workflow_adk::ModelRouteTerminalErrorKind::Provider
+    );
+    assert_eq!(error.attempts().len(), 1);
+    assert_eq!(first_probe.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(second_probe.calls.load(Ordering::SeqCst), 0);
+    assert!(!format!("{error:?}{error}").contains("terminal-secret"));
+}
+
+#[tokio::test]
+async fn all_retryable_failures_return_bounded_typed_diagnostics() {
+    let first = ModelRouteCandidate::new(ModelRole::Worker, "prompt-secret", "1");
+    let second = ModelRouteCandidate::new(ModelRole::Worker, "url-secret", "1");
+    let first_probe = Arc::new(ErrorProbe {
+        calls: AtomicUsize::new(0),
+        category: ErrorCategory::RateLimited,
+    });
+    let second_probe = Arc::new(ErrorProbe {
+        calls: AtomicUsize::new(0),
+        category: ErrorCategory::Unavailable,
+    });
+    let mut registry = ModelProfileRegistry::new()
+        .with_worker(FakeModelProfile::new(
+            "prompt-secret",
+            "1",
+            "first-model",
+            ["unused"],
+        ))
+        .unwrap();
+    registry
+        .register(FakeModelProfile::new(
+            "url-secret",
+            "1",
+            "second-model",
+            ["unused"],
+        ))
+        .unwrap();
+    let spec = invocation(&registry);
+    let snapshot = ModelRouteSnapshot::new(
+        registry,
+        [first.clone(), second.clone()],
+        ModelRouteAuthorization::new([first.clone(), second.clone()]),
+    )
+    .unwrap()
+    .with_test_llm(first, first_probe)
+    .unwrap()
+    .with_test_llm(second, second_probe)
+    .unwrap();
+    let error = ModelRoutePublisher::new(snapshot)
+        .policy(Instant::now() + Duration::from_secs(1))
+        .invoke(
+            &spec,
+            &CredentialBroker::new(),
+            &ModelRouteCancellation::new(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        workflow_adk::ModelRouteTerminalErrorKind::Exhausted
+    );
+    assert_eq!(error.attempts().len(), 2);
+    assert!(error.attempts().iter().all(|attempt|
+        attempt.kind() == workflow_adk::ModelRouteAttemptKind::RetryableProvider));
+    let diagnostic = format!("{error:?}{error}");
+    assert!(!diagnostic.contains("prompt-secret"));
+    assert!(!diagnostic.contains("url-secret"));
+}
+
+#[tokio::test]
+async fn active_call_keeps_old_snapshot_while_next_call_uses_published_snapshot() {
+    let old_first = ModelRouteCandidate::new(ModelRole::Worker, "old-first", "1");
+    let old_second = ModelRouteCandidate::new(ModelRole::Worker, "old-second", "1");
+    let new_candidate = ModelRouteCandidate::new(ModelRole::Worker, "new", "1");
+    let started = Arc::new(adk_rust::tokio::sync::Notify::new());
+    let release = Arc::new(adk_rust::tokio::sync::Notify::new());
+    let old_first_probe = Arc::new(ErrorProbe {
+        calls: AtomicUsize::new(0),
+        category: ErrorCategory::RateLimited,
+    });
+    let old_second_probe = Arc::new(GateSuccessProbe {
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+        calls: AtomicUsize::new(0),
+    });
+    let new_probe = Arc::new(SuccessProbe {
+        calls: AtomicUsize::new(0),
+    });
+    let mut registry = ModelProfileRegistry::new()
+        .with_worker(FakeModelProfile::new(
+            "old-first",
+            "1",
+            "old-first-model",
+            ["unused"],
+        ))
+        .unwrap();
+    registry
+        .register(FakeModelProfile::new(
+            "old-second",
+            "1",
+            "old-second-model",
+            ["unused"],
+        ))
+        .unwrap();
+    registry
+        .register(FakeModelProfile::new("new", "1", "new-model", ["unused"]))
+        .unwrap();
+    let spec = invocation(&registry);
+    let old_snapshot = ModelRouteSnapshot::new(
+        registry.clone(),
+        [old_first.clone(), old_second.clone()],
+        ModelRouteAuthorization::new([old_first.clone(), old_second.clone()]),
+    )
+    .unwrap()
+    .with_test_llm(old_first.clone(), old_first_probe.clone())
+    .unwrap()
+    .with_test_llm(old_second.clone(), old_second_probe.clone())
+    .unwrap();
+    let publisher = ModelRoutePublisher::new(old_snapshot);
+    let old_policy = publisher.policy(Instant::now() + Duration::from_secs(1));
+    let old_task = adk_rust::tokio::spawn({
+        let spec = spec.clone();
+        async move {
+            old_policy
+                .invoke(
+                    &spec,
+                    &CredentialBroker::new(),
+                    &ModelRouteCancellation::new(),
+                )
+                .await
+        }
+    });
+    started.notified().await;
+    let new_snapshot = ModelRouteSnapshot::new(
+        registry,
+        [new_candidate.clone()],
+        ModelRouteAuthorization::new([new_candidate.clone()]),
+    )
+    .unwrap()
+    .with_test_llm(new_candidate, new_probe.clone())
+    .unwrap();
+    publisher.publish(new_snapshot).unwrap();
+    release.notify_one();
+    let old_result = old_task.await.unwrap().unwrap();
+    let new_result = publisher
+        .policy(Instant::now() + Duration::from_secs(1))
+        .invoke(
+            &spec,
+            &CredentialBroker::new(),
+            &ModelRouteCancellation::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(old_result.attempts(), 1);
+    assert_eq!(old_first_probe.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(old_second_probe.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(new_result.attempts(), 1);
+    assert_eq!(new_probe.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn unauthorized_candidate_stops_before_any_binding_or_provider_call() {
     let first = ModelRouteCandidate::new(ModelRole::Worker, "first", "1");
     let second = ModelRouteCandidate::new(ModelRole::Worker, "second", "1");
@@ -324,6 +561,67 @@ async fn cancellation_interrupts_a_pending_attempt() {
         error.kind(),
         workflow_adk::ModelRouteTerminalErrorKind::Cancelled
     );
+}
+
+#[tokio::test]
+async fn deadline_interrupts_pending_attempt_without_fallback() {
+    let first = ModelRouteCandidate::new(ModelRole::Worker, "pending", "1");
+    let second = ModelRouteCandidate::new(ModelRole::Worker, "not-after-deadline", "1");
+    let started = Arc::new(adk_rust::tokio::sync::Notify::new());
+    let second_probe = Arc::new(SuccessProbe {
+        calls: AtomicUsize::new(0),
+    });
+    let mut registry = ModelProfileRegistry::new()
+        .with_worker(FakeModelProfile::new(
+            "pending",
+            "1",
+            "first-model",
+            ["unused"],
+        ))
+        .unwrap();
+    registry
+        .register(FakeModelProfile::new(
+            "not-after-deadline",
+            "1",
+            "second-model",
+            ["unused"],
+        ))
+        .unwrap();
+    let spec = invocation(&registry);
+    let snapshot = ModelRouteSnapshot::new(
+        registry,
+        [first.clone(), second.clone()],
+        ModelRouteAuthorization::new([first.clone(), second.clone()]),
+    )
+    .unwrap()
+    .with_test_llm(
+        first,
+        Arc::new(PendingProbe {
+            started: Arc::clone(&started),
+        }),
+    )
+    .unwrap()
+    .with_test_llm(second, second_probe.clone())
+    .unwrap();
+    let policy =
+        ModelRoutePublisher::new(snapshot).policy(Instant::now() + Duration::from_millis(20));
+    let task = adk_rust::tokio::spawn(async move {
+        policy
+            .invoke(
+                &spec,
+                &CredentialBroker::new(),
+                &ModelRouteCancellation::new(),
+            )
+            .await
+    });
+    started.notified().await;
+    let error = task.await.unwrap().unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        workflow_adk::ModelRouteTerminalErrorKind::DeadlineExceeded
+    );
+    assert_eq!(second_probe.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
