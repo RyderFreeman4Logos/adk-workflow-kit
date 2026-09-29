@@ -462,7 +462,11 @@ async fn active_call_keeps_old_snapshot_while_next_call_uses_published_snapshot(
 
 #[tokio::test]
 async fn unauthorized_candidate_stops_before_any_binding_or_provider_call() {
-    let resolver = Arc::new(repair::ForbiddenResolver(AtomicUsize::new(0)));
+    let resolver = Arc::new(repair::AsyncResolver {
+        calls: AtomicUsize::new(0),
+        drops: Arc::new(AtomicUsize::new(0)),
+        cancel: None,
+    });
     let broker = CredentialBroker::new().with_secret_provider(resolver.clone());
     let snapshot = ModelRouteSnapshot::new(
         repair::compatible_registry(),
@@ -479,7 +483,7 @@ async fn unauthorized_candidate_stops_before_any_binding_or_provider_call() {
         error.kind(),
         workflow_adk::ModelRouteTerminalErrorKind::AuthorizationDenied
     );
-    assert_eq!(resolver.0.load(Ordering::SeqCst), 0);
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

@@ -456,10 +456,10 @@ async fn fallback_preserves_absolute_deadline_and_cancellation() {
     fallback_matrix(true).await;
 }
 
-struct AsyncResolver {
-    calls: AtomicUsize,
-    drops: Arc<AtomicUsize>,
-    cancel: Option<ModelRouteCancellation>,
+pub(super) struct AsyncResolver {
+    pub(super) calls: AtomicUsize,
+    pub(super) drops: Arc<AtomicUsize>,
+    pub(super) cancel: Option<ModelRouteCancellation>,
 }
 impl SecretProvider for AsyncResolver {
     fn resolve(&self, _: &str) -> Result<SecretValue, CredentialError> {
@@ -527,15 +527,15 @@ async fn external_caller_opts_in_only_after_deterministic_evidence() {
     let calls = Arc::new(SuccessProbe {
         calls: AtomicUsize::new(0),
     });
-    let publisher = ModelRoutePublisher::new(
-        snapshot(registry(&["first"]), &["first"])
-            .with_test_llm(candidate("first"), calls.clone())
-            .unwrap(),
-    );
     for semantic_requested in [false, true] {
         let evidence = ["verified deterministic citation"];
         assert!(!evidence.is_empty());
         if semantic_requested {
+            let publisher = ModelRoutePublisher::new(
+                snapshot(registry(&["first"]), &["first"])
+                    .with_test_llm(candidate("first"), calls.clone())
+                    .unwrap(),
+            );
             publisher
                 .policy(Instant::now() + Duration::from_secs(5))
                 .invoke(
@@ -602,6 +602,65 @@ async fn terminal_and_streamed_exhaustion_diagnostics_are_private() {
                 assert!(!diagnostics.contains(marker));
             }
             assert!(diagnostics.len() < 1024);
+        }
+    }
+}
+
+struct ReadyResolver {
+    cancellation: Option<ModelRouteCancellation>,
+}
+impl SecretProvider for ReadyResolver {
+    fn resolve(&self, _: &str) -> Result<SecretValue, CredentialError> {
+        panic!("route used sync resolver")
+    }
+    fn resolve_for_route<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SecretValue, CredentialError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            if let Some(token) = &self.cancellation {
+                token.cancel();
+            }
+            Ok(SecretValue::new("synthetic-inert-credential"))
+        })
+    }
+}
+#[tokio::test]
+async fn explicit_async_credentials_bind_and_success_completion_obeys_stop() {
+    for cancel_during_resolution in [false, true] {
+        let token = ModelRouteCancellation::new();
+        let probe = Arc::new(SuccessProbe {
+            calls: AtomicUsize::new(0),
+        });
+        let broker = CredentialBroker::new().with_secret_provider(Arc::new(ReadyResolver {
+            cancellation: cancel_during_resolution.then(|| token.clone()),
+        }));
+        let snap = snapshot(compatible_registry(), &["first"])
+            .with_test_llm(candidate("first"), probe.clone())
+            .unwrap();
+        let outcome = ModelRoutePublisher::new(snap)
+            .policy(Instant::now() + Duration::from_secs(5))
+            .invoke(&request(), &broker, &token)
+            .await;
+        if cancel_during_resolution {
+            assert_eq!(
+                outcome.unwrap_err().kind(),
+                ModelRouteTerminalErrorKind::Cancelled
+            );
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(
+                outcome
+                    .unwrap()
+                    .provenance()
+                    .provider_route()
+                    .profile()
+                    .name(),
+                "first"
+            );
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
         }
     }
 }
