@@ -247,6 +247,20 @@ impl std::error::Error for CredentialError {}
 /// A secret-provider implementation. It receives only the opaque handle.
 pub trait SecretProvider: Send + Sync {
     fn resolve(&self, handle: &str) -> Result<SecretValue, CredentialError>;
+
+    /// Opt-in, cancellation-safe resolution for model routes. The default rejects;
+    /// it NEVER calls the potentially blocking synchronous resolver. Implementations
+    /// must return promptly, never block while polled, and release request-owned
+    /// work when dropped. Hosts own any independent service lifecycle/admission.
+    /// No worker is spawned by this API; wrapping `resolve` in `async` is invalid.
+    fn resolve_for_route<'a>(
+        &'a self,
+        _handle: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SecretValue, CredentialError>> + Send + 'a>,
+    > {
+        Box::pin(std::future::ready(Err(CredentialError::provider())))
+    }
 }
 
 /// Resolves environment or secret-provider handles at binding time.
@@ -267,6 +281,21 @@ impl CredentialBroker {
     pub fn with_secret_provider(mut self, provider: Arc<dyn SecretProvider>) -> Self {
         self.provider = Some(provider);
         self
+    }
+    async fn resolve_for_route(
+        &self,
+        handle: &CredentialHandle,
+    ) -> Result<SecretValue, CredentialError> {
+        match handle {
+            CredentialHandle::Environment(_) => self.resolve(handle),
+            CredentialHandle::SecretProvider(name) => {
+                self.provider
+                    .as_ref()
+                    .ok_or_else(CredentialError::missing)?
+                    .resolve_for_route(name)
+                    .await
+            }
+        }
     }
     fn resolve(&self, handle: &CredentialHandle) -> Result<SecretValue, CredentialError> {
         match handle {
@@ -594,7 +623,16 @@ impl ModelProfile {
             return Err(ModelProfileError::invalid());
         }
         let (model, url) = match self {
-            Self::Fake(value) => (&value.model, None),
+            Self::Fake(value) => {
+                if value
+                    .responses
+                    .iter()
+                    .any(|response| !response.is_string() && !response.is_object())
+                {
+                    return Err(ModelProfileError::invalid());
+                }
+                (&value.model, None)
+            }
             Self::OpenAiCompatible(value) => (&value.model, Some(value.base_url.as_str())),
         };
         if model.is_empty()
@@ -698,8 +736,8 @@ impl ModelProfileRegistry {
         Ok(())
     }
     pub fn validate(&self) -> Result<(), ModelProfileError> {
-        for profile in self.profiles.values() {
-            profile.validate()?;
+        for (identity, profile) in &self.profiles {
+            Self::validate_entry(identity, profile)?;
         }
         for identity in [self.worker.as_ref(), self.reviewer.as_ref()]
             .into_iter()
@@ -710,6 +748,15 @@ impl ModelProfileRegistry {
             }
         }
         Ok(())
+    }
+    fn validate_entry(
+        identity: &ModelProfileIdentity,
+        profile: &ModelProfile,
+    ) -> Result<(), ModelProfileError> {
+        if identity != profile.identity() {
+            return Err(ModelProfileError::invalid());
+        }
+        profile.validate()
     }
     pub fn contains(&self, identity: &ModelProfileIdentity) -> bool {
         self.profiles.contains_key(identity)
@@ -757,7 +804,31 @@ impl ModelProfileRegistry {
             .profiles
             .get(identity)
             .ok_or_else(ModelProfileError::missing)?;
+        Self::validate_entry(identity, profile)?;
         profile.bind(role, broker)
+    }
+
+    pub(crate) async fn bind_route(
+        &self,
+        role: ModelRole,
+        identity: &ModelProfileIdentity,
+        broker: &CredentialBroker,
+    ) -> Result<ModelBinding, ModelProfileError> {
+        let profile = self
+            .profiles
+            .get(identity)
+            .ok_or_else(ModelProfileError::missing)?;
+        Self::validate_entry(identity, profile)?;
+        let secret = match profile {
+            ModelProfile::Fake(_) => None,
+            ModelProfile::OpenAiCompatible(value) => Some(
+                broker
+                    .resolve_for_route(&value.credential)
+                    .await
+                    .map_err(ModelProfileError::credential)?,
+            ),
+        };
+        profile.bind_resolved(role, secret)
     }
 }
 
@@ -804,21 +875,23 @@ impl ModelProfile {
         role: ModelRole,
         broker: &CredentialBroker,
     ) -> Result<ModelBinding, ModelProfileError> {
-        // Every live binding must have lossless JSON policy provenance. Validate here,
-        // including deserialized registries, before provider construction or identity use.
-        let sampling = self.runtime().sampling();
-        if [
-            sampling.temperature,
-            sampling.top_p,
-            sampling.frequency_penalty,
-            sampling.presence_penalty,
-        ]
-        .into_iter()
-        .flatten()
-        .any(|value| !value.is_finite())
-        {
-            return Err(ModelProfileError::invalid());
-        }
+        self.validate()?;
+        let secret = match self {
+            Self::Fake(_) => None,
+            Self::OpenAiCompatible(value) => Some(
+                broker
+                    .resolve(&value.credential)
+                    .map_err(ModelProfileError::credential)?,
+            ),
+        };
+        self.bind_resolved(role, secret)
+    }
+
+    fn bind_resolved(
+        &self,
+        role: ModelRole,
+        secret: Option<SecretValue>,
+    ) -> Result<ModelBinding, ModelProfileError> {
         let (llm, requested, provider, fake_queue) = match self {
             Self::Fake(value) => {
                 let mut responses = VecDeque::new();
@@ -861,9 +934,8 @@ impl ModelProfile {
                 )
             }
             Self::OpenAiCompatible(value) => {
-                let secret = broker
-                    .resolve(&value.credential)
-                    .map_err(ModelProfileError::credential)?;
+                let secret = secret
+                    .ok_or_else(|| ModelProfileError::credential(CredentialError::missing()))?;
                 let config = OpenAICompatibleConfig::new(secret.expose(), &value.model)
                     .with_provider_name(&value.provider)
                     .with_base_url(&value.base_url);
@@ -1051,6 +1123,7 @@ fn timed_response_stream(
 
 fn map_adk_error(profile: &ModelProfileIdentity, error: AdkError) -> ModelProfileError {
     let kind = match error.category {
+        _ if retryable_provider_error(&error) => ModelProfileErrorKind::RetryableProvider,
         ErrorCategory::Timeout => ModelProfileErrorKind::Timeout,
         ErrorCategory::InvalidInput => ModelProfileErrorKind::InvalidRequest,
         ErrorCategory::RateLimited | ErrorCategory::Unavailable => {

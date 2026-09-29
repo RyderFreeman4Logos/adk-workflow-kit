@@ -1,3 +1,8 @@
+#![cfg(feature = "test-support")]
+
+#[path = "issue_311/repair.rs"]
+mod repair;
+
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -27,7 +32,7 @@ struct PendingProbe {
     started: Arc<adk_rust::tokio::sync::Notify>,
 }
 
-struct GateSuccessProbe {
+struct GateErrorProbe {
     started: Arc<adk_rust::tokio::sync::Notify>,
     release: Arc<adk_rust::tokio::sync::Notify>,
     calls: AtomicUsize,
@@ -89,7 +94,7 @@ impl Llm for PendingProbe {
 }
 
 #[adk_rust::async_trait]
-impl Llm for GateSuccessProbe {
+impl Llm for GateErrorProbe {
     fn name(&self) -> &str {
         "issue-311-gated-success-probe"
     }
@@ -102,9 +107,12 @@ impl Llm for GateSuccessProbe {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
         self.release.notified().await;
-        Ok(Box::pin(adk_rust::futures::stream::iter([Ok(
-            LlmResponse::new(Content::new("assistant").with_text(r#"{"answer":"first"}"#)),
-        )])))
+        Err(AdkError::new(
+            ErrorComponent::Model,
+            ErrorCategory::RateLimited,
+            "synthetic",
+            "synthetic",
+        ))
     }
 }
 
@@ -121,25 +129,8 @@ fn output_contract() -> StructuredOutputContract {
     .unwrap()
 }
 
-fn invocation(registry: &ModelProfileRegistry) -> ModelInvocationSpec {
-    let binding = registry.bind_worker(&CredentialBroker::new()).unwrap();
-    let output = output_contract();
-    let protocol = PromptProtocol::new(
-        "issue-311 policy",
-        vec![],
-        output.schema().clone(),
-        json!({}),
-        TrustDomain::TrustedGoal,
-    )
-    .unwrap();
-    ModelInvocationSpec::new(
-        protocol,
-        "issue-311 task",
-        ProviderRouteIdentity::from_binding(&binding),
-        InferenceBudget::medium().with_max_retries(0).unwrap(),
-        output,
-    )
-    .unwrap()
+fn invocation(_registry: &ModelProfileRegistry) -> ModelInvocationSpec {
+    repair::request()
 }
 
 #[tokio::test]
@@ -374,13 +365,12 @@ async fn active_call_keeps_old_snapshot_while_next_call_uses_published_snapshot(
     let new_candidate = ModelRouteCandidate::new(ModelRole::Worker, "new", "1");
     let started = Arc::new(adk_rust::tokio::sync::Notify::new());
     let release = Arc::new(adk_rust::tokio::sync::Notify::new());
-    let old_first_probe = Arc::new(ErrorProbe {
-        calls: AtomicUsize::new(0),
-        category: ErrorCategory::RateLimited,
-    });
-    let old_second_probe = Arc::new(GateSuccessProbe {
+    let old_first_probe = Arc::new(GateErrorProbe {
         started: Arc::clone(&started),
         release: Arc::clone(&release),
+        calls: AtomicUsize::new(0),
+    });
+    let old_second_probe = Arc::new(SuccessProbe {
         calls: AtomicUsize::new(0),
     });
     let new_probe = Arc::new(SuccessProbe {
@@ -430,7 +420,9 @@ async fn active_call_keeps_old_snapshot_while_next_call_uses_published_snapshot(
                 .await
         }
     });
-    started.notified().await;
+    adk_rust::tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("provider did not start before readiness bound");
     let new_snapshot = ModelRouteSnapshot::new(
         registry,
         [new_candidate.clone()],
@@ -439,6 +431,7 @@ async fn active_call_keeps_old_snapshot_while_next_call_uses_published_snapshot(
     .unwrap()
     .with_test_llm(new_candidate, new_probe.clone())
     .unwrap();
+    assert_eq!(old_second_probe.calls.load(Ordering::SeqCst), 0);
     publisher.publish(new_snapshot).unwrap();
     release.notify_one();
     let old_result = old_task.await.unwrap().unwrap();
@@ -452,6 +445,14 @@ async fn active_call_keeps_old_snapshot_while_next_call_uses_published_snapshot(
         .await
         .unwrap();
 
+    assert_eq!(
+        old_result.provenance().provider_route().profile().name(),
+        "old-second"
+    );
+    assert_eq!(
+        new_result.provenance().provider_route().profile().name(),
+        "new"
+    );
     assert_eq!(old_result.attempts(), 1);
     assert_eq!(old_first_probe.calls.load(Ordering::SeqCst), 1);
     assert_eq!(old_second_probe.calls.load(Ordering::SeqCst), 1);
@@ -461,59 +462,24 @@ async fn active_call_keeps_old_snapshot_while_next_call_uses_published_snapshot(
 
 #[tokio::test]
 async fn unauthorized_candidate_stops_before_any_binding_or_provider_call() {
-    let first = ModelRouteCandidate::new(ModelRole::Worker, "first", "1");
-    let second = ModelRouteCandidate::new(ModelRole::Worker, "second", "1");
-    let first_probe = Arc::new(SuccessProbe {
-        calls: AtomicUsize::new(0),
-    });
-    let second_probe = Arc::new(SuccessProbe {
-        calls: AtomicUsize::new(0),
-    });
-    let mut registry = ModelProfileRegistry::new()
-        .with_worker(FakeModelProfile::new(
-            "first",
-            "1",
-            "first-model",
-            ["unused"],
-        ))
-        .unwrap();
-    registry
-        .register(FakeModelProfile::new(
-            "second",
-            "1",
-            "second-model",
-            ["unused"],
-        ))
-        .unwrap();
-    let spec = invocation(&registry);
+    let resolver = Arc::new(repair::ForbiddenResolver(AtomicUsize::new(0)));
+    let broker = CredentialBroker::new().with_secret_provider(resolver.clone());
     let snapshot = ModelRouteSnapshot::new(
-        registry,
-        [first.clone(), second.clone()],
-        ModelRouteAuthorization::new([second.clone()]),
+        repair::compatible_registry(),
+        [ModelRouteCandidate::new(ModelRole::Worker, "first", "1")],
+        ModelRouteAuthorization::default(),
     )
-    .unwrap()
-    .with_test_llm(first.clone(), first_probe.clone())
-    .unwrap()
-    .with_test_llm(second.clone(), second_probe.clone())
     .unwrap();
-    let policy = ModelRoutePublisher::new(snapshot).policy(Instant::now() + Duration::from_secs(1));
-
-    let error = policy
-        .invoke(
-            &spec,
-            &CredentialBroker::new(),
-            &ModelRouteCancellation::new(),
-        )
+    let error = ModelRoutePublisher::new(snapshot)
+        .policy(Instant::now() + Duration::from_secs(5))
+        .invoke(&repair::request(), &broker, &ModelRouteCancellation::new())
         .await
         .unwrap_err();
-
     assert_eq!(
         error.kind(),
         workflow_adk::ModelRouteTerminalErrorKind::AuthorizationDenied
     );
-    assert_eq!(error.attempts().len(), 1);
-    assert_eq!(first_probe.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(second_probe.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(resolver.0.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -553,7 +519,9 @@ async fn cancellation_interrupts_a_pending_attempt() {
                 .await
         }
     });
-    started.notified().await;
+    adk_rust::tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("provider did not start before readiness bound");
     cancellation.cancel();
 
     let error = task.await.unwrap().unwrap_err();
@@ -563,65 +531,9 @@ async fn cancellation_interrupts_a_pending_attempt() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn deadline_interrupts_pending_attempt_without_fallback() {
-    let first = ModelRouteCandidate::new(ModelRole::Worker, "pending", "1");
-    let second = ModelRouteCandidate::new(ModelRole::Worker, "not-after-deadline", "1");
-    let started = Arc::new(adk_rust::tokio::sync::Notify::new());
-    let second_probe = Arc::new(SuccessProbe {
-        calls: AtomicUsize::new(0),
-    });
-    let mut registry = ModelProfileRegistry::new()
-        .with_worker(FakeModelProfile::new(
-            "pending",
-            "1",
-            "first-model",
-            ["unused"],
-        ))
-        .unwrap();
-    registry
-        .register(FakeModelProfile::new(
-            "not-after-deadline",
-            "1",
-            "second-model",
-            ["unused"],
-        ))
-        .unwrap();
-    let spec = invocation(&registry);
-    let snapshot = ModelRouteSnapshot::new(
-        registry,
-        [first.clone(), second.clone()],
-        ModelRouteAuthorization::new([first.clone(), second.clone()]),
-    )
-    .unwrap()
-    .with_test_llm(
-        first,
-        Arc::new(PendingProbe {
-            started: Arc::clone(&started),
-        }),
-    )
-    .unwrap()
-    .with_test_llm(second, second_probe.clone())
-    .unwrap();
-    let policy =
-        ModelRoutePublisher::new(snapshot).policy(Instant::now() + Duration::from_millis(20));
-    let task = adk_rust::tokio::spawn(async move {
-        policy
-            .invoke(
-                &spec,
-                &CredentialBroker::new(),
-                &ModelRouteCancellation::new(),
-            )
-            .await
-    });
-    started.notified().await;
-    let error = task.await.unwrap().unwrap_err();
-
-    assert_eq!(
-        error.kind(),
-        workflow_adk::ModelRouteTerminalErrorKind::DeadlineExceeded
-    );
-    assert_eq!(second_probe.calls.load(Ordering::SeqCst), 0);
+    repair::fallback_matrix(false).await;
 }
 
 #[tokio::test]

@@ -142,6 +142,16 @@ issue-227-test:
 issue-289-adk:
     {{_io}} cargo +1.98.0 test -p workflow-adk --lib model_invocation::tests:: --locked -- --nocapture
 
+# Default-feature package coverage must remain separate from workspace feature unification.
+adk-default-test:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --locked -- --test-threads=1
+
+adk-model-profiles:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test model_profiles --locked
+
+runtime-hot-reload:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --lib hot_reload::tests:: --locked
+
 # Focused #311 offline ordered model-route snapshot and fallback boundary.
 issue-311-adk test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_311_model_routes {{test_name}} --locked -- --nocapture --test-threads=1
@@ -387,7 +397,7 @@ check-branch:
 
 pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit pattern-catalog-test m2-02-green test-local-gates
 
-_quality-gates: fmt-check check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk test-local-gates
+_quality-gates: fmt-check check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk test-local-gates
 
 quality-gates:
     scripts/local-gates.sh produce
