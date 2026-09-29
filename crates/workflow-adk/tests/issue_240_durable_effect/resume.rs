@@ -7,6 +7,7 @@ use super::{
     remove_production_root, request,
 };
 use std::{os::unix::process::ExitStatusExt, process::Command, sync::atomic::AtomicBool};
+use workflow_adk::execution::PendingToolApproval;
 
 struct ChildGuard(Option<std::process::Child>);
 impl Drop for ChildGuard {
@@ -34,6 +35,71 @@ fn interrupted_child(mut child: ChildGuard) -> std::process::ExitStatus {
         assert!(std::time::Instant::now() < deadline, "child deadline");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn pending_approval_debug_redacts_all_review_material() {
+    let markers = [
+        "synthetic-run-id-marker",
+        "synthetic-checkpoint-marker",
+        "synthetic-ledger-marker",
+        "synthetic-actor-marker",
+        "synthetic-tool-marker",
+        "synthetic-call-marker",
+        "synthetic-argument-marker",
+        "synthetic-fingerprint-marker",
+    ];
+    let pending = PendingToolApproval {
+        run_id: markers[0].to_owned(),
+        checkpoint_identity: markers[1].to_owned(),
+        ledger_digest: markers[2].to_owned(),
+        actor: markers[3].to_owned(),
+        tool_name: markers[4].to_owned(),
+        call_id: markers[5].to_owned(),
+        arguments: json!({"private": markers[6]}),
+        argument_fingerprint: markers[7].to_owned(),
+    };
+
+    assert!(
+        pending.run_id == markers[0],
+        "review run ID must stay exact"
+    );
+    assert!(
+        pending.checkpoint_identity == markers[1],
+        "checkpoint identity must stay exact"
+    );
+    assert!(
+        pending.ledger_digest == markers[2],
+        "ledger digest must stay exact"
+    );
+    assert!(pending.actor == markers[3], "review actor must stay exact");
+    assert!(
+        pending.tool_name == markers[4],
+        "review tool name must stay exact"
+    );
+    assert!(
+        pending.call_id == markers[5],
+        "review call ID must stay exact"
+    );
+    assert!(
+        pending.arguments == json!({"private": markers[6]}),
+        "review arguments must stay exact"
+    );
+    assert!(
+        pending.argument_fingerprint == markers[7],
+        "argument fingerprint must stay exact"
+    );
+
+    let direct = format!("{pending:?}");
+    assert!(
+        markers.iter().all(|marker| !direct.contains(marker)),
+        "PendingToolApproval Debug must redact review values"
+    );
+    let nested = format!("{:?}", vec![pending]);
+    assert!(
+        markers.iter().all(|marker| !nested.contains(marker)),
+        "nested PendingToolApproval Debug must redact review values"
+    );
 }
 
 struct ResumeExecutor {

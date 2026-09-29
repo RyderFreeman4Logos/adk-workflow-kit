@@ -14,7 +14,7 @@ use workflow_runtime::{
 };
 
 /// A pending proposal, not an approval. Authenticate the reviewing human separately.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct PendingToolApproval {
     /// Run whose trusted checkpoint supplied this proposal.
     pub run_id: String,
@@ -32,6 +32,14 @@ pub struct PendingToolApproval {
     pub arguments: Value,
     /// Canonical argument digest checked against the persisted pending call.
     pub argument_fingerprint: String,
+}
+
+impl std::fmt::Debug for PendingToolApproval {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingToolApproval")
+            .finish_non_exhaustive()
+    }
 }
 
 impl ExecutionBackend {
