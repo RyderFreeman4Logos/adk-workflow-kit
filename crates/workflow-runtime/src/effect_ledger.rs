@@ -24,10 +24,7 @@ use std::{
         io::AsRawFd,
     },
     path::{Component, Path, PathBuf},
-    sync::{
-        Mutex, OnceLock,
-        atomic::{AtomicI32, Ordering},
-    },
+    sync::{Mutex, OnceLock},
 };
 
 /// Trusted application context; expiry is absolute Unix milliseconds, not process uptime.
@@ -516,47 +513,11 @@ fn private_file(path: &Path, directory: &fs::Metadata) -> Result<File, LedgerErr
 }
 
 static LEASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-const MAX_LEASE_FDS: usize = 64;
-static LEASE_FDS: OnceLock<[AtomicI32; MAX_LEASE_FDS]> = OnceLock::new();
-
-unsafe extern "C" fn close_inherited_leases() {
-    if let Some(fds) = LEASE_FDS.get() {
-        for fd in fds {
-            let value = fd.swap(-1, Ordering::Relaxed);
-            if value >= 0 {
-                unsafe { libc::close(value) };
-            }
-        }
-    }
-}
-
-fn lease_fds() -> &'static [AtomicI32; MAX_LEASE_FDS] {
-    LEASE_FDS.get_or_init(|| {
-        // Only the async-signal-safe child hook runs after fork. Arbitrary Rust
-        // in the child is unsupported; fork-to-exec is the supported boundary.
-        unsafe { libc::pthread_atfork(None, None, Some(close_inherited_leases)) };
-        std::array::from_fn(|_| AtomicI32::new(-1))
-    })
-}
-
-fn register_lease_fd(fd: i32) -> bool {
-    lease_fds().iter().any(|slot| {
-        slot.compare_exchange(-1, fd, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    })
-}
-
-fn unregister_lease_fd(fd: i32) {
-    if let Some(fds) = LEASE_FDS.get() {
-        for slot in fds {
-            let _ = slot.compare_exchange(fd, -1, Ordering::Relaxed, Ordering::Relaxed);
-        }
-    }
-}
 
 struct Lease {
-    _file: File,
+    file: File,
     path: PathBuf,
+    owner_pid: libc::pid_t,
 }
 
 impl Lease {
@@ -575,10 +536,11 @@ impl Lease {
         };
         let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &mut lock) };
         if result == -1 {
+            let error = std::io::Error::last_os_error();
             held.remove(&path);
             return Err(
-                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES)
-                    || std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+                if error.raw_os_error() == Some(libc::EACCES)
+                    || error.raw_os_error() == Some(libc::EAGAIN)
                 {
                     LedgerError::Busy
                 } else {
@@ -586,30 +548,48 @@ impl Lease {
                 },
             );
         }
-        if !register_lease_fd(file.as_raw_fd()) {
-            let mut unlock = libc::flock {
-                l_type: libc::F_UNLCK as libc::c_short,
-                l_whence: libc::SEEK_SET as libc::c_short,
-                l_start: 0,
-                l_len: 0,
-                l_pid: 0,
-            };
-            let _ = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &mut unlock) };
-            held.remove(&path);
-            return Err(LedgerError::Storage);
-        }
+        let owner_pid = unsafe { libc::getpid() };
         drop(held);
-        Ok(Self { _file: file, path })
+        Ok(Self {
+            file,
+            path,
+            owner_pid,
+        })
+    }
+}
+
+fn unlock_lease(fd: i32) -> Result<(), ()> {
+    let mut unlock = libc::flock {
+        l_type: libc::F_UNLCK as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    };
+    loop {
+        let result = unsafe { libc::fcntl(fd, libc::F_OFD_SETLK, &mut unlock) };
+        if result == 0 {
+            return Ok(());
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return Err(());
+        }
     }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        unregister_lease_fd(self._file.as_raw_fd());
-        if let Some(leases) = LEASES.get() {
-            let _ = leases.lock().map(|mut held| {
-                held.remove(&self.path);
-            });
+        if unsafe { libc::getpid() } == self.owner_pid {
+            // Do not rely on close: explicitly release only the process that acquired it.
+            // An unexpected unlock failure is fail-stop rather than silently weakening the lease.
+            if unlock_lease(self.file.as_raw_fd()).is_err() {
+                std::process::abort();
+            }
+            if let Some(leases) = LEASES.get() {
+                let _ = leases.lock().map(|mut held| {
+                    held.remove(&self.path);
+                });
+            }
         }
     }
 }

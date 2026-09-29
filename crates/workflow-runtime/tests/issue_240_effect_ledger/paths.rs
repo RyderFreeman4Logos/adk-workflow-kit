@@ -7,6 +7,52 @@ use std::{
 };
 
 #[test]
+fn child_cleanup_does_not_release_live_parent_lease() {
+    let root = TestDir::new();
+    let ledger = root.ledger();
+    let mut ready = [0; 2];
+    unsafe {
+        assert_eq!(libc::pipe(ready.as_mut_ptr()), 0);
+    }
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        unsafe {
+            libc::close(ready[0]);
+            libc::write(ready[1], b"ready".as_ptr().cast(), 5);
+            libc::close(ready[1]);
+            libc::_exit(0);
+        }
+    }
+    unsafe {
+        libc::close(ready[1]);
+    }
+    let mut child = ForkChild(pid);
+    let mut readiness = libc::pollfd {
+        fd: ready[0],
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(unsafe { libc::poll(&mut readiness, 1, 20_000) }, 1);
+    let mut byte = [0; 5];
+    assert_eq!(
+        unsafe { libc::read(ready[0], byte.as_mut_ptr().cast(), 5) },
+        5
+    );
+    child.wait();
+    unsafe {
+        libc::close(ready[0]);
+    }
+    let competitor = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "paths::lease_child", "--ignored", "--nocapture"])
+        .env("ISSUE_240_LEDGER", root.0.join("ledger.db"))
+        .status()
+        .unwrap();
+    assert!(competitor.success());
+    drop(ledger);
+}
+
+#[test]
 fn lease_release_is_not_delayed_by_a_forked_pre_exec_child() {
     let root = TestDir::new();
     let path = root.0.join("ledger.db");
