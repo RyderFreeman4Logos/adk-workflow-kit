@@ -3,10 +3,11 @@ use std::num::NonZeroU64;
 use workflow_runtime::{
     Actionability, AmbiguityReasonCode, CapabilityId, ComponentId, GitHubIssueMetadata,
     GitHubIssueState, ISSUE_CARD_MAX_COLLECTION_ITEMS, ISSUE_CARD_MAX_OBJECTIVE_BYTES,
-    ISSUE_CARD_MAX_RENDERED_BYTES, InMemoryArtifactStore, IssueCardCacheIdentity, IssueCardError,
-    IssueCardV1, OfflineComment, OfflineIssueContent, PriorityDependency, PriorityEffort,
-    PriorityImpact, PriorityInputs, PriorityReasonCode, PriorityScore, PriorityUrgency, RiskCode,
-    TrustPolicy, UnableReasonCode, build_canonical_issue_artifact,
+    ISSUE_CARD_MAX_RENDERED_BYTES, InMemoryArtifactStore, IssueCardCacheIdentity,
+    IssueCardCollectionInputs, IssueCardError, IssueCardV1, OfflineComment, OfflineIssueContent,
+    PriorityDependency, PriorityEffort, PriorityImpact, PriorityInputs, PriorityReasonCode,
+    PriorityScore, PriorityUrgency, RiskCode, TrustPolicy, UnableReasonCode,
+    build_canonical_issue_artifact,
 };
 
 fn issue(number: u64) -> GitHubIssueMetadata {
@@ -269,12 +270,13 @@ fn public_cards_with_the_same_artifact_model_and_prompt_do_not_share_cache_ident
         high.actionability(),
         high.priority_inputs(),
         &artifact,
-        high.source().clone(),
-        high.cache_identity().clone(),
-        high.components().to_vec(),
-        high.prerequisites().to_vec(),
-        high.capabilities().to_vec(),
-        high.risks().to_vec(),
+        (high.source().clone(), high.cache_identity().clone()),
+        IssueCardCollectionInputs::new(
+            high.components().to_vec(),
+            high.prerequisites().to_vec(),
+            high.capabilities().to_vec(),
+            high.risks().to_vec(),
+        ),
     )
     .expect("rehydrate matching card");
     assert_eq!(
@@ -287,12 +289,13 @@ fn public_cards_with_the_same_artifact_model_and_prompt_do_not_share_cache_ident
         low.actionability(),
         low.priority_inputs(),
         &artifact,
-        high.source().clone(),
-        high.cache_identity().clone(),
-        low.components().to_vec(),
-        low.prerequisites().to_vec(),
-        low.capabilities().to_vec(),
-        low.risks().to_vec(),
+        (high.source().clone(), high.cache_identity().clone()),
+        IssueCardCollectionInputs::new(
+            low.components().to_vec(),
+            low.prerequisites().to_vec(),
+            low.capabilities().to_vec(),
+            low.risks().to_vec(),
+        ),
     );
     assert_eq!(
         rejected.expect_err("stale card cache"),
@@ -340,12 +343,13 @@ fn public_rehydrate_preserves_enriched_collections_and_rejects_stale_digest() {
         card.actionability(),
         card.priority_inputs(),
         &artifact,
-        card.source().clone(),
-        card.cache_identity().clone(),
-        card.components().to_vec(),
-        card.prerequisites().to_vec(),
-        card.capabilities().to_vec(),
-        card.risks().to_vec(),
+        (card.source().clone(), card.cache_identity().clone()),
+        IssueCardCollectionInputs::new(
+            card.components().to_vec(),
+            card.prerequisites().to_vec(),
+            card.capabilities().to_vec(),
+            card.risks().to_vec(),
+        ),
     )
     .expect("enriched card must rehydrate");
 
@@ -369,12 +373,13 @@ fn public_rehydrate_preserves_enriched_collections_and_rejects_stale_digest() {
             card.actionability(),
             card.priority_inputs(),
             &artifact,
-            card.source().clone(),
-            stale.cache_identity().clone(),
-            card.components().to_vec(),
-            card.prerequisites().to_vec(),
-            card.capabilities().to_vec(),
-            card.risks().to_vec(),
+            (card.source().clone(), stale.cache_identity().clone()),
+            IssueCardCollectionInputs::new(
+                card.components().to_vec(),
+                card.prerequisites().to_vec(),
+                card.capabilities().to_vec(),
+                card.risks().to_vec(),
+            ),
         )
         .expect_err("digest mismatch must reject tampered collection"),
         IssueCardError::InvalidIdentity
@@ -404,12 +409,13 @@ fn rehydration_rejects_cross_artifact_policy_material() {
         Actionability::Actionable,
         inputs(PriorityImpact::High),
         &artifact_a,
-        card_b.source().clone(),
-        card_b.cache_identity().clone(),
-        card_b.components().to_vec(),
-        card_b.prerequisites().to_vec(),
-        card_b.capabilities().to_vec(),
-        card_b.risks().to_vec(),
+        (card_b.source().clone(), card_b.cache_identity().clone()),
+        IssueCardCollectionInputs::new(
+            card_b.components().to_vec(),
+            card_b.prerequisites().to_vec(),
+            card_b.capabilities().to_vec(),
+            card_b.risks().to_vec(),
+        ),
     )
     .expect_err("cross-artifact source must be rejected");
     assert_eq!(error, IssueCardError::InvalidIdentity);
@@ -420,12 +426,13 @@ fn rehydration_rejects_cross_artifact_policy_material() {
         Actionability::Actionable,
         inputs(PriorityImpact::High),
         &artifact_a,
-        card_a.source().clone(),
-        card_b.cache_identity().clone(),
-        card_a.components().to_vec(),
-        card_a.prerequisites().to_vec(),
-        card_a.capabilities().to_vec(),
-        card_a.risks().to_vec(),
+        (card_a.source().clone(), card_b.cache_identity().clone()),
+        IssueCardCollectionInputs::new(
+            card_a.components().to_vec(),
+            card_a.prerequisites().to_vec(),
+            card_a.capabilities().to_vec(),
+            card_a.risks().to_vec(),
+        ),
     )
     .expect_err("mismatched policy cache must be rejected");
     assert_eq!(error, IssueCardError::InvalidIdentity);

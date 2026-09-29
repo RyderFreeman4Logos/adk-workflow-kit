@@ -747,6 +747,31 @@ impl IssueCardCacheIdentity {
     }
 }
 
+/// Typed collections admitted into an IssueCard.
+pub struct IssueCardCollectionInputs {
+    components: Vec<ComponentId>,
+    prerequisites: Vec<ComponentId>,
+    capabilities: Vec<CapabilityId>,
+    risks: Vec<RiskCode>,
+}
+
+impl IssueCardCollectionInputs {
+    /// Groups the four typed card collections for admission or rehydration.
+    pub fn new(
+        components: Vec<ComponentId>,
+        prerequisites: Vec<ComponentId>,
+        capabilities: Vec<CapabilityId>,
+        risks: Vec<RiskCode>,
+    ) -> Self {
+        Self {
+            components,
+            prerequisites,
+            capabilities,
+            risks,
+        }
+    }
+}
+
 /// Version-one typed planning card admitted from a canonical artifact.
 #[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -810,10 +835,12 @@ impl IssueCardV1 {
             priority_inputs,
             source,
             cache_identity,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            vec![RiskCode::UncalibratedPriority],
+            IssueCardCollectionInputs::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![RiskCode::UncalibratedPriority],
+            ),
         )
     }
 
@@ -823,21 +850,17 @@ impl IssueCardV1 {
     /// cache, and typed collection fields; the caller cannot declare replacement
     /// hashes or policy. Collections are bounded, sorted, and deduplicated before
     /// their complete card digest is compared with the supplied cache identity.
-    #[allow(clippy::too_many_arguments)]
     pub fn rehydrate(
         id: impl Into<String>,
         objective: impl Into<String>,
         actionability: Actionability,
         priority_inputs: PriorityInputs,
         artifact: &CanonicalIssueArtifact,
-        source: TrustedSourceBinding,
-        cache_identity: IssueCardCacheIdentity,
-        components: Vec<ComponentId>,
-        prerequisites: Vec<ComponentId>,
-        capabilities: Vec<CapabilityId>,
-        risks: Vec<RiskCode>,
+        source_and_cache: (TrustedSourceBinding, IssueCardCacheIdentity),
+        collections: IssueCardCollectionInputs,
     ) -> Result<Self, IssueCardError> {
         let expected_source = TrustedSourceBinding::from_artifact(artifact)?;
+        let (source, cache_identity) = source_and_cache;
         let expected = Self::assemble(
             id,
             objective,
@@ -845,10 +868,7 @@ impl IssueCardV1 {
             priority_inputs,
             source,
             cache_identity.clone(),
-            components,
-            prerequisites,
-            capabilities,
-            risks,
+            collections,
         )?;
         if expected.source != expected_source || cache_identity != expected.cache_identity {
             return Err(IssueCardError::InvalidIdentity);
@@ -856,7 +876,6 @@ impl IssueCardV1 {
         Ok(expected)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn assemble(
         id: impl Into<String>,
         objective: impl Into<String>,
@@ -864,15 +883,18 @@ impl IssueCardV1 {
         priority_inputs: PriorityInputs,
         source: TrustedSourceBinding,
         cache_identity: IssueCardCacheIdentity,
-        component_values: Vec<ComponentId>,
-        prerequisite_values: Vec<ComponentId>,
-        capability_values: Vec<CapabilityId>,
-        risk_values: Vec<RiskCode>,
+        collections: IssueCardCollectionInputs,
     ) -> Result<Self, IssueCardError> {
         let id = id.into();
         let objective = objective.into();
         validate_field(&id)?;
         validate_bounded_field(&objective, ISSUE_CARD_MAX_OBJECTIVE_BYTES)?;
+        let IssueCardCollectionInputs {
+            components: component_values,
+            prerequisites: prerequisite_values,
+            capabilities: capability_values,
+            risks: risk_values,
+        } = collections;
         let mut components = Vec::new();
         append_bounded(&mut components, component_values)?;
         let mut prerequisites = Vec::new();

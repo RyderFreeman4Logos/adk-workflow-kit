@@ -108,9 +108,9 @@ pub use issue_card::{
     ISSUE_CARD_MAX_COLLECTION_ITEMS, ISSUE_CARD_MAX_IDENTIFIER_BYTES,
     ISSUE_CARD_MAX_OBJECTIVE_BYTES, ISSUE_CARD_MAX_RENDERED_BYTES, ISSUE_CARD_MAX_SOURCE_EVIDENCE,
     ISSUE_CARD_PRIORITY_ORDER_VERSION_V1, ISSUE_CARD_SCHEMA_VERSION_V1, IssueCardCacheIdentity,
-    IssueCardError, IssueCardV1, PriorityDependency, PriorityEffort, PriorityImpact,
-    PriorityInputs, PriorityOrderKey, PriorityReasonCode, PriorityScore, PriorityUrgency, RiskCode,
-    SourceEvidence, TrustedSourceBinding, UnableReasonCode,
+    IssueCardCollectionInputs, IssueCardError, IssueCardV1, PriorityDependency, PriorityEffort,
+    PriorityImpact, PriorityInputs, PriorityOrderKey, PriorityReasonCode, PriorityScore,
+    PriorityUrgency, RiskCode, SourceEvidence, TrustedSourceBinding, UnableReasonCode,
 };
 pub use issue_plan::{
     ExplicitIssueEdge, ISSUE_PLAN_MAX_CARDS, ISSUE_PLAN_MAX_EDGES, IssuePlanError, IssuePlanTitle,
