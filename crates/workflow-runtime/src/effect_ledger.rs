@@ -24,7 +24,10 @@ use std::{
         io::AsRawFd,
     },
     path::{Component, Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicI32, Ordering},
+    },
 };
 
 /// Trusted application context; expiry is absolute Unix milliseconds, not process uptime.
@@ -147,6 +150,8 @@ impl From<rusqlite::Error> for LedgerError {
 /// The caller must provide a private, trusted directory and keep it in place.
 pub struct EffectLedger {
     connection: Connection,
+    // Keep the admission-bound descriptor alive; SQLite opens through this fd.
+    _database: File,
     _lease: Lease,
 }
 impl EffectLedger {
@@ -173,7 +178,8 @@ impl EffectLedger {
                 Err(_) => return Err(LedgerError::Storage),
             }
         }
-        let connection = Connection::open(&path)?;
+        let database_path = format!("/proc/self/fd/{}", database.as_raw_fd());
+        let connection = Connection::open(database_path)?;
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS effect_ledger_meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL);
@@ -194,6 +200,7 @@ impl EffectLedger {
             .map_err(|_| LedgerError::Storage)?;
         Ok(Self {
             connection,
+            _database: database,
             _lease: lease,
         })
     }
@@ -481,22 +488,21 @@ fn private_directory(path: &Path) -> Result<PathBuf, LedgerError> {
 }
 
 fn private_file(path: &Path, directory: &fs::Metadata) -> Result<File, LedgerError> {
-    match fs::symlink_metadata(path) {
-        Ok(m) if !m.is_file() || m.permissions().mode() & 0o077 != 0 || m.nlink() != 1 => {
-            return Err(LedgerError::InvalidInput);
-        }
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err(LedgerError::Storage),
-    }
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .map_err(|_| LedgerError::Storage)?;
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                LedgerError::InvalidInput
+            } else {
+                LedgerError::Storage
+            }
+        })?;
     let metadata = file.metadata().map_err(|_| LedgerError::Storage)?;
     if !metadata.is_file()
         || metadata.permissions().mode() & 0o077 != 0
@@ -510,6 +516,43 @@ fn private_file(path: &Path, directory: &fs::Metadata) -> Result<File, LedgerErr
 }
 
 static LEASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+const MAX_LEASE_FDS: usize = 64;
+static LEASE_FDS: OnceLock<[AtomicI32; MAX_LEASE_FDS]> = OnceLock::new();
+
+unsafe extern "C" fn close_inherited_leases() {
+    if let Some(fds) = LEASE_FDS.get() {
+        for fd in fds {
+            let value = fd.swap(-1, Ordering::Relaxed);
+            if value >= 0 {
+                unsafe { libc::close(value) };
+            }
+        }
+    }
+}
+
+fn lease_fds() -> &'static [AtomicI32; MAX_LEASE_FDS] {
+    LEASE_FDS.get_or_init(|| {
+        // Only the async-signal-safe child hook runs after fork. Arbitrary Rust
+        // in the child is unsupported; fork-to-exec is the supported boundary.
+        unsafe { libc::pthread_atfork(None, None, Some(close_inherited_leases)) };
+        std::array::from_fn(|_| AtomicI32::new(-1))
+    })
+}
+
+fn register_lease_fd(fd: i32) -> bool {
+    lease_fds().iter().any(|slot| {
+        slot.compare_exchange(-1, fd, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    })
+}
+
+fn unregister_lease_fd(fd: i32) {
+    if let Some(fds) = LEASE_FDS.get() {
+        for slot in fds {
+            let _ = slot.compare_exchange(fd, -1, Ordering::Relaxed, Ordering::Relaxed);
+        }
+    }
+}
 
 struct Lease {
     _file: File,
@@ -530,7 +573,7 @@ impl Lease {
             l_len: 0,
             l_pid: 0,
         };
-        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &mut lock) };
+        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &mut lock) };
         if result == -1 {
             held.remove(&path);
             return Err(
@@ -543,6 +586,18 @@ impl Lease {
                 },
             );
         }
+        if !register_lease_fd(file.as_raw_fd()) {
+            let mut unlock = libc::flock {
+                l_type: libc::F_UNLCK as libc::c_short,
+                l_whence: libc::SEEK_SET as libc::c_short,
+                l_start: 0,
+                l_len: 0,
+                l_pid: 0,
+            };
+            let _ = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &mut unlock) };
+            held.remove(&path);
+            return Err(LedgerError::Storage);
+        }
         drop(held);
         Ok(Self { _file: file, path })
     }
@@ -550,6 +605,7 @@ impl Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
+        unregister_lease_fd(self._file.as_raw_fd());
         if let Some(leases) = LEASES.get() {
             let _ = leases.lock().map(|mut held| {
                 held.remove(&self.path);

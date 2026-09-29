@@ -79,6 +79,46 @@ impl Drop for ForkChild {
 }
 
 #[test]
+fn pathname_symlink_victim_is_rejected_before_sqlite_mutation() {
+    let root = TestDir::new();
+    let victim = root.0.join("victim.db");
+    fs::write(&victim, b"victim").unwrap();
+    symlink("victim.db", root.0.join("ledger.db")).unwrap();
+    assert!(matches!(
+        EffectLedger::open(root.0.join("ledger.db")),
+        Err(LedgerError::InvalidInput)
+    ));
+    assert_eq!(fs::read(victim).unwrap(), b"victim");
+    assert!(!root.0.join("victim.db-wal").exists());
+}
+
+#[test]
+fn independent_alias_close_does_not_release_live_lease() {
+    let root = TestDir::new();
+    let ledger = root.ledger();
+    let alias = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.0.join("ledger.effect-lock"))
+        .unwrap();
+    drop(alias);
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "paths::lease_child", "--ignored", "--nocapture"])
+        .env("ISSUE_240_LEDGER", root.0.join("ledger.db"))
+        .status()
+        .unwrap();
+    assert!(child.success());
+    drop(ledger);
+}
+
+#[test]
+#[ignore = "subprocess entry point, invoked only by lease ownership test"]
+fn lease_child() {
+    let path = std::env::var("ISSUE_240_LEDGER").unwrap();
+    assert!(matches!(EffectLedger::open(path), Err(LedgerError::Busy)));
+}
+
+#[test]
 #[ignore = "subprocess entry point, invoked only by path admission test"]
 fn path_child() {
     let path = std::env::var("ISSUE_240_LEDGER").unwrap();
