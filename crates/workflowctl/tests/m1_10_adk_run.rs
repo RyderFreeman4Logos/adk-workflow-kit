@@ -422,6 +422,10 @@ fn oracle_failure_boundary_sink_is_bounded_content_free_and_opt_in() {
             "--nocapture",
         ])
         .env(ORACLE_FAILURE_BOUNDARY_SINK_ENV, &sink_path)
+        .env(
+            ORACLE_FAILURE_BOUNDARY_OPERATION_ENV,
+            "boundary-sink-fixture",
+        )
         .env(ORACLE_FAILURE_BOUNDARY_FIXTURE_ENV, "1")
         .env(UNPROVEN_REAP_FIXTURE_ENV, "1")
         .output()
@@ -473,6 +477,10 @@ fn oracle_failure_boundary_sink_is_bounded_content_free_and_opt_in() {
                 "--nocapture",
             ])
             .env(ORACLE_FAILURE_BOUNDARY_SINK_ENV, path)
+            .env(
+                ORACLE_FAILURE_BOUNDARY_OPERATION_ENV,
+                "boundary-sink-fixture",
+            )
             .env(ORACLE_FAILURE_BOUNDARY_FIXTURE_ENV, "1")
             .env(UNPROVEN_REAP_FIXTURE_ENV, "1")
             .output()
@@ -498,6 +506,7 @@ fn oracle_failure_boundary_sink_is_bounded_content_free_and_opt_in() {
             "--nocapture",
         ])
         .env_remove(ORACLE_FAILURE_BOUNDARY_SINK_ENV)
+        .env_remove(ORACLE_FAILURE_BOUNDARY_OPERATION_ENV)
         .env(ORACLE_FAILURE_BOUNDARY_FIXTURE_ENV, "1")
         .env(UNPROVEN_REAP_FIXTURE_ENV, "1")
         .output()
