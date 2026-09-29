@@ -489,6 +489,7 @@ fn adk_bridge_refreshes_expiry_clock_between_recovery_phases() {
         .approve(&request, request.approval_digest(), "operator", 1)
         .expect("approval");
     let executions = Arc::new(AtomicUsize::new(0));
+    let reconciles = Arc::new(AtomicUsize::new(0));
     let (policy, _, _) = fixture();
     let mut executors = ExecutorRegistry::new();
     executors
@@ -496,7 +497,7 @@ fn adk_bridge_refreshes_expiry_clock_between_recovery_phases() {
             "increment",
             policy.tools.get("increment").expect("rule").clone(),
             CrossingExpiryExecutor {
-                reconciles: AtomicUsize::new(0),
+                reconciles: Arc::clone(&reconciles),
                 executions: Arc::clone(&executions),
             },
         )
@@ -540,21 +541,31 @@ fn adk_bridge_refreshes_expiry_clock_between_recovery_phases() {
     )
     .expect("bridge");
     let call = ToolCall::new("increment", "call-1", "actor-1", json!({"count": 1}));
+    // The first reconciliation is an immediate Unknown before the +1 s expiry;
+    // the next is Absent after its bounded 1.1 s crossing delay.
     let response = bridge.invoke(call);
+    assert!(reconciles.load(Ordering::SeqCst) >= 2);
     assert_eq!(executions.load(Ordering::SeqCst), 0);
-    drop(response);
+    assert_eq!(
+        response
+            .expect_err("expired nonterminal result is retriable")
+            .kind(),
+        workflow_runtime::ToolBridgeErrorKind::HandlerFailed
+    );
     fs::remove_dir_all(root).expect("cleanup");
 }
 
 struct CrossingExpiryExecutor {
-    reconciles: AtomicUsize,
+    reconciles: Arc<AtomicUsize>,
     executions: Arc<AtomicUsize>,
 }
 
 impl EffectExecutor for CrossingExpiryExecutor {
     fn reconcile(&mut self, _request: &ApprovalRequest) -> RemoteObservation {
-        if self.reconciles.fetch_add(1, Ordering::SeqCst) == 0 {
+        if self.reconciles.fetch_add(1, Ordering::SeqCst) == 1 {
             std::thread::sleep(Duration::from_millis(1_100));
+            RemoteObservation::Absent
+        } else if self.reconciles.load(Ordering::SeqCst) == 1 {
             RemoteObservation::Unknown
         } else {
             RemoteObservation::Absent

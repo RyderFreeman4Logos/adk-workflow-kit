@@ -121,21 +121,26 @@ fn lease_release_is_not_delayed_by_a_forked_pre_exec_child() {
 
 struct ForkChild(Option<libc::pid_t>);
 impl ForkChild {
-    fn wait(&mut self) {
-        let Some(pid) = self.0 else { return };
+    fn reap(pid: libc::pid_t) -> bool {
         let mut status = 0;
         loop {
             let result = unsafe { libc::waitpid(pid, &mut status, 0) };
             if result == pid {
-                self.0 = None;
-                return;
+                return true;
             }
             if result == -1
                 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
             {
                 continue;
             }
-            return;
+            return false;
+        }
+    }
+
+    fn wait(&mut self) {
+        let Some(pid) = self.0 else { return };
+        if Self::reap(pid) {
+            self.0 = None;
         }
     }
 }
@@ -144,8 +149,8 @@ impl Drop for ForkChild {
         if let Some(pid) = self.0.take() {
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
-                libc::waitpid(pid, std::ptr::null_mut(), 0);
             }
+            Self::reap(pid);
         }
     }
 }
