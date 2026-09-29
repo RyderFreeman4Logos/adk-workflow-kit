@@ -19,12 +19,25 @@ use crate::{
 };
 
 /// One model or workflow function call received by the bridge.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ToolCall {
     name: String,
     call_id: String,
     actor: String,
     arguments: Value,
+}
+
+impl fmt::Debug for ToolCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Keep model-controlled values and argument keys out of diagnostics.
+        formatter
+            .debug_struct("ToolCall")
+            .field("name", &"<redacted>")
+            .field("call_id", &"<redacted>")
+            .field("actor", &"<redacted>")
+            .field("arguments", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl ToolCall {
