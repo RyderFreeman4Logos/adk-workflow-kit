@@ -389,7 +389,6 @@ impl ToolHandler for DurableEffectHandler {
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::InvalidInput));
         }
 
-        let now = Self::now_unix_ms();
         let mut ledger = self
             .ledger
             .lock()
@@ -404,7 +403,7 @@ impl ToolHandler for DurableEffectHandler {
                 break;
             }
             state = ledger
-                .advance(&self.request, &mut registry, now)
+                .advance(&self.request, &mut registry, Self::now_unix_ms())
                 .map_err(Self::bridge_error)?;
         }
 
@@ -421,10 +420,9 @@ impl ToolHandler for DurableEffectHandler {
             | EffectState::Started
             | EffectState::Committed
             | EffectState::Proposed
-            | EffectState::Approved => Ok(ToolEnvelope::failure(
-                ToolFailure::Unavailable,
-                self.registration.provenance().clone(),
-            )),
+            | EffectState::Approved => {
+                Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))
+            }
         }
     }
 }

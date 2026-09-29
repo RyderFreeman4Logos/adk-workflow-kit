@@ -27,7 +27,7 @@ fn child_cleanup_does_not_release_live_parent_lease() {
     unsafe {
         libc::close(ready[1]);
     }
-    let mut child = ForkChild(pid);
+    let mut child = ForkChild(Some(pid));
     let mut readiness = libc::pollfd {
         fd: ready[0],
         events: libc::POLLIN,
@@ -50,6 +50,18 @@ fn child_cleanup_does_not_release_live_parent_lease() {
         .unwrap();
     assert!(competitor.success());
     drop(ledger);
+}
+
+#[test]
+fn successful_fork_child_wait_disarms_cleanup() {
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        unsafe { libc::_exit(0) }
+    }
+    let mut child = ForkChild(Some(pid));
+    child.wait();
+    assert!(child.0.is_none());
 }
 
 #[test]
@@ -79,7 +91,7 @@ fn lease_release_is_not_delayed_by_a_forked_pre_exec_child() {
         libc::close(ready[1]);
         libc::close(release[0]);
     }
-    let mut child = ForkChild(pid);
+    let mut child = ForkChild(Some(pid));
     let mut readiness = libc::pollfd {
         fd: ready[0],
         events: libc::POLLIN,
@@ -107,19 +119,33 @@ fn lease_release_is_not_delayed_by_a_forked_pre_exec_child() {
     child.wait();
 }
 
-struct ForkChild(libc::pid_t);
+struct ForkChild(Option<libc::pid_t>);
 impl ForkChild {
     fn wait(&mut self) {
-        unsafe {
-            libc::waitpid(self.0, std::ptr::null_mut(), 0);
+        let Some(pid) = self.0 else { return };
+        let mut status = 0;
+        loop {
+            let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if result == pid {
+                self.0 = None;
+                return;
+            }
+            if result == -1
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            return;
         }
     }
 }
 impl Drop for ForkChild {
     fn drop(&mut self) {
-        unsafe {
-            libc::kill(self.0, libc::SIGKILL);
-            libc::waitpid(self.0, std::ptr::null_mut(), 0);
+        if let Some(pid) = self.0.take() {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
         }
     }
 }

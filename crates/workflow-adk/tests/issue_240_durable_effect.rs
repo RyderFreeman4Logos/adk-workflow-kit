@@ -356,6 +356,221 @@ fn adk_tool_bridge_runs_durable_effect_and_replays_without_duplicate_executor_ca
     fs::remove_dir_all(root).expect("cleanup");
 }
 
+struct RecoveryExecutor {
+    reconciles: AtomicUsize,
+    executions: Arc<AtomicUsize>,
+}
+
+impl EffectExecutor for RecoveryExecutor {
+    fn reconcile(&mut self, _request: &ApprovalRequest) -> RemoteObservation {
+        if self.reconciles.fetch_add(1, Ordering::SeqCst) < 3 {
+            RemoteObservation::Unknown
+        } else {
+            RemoteObservation::Committed
+        }
+    }
+
+    fn execute(&mut self, _request: &ApprovalRequest) -> ExecutionOutcome {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        ExecutionOutcome::Committed
+    }
+
+    fn verify(&mut self, _request: &ApprovalRequest) -> Postcondition {
+        Postcondition::Satisfied
+    }
+}
+
+#[test]
+fn adk_bridge_retries_nonterminal_durable_result_without_caching_it() {
+    let root = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .expect("HOME is set")
+        .join("tmp")
+        .join(format!("issue-240-recovery-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("ledger root");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private root");
+    let expiry = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64
+        + 60_000;
+    let request = request(expiry);
+    let mut ledger = EffectLedger::open(root.join("ledger.db")).expect("ledger");
+    ledger.propose(&request).expect("proposal");
+    ledger
+        .approve(&request, request.approval_digest(), "operator", 1)
+        .expect("approval");
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (policy, _, _) = fixture();
+    let mut executors = ExecutorRegistry::new();
+    executors
+        .register(
+            "increment",
+            policy.tools.get("increment").expect("rule").clone(),
+            RecoveryExecutor {
+                reconciles: AtomicUsize::new(0),
+                executions: Arc::clone(&executions),
+            },
+        )
+        .expect("executor");
+    let registration = ToolRegistration::for_types::<Value, Value>(
+        "increment",
+        ToolProvenance::new("increment", "1"),
+        ToolFlags::new(false, true, true),
+    )
+    .expect("registration")
+    .with_required_capabilities([SandboxCapability::Network])
+    .with_required_scopes(["fake"])
+    .with_idempotency(ToolIdempotency::StableKey);
+    let handler =
+        DurableEffectHandler::new(request, ledger, executors, registration).expect("handler");
+    let approvals = ApprovalLedger::new().grant(
+        "increment",
+        "call-1",
+        &json!({"count": 1}),
+        "actor-1",
+        Duration::from_secs(60),
+    );
+    let authority = CapabilityIntersection::new(
+        [SandboxCapability::Network],
+        ["increment"],
+        ["increment"],
+        ["fake"],
+        ["increment"],
+        ["increment"],
+        [SandboxCapability::Network],
+    );
+    let bridge = AdkToolBridge::for_durable_effect(
+        sandbox(),
+        authority,
+        Some(approvals),
+        InMemoryArtifactStore::new(
+            NonZeroU64::new(4096).expect("positive"),
+            NonZeroU64::new(16).expect("positive"),
+        ),
+        handler,
+    )
+    .expect("bridge");
+    let call = ToolCall::new("increment", "call-1", "actor-1", json!({"count": 1}));
+    assert_eq!(
+        bridge
+            .invoke(call.clone())
+            .expect_err("nonterminal is retriable")
+            .kind(),
+        workflow_runtime::ToolBridgeErrorKind::HandlerFailed
+    );
+    let response = bridge.invoke(call).expect("observable recovery");
+    assert!(matches!(
+        response,
+        workflow_runtime::ToolEnvelope::Success { .. }
+    ));
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn adk_bridge_refreshes_expiry_clock_between_recovery_phases() {
+    let root = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .expect("HOME is set")
+        .join("tmp")
+        .join(format!("issue-240-expiry-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("ledger root");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private root");
+    let expiry = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64
+        + 1_000;
+    let request = request(expiry);
+    let mut ledger = EffectLedger::open(root.join("ledger.db")).expect("ledger");
+    ledger.propose(&request).expect("proposal");
+    ledger
+        .approve(&request, request.approval_digest(), "operator", 1)
+        .expect("approval");
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (policy, _, _) = fixture();
+    let mut executors = ExecutorRegistry::new();
+    executors
+        .register(
+            "increment",
+            policy.tools.get("increment").expect("rule").clone(),
+            CrossingExpiryExecutor {
+                reconciles: AtomicUsize::new(0),
+                executions: Arc::clone(&executions),
+            },
+        )
+        .expect("executor");
+    let registration = ToolRegistration::for_types::<Value, Value>(
+        "increment",
+        ToolProvenance::new("increment", "1"),
+        ToolFlags::new(false, true, true),
+    )
+    .expect("registration")
+    .with_required_capabilities([SandboxCapability::Network])
+    .with_required_scopes(["fake"])
+    .with_idempotency(ToolIdempotency::StableKey);
+    let handler =
+        DurableEffectHandler::new(request, ledger, executors, registration).expect("handler");
+    let approvals = ApprovalLedger::new().grant(
+        "increment",
+        "call-1",
+        &json!({"count": 1}),
+        "actor-1",
+        Duration::from_secs(60),
+    );
+    let authority = CapabilityIntersection::new(
+        [SandboxCapability::Network],
+        ["increment"],
+        ["increment"],
+        ["fake"],
+        ["increment"],
+        ["increment"],
+        [SandboxCapability::Network],
+    );
+    let bridge = AdkToolBridge::for_durable_effect(
+        sandbox(),
+        authority,
+        Some(approvals),
+        InMemoryArtifactStore::new(
+            NonZeroU64::new(4096).expect("positive"),
+            NonZeroU64::new(16).expect("positive"),
+        ),
+        handler,
+    )
+    .expect("bridge");
+    let call = ToolCall::new("increment", "call-1", "actor-1", json!({"count": 1}));
+    let response = bridge.invoke(call);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    drop(response);
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+struct CrossingExpiryExecutor {
+    reconciles: AtomicUsize,
+    executions: Arc<AtomicUsize>,
+}
+
+impl EffectExecutor for CrossingExpiryExecutor {
+    fn reconcile(&mut self, _request: &ApprovalRequest) -> RemoteObservation {
+        if self.reconciles.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::thread::sleep(Duration::from_millis(1_100));
+            RemoteObservation::Unknown
+        } else {
+            RemoteObservation::Absent
+        }
+    }
+
+    fn execute(&mut self, _request: &ApprovalRequest) -> ExecutionOutcome {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        ExecutionOutcome::Committed
+    }
+
+    fn verify(&mut self, _request: &ApprovalRequest) -> Postcondition {
+        Postcondition::Satisfied
+    }
+}
+
 #[test]
 fn execution_backend_runs_host_injected_durable_effect_and_rejects_mismatched_retry() {
     let root = production_root();
