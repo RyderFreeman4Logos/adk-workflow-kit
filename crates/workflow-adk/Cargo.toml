@@ -25,4 +25,4 @@ sha2.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "test-util"] }

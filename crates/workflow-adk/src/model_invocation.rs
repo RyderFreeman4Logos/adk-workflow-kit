@@ -455,6 +455,15 @@ impl ProviderRouteIdentity {
 
 pub type ModelRouteIdentity = ProviderRouteIdentity;
 
+#[path = "model_routes.rs"]
+mod routes;
+pub use routes::{
+    MAX_MODEL_ROUTE_CANDIDATES, ModelRouteAttempt, ModelRouteAttemptKind, ModelRouteAuthorization,
+    ModelRouteCancellation, ModelRouteCandidate, ModelRoutePolicy, ModelRoutePublisher,
+    ModelRouteSnapshot, ModelRouteSnapshotError, ModelRouteSnapshotErrorKind,
+    ModelRouteTerminalError, ModelRouteTerminalErrorKind,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StructuredOutputContractError {
     InvalidSchema,
@@ -618,6 +627,7 @@ impl ModelInvocationResult {
         self.output
     }
 
+    /// Validation attempts within the successful binding, not route candidates.
     pub fn attempts(&self) -> u8 {
         self.attempts
     }
@@ -767,6 +777,12 @@ impl ModelInvocationSpec {
 
     pub fn route(&self) -> &ProviderRouteIdentity {
         &self.route
+    }
+
+    pub fn with_route(&self, route: ProviderRouteIdentity) -> Self {
+        let mut value = self.clone();
+        value.route = route;
+        value
     }
 
     pub fn budget(&self) -> &InferenceBudget {
