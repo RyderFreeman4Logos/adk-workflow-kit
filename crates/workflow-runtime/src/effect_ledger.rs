@@ -2,6 +2,9 @@
 //!
 //! Callers authenticate approvers and supply trusted policy/goal/clock inputs.
 //! Digests are binding identities, not signatures. Raw proposals are never persisted.
+//! The operator owns this host boundary; hostile same-UID pathname replacement is out of scope.
+//! Reconciliation must resolve an indeterminate effect before retry; exactly-once external effects
+//! require backend idempotency and are not implied by this ledger.
 use crate::{
     ChildSandbox, FirewallDecision, ToolBridgeError, ToolBridgeErrorKind, ToolCallContext,
     ToolEnvelope, ToolFailure, ToolHandler, ToolRegistration, argument_fingerprint,

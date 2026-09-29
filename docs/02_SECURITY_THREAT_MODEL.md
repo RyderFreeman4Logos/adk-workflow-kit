@@ -236,3 +236,12 @@ The implementation is unacceptable unless all are true:
 - cross-trust-domain KV reuse is disabled by salt/serving isolation;
 - ordinary logs do not expose real secrets, synthetic credentials, or unrestricted CoT;
 - the adversarial acceptance suite records zero unauthorized issue mutations.
+
+### 8.1 Host boundary and durable-effect contract
+
+The operator is trusted to control the execution host. Hostile same-UID processes that replace
+configured pathnames are outside this threat model; this does not grant the model or any tool
+host authority. Ownership, no-follow, sidecar, and configured-directory symlink checks remain
+mandatory. An indeterminate effect is reconciled before retry, and exactly-once delivery of an
+external side effect requires idempotency support from that backend; the ledger alone does not
+provide it.

@@ -37,12 +37,12 @@ use workflow_compiler::{
 };
 use workflow_ir::IrModelRole;
 use workflow_runtime::{
-    ActivateSkillInput, ArtifactId, ArtifactStore, BackendCapabilities, CacheDisposition,
-    CacheProvenance, CapabilityIntersection, CheckpointManifestV1, DurableCheckpointV1,
-    EffectCommit, EffectJournal, EffectKey, FilesystemArtifactStore, Materialization,
-    NodeCacheEntry, NodeCacheInvalidationReason, NodeCacheKey, NodeCacheKeyMaterial,
-    NodeCacheLookup, NodeCacheOutcome, NodeResultCache, PageRequest, PolicyCapabilities,
-    ProtectedArtifactReferenceV1, PureTransformRequest, ReadSkillResourceInput,
+    ActivateSkillInput, ApprovalLedger, ArtifactId, ArtifactStore, BackendCapabilities,
+    CacheDisposition, CacheProvenance, CapabilityIntersection, CheckpointManifestV1,
+    DurableCheckpointV1, EffectCommit, EffectJournal, EffectKey, FilesystemArtifactStore,
+    Materialization, NodeCacheEntry, NodeCacheInvalidationReason, NodeCacheKey,
+    NodeCacheKeyMaterial, NodeCacheLookup, NodeCacheOutcome, NodeResultCache, PageRequest,
+    PolicyCapabilities, ProtectedArtifactReferenceV1, PureTransformRequest, ReadSkillResourceInput,
     ReadSourceRangeTool, RequestedCapabilities, RunContext, RunId, RunLimits, RunSandbox,
     RunSkillScriptInput, SandboxCapability, SearchCodeTool, SqliteCheckpointStore, ToolBridge,
     ToolBridgeError, ToolBridgeErrorKind, ToolCall, ToolCallContext, ToolEnvelope, ToolFlags,
@@ -2340,6 +2340,9 @@ pub struct ExecutionProfileV1 {
     tools: Vec<ToolWire>,
     #[serde(skip)]
     tool_implementations: Option<Arc<ToolImplementationRegistry>>,
+    /// Host-granted call approvals are runtime-only and never restored from a checkpoint.
+    #[serde(skip)]
+    approvals: Option<ApprovalLedger>,
     #[serde(default)]
     skills: Vec<SkillWire>,
     #[serde(default)]
@@ -2566,6 +2569,12 @@ struct LoopPolicyWire {
 }
 
 impl ExecutionProfileV1 {
+    /// Binds host-granted call approvals to this in-memory execution only.
+    pub fn with_approvals(mut self, approvals: ApprovalLedger) -> Self {
+        self.approvals = Some(approvals);
+        self
+    }
+
     /// Parses and validates one bounded, secret-free profile projection.
     pub fn parse(bytes: &[u8]) -> Result<Self, ExecutionError> {
         if bytes.is_empty() || bytes.len() > 64 * 1024 {
@@ -4929,7 +4938,7 @@ impl ExecutionBackend {
                             resolved_plan.node_tools(node.id().as_str()),
                             resolved_plan.node_skills(node.id().as_str()),
                             &effective_capabilities,
-                            profile.run_limits().max_tool_output_bytes(),
+                            &profile,
                             &run_root.join("artifacts"),
                         )?;
                         let cache = durable_node_cache(
@@ -5494,7 +5503,7 @@ impl ExecutionBackend {
                         resolved_plan.node_tools(node.id().as_str()),
                         resolved_plan.node_skills(node.id().as_str()),
                         &effective_capabilities,
-                        profile.run_limits().max_tool_output_bytes(),
+                        &profile,
                         &root.join("artifacts"),
                     )?,
                 ))
@@ -6252,7 +6261,7 @@ fn build_toolset(
     bindings: &[ResolvedBinding],
     skills: &[ResolvedBinding],
     effective_capabilities: &[SandboxCapability],
-    max_tool_output_bytes: NonZeroU64,
+    profile: &ExecutionProfileV1,
     artifact_root: &Path,
 ) -> Result<Option<BoundTool>, ExecutionError> {
     if bindings.is_empty() && skills.is_empty() {
@@ -6274,18 +6283,22 @@ fn build_toolset(
         names.iter(),
         effective_capabilities.iter().copied(),
     );
-    let artifact_limit = max_tool_output_bytes
-        .get()
-        .max(ARTIFACT_LIMIT.saturating_add(1));
     let adapter = AdkToolBridge::for_selected(
         bridge,
         names.iter().map(String::as_str),
         node_id,
         authority,
-        None,
+        profile.approvals.clone(),
         FilesystemArtifactStore::try_new(
             artifact_root,
-            NonZeroU64::new(artifact_limit).expect("positive artifact limit"),
+            NonZeroU64::new(
+                profile
+                    .run_limits()
+                    .max_tool_output_bytes()
+                    .get()
+                    .max(ARTIFACT_LIMIT.saturating_add(1)),
+            )
+            .expect("positive artifact limit"),
             NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page limit"),
         )
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?,

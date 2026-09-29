@@ -2,25 +2,29 @@ use std::{
     fs,
     num::NonZeroU64,
     os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Value, json};
+use workflow_adk::execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1};
 use workflow_adk::tool_bridge::AdkToolBridge;
 use workflow_runtime::{
     ApprovalLedger, CapabilityIntersection, InMemoryArtifactStore, RunContext, RunId, RunLimits,
-    RunSandbox, SandboxCapability, ToolCall, ToolFlags, ToolIdempotency, ToolProvenance,
-    ToolRegistration, WorkdirManager,
+    RunSandbox, SandboxCapability, ToolCall, ToolFlags, ToolIdempotency,
+    ToolImplementationRegistry, ToolProvenance, ToolRegistration, WorkdirManager,
     effect_ledger::{
         ApprovalContext, ApprovalRequest, DurableEffectHandler, EffectExecutor, EffectLedger,
         ExecutionOutcome, ExecutorRegistry, Postcondition, RemoteObservation,
     },
     firewall::{FirewallPolicy, ToolProposal, TrustedGoal},
 };
+
+static NEXT_PRODUCTION_ROOT: AtomicU64 = AtomicU64::new(0);
 
 struct CounterExecutor {
     calls: Arc<AtomicUsize>,
@@ -155,6 +159,104 @@ fn request(expiry: u64) -> ApprovalRequest {
     .expect("request fixture")
 }
 
+const PRODUCTION_WORKFLOW: &str = r#"
+schema_version = 1
+
+[workflow]
+id = "issue-240-production"
+version = "1"
+entry = "work"
+
+[[nodes]]
+id = "work"
+kind = "agent"
+model = { role = "worker", id = "fake-model", version = "1" }
+tools = [{ id = "increment", version = "1" }]
+
+[[nodes]]
+id = "done"
+kind = "terminal"
+
+[[edges]]
+from = "work"
+to = "done"
+"#;
+
+fn production_root() -> PathBuf {
+    let root = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .expect("HOME is set")
+        .join("tmp")
+        .join(format!(
+            "issue-240-production-{}-{}",
+            std::process::id(),
+            NEXT_PRODUCTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+    fs::create_dir_all(root.join("runs")).expect("production root");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+        .expect("production root must be private");
+    fs::write(root.join("workflow.toml"), PRODUCTION_WORKFLOW).expect("workflow");
+    root
+}
+
+fn remove_production_root(root: &Path) {
+    fn make_writable(path: &Path) {
+        let metadata = fs::symlink_metadata(path).expect("production cleanup metadata");
+        if metadata.file_type().is_dir() {
+            for entry in fs::read_dir(path).expect("production cleanup directory") {
+                make_writable(&entry.expect("production cleanup entry").path());
+            }
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("production directory writable");
+        } else {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .expect("production file writable");
+        }
+    }
+    make_writable(root);
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+fn production_profile(count: u64, approvals: ApprovalLedger) -> ExecutionProfileV1 {
+    let responses = vec![
+        json!({
+            "calls": [{
+                "id": "call-1",
+                "name": "increment",
+                "args": {"count": count}
+            }]
+        }),
+        json!(
+            serde_json::to_string(&json!({
+                "status": "finished",
+                "output": {"done": true}
+            }))
+            .expect("finish response")
+        ),
+    ];
+    ExecutionProfileV1::parse(
+        &serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "model": {
+                "provider": "fake",
+                "name": "fake-model",
+                "version": "1",
+                "model": "fake",
+                "responses": responses
+            },
+            "tools": [{
+                "name": "increment",
+                "input_schema": {"type": "object"},
+                "required_capabilities": ["network"]
+            }],
+            "sandbox": {"capabilities": ["network"]}
+        }))
+        .expect("profile JSON"),
+    )
+    .expect("production profile")
+    .with_approvals(approvals)
+}
+
 #[test]
 fn adk_tool_bridge_runs_durable_effect_and_replays_without_duplicate_executor_call() {
     let root = std::env::var_os("HOME")
@@ -252,4 +354,88 @@ fn adk_tool_bridge_runs_durable_effect_and_replays_without_duplicate_executor_ca
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn execution_backend_runs_host_injected_durable_effect_and_rejects_mismatched_retry() {
+    let root = production_root();
+    let expiry = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64
+        + 60_000;
+    let request = request(expiry);
+    let mut ledger = EffectLedger::open(root.join("effect-ledger.sqlite")).expect("ledger");
+    ledger.propose(&request).expect("proposal");
+    ledger
+        .approve(&request, request.approval_digest(), "operator", 1)
+        .expect("durable approval");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (policy, _, _) = fixture();
+    let mut executors = ExecutorRegistry::new();
+    executors
+        .register(
+            "increment",
+            policy.tools.get("increment").expect("rule").clone(),
+            CounterExecutor {
+                calls: Arc::clone(&calls),
+            },
+        )
+        .expect("executor");
+    let registration = ToolRegistration::for_types::<Value, Value>(
+        "increment",
+        ToolProvenance::new("increment", "1"),
+        ToolFlags::new(false, true, true),
+    )
+    .expect("registration")
+    .with_required_capabilities([SandboxCapability::Network])
+    .with_idempotency(ToolIdempotency::StableKey);
+    let handler = DurableEffectHandler::new(request, ledger, executors, registration)
+        .expect("durable handler binding");
+    let mut implementations = ToolImplementationRegistry::new();
+    implementations
+        .register("increment", "1", Arc::new(handler))
+        .expect("implementation registry");
+
+    let approvals = ApprovalLedger::new().grant(
+        "increment",
+        "call-1",
+        &json!({"count": 1}),
+        "work",
+        Duration::from_secs(60),
+    );
+    let workflow = root.join("workflow.toml");
+    let runs = root.join("runs");
+    ExecutionBackend::run_with_implementations(
+        &workflow,
+        production_profile(1, approvals.clone()),
+        json!({}),
+        &runs,
+        &implementations,
+    )
+    .expect("first production route run");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    ExecutionBackend::run_with_implementations(
+        &workflow,
+        production_profile(1, approvals.clone()),
+        json!({}),
+        &runs,
+        &implementations,
+    )
+    .expect("ledger-backed replay");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let denied = ExecutionBackend::run_with_implementations(
+        &workflow,
+        production_profile(2, approvals),
+        json!({}),
+        &runs,
+        &implementations,
+    )
+    .expect_err("mismatched host approval must deny");
+    assert_eq!(denied.kind(), ExecutionErrorKind::AuthorizationDenied);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    remove_production_root(&root);
 }
