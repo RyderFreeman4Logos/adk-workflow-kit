@@ -22,7 +22,7 @@ use workflow_compiler::{
 use workflow_runtime::{
     ApprovalLedger, ArtifactPage, ArtifactStore, CapabilityIntersection, ChildSandbox, PageRequest,
     RunSandbox, ToolBridge, ToolBridgeError, ToolCall, ToolEnvelope, ToolFailure, ToolHandler,
-    ToolProvenance, ToolRegistration,
+    ToolProvenance, ToolRegistration, effect_ledger::DurableEffectHandler,
 };
 
 struct BridgeState<S> {
@@ -213,6 +213,20 @@ where
             .expect("new tool bridge state is unshared")
             .actor = Some(actor.into());
         Ok(adapter)
+    }
+
+    /// Builds the ADK view for one durable, firewall-bound effect handler.
+    pub fn for_durable_effect(
+        sandbox: RunSandbox,
+        authority: CapabilityIntersection,
+        approvals: Option<ApprovalLedger>,
+        artifacts: S,
+        handler: DurableEffectHandler,
+    ) -> std::result::Result<Self, ToolBridgeError> {
+        let registration = handler.registration().clone();
+        let mut bridge = ToolBridge::new(sandbox);
+        bridge.register(registration, handler)?;
+        Ok(Self::new(bridge, authority, approvals, artifacts))
     }
 
     /// Builds the production ADK script tool over exactly one run sandbox.

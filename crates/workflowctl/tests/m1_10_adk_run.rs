@@ -408,6 +408,7 @@ fn oracle_child_failure_diagnostic_is_bounded_and_content_free() {
 }
 
 const ORACLE_FAILURE_BOUNDARY_SINK_ENV: &str = "WORKFLOWCTL_ORACLE_FAILURE_BOUNDARY_SINK";
+const ORACLE_FAILURE_BOUNDARY_OPERATION_ENV: &str = "WORKFLOWCTL_ORACLE_FAILURE_BOUNDARY_OPERATION";
 const ORACLE_FAILURE_BOUNDARY_FIXTURE_ENV: &str = "WORKFLOWCTL_ORACLE_FAILURE_BOUNDARY_FIXTURE";
 
 #[test]
@@ -421,6 +422,10 @@ fn oracle_failure_boundary_sink_is_bounded_content_free_and_opt_in() {
             "--nocapture",
         ])
         .env(ORACLE_FAILURE_BOUNDARY_SINK_ENV, &sink_path)
+        .env(
+            ORACLE_FAILURE_BOUNDARY_OPERATION_ENV,
+            "boundary-sink-fixture",
+        )
         .env(ORACLE_FAILURE_BOUNDARY_FIXTURE_ENV, "1")
         .env(UNPROVEN_REAP_FIXTURE_ENV, "1")
         .output()
@@ -428,7 +433,21 @@ fn oracle_failure_boundary_sink_is_bounded_content_free_and_opt_in() {
     assert_child_failure(&output, "boundary sink fixture must fail");
     let sink = fs::read(&sink_path).expect("failed boundary sink must be present");
     assert!(sink.len() <= 256);
-    assert_eq!(sink, b"boundary=wait_deadline\n");
+    assert_eq!(
+        sink,
+        b"phase=child_spawned\nphase=wait_deadline\nphase=reap_attempted\n"
+    );
+    assert!(
+        sink.split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .all(|row| matches!(
+                row,
+                b"phase=child_spawned"
+                    | b"phase=wait_deadline"
+                    | b"phase=child_reaped"
+                    | b"phase=reap_attempted"
+            ))
+    );
     assert!(!sink.windows(2).any(|window| window == b"{\""));
     assert!(!sink.windows(1).any(|byte| byte[0] == b'/'));
     let mode = std::os::unix::fs::PermissionsExt::mode(
@@ -458,6 +477,10 @@ fn oracle_failure_boundary_sink_is_bounded_content_free_and_opt_in() {
                 "--nocapture",
             ])
             .env(ORACLE_FAILURE_BOUNDARY_SINK_ENV, path)
+            .env(
+                ORACLE_FAILURE_BOUNDARY_OPERATION_ENV,
+                "boundary-sink-fixture",
+            )
             .env(ORACLE_FAILURE_BOUNDARY_FIXTURE_ENV, "1")
             .env(UNPROVEN_REAP_FIXTURE_ENV, "1")
             .output()
@@ -483,6 +506,7 @@ fn oracle_failure_boundary_sink_is_bounded_content_free_and_opt_in() {
             "--nocapture",
         ])
         .env_remove(ORACLE_FAILURE_BOUNDARY_SINK_ENV)
+        .env_remove(ORACLE_FAILURE_BOUNDARY_OPERATION_ENV)
         .env(ORACLE_FAILURE_BOUNDARY_FIXTURE_ENV, "1")
         .env(UNPROVEN_REAP_FIXTURE_ENV, "1")
         .output()
@@ -623,10 +647,14 @@ struct RequestObservation {
 
 const ORACLE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn record_oracle_failure_boundary() -> Option<std::ffi::OsString> {
+fn record_oracle_failure_boundary(operation: &'static str) -> Option<std::ffi::OsString> {
+    let scoped = std::env::var_os(ORACLE_FAILURE_BOUNDARY_OPERATION_ENV);
+    if scoped.is_some_and(|value| value != operation) {
+        return None;
+    }
     std::env::var_os(ORACLE_FAILURE_BOUNDARY_SINK_ENV)
 }
-fn write_oracle_failure_boundary(path: std::ffi::OsString) {
+fn write_oracle_failure_boundary(path: std::ffi::OsString, phases: &[&'static str]) {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let Ok(mut file) = fs::OpenOptions::new()
         .create_new(true)
@@ -638,7 +666,9 @@ fn write_oracle_failure_boundary(path: std::ffi::OsString) {
         return;
     };
     let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
-    let _ = file.write_all(b"boundary=wait_deadline\n");
+    for phase in phases {
+        let _ = writeln!(file, "phase={phase}");
+    }
     let _ = file.flush();
 }
 
@@ -1256,7 +1286,10 @@ fn recorded_starttime(stat: &OwnedChildStat) -> Option<u64> {
     }
 }
 
-fn clean_up_child(mut child: Child, operation: &'static str) -> Vec<&'static str> {
+fn clean_up_child_with_reap(
+    mut child: Child,
+    operation: &'static str,
+) -> (Vec<&'static str>, bool) {
     let pid = child.id();
     let initial_stat = owned_child_stat(pid);
     let recorded = recorded_starttime(&initial_stat);
@@ -1275,8 +1308,11 @@ fn clean_up_child(mut child: Child, operation: &'static str) -> Vec<&'static str
             Ok(None) => "still-alive".to_string(),
             Err(error) => format_wait_error(&error),
         };
-        if let Some(path) = record_oracle_failure_boundary() {
-            write_oracle_failure_boundary(path);
+        if let Some(path) = record_oracle_failure_boundary(operation) {
+            write_oracle_failure_boundary(
+                path,
+                &["child_spawned", "wait_deadline", "reap_attempted"],
+            );
         }
         abort_unproven_reap(
             operation,
@@ -1293,7 +1329,7 @@ fn clean_up_child(mut child: Child, operation: &'static str) -> Vec<&'static str
         let (wait_kind, wait) = match child.try_wait() {
             Ok(Some(_)) => {
                 diagnostics.push("oracle child reaped after kill");
-                return diagnostics;
+                return (diagnostics, true);
             }
             Ok(None) => (OracleWait::StillAlive, "still-alive".to_string()),
             Err(error) => {
@@ -1316,7 +1352,7 @@ fn clean_up_child(mut child: Child, operation: &'static str) -> Vec<&'static str
         ) {
             OracleReapProgress::Reaped => {
                 diagnostics.push("oracle child reaped after kill");
-                return diagnostics;
+                return (diagnostics, true);
             }
             OracleReapProgress::Wait => {
                 let deadline = if matching_uninterruptible_io(kill_ok, &terminal, recorded) {
@@ -1342,6 +1378,10 @@ fn clean_up_child(mut child: Child, operation: &'static str) -> Vec<&'static str
     }
 }
 
+fn clean_up_child(child: Child, operation: &'static str) -> Vec<&'static str> {
+    clean_up_child_with_reap(child, operation).0
+}
+
 fn wait_bounded_child(
     mut child: Child,
     stdout_path: &Path,
@@ -1356,14 +1396,16 @@ fn wait_bounded_child(
             Ok(None) => {
                 // Record the boundary locally; emit only after containment so
                 // a refused or blocking sink cannot delay cleanup.
-                let boundary = record_oracle_failure_boundary();
-                let diagnostics = diagnostics_after_cleanup(
-                    clean_up_child(child, operation),
-                    stdout_path,
-                    stderr_path,
-                );
+                let boundary = record_oracle_failure_boundary(operation);
+                let (cleanup, reaped) = clean_up_child_with_reap(child, operation);
+                let phases = if reaped {
+                    &["child_spawned", "wait_deadline", "child_reaped"][..]
+                } else {
+                    &["child_spawned", "wait_deadline", "reap_attempted"][..]
+                };
+                let diagnostics = diagnostics_after_cleanup(cleanup, stdout_path, stderr_path);
                 if let Some(path) = boundary {
-                    write_oracle_failure_boundary(path);
+                    write_oracle_failure_boundary(path, phases);
                 }
                 return Err(format!(
                     "oracle child timed out; {}",
