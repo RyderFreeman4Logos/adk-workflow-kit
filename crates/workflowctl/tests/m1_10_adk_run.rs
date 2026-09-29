@@ -408,6 +408,7 @@ fn oracle_child_failure_diagnostic_is_bounded_and_content_free() {
 }
 
 const ORACLE_FAILURE_BOUNDARY_SINK_ENV: &str = "WORKFLOWCTL_ORACLE_FAILURE_BOUNDARY_SINK";
+const ORACLE_FAILURE_BOUNDARY_OPERATION_ENV: &str = "WORKFLOWCTL_ORACLE_FAILURE_BOUNDARY_OPERATION";
 const ORACLE_FAILURE_BOUNDARY_FIXTURE_ENV: &str = "WORKFLOWCTL_ORACLE_FAILURE_BOUNDARY_FIXTURE";
 
 #[test]
@@ -637,7 +638,11 @@ struct RequestObservation {
 
 const ORACLE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn record_oracle_failure_boundary() -> Option<std::ffi::OsString> {
+fn record_oracle_failure_boundary(operation: &'static str) -> Option<std::ffi::OsString> {
+    let scoped = std::env::var_os(ORACLE_FAILURE_BOUNDARY_OPERATION_ENV);
+    if scoped.is_some_and(|value| value != operation) {
+        return None;
+    }
     std::env::var_os(ORACLE_FAILURE_BOUNDARY_SINK_ENV)
 }
 fn write_oracle_failure_boundary(path: std::ffi::OsString, phases: &[&'static str]) {
@@ -1294,7 +1299,7 @@ fn clean_up_child_with_reap(
             Ok(None) => "still-alive".to_string(),
             Err(error) => format_wait_error(&error),
         };
-        if let Some(path) = record_oracle_failure_boundary() {
+        if let Some(path) = record_oracle_failure_boundary(operation) {
             write_oracle_failure_boundary(
                 path,
                 &["child_spawned", "wait_deadline", "reap_attempted"],
@@ -1382,7 +1387,7 @@ fn wait_bounded_child(
             Ok(None) => {
                 // Record the boundary locally; emit only after containment so
                 // a refused or blocking sink cannot delay cleanup.
-                let boundary = record_oracle_failure_boundary();
+                let boundary = record_oracle_failure_boundary(operation);
                 let (cleanup, reaped) = clean_up_child_with_reap(child, operation);
                 let phases = if reaped {
                     &["child_spawned", "wait_deadline", "child_reaped"][..]
