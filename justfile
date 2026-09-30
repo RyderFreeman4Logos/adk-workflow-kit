@@ -156,6 +156,10 @@ runtime-hot-reload:
 issue-311-adk test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_311_model_routes {{test_name}} --locked -- --nocapture --test-threads=1
 
+# Focused #314 ToolCall Debug privacy regression.
+issue-314-runtime test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_314_tool_call_debug {{test_name}} --locked -- --exact --nocapture
+
 # Focused #228 compact typed-output protocol tests.
 issue-228-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_228_typed_outputs {{test_name}} --locked -- --nocapture
