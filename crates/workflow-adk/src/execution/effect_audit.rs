@@ -173,7 +173,9 @@ impl ToolHandler for AuditedHandler {
         if result.is_ok() {
             *binding = self
                 .handler
-                .effect_audit(&fingerprint)?
+                .effect_audit(&fingerprint)
+                .ok()
+                .flatten()
                 .as_ref()
                 .map(CompletedEffect::from_receipt);
         }

@@ -1,5 +1,9 @@
 use super::*;
 use std::process::Command;
+use workflow_runtime::{
+    ChildSandbox, ToolBridgeError, ToolBridgeErrorKind, ToolCallContext, ToolEnvelope, ToolFailure,
+    ToolHandler,
+};
 
 struct TerminalExecutor {
     calls: Arc<AtomicUsize>,
@@ -151,6 +155,150 @@ fn assert_resume(
         *expected
     );
     assert_eq!(calls.load(Ordering::SeqCst), count);
+}
+
+struct AuditErrorHandler {
+    calls: Arc<AtomicUsize>,
+    audit_calls: Arc<AtomicUsize>,
+    envelope: ToolEnvelope<Value>,
+    registration: ToolRegistration,
+}
+
+impl ToolHandler for AuditErrorHandler {
+    fn effect_audit(
+        &self,
+        _: &str,
+    ) -> Result<Option<workflow_runtime::effect_ledger::EffectAuditReceipt>, ToolBridgeError> {
+        self.audit_calls.fetch_add(1, Ordering::SeqCst);
+        Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed))
+    }
+
+    fn required_capabilities(&self, _: &Value) -> Result<Vec<SandboxCapability>, ToolBridgeError> {
+        Ok(vec![SandboxCapability::Network])
+    }
+
+    fn requires_approval(&self, _: &Value) -> Result<bool, ToolBridgeError> {
+        Ok(true)
+    }
+
+    fn execute(
+        &self,
+        _: &ChildSandbox<'_>,
+        _: &ToolCallContext,
+        _: &Value,
+    ) -> Result<ToolEnvelope<Value>, ToolBridgeError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.envelope.clone())
+    }
+
+    fn implementation_identity(&self) -> String {
+        "issue-240-audit-error/v1".into()
+    }
+
+    fn registration(&self) -> Option<ToolRegistration> {
+        Some(self.registration.clone())
+    }
+}
+
+fn assert_no_effect_audits(value: &Value) {
+    match value.get("effect_audits") {
+        None => {}
+        Some(Value::Array(audits)) => assert!(audits.is_empty()),
+        other => panic!("unavailable advisory audits must not be projected: {other:?}"),
+    }
+}
+
+fn assert_completed_envelope(run_root: &Path, expected: &Value) {
+    let ledger = read_json(&run_root.join("loop-ledger.json"));
+    let node = &ledger["nodes"]["work"];
+    assert_eq!(node["pending_calls"], json!([]));
+    let completed = node["completed_calls"].as_array().expect("completed calls");
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0]["call"]["response"], *expected);
+}
+
+fn audit_lookup_error_preserves_envelope(envelope: ToolEnvelope<Value>) {
+    let root = production_root();
+    let expected = serde_json::to_value(&envelope).expect("expected envelope");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let audit_calls = Arc::new(AtomicUsize::new(0));
+    let registration = ToolRegistration::for_types::<Value, Value>(
+        "increment",
+        ToolProvenance::new("increment", "1"),
+        ToolFlags::new(false, true, true),
+    )
+    .expect("registration")
+    .with_required_capabilities([SandboxCapability::Network])
+    .with_idempotency(ToolIdempotency::StableKey);
+    let mut implementations = ToolImplementationRegistry::new();
+    implementations
+        .register(
+            "increment",
+            "1",
+            Arc::new(AuditErrorHandler {
+                calls: Arc::clone(&calls),
+                audit_calls: Arc::clone(&audit_calls),
+                envelope,
+                registration,
+            }),
+        )
+        .expect("implementation");
+
+    let receipt = match ExecutionBackend::run_with_implementations(
+        root.join("workflow.toml"),
+        profile(&root, false),
+        json!({}),
+        root.join("runs"),
+        &implementations,
+    ) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            remove_production_root(&root);
+            panic!("advisory audit error replaced the handler result: {error:?}");
+        }
+    };
+    assert_eq!(receipt.status(), "succeeded");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(audit_calls.load(Ordering::SeqCst) > 0);
+    let receipt_json = serde_json::to_value(&receipt).expect("receipt");
+    assert_no_effect_audits(&receipt_json);
+    assert_completed_envelope(receipt.run_root(), &expected);
+    let manifest = read_json(&receipt.run_root().join("run-manifest.json"));
+    assert_eq!(manifest["status"], "succeeded");
+    assert_no_effect_audits(&manifest);
+
+    let resumed = match ExecutionBackend::resume_with_implementations(
+        root.join("runs"),
+        receipt.run_id(),
+        &implementations,
+    ) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            remove_production_root(&root);
+            panic!("completed resume lost the delivered handler result: {error:?}");
+        }
+    };
+    assert_eq!(resumed.status(), "succeeded");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_completed_envelope(resumed.run_root(), &expected);
+    assert_no_effect_audits(&read_json(&resumed.run_root().join("run-manifest.json")));
+    remove_production_root(&root);
+}
+
+#[test]
+fn audit_lookup_error_preserves_success_envelope_on_production_route() {
+    audit_lookup_error_preserves_envelope(ToolEnvelope::success(
+        json!({"delivered":"success"}),
+        ToolProvenance::new("increment", "1"),
+    ));
+}
+
+#[test]
+fn audit_lookup_error_preserves_failure_envelope_on_production_route() {
+    audit_lookup_error_preserves_envelope(ToolEnvelope::failure(
+        ToolFailure::Unavailable,
+        ToolProvenance::new("increment", "1"),
+    ));
 }
 
 #[test]
