@@ -1,11 +1,11 @@
 //! Advisory effect provenance, scoped to real invocations and checkpoint-bound completions.
 use super::{
-    ExecutionError, ExecutionErrorKind, ExecutionProfileV1, ExecutionReceipt, LoopLedgerStore,
-    RunManifestV2, node_cache_inventory,
+    CompletedCall, ExecutionError, ExecutionErrorKind, ExecutionProfileV1, ExecutionReceipt,
+    LoopLedgerStore, PendingCall, RunManifestV2, node_cache_inventory,
 };
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -13,8 +13,26 @@ use workflow_runtime::effect_ledger::EffectAuditReceipt;
 use workflow_runtime::{ChildSandbox, ToolBridgeError, ToolCallContext, ToolHandler};
 use workflow_runtime::{SandboxCapability, ToolRegistration};
 
+/// Checkpoint-bound advisory identity, never execution authority.
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CompletedEffect {
+    effect_key: String,
+    approval_digest: String,
+    executor_digest: String,
+}
+impl CompletedEffect {
+    fn from_receipt(receipt: &EffectAuditReceipt) -> Self {
+        Self {
+            effect_key: receipt.effect_key.clone(),
+            approval_digest: receipt.approval_digest.clone(),
+            executor_digest: receipt.executor_digest.clone(),
+        }
+    }
+}
+type Invocation = (String, String, String);
 #[derive(Clone, Default)]
-pub(super) struct EffectAudits(Arc<Mutex<BTreeSet<(String, String, String)>>>);
+pub(super) struct EffectAudits(Arc<Mutex<BTreeMap<Invocation, Option<CompletedEffect>>>>);
 
 impl EffectAudits {
     pub(super) fn wrap(
@@ -43,30 +61,81 @@ impl EffectAudits {
             .0
             .lock()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-        for (name, version, fingerprint) in calls.iter() {
+        for (name, version, fingerprint) in calls.keys() {
             // Invalid live bindings cannot produce evidence or replace the execution verdict.
             if let Ok(Some(receipt)) = registry.effect_audit(name, version, fingerprint) {
                 receipts.insert(receipt.effect_key.clone(), receipt);
             }
         }
+        drop(calls);
         // Never consult run-manifest evidence: only checkpoint-bound completed calls
         // may select a live projection on resume. Reports cannot authorize execution.
         if let Some(ledger) = ledger {
-            for (_, _, name, fingerprint, response) in ledger.completed_tool_responses()? {
-                if let Some(key) = response
-                    .pointer("/payload/effect_key")
-                    .and_then(Value::as_str)
-                    && let Some(version) = response
-                        .pointer("/provenance/tool_version")
+            let nodes = ledger
+                .nodes
+                .lock()
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+            for call in nodes
+                .values()
+                .flat_map(|state| &state.completed_calls)
+                .map(CompletedCall::call)
+            {
+                if let Some(binding) = call.effect.as_ref()
+                    && let Some(version) = call
+                        .response
+                        .as_ref()
+                        .and_then(|response| response.pointer("/provenance/tool_version"))
                         .and_then(Value::as_str)
-                    && let Ok(Some(receipt)) = registry.effect_audit(&name, version, &fingerprint)
-                    && receipt.effect_key == key
+                    && let Ok(Some(receipt)) =
+                        registry.effect_audit(&call.name, version, &call.fingerprint)
+                    && CompletedEffect::from_receipt(&receipt) == *binding
                 {
                     receipts.insert(receipt.effect_key.clone(), receipt);
                 }
             }
         }
         Ok(receipts.into_values().collect())
+    }
+
+    // Both ordinary completion and pending replay retain identity from the actual
+    // invocation, not from a response payload or a newly registered handler.
+    pub(super) fn completed(
+        &self,
+        call: &PendingCall,
+        response: Value,
+    ) -> Result<CompletedCall, ExecutionError> {
+        let version = response
+            .pointer("/provenance/tool_version")
+            .and_then(Value::as_str);
+        let calls = self
+            .0
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let effect = version
+            .and_then(|version| {
+                calls.get(&(
+                    call.name.clone(),
+                    version.to_owned(),
+                    call.fingerprint.clone(),
+                ))
+            })
+            .cloned()
+            .flatten();
+        let call = PendingCall {
+            response: Some(response),
+            effect,
+            ..call.clone()
+        };
+        Ok(
+            if matches!(
+                call.name.as_str(),
+                "activate_skill" | "read_skill_resource" | "run_skill_script"
+            ) {
+                CompletedCall::Skill(call)
+            } else {
+                CompletedCall::Ordinary(call)
+            },
+        )
     }
 }
 
@@ -94,17 +163,20 @@ impl ToolHandler for AuditedHandler {
         arguments: &Value,
     ) -> Result<workflow_runtime::ToolEnvelope<Value>, ToolBridgeError> {
         let result = self.handler.execute(sandbox, context, arguments);
-        self.calls
-            .0
-            .lock()
-            .map_err(|_| {
-                ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed)
-            })?
-            .insert((
-                self.name.clone(),
-                self.version.clone(),
-                workflow_runtime::argument_fingerprint(arguments),
-            ));
+        let fingerprint = workflow_runtime::argument_fingerprint(arguments);
+        let mut calls = self.calls.0.lock().map_err(|_| {
+            ToolBridgeError::new(workflow_runtime::ToolBridgeErrorKind::HandlerFailed)
+        })?;
+        let binding = calls
+            .entry((self.name.clone(), self.version.clone(), fingerprint.clone()))
+            .or_default();
+        if result.is_ok() {
+            *binding = self
+                .handler
+                .effect_audit(&fingerprint)?
+                .as_ref()
+                .map(CompletedEffect::from_receipt);
+        }
         result
     }
 }

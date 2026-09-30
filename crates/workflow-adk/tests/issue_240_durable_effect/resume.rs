@@ -9,7 +9,7 @@ use super::{
 use std::{os::unix::process::ExitStatusExt, process::Command, sync::atomic::AtomicBool};
 use workflow_adk::execution::PendingToolApproval;
 
-struct ChildGuard(Option<std::process::Child>);
+pub(super) struct ChildGuard(pub(super) Option<std::process::Child>);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(child) = &mut self.0 {
@@ -19,7 +19,7 @@ impl Drop for ChildGuard {
     }
 }
 
-fn interrupted_child(mut child: ChildGuard) -> std::process::ExitStatus {
+pub(super) fn interrupted_child(mut child: ChildGuard) -> std::process::ExitStatus {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(status) = child

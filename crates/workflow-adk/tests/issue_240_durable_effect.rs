@@ -24,6 +24,8 @@ use workflow_runtime::{
     firewall::{FirewallPolicy, ToolProposal, TrustedGoal},
 };
 
+#[path = "issue_240_durable_effect/completion.rs"]
+mod completion;
 #[path = "issue_240_durable_effect/resume.rs"]
 mod resume;
 

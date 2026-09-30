@@ -143,6 +143,8 @@ struct PendingCall {
     admission_ordinal: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     response: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effect: Option<effect_audit::CompletedEffect>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -183,6 +185,7 @@ struct LoopLedgerStore {
     checkpoint_manifest: CheckpointManifestV1,
     run_id: RunId,
     persist_raw_loop_state: bool,
+    effect_audits: EffectAudits,
     nodes: Mutex<BTreeMap<String, LoopState>>,
     replaying_skill_resource_reads: Mutex<BTreeSet<(String, String)>>,
 }
@@ -203,6 +206,7 @@ impl LoopLedgerStore {
             checkpoint_manifest,
             run_id,
             persist_raw_loop_state,
+            effect_audits: EffectAudits::default(),
             nodes: Mutex::new(BTreeMap::new()),
             replaying_skill_resource_reads: Mutex::new(BTreeSet::new()),
         };
@@ -243,6 +247,7 @@ impl LoopLedgerStore {
             checkpoint_manifest,
             run_id,
             persist_raw_loop_state,
+            effect_audits: EffectAudits::default(),
             nodes: Mutex::new(nodes),
             replaying_skill_resource_reads: Mutex::new(BTreeSet::new()),
         })
@@ -521,20 +526,7 @@ impl LoopLedgerStore {
             .remove(index)
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         state.tool_output_bytes = total;
-        let completed = if matches!(
-            call.name.as_str(),
-            "activate_skill" | "read_skill_resource" | "run_skill_script"
-        ) {
-            CompletedCall::Skill(PendingCall {
-                response: Some(response.clone()),
-                ..call.clone()
-            })
-        } else {
-            CompletedCall::Ordinary(PendingCall {
-                response: Some(response.clone()),
-                ..call.clone()
-            })
-        };
+        let completed = self.effect_audits.completed(&call, response.clone())?;
         state.completed_calls.push(completed);
         if !state
             .conversation
@@ -1190,6 +1182,7 @@ fn valid_loop_state(state: &LoopState) -> bool {
                         model_iteration: model_iterations,
                         admission_ordinal,
                         response: None,
+                        effect: None,
                     });
                 }
                 adk_rust::Part::FunctionCall { .. } => return false,
@@ -1469,6 +1462,7 @@ impl LoopController {
                     model_iteration: next.model_iterations + 1,
                     admission_ordinal: next.total_tool_calls,
                     response: None,
+                    effect: None,
                 });
             }
         }
@@ -1612,17 +1606,11 @@ impl LoopController {
             "run_skill_script" => Some("after-skill-call-completion-run_skill_script"),
             _ => None,
         };
-        let completed = if completion_barrier.is_some() {
-            CompletedCall::Skill(PendingCall {
-                response: Some(response.clone()),
-                ..call.clone()
-            })
-        } else {
-            CompletedCall::Ordinary(PendingCall {
-                response: Some(response.clone()),
-                ..call.clone()
-            })
-        };
+        let completed = self
+            .ledger
+            .effect_audits
+            .completed(&call, response.clone())
+            .map_err(|_| self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable"))?;
         next.completed_calls.push(completed);
         next.conversation
             .push(tool_response_content(&call, response.clone()));
@@ -2788,6 +2776,7 @@ impl ExecutionProfileV1 {
                     model_iteration: 0,
                     admission_ordinal: 0,
                     response: None,
+                    effect: None,
                 })?;
                 Some(json!({"id": id, "name": name, "args": args}))
             })
@@ -4774,7 +4763,10 @@ impl ExecutionBackend {
             run_id.clone(),
             profile.skill_packages()?.is_empty(),
         ) {
-            Ok(ledger) => Some(Arc::new(ledger)),
+            Ok(mut ledger) => {
+                ledger.effect_audits = profile.effect_audits.clone();
+                Some(Arc::new(ledger))
+            }
             Err(_) => {
                 persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
                 None
@@ -5453,7 +5445,7 @@ impl ExecutionBackend {
             terminal: Arc::clone(&terminal_kind),
             last_progress: Arc::clone(&last_progress),
         });
-        let loop_ledger = Arc::new(LoopLedgerStore::open(
+        let mut loop_ledger = LoopLedgerStore::open(
             root.join(LOOP_LEDGER_FILE),
             root.join("checkpoint.sqlite"),
             ledger_identity,
@@ -5461,7 +5453,9 @@ impl ExecutionBackend {
             run_identity.clone(),
             checkpoint_ledger_digest(checkpoint.state())?.as_str(),
             profile.skill_packages()?.is_empty(),
-        )?);
+        )?;
+        loop_ledger.effect_audits = profile.effect_audits.clone();
+        let loop_ledger = Arc::new(loop_ledger);
         let tool_registry = build_tool_registry(
             &profile,
             &resolved_plan,
