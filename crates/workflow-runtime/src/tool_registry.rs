@@ -96,6 +96,16 @@ impl ToolImplementationRegistry {
             .ok_or(ToolImplementationRegistryError::NotFound)
     }
 
+    /// Projects only the selected call, without enumerating unrelated effects.
+    pub fn effect_audit(
+        &self,
+        id: &str,
+        version: &str,
+        fingerprint: &str,
+    ) -> Result<Option<crate::effect_ledger::EffectAuditReceipt>, ToolBridgeError> {
+        self.resolve(id, version)?.effect_audit(fingerprint)
+    }
+
     /// Returns a deterministic identity over registered implementations and config.
     pub fn identity(&self) -> String {
         let mut hasher = Sha256::new();

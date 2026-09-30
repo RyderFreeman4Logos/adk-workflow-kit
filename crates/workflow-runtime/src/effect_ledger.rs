@@ -120,6 +120,20 @@ pub enum EffectState {
     Indeterminate,
 }
 
+/// Versioned, privacy-safe evidence only. Deserialization confers no authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectAuditReceipt {
+    pub schema_version: u16,
+    pub effect_key: String,
+    pub approval_digest: String,
+    pub target_digest: String,
+    pub policy_digest: String,
+    pub workflow_lock: String,
+    pub executor_digest: String,
+    pub history: Vec<EffectState>,
+}
+
 /// Privacy-safe failures, with no proposal payload or database path in diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LedgerError {
@@ -366,6 +380,40 @@ impl DurableEffectHandler {
 }
 
 impl ToolHandler for DurableEffectHandler {
+    fn effect_audit(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<EffectAuditReceipt>, ToolBridgeError> {
+        let arguments = serde_json::to_value(&self.request.proposal.arguments)
+            .map_err(|_| Self::bridge_error(LedgerError::InvalidInput))?;
+        if fingerprint != argument_fingerprint(&arguments) {
+            return Ok(None);
+        }
+        let ledger = self
+            .ledger
+            .lock()
+            .map_err(|_| Self::bridge_error(LedgerError::Storage))?;
+        let history = match ledger.history(&self.request) {
+            Ok(history) => history,
+            Err(LedgerError::Missing) => return Ok(None),
+            Err(error) => return Err(Self::bridge_error(error)),
+        };
+        Ok(Some(EffectAuditReceipt {
+            schema_version: 1,
+            effect_key: self.request.effect_key.clone(),
+            approval_digest: self.request.approval_digest.clone(),
+            target_digest: argument_fingerprint(&json!({
+                "domain": "effect-target-v1", "intent": self.request.proposal.intent
+            })),
+            policy_digest: self.request.rule_digest.clone(),
+            workflow_lock: self.request.context.workflow_lock.clone(),
+            executor_digest: argument_fingerprint(&json!(
+                self.registration.implementation_digest()
+            )),
+            history,
+        }))
+    }
+
     fn implementation_identity(&self) -> String {
         format!(
             "durable-effect:{}",

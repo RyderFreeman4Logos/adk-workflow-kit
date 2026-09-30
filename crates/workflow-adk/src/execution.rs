@@ -1,7 +1,10 @@
 //! Profile-driven execution, explicit host-authorized simulation, and run-state persistence.
 
 mod behavioral;
+mod effect_audit;
 pub use behavioral::BehavioralExecutionReceipt;
+use effect_audit::EffectAudits;
+use workflow_runtime::effect_ledger::EffectAuditReceipt;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -2343,6 +2346,8 @@ pub struct ExecutionProfileV1 {
     tools: Vec<ToolWire>,
     #[serde(skip)]
     tool_implementations: Option<Arc<ToolImplementationRegistry>>,
+    #[serde(skip)]
+    effect_audits: EffectAudits,
     /// Host-granted call approvals are runtime-only and never restored from a checkpoint.
     #[serde(skip)]
     approvals: Option<ApprovalLedger>,
@@ -4296,24 +4301,8 @@ pub struct ExecutionReceipt {
     event_counts: CacheEventCounts,
     #[serde(default)]
     node_cache: NodeCacheInventory,
-}
-
-impl ExecutionReceipt {
-    pub fn run_id(&self) -> &str {
-        &self.run_id
-    }
-    pub fn status(&self) -> &str {
-        &self.status
-    }
-    pub fn run_root(&self) -> &Path {
-        &self.run_root
-    }
-    pub fn plan_hash(&self) -> &str {
-        &self.plan_hash
-    }
-    pub fn resume_identity(&self) -> &str {
-        &self.resume_identity
-    }
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    effect_audits: Vec<EffectAuditReceipt>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4332,6 +4321,8 @@ struct RunManifestV2 {
     plan_hash: String,
     resume_identity: String,
     checkpoint_manifest: Option<CheckpointManifestV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    effect_audits: Vec<EffectAuditReceipt>,
     #[serde(default)]
     cache_dispositions: BTreeMap<String, String>,
     #[serde(default)]
@@ -4351,25 +4342,6 @@ struct CacheEventCounts {
 struct NodeCacheInventory {
     entry_count: u64,
     negative_entries: u64,
-}
-
-impl RunManifestV2 {
-    fn receipt(&self, run_root: PathBuf) -> ExecutionReceipt {
-        let node_cache = node_cache_inventory(run_root.parent().unwrap_or(&run_root));
-        ExecutionReceipt {
-            run_id: self.run_id.clone(),
-            workflow_id: self.workflow_id.clone(),
-            status: self.status.clone(),
-            artifact_id: self.artifact_id.clone(),
-            run_root,
-            resume_count: self.resume_count,
-            plan_hash: self.plan_hash.clone(),
-            resume_identity: self.resume_identity.clone(),
-            cache_dispositions: self.cache_dispositions.clone(),
-            event_counts: self.event_counts.clone(),
-            node_cache,
-        }
-    }
 }
 
 /// Stable execution failure categories used by the CLI facade.
@@ -4703,6 +4675,7 @@ impl ExecutionBackend {
         };
         skill_snapshot_test_barrier();
         profile.bind_declared_implementations(workflow.as_ref())?;
+        profile.effect_audits = EffectAudits::default();
         let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
         let requested = RequestedCapabilities::new(required_capabilities.iter().copied());
         verify_sandbox_capabilities(
@@ -4882,6 +4855,7 @@ impl ExecutionBackend {
                     checkpoint_manifest: Some(checkpoint_manifest.clone()),
                     cache_dispositions: BTreeMap::new(),
                     event_counts: CacheEventCounts::default(),
+                    effect_audits: Vec::new(),
                 };
                 if write_json(&run_root.join("run-manifest.json"), &provisional).is_err() {
                     persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
@@ -5242,6 +5216,9 @@ impl ExecutionBackend {
             plan_hash: resolved_plan.plan_hash().to_owned(),
             resume_identity: resolved_plan.resume_identity().to_owned(),
             checkpoint_manifest: Some(checkpoint_manifest),
+            effect_audits: profile
+                .effect_audits
+                .collect(&profile, loop_ledger.as_deref())?,
             cache_dispositions,
             event_counts,
         };
@@ -5528,6 +5505,9 @@ impl ExecutionBackend {
                 )
             })
         {
+            manifest.effect_audits = profile
+                .effect_audits
+                .collect(&profile, Some(&loop_ledger))?;
             // Missing fresh authority leaves the checkpoint resumable, not terminal.
             if error.kind() == ExecutionErrorKind::AuthorizationDenied {
                 return Err(error.with_receipt(manifest.receipt(root)));
@@ -5541,6 +5521,9 @@ impl ExecutionBackend {
                 error,
             ));
         }
+        manifest.effect_audits = profile
+            .effect_audits
+            .collect(&profile, Some(&loop_ledger))?;
         restore_tool_events(&loop_ledger, &tool_event_counts, &mut mapper)?;
 
         let mut retry_models = Vec::new();
@@ -5649,6 +5632,9 @@ impl ExecutionBackend {
             Ok(state) => state,
             Err(error) => {
                 let _ = record_binding_retries(&mut mapper, retry_models.clone(), run_id, next);
+                manifest.effect_audits = profile
+                    .effect_audits
+                    .collect(&profile, Some(&loop_ledger))?;
                 return Err(resume_failure(
                     &root,
                     &events_path,
@@ -5714,6 +5700,9 @@ impl ExecutionBackend {
         crash_barrier("after-checkpoint");
         crash_barrier("after-result");
         let (cache_dispositions, event_counts) = cache_provenance(mapper.events());
+        manifest.effect_audits = profile
+            .effect_audits
+            .collect(&profile, Some(&loop_ledger))?;
         manifest.status = "succeeded".to_owned();
         manifest.artifact_id = artifact_id;
         manifest.resume_count = next;
@@ -6158,7 +6147,10 @@ fn build_tool_registry(
             .and_then(|registry| registry.resolve(&tool.name, "1").ok())
         {
             bridge
-                .register_shared(registration, handler)
+                .register_shared(
+                    registration.clone(),
+                    profile.effect_audits.wrap(handler, &registration),
+                )
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
             continue;
         }
