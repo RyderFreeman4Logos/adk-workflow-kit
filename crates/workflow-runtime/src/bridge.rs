@@ -75,7 +75,7 @@ impl ToolCall {
 }
 
 /// Read-only context passed to a registered handler.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ToolCallContext {
     call_id: String,
     actor: String,
@@ -83,6 +83,21 @@ pub struct ToolCallContext {
     idempotency_key: String,
     implementation_digest: String,
     deadline: Duration,
+}
+
+impl fmt::Debug for ToolCallContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Keep invocation identifiers and implementation metadata out of diagnostics.
+        formatter
+            .debug_struct("ToolCallContext")
+            .field("call_id", &"<redacted>")
+            .field("actor", &"<redacted>")
+            .field("argument_fingerprint", &"<redacted>")
+            .field("idempotency_key", &"<redacted>")
+            .field("implementation_digest", &"<redacted>")
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ToolCallContext {
