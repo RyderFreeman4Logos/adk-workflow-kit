@@ -129,6 +129,14 @@ impl ToolCallContext {
 
 /// A registered workflow-kit handler.
 pub trait ToolHandler: Send + Sync {
+    /// Advisory projection for an exact call; never grants or restores authority.
+    fn effect_audit(
+        &self,
+        _argument_fingerprint: &str,
+    ) -> Result<Option<crate::effect_ledger::EffectAuditReceipt>, ToolBridgeError> {
+        Ok(None)
+    }
+
     /// Returns the validated call-specific capabilities needed by this handler.
     fn required_capabilities(
         &self,
@@ -187,6 +195,13 @@ where
 }
 
 impl ToolHandler for Arc<dyn ToolHandler> {
+    fn effect_audit(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<crate::effect_ledger::EffectAuditReceipt>, ToolBridgeError> {
+        (**self).effect_audit(fingerprint)
+    }
+
     fn required_capabilities(
         &self,
         arguments: &Value,

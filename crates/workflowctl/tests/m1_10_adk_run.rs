@@ -18,6 +18,8 @@ use workflow_runtime::{
     SqliteCheckpointStore, WorkflowRuntimeEventV1,
 };
 
+#[path = "support/oracle_reap_witness.rs"]
+mod oracle_reap_witness;
 #[path = "support/owned_tree.rs"]
 mod owned_tree;
 
@@ -1290,6 +1292,7 @@ fn clean_up_child_with_reap(
     mut child: Child,
     operation: &'static str,
 ) -> (Vec<&'static str>, bool) {
+    let mut witness = oracle_reap_witness::Witness::new(Instant::now());
     let pid = child.id();
     let initial_stat = owned_child_stat(pid);
     let recorded = recorded_starttime(&initial_stat);
@@ -1303,10 +1306,10 @@ fn clean_up_child_with_reap(
         }
     };
     if std::env::var_os(UNPROVEN_REAP_FIXTURE_ENV).is_some() {
-        let wait = match child.try_wait() {
-            Ok(Some(status)) => format_wait_status(status),
-            Ok(None) => "still-alive".to_string(),
-            Err(error) => format_wait_error(&error),
+        let (wait_kind, wait) = match child.try_wait() {
+            Ok(Some(status)) => (OracleWait::Reaped, format_wait_status(status)),
+            Ok(None) => (OracleWait::StillAlive, "still-alive".to_string()),
+            Err(error) => (OracleWait::Error, format_wait_error(&error)),
         };
         if let Some(path) = record_oracle_failure_boundary(operation) {
             write_oracle_failure_boundary(
@@ -1314,6 +1317,15 @@ fn clean_up_child_with_reap(
                 &["child_spawned", "wait_deadline", "reap_attempted"],
             );
         }
+        witness.record(
+            Instant::now(),
+            wait_kind,
+            &owned_child_stat(pid),
+            recorded,
+            oracle_reap_witness::Deadline::ForcedFixture,
+            true,
+        );
+        witness.emit(&mut std::io::stderr().lock());
         abort_unproven_reap(
             operation,
             pid,
@@ -1341,6 +1353,21 @@ fn clean_up_child_with_reap(
         };
         let now = Instant::now();
         let terminal = owned_child_stat(pid);
+        witness.record(
+            now,
+            wait_kind,
+            &terminal,
+            recorded,
+            oracle_reap_witness::selected_deadline(
+                kill_ok,
+                wait_kind,
+                &terminal,
+                recorded,
+                now,
+                d_state_deadline,
+            ),
+            false,
+        );
         match oracle_reap_progress(
             kill_ok,
             wait_kind,
@@ -1366,14 +1393,17 @@ fn clean_up_child_with_reap(
                         .min(Duration::from_millis(10)),
                 );
             }
-            OracleReapProgress::AbortUnproven => abort_unproven_reap(
-                operation,
-                pid,
-                &starttime,
-                &kill,
-                &wait,
-                &format_terminal(pid),
-            ),
+            OracleReapProgress::AbortUnproven => {
+                witness.emit(&mut std::io::stderr().lock());
+                abort_unproven_reap(
+                    operation,
+                    pid,
+                    &starttime,
+                    &kill,
+                    &wait,
+                    &format_terminal(pid),
+                )
+            }
         }
     }
 }
@@ -2533,6 +2563,11 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
         "terminal must be esrch, state+starttime, errno, or unavailable"
     );
     assert!(sentinel_survived, "abort must not unwind root cleanup");
+    oracle_reap_witness::assert_abort_witness(stderr);
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&output.status),
+        Some(libc::SIGABRT)
+    );
 }
 
 #[test]

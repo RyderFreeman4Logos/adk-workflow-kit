@@ -9,7 +9,7 @@ use super::{
 use std::{os::unix::process::ExitStatusExt, process::Command, sync::atomic::AtomicBool};
 use workflow_adk::execution::PendingToolApproval;
 
-struct ChildGuard(Option<std::process::Child>);
+pub(super) struct ChildGuard(pub(super) Option<std::process::Child>);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(child) = &mut self.0 {
@@ -19,7 +19,7 @@ impl Drop for ChildGuard {
     }
 }
 
-fn interrupted_child(mut child: ChildGuard) -> std::process::ExitStatus {
+pub(super) fn interrupted_child(mut child: ChildGuard) -> std::process::ExitStatus {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(status) = child
@@ -219,10 +219,22 @@ fn fresh_approval_resume_preserves_pending_authority_and_deduplicates() {
         .map(|e| e.path())
         .find(|p| p.join("run-manifest.json").is_file())
         .expect("interrupted run");
-    let manifest: Value =
+    let mut manifest: Value =
         serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).expect("manifest"))
             .expect("manifest JSON");
-    let run_id = manifest["run_id"].as_str().expect("run ID");
+    let run_id_owned = manifest["run_id"].as_str().expect("run ID").to_owned();
+    let run_id = run_id_owned.as_str();
+    manifest["effect_audits"] = json!([{
+        "schema_version":1,"effect_key":"0".repeat(64),"approval_digest":"0".repeat(64),
+        "target_digest":"0".repeat(64),"policy_digest":"0".repeat(64),
+        "workflow_lock":"b".repeat(64),"executor_digest":"0".repeat(64),
+        "history":["proposed","approved","started","committed","verified"]
+    }]);
+    fs::write(
+        run_root.join("run-manifest.json"),
+        serde_json::to_vec(&manifest).expect("tampered JSON"),
+    )
+    .expect("tampered report");
     let persisted_profile = fs::read(run_root.join("execution-profile.json")).expect("profile");
     let profile_json: Value = serde_json::from_slice(&persisted_profile).expect("profile JSON");
     assert!(profile_json.get("approvals").is_none());
@@ -271,6 +283,13 @@ fn fresh_approval_resume_preserves_pending_authority_and_deduplicates() {
         .expect_err("no restored authority");
     assert_eq!(denied.kind(), ExecutionErrorKind::AuthorizationDenied);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        serde_json::to_value(denied.receipt().expect("denial receipt"))
+            .expect("receipt JSON")
+            .get("effect_audits")
+            .is_none(),
+        "tampered reports are not live provenance or authority"
+    );
     assert_eq!(
         ExecutionBackend::inspect(&runs, run_id)
             .expect("inspect")
@@ -359,6 +378,16 @@ fn fresh_approval_resume_preserves_pending_authority_and_deduplicates() {
     )
     .expect("fresh exact grant must resume");
     assert_eq!(resumed.status(), "succeeded");
+    let audit = serde_json::to_value(&resumed).expect("receipt JSON")["effect_audits"].clone();
+    assert_eq!(
+        audit[0]["history"],
+        json!(["proposed", "approved", "started", "committed", "verified"])
+    );
+    assert_ne!(audit[0]["effect_key"], json!("0".repeat(64)));
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(run_root.join("run-manifest.json")).expect("manifest"))
+            .expect("manifest JSON");
+    assert_eq!(manifest["effect_audits"], audit);
     assert!(
         ExecutionBackend::inspect_pending_tools(&runs, run_id)
             .expect("completed inspection")

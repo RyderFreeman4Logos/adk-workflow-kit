@@ -1,7 +1,10 @@
 //! Profile-driven execution, explicit host-authorized simulation, and run-state persistence.
 
 mod behavioral;
+mod effect_audit;
 pub use behavioral::BehavioralExecutionReceipt;
+use effect_audit::EffectAudits;
+use workflow_runtime::effect_ledger::EffectAuditReceipt;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -140,6 +143,8 @@ struct PendingCall {
     admission_ordinal: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     response: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effect: Option<effect_audit::CompletedEffect>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -180,6 +185,7 @@ struct LoopLedgerStore {
     checkpoint_manifest: CheckpointManifestV1,
     run_id: RunId,
     persist_raw_loop_state: bool,
+    effect_audits: EffectAudits,
     nodes: Mutex<BTreeMap<String, LoopState>>,
     replaying_skill_resource_reads: Mutex<BTreeSet<(String, String)>>,
 }
@@ -200,6 +206,7 @@ impl LoopLedgerStore {
             checkpoint_manifest,
             run_id,
             persist_raw_loop_state,
+            effect_audits: EffectAudits::default(),
             nodes: Mutex::new(BTreeMap::new()),
             replaying_skill_resource_reads: Mutex::new(BTreeSet::new()),
         };
@@ -240,6 +247,7 @@ impl LoopLedgerStore {
             checkpoint_manifest,
             run_id,
             persist_raw_loop_state,
+            effect_audits: EffectAudits::default(),
             nodes: Mutex::new(nodes),
             replaying_skill_resource_reads: Mutex::new(BTreeSet::new()),
         })
@@ -518,20 +526,7 @@ impl LoopLedgerStore {
             .remove(index)
             .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         state.tool_output_bytes = total;
-        let completed = if matches!(
-            call.name.as_str(),
-            "activate_skill" | "read_skill_resource" | "run_skill_script"
-        ) {
-            CompletedCall::Skill(PendingCall {
-                response: Some(response.clone()),
-                ..call.clone()
-            })
-        } else {
-            CompletedCall::Ordinary(PendingCall {
-                response: Some(response.clone()),
-                ..call.clone()
-            })
-        };
+        let completed = self.effect_audits.completed(&call, response.clone())?;
         state.completed_calls.push(completed);
         if !state
             .conversation
@@ -1187,6 +1182,7 @@ fn valid_loop_state(state: &LoopState) -> bool {
                         model_iteration: model_iterations,
                         admission_ordinal,
                         response: None,
+                        effect: None,
                     });
                 }
                 adk_rust::Part::FunctionCall { .. } => return false,
@@ -1466,6 +1462,7 @@ impl LoopController {
                     model_iteration: next.model_iterations + 1,
                     admission_ordinal: next.total_tool_calls,
                     response: None,
+                    effect: None,
                 });
             }
         }
@@ -1609,17 +1606,11 @@ impl LoopController {
             "run_skill_script" => Some("after-skill-call-completion-run_skill_script"),
             _ => None,
         };
-        let completed = if completion_barrier.is_some() {
-            CompletedCall::Skill(PendingCall {
-                response: Some(response.clone()),
-                ..call.clone()
-            })
-        } else {
-            CompletedCall::Ordinary(PendingCall {
-                response: Some(response.clone()),
-                ..call.clone()
-            })
-        };
+        let completed = self
+            .ledger
+            .effect_audits
+            .completed(&call, response.clone())
+            .map_err(|_| self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable"))?;
         next.completed_calls.push(completed);
         next.conversation
             .push(tool_response_content(&call, response.clone()));
@@ -2343,6 +2334,8 @@ pub struct ExecutionProfileV1 {
     tools: Vec<ToolWire>,
     #[serde(skip)]
     tool_implementations: Option<Arc<ToolImplementationRegistry>>,
+    #[serde(skip)]
+    effect_audits: EffectAudits,
     /// Host-granted call approvals are runtime-only and never restored from a checkpoint.
     #[serde(skip)]
     approvals: Option<ApprovalLedger>,
@@ -2783,6 +2776,7 @@ impl ExecutionProfileV1 {
                     model_iteration: 0,
                     admission_ordinal: 0,
                     response: None,
+                    effect: None,
                 })?;
                 Some(json!({"id": id, "name": name, "args": args}))
             })
@@ -4296,24 +4290,8 @@ pub struct ExecutionReceipt {
     event_counts: CacheEventCounts,
     #[serde(default)]
     node_cache: NodeCacheInventory,
-}
-
-impl ExecutionReceipt {
-    pub fn run_id(&self) -> &str {
-        &self.run_id
-    }
-    pub fn status(&self) -> &str {
-        &self.status
-    }
-    pub fn run_root(&self) -> &Path {
-        &self.run_root
-    }
-    pub fn plan_hash(&self) -> &str {
-        &self.plan_hash
-    }
-    pub fn resume_identity(&self) -> &str {
-        &self.resume_identity
-    }
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    effect_audits: Vec<EffectAuditReceipt>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4332,6 +4310,8 @@ struct RunManifestV2 {
     plan_hash: String,
     resume_identity: String,
     checkpoint_manifest: Option<CheckpointManifestV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    effect_audits: Vec<EffectAuditReceipt>,
     #[serde(default)]
     cache_dispositions: BTreeMap<String, String>,
     #[serde(default)]
@@ -4351,25 +4331,6 @@ struct CacheEventCounts {
 struct NodeCacheInventory {
     entry_count: u64,
     negative_entries: u64,
-}
-
-impl RunManifestV2 {
-    fn receipt(&self, run_root: PathBuf) -> ExecutionReceipt {
-        let node_cache = node_cache_inventory(run_root.parent().unwrap_or(&run_root));
-        ExecutionReceipt {
-            run_id: self.run_id.clone(),
-            workflow_id: self.workflow_id.clone(),
-            status: self.status.clone(),
-            artifact_id: self.artifact_id.clone(),
-            run_root,
-            resume_count: self.resume_count,
-            plan_hash: self.plan_hash.clone(),
-            resume_identity: self.resume_identity.clone(),
-            cache_dispositions: self.cache_dispositions.clone(),
-            event_counts: self.event_counts.clone(),
-            node_cache,
-        }
-    }
 }
 
 /// Stable execution failure categories used by the CLI facade.
@@ -4703,6 +4664,7 @@ impl ExecutionBackend {
         };
         skill_snapshot_test_barrier();
         profile.bind_declared_implementations(workflow.as_ref())?;
+        profile.effect_audits = EffectAudits::default();
         let (sandbox_capabilities, required_capabilities) = profile.capabilities()?;
         let requested = RequestedCapabilities::new(required_capabilities.iter().copied());
         verify_sandbox_capabilities(
@@ -4801,7 +4763,10 @@ impl ExecutionBackend {
             run_id.clone(),
             profile.skill_packages()?.is_empty(),
         ) {
-            Ok(ledger) => Some(Arc::new(ledger)),
+            Ok(mut ledger) => {
+                ledger.effect_audits = profile.effect_audits.clone();
+                Some(Arc::new(ledger))
+            }
             Err(_) => {
                 persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
                 None
@@ -4882,6 +4847,7 @@ impl ExecutionBackend {
                     checkpoint_manifest: Some(checkpoint_manifest.clone()),
                     cache_dispositions: BTreeMap::new(),
                     event_counts: CacheEventCounts::default(),
+                    effect_audits: Vec::new(),
                 };
                 if write_json(&run_root.join("run-manifest.json"), &provisional).is_err() {
                     persistence_error = Some(ExecutionError::new(ExecutionErrorKind::Persistence));
@@ -5242,6 +5208,9 @@ impl ExecutionBackend {
             plan_hash: resolved_plan.plan_hash().to_owned(),
             resume_identity: resolved_plan.resume_identity().to_owned(),
             checkpoint_manifest: Some(checkpoint_manifest),
+            effect_audits: profile
+                .effect_audits
+                .collect(&profile, loop_ledger.as_deref())?,
             cache_dispositions,
             event_counts,
         };
@@ -5476,7 +5445,7 @@ impl ExecutionBackend {
             terminal: Arc::clone(&terminal_kind),
             last_progress: Arc::clone(&last_progress),
         });
-        let loop_ledger = Arc::new(LoopLedgerStore::open(
+        let mut loop_ledger = LoopLedgerStore::open(
             root.join(LOOP_LEDGER_FILE),
             root.join("checkpoint.sqlite"),
             ledger_identity,
@@ -5484,7 +5453,9 @@ impl ExecutionBackend {
             run_identity.clone(),
             checkpoint_ledger_digest(checkpoint.state())?.as_str(),
             profile.skill_packages()?.is_empty(),
-        )?);
+        )?;
+        loop_ledger.effect_audits = profile.effect_audits.clone();
+        let loop_ledger = Arc::new(loop_ledger);
         let tool_registry = build_tool_registry(
             &profile,
             &resolved_plan,
@@ -5528,6 +5499,9 @@ impl ExecutionBackend {
                 )
             })
         {
+            manifest.effect_audits = profile
+                .effect_audits
+                .collect(&profile, Some(&loop_ledger))?;
             // Missing fresh authority leaves the checkpoint resumable, not terminal.
             if error.kind() == ExecutionErrorKind::AuthorizationDenied {
                 return Err(error.with_receipt(manifest.receipt(root)));
@@ -5541,6 +5515,9 @@ impl ExecutionBackend {
                 error,
             ));
         }
+        manifest.effect_audits = profile
+            .effect_audits
+            .collect(&profile, Some(&loop_ledger))?;
         restore_tool_events(&loop_ledger, &tool_event_counts, &mut mapper)?;
 
         let mut retry_models = Vec::new();
@@ -5649,6 +5626,9 @@ impl ExecutionBackend {
             Ok(state) => state,
             Err(error) => {
                 let _ = record_binding_retries(&mut mapper, retry_models.clone(), run_id, next);
+                manifest.effect_audits = profile
+                    .effect_audits
+                    .collect(&profile, Some(&loop_ledger))?;
                 return Err(resume_failure(
                     &root,
                     &events_path,
@@ -5714,6 +5694,9 @@ impl ExecutionBackend {
         crash_barrier("after-checkpoint");
         crash_barrier("after-result");
         let (cache_dispositions, event_counts) = cache_provenance(mapper.events());
+        manifest.effect_audits = profile
+            .effect_audits
+            .collect(&profile, Some(&loop_ledger))?;
         manifest.status = "succeeded".to_owned();
         manifest.artifact_id = artifact_id;
         manifest.resume_count = next;
@@ -6158,7 +6141,10 @@ fn build_tool_registry(
             .and_then(|registry| registry.resolve(&tool.name, "1").ok())
         {
             bridge
-                .register_shared(registration, handler)
+                .register_shared(
+                    registration.clone(),
+                    profile.effect_audits.wrap(handler, &registration),
+                )
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))?;
             continue;
         }

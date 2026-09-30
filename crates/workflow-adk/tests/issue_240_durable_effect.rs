@@ -24,6 +24,8 @@ use workflow_runtime::{
     firewall::{FirewallPolicy, ToolProposal, TrustedGoal},
 };
 
+#[path = "issue_240_durable_effect/completion.rs"]
+mod completion;
 #[path = "issue_240_durable_effect/resume.rs"]
 mod resume;
 
@@ -636,7 +638,7 @@ fn execution_backend_runs_host_injected_durable_effect_and_rejects_mismatched_re
     );
     let workflow = root.join("workflow.toml");
     let runs = root.join("runs");
-    ExecutionBackend::run_with_implementations(
+    let receipt = ExecutionBackend::run_with_implementations(
         &workflow,
         production_profile(1, approvals.clone()),
         json!({}),
@@ -645,6 +647,36 @@ fn execution_backend_runs_host_injected_durable_effect_and_rejects_mismatched_re
     )
     .expect("first production route run");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let report = serde_json::to_value(&receipt).expect("receipt JSON");
+    assert_eq!(
+        report["effect_audits"][0]["history"],
+        json!(["proposed", "approved", "started", "committed", "verified"])
+    );
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("run-manifest.json")).expect("manifest"),
+    )
+    .expect("manifest JSON");
+    assert!(manifest["checkpoint_manifest"].is_object());
+    assert_eq!(manifest["effect_audits"], report["effect_audits"]);
+    let inspected = ExecutionBackend::inspect(&runs, receipt.run_id()).expect("inspect");
+    assert_eq!(
+        serde_json::to_value(inspected).expect("inspect JSON")["effect_audits"],
+        report["effect_audits"]
+    );
+    let audit = serde_json::to_string(&report["effect_audits"]).expect("audit JSON");
+    for private in [
+        "operator",
+        "counter",
+        "local",
+        "fake",
+        "count",
+        "increment-once",
+    ] {
+        assert!(
+            !audit.contains(private),
+            "private audit material: {private}"
+        );
+    }
 
     ExecutionBackend::run_with_implementations(
         &workflow,
@@ -665,6 +697,78 @@ fn execution_backend_runs_host_injected_durable_effect_and_rejects_mismatched_re
     )
     .expect_err("mismatched host approval must deny");
     assert_eq!(denied.kind(), ExecutionErrorKind::AuthorizationDenied);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        serde_json::to_value(denied.receipt().expect("denial receipt"))
+            .expect("receipt JSON")
+            .get("effect_audits")
+            .is_none(),
+        "a denied call cannot report a stale verified effect"
+    );
+    let mut tampered = manifest;
+    tampered["effect_audits"][0]["history"] = json!(["failed"]);
+    tampered["effect_audits"][0]["approval_digest"] = json!("0".repeat(64));
+    fs::write(
+        receipt.run_root().join("run-manifest.json"),
+        serde_json::to_vec(&tampered).expect("tampered JSON"),
+    )
+    .expect("tampered report");
+    let resumed =
+        ExecutionBackend::resume_with_implementations(&runs, receipt.run_id(), &implementations)
+            .expect("live projection on completed resume");
+    assert_eq!(
+        serde_json::to_value(&resumed).expect("receipt JSON")["effect_audits"],
+        report["effect_audits"]
+    );
+    let refreshed: Value = serde_json::from_slice(
+        &fs::read(receipt.run_root().join("run-manifest.json")).expect("manifest"),
+    )
+    .expect("manifest JSON");
+    assert_eq!(refreshed["effect_audits"], report["effect_audits"]);
+    let roundtrip: workflow_adk::execution::ExecutionReceipt =
+        serde_json::from_value(report.clone()).expect("roundtrip");
+    assert_eq!(roundtrip, receipt);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(report["effect_audits"][0]["schema_version"], json!(1));
+    for field in [
+        "effect_key",
+        "approval_digest",
+        "target_digest",
+        "policy_digest",
+        "workflow_lock",
+        "executor_digest",
+    ] {
+        let digest = report["effect_audits"][0][field].as_str().expect("digest");
+        assert_eq!(digest.len(), 64);
+        assert!(
+            digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+    }
+    let mut idle_profile =
+        serde_json::to_value(production_profile(1, ApprovalLedger::new())).expect("profile JSON");
+    idle_profile["model"]["responses"] =
+        json!([
+            serde_json::to_string(&json!({"status":"finished", "output":{"done":true}}))
+                .expect("finish JSON")
+        ]);
+    let idle = ExecutionBackend::run_with_implementations(
+        &workflow,
+        ExecutionProfileV1::parse(&serde_json::to_vec(&idle_profile).expect("profile bytes"))
+            .expect("idle profile"),
+        json!({}),
+        &runs,
+        &implementations,
+    )
+    .expect("registered but unexecuted effect");
+    assert!(
+        serde_json::to_value(idle)
+            .expect("idle receipt")
+            .get("effect_audits")
+            .is_none(),
+        "registration alone is not effect execution"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     remove_production_root(&root);
 }
