@@ -6637,6 +6637,7 @@ impl ToolHandler for StaticToolHandler {
     }
 }
 
+#[cfg(debug_assertions)]
 fn crash_barrier(name: &str) {
     let configured = std::env::var("WORKFLOW_KIT_TEST_CRASH_BARRIER").ok();
     let (configured, hit) = configured
@@ -6658,6 +6659,10 @@ fn crash_barrier(name: &str) {
         }
     }
 }
+
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+fn crash_barrier(_: &str) {}
 
 fn fresh_run_id() -> Result<RunId, ExecutionError> {
     let nanos = SystemTime::now()

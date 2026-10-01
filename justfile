@@ -13,6 +13,10 @@ fmt-check:
 check:
     {{_io}} cargo +1.98.0 check --workspace --all-targets --locked
 
+# Compile the release CLI consumer with debug assertions disabled.
+issue-323-release-consumer:
+    {{_io}} cargo +1.98.0 build -p workflowctl --release --locked
+
 clippy:
     {{_io}} cargo +1.98.0 clippy --workspace --all-targets --locked -- -D warnings
 
@@ -401,7 +405,7 @@ check-branch:
 
 pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit pattern-catalog-test m2-02-green test-local-gates
 
-_quality-gates: fmt-check check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk test-local-gates
+_quality-gates: fmt-check issue-323-release-consumer check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk test-local-gates
 
 quality-gates:
     scripts/local-gates.sh produce
