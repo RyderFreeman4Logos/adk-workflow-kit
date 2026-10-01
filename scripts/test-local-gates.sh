@@ -17,6 +17,25 @@ if [[ "$selection" != *'cargo +1.98.0 test -p workflow-adk --locked -- --test-th
     exit 1
 fi
 
+release_command='ionice -c 3 cargo +1.98.0 build -p workflowctl --release --locked'
+count_occurrences() {
+    local text="$1" needle="$2" count=0
+    while [[ "$text" == *"$needle"* ]]; do
+        text="${text#*"$needle"}"
+        ((count += 1))
+    done
+    printf '%s' "$count"
+}
+if [[ "$(count_occurrences "$selection" "$release_command")" -ne 1 ]]; then
+    printf 'FAIL canonical aggregate must select the release consumer exactly once\n' >&2
+    exit 1
+fi
+fast_selection="$(just --justfile "$repo_root/justfile" --dry-run pre-commit-fast 2>&1)"
+if [[ "$fast_selection" == *"$release_command"* ]]; then
+    printf 'FAIL release consumer is duplicated inside pre-commit-fast and Lefthook\n' >&2
+    exit 1
+fi
+
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/adk-local-gates.XXXXXX")"
 trap 'rm -rf -- "$test_root"' EXIT
 fixture="$test_root/repo"
@@ -104,6 +123,11 @@ if [[ "$lefthook_config" != *$'pre-commit:\n  piped: true\n  commands:\n    bran
     printf 'FAIL pre-commit hook does not reject main before running local gates\n' >&2
     exit 1
 fi
+if [[ "$lefthook_config" != *$'    local-gates:\n      run: just pre-commit-fast\n    release-profile:\n      run: just issue-323-release-consumer'* ||
+    "$(count_occurrences "$lefthook_config" 'just issue-323-release-consumer')" -ne 1 ]]; then
+    printf 'FAIL pre-commit hook must run the release consumer exactly once after local gates\n' >&2
+    exit 1
+fi
 if [[ "$lefthook_config" != *$'pre-push:\n  commands:\n    local-gates:\n      run: just pre-push\n      use_stdin: true'* ]]; then
     printf 'FAIL pre-push hook does not forward Git update records to just pre-push\n' >&2
     exit 1
@@ -112,10 +136,10 @@ fi
 
 justfile_contract="$(<"$repo_root/justfile")"
 if [[ "$justfile_contract" != *'pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit pattern-catalog-test m2-02-green test-local-gates'* ||
-    "$justfile_contract" != *'_quality-gates: fmt-check check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk test-local-gates'* ||
+    "$justfile_contract" != *'_quality-gates: fmt-check issue-323-release-consumer check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk test-local-gates'* ||
     "$justfile_contract" == *'pre-commit-fast: '*m2-02-red* ||
     "$justfile_contract" == *'_quality-gates: '*m2-02-red* ]]; then
-    printf 'FAIL quality gates omit the canonical M2-02/#269 consumer contracts\n' >&2
+    printf 'FAIL quality gates omit the required release or canonical M2-02/#269 consumer contracts\n' >&2
     exit 1
 fi
 ((assertions += 1))
@@ -144,9 +168,59 @@ hook_rc=$?
 set -e
 if [[ $hook_rc -eq 0 || ! -e "$hook_fixture/hook.log" ||
     "$(<"$hook_fixture/hook.log")" != *branch-protection* ||
-    "$(<"$hook_fixture/hook.log")" == *local-gates* ]]; then
+    "$(<"$hook_fixture/hook.log")" == *local-gates* ||
+    "$(<"$hook_fixture/hook.log")" == *release-profile* ]]; then
     printf 'FAIL pre-commit branch protection started local gates: exit=%s output=%s\n' \
         "$hook_rc" "$hook_output" >&2
+    exit 1
+fi
+((assertions += 1))
+
+printf '%s\n' \
+    'check-branch:' \
+    '    @printf "branch-protection\\n" >> hook.log' \
+    'pre-commit-fast:' \
+    '    @printf "local-gates\\n" >> hook.log' \
+    'issue-323-release-consumer:' \
+    '    @printf "release-profile\\n" >> hook.log' \
+    '    @false' \
+    > "$hook_fixture/justfile"
+rm -f -- "$hook_fixture/hook.log"
+set +e
+release_hook_output="$(cd "$hook_fixture" && lefthook run pre-commit 2>&1)"
+release_hook_rc=$?
+set -e
+if [[ $release_hook_rc -eq 0 || ! -e "$hook_fixture/hook.log" ||
+    "$(<"$hook_fixture/hook.log")" != $'branch-protection\nlocal-gates\nrelease-profile' ]]; then
+    printf 'FAIL pre-commit did not propagate release-profile failure: exit=%s output=%s\n' \
+        "$release_hook_rc" "$release_hook_output" >&2
+    exit 1
+fi
+((assertions += 1))
+
+release_bin="$test_root/release-bin"
+release_log="$test_root/release-cargo.log"
+mkdir -p "$release_bin"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'printf "%s\\n" "$*" >> "${FAKE_RELEASE_LOG:?}"' \
+    'if [[ "$*" == *"fmt --all -- --check"* ]]; then exit 0; fi' \
+    'if [[ "$*" == *"build -p workflowctl --release --locked"* ]]; then exit 42; fi' \
+    'printf "unexpected release-test cargo argv: %s\\n" "$*" >&2' \
+    'exit 64' \
+    > "$release_bin/cargo"
+chmod +x "$release_bin/cargo"
+set +e
+release_gate_output="$(PATH="$release_bin:$PATH" FAKE_RELEASE_LOG="$release_log" \
+    JUST_NO_DOTENV=true just --justfile "$repo_root/justfile" _quality-gates 2>&1)"
+release_gate_rc=$?
+set -e
+if [[ $release_gate_rc -ne 42 ||
+    "$release_gate_output" != *"$release_command"* ||
+    "$release_gate_output" != *'recipe `issue-323-release-consumer` failed'* ]]; then
+    printf 'FAIL aggregate did not propagate release-consumer failure: exit=%s output=%s\n' \
+        "$release_gate_rc" "$release_gate_output" >&2
     exit 1
 fi
 ((assertions += 1))
