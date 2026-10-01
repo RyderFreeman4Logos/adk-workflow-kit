@@ -13,6 +13,10 @@ fmt-check:
 check:
     {{_io}} cargo +1.98.0 check --workspace --all-targets --locked
 
+# Compile the release CLI consumer with debug assertions disabled.
+issue-323-release-consumer:
+    {{_io}} cargo +1.98.0 build -p workflowctl --release --locked
+
 clippy:
     {{_io}} cargo +1.98.0 clippy --workspace --all-targets --locked -- -D warnings
 
