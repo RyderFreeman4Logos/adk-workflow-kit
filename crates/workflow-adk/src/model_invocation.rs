@@ -866,6 +866,7 @@ impl ModelInvocationSpec {
         let config = request.config.get_or_insert_with(Default::default);
         config.max_output_tokens = Some(self.budget.max_output_tokens() as i32);
         config.seed = Some(self.deterministic_seed());
+        config.response_schema = Some(self.output.schema().clone());
         config.extensions.insert(
             "workflow_kit".to_owned(),
             json!({
