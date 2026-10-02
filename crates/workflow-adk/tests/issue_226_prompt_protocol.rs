@@ -1,11 +1,30 @@
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
 use serde_json::json;
 use workflow_adk::model_invocation::{
     EscalationPolicy, InferenceBudget, ModelInvocationErrorKind, ModelInvocationSpec,
     ModelProfileIdentity, PromptProtocol, ProviderRouteIdentity, ReasoningEffort,
     StructuredOutputContract, ToolDefinition,
 };
-use workflow_adk::model_profiles::{CredentialBroker, FakeModelProfile, ModelProfileRegistry};
+use workflow_adk::model_profiles::{
+    CredentialBroker, CredentialHandle, FakeModelProfile, ModelProfileRegistry,
+    OpenAiCompatibleProfile, SecretProvider, SecretValue,
+};
 use workflow_runtime::TrustDomain;
+
+struct LocalSecret;
+impl SecretProvider for LocalSecret {
+    fn resolve(
+        &self,
+        _handle: &str,
+    ) -> Result<SecretValue, workflow_adk::model_profiles::CredentialError> {
+        Ok(SecretValue::new("local-only"))
+    }
+}
 
 fn route(model: &str, tokenizer: &str) -> ProviderRouteIdentity {
     ProviderRouteIdentity::new(
@@ -518,7 +537,7 @@ fn request_identity_and_provenance_share_budget_and_seed() {
         "task",
         route("fake-model", "tokenizer-v1"),
         budget.clone(),
-        output,
+        output.clone(),
     )
     .expect("matching protocol and output schema");
     let request = spec.to_llm_request();
@@ -530,11 +549,105 @@ fn request_identity_and_provenance_share_budget_and_seed() {
         Some(budget.max_output_tokens() as i32)
     );
     assert_eq!(config.seed, Some(spec.deterministic_seed()));
+    assert_eq!(config.response_schema.as_ref(), Some(output.schema()));
     assert_eq!(
         provenance.max_output_tokens() as usize,
         budget.max_output_tokens()
     );
     assert_eq!(provenance.seed(), spec.deterministic_seed());
+}
+
+#[tokio::test]
+async fn openai_compatible_wire_carries_strict_output_schema() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let schema = contract().schema().clone();
+    let expected = schema.clone();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut raw = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let bytes = socket.read(&mut buffer).unwrap();
+            raw.extend_from_slice(&buffer[..bytes]);
+            if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let header_end = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let content_length = String::from_utf8_lossy(&raw[..header_end])
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        while raw.len() < header_end + content_length {
+            let bytes = socket.read(&mut buffer).unwrap();
+            raw.extend_from_slice(&buffer[..bytes]);
+        }
+        let body: serde_json::Value =
+            serde_json::from_slice(&raw[header_end..]).expect("openai request json");
+        let format = &body["response_format"];
+        assert_eq!(format["type"], "json_schema");
+        assert_eq!(format["json_schema"]["strict"], true);
+        assert_eq!(format["json_schema"]["schema"], expected);
+        let reply = r#"{"choices":[{"message":{"role":"assistant","content":"{\"answer\":\"ok\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            reply.len(),
+            reply
+        )
+        .unwrap();
+        socket.flush().unwrap();
+    });
+
+    let profile = OpenAiCompatibleProfile::new(
+        "worker",
+        "1",
+        "local-model",
+        format!("http://{address}/v1"),
+        CredentialHandle::SecretProvider("local-key".to_owned()),
+    )
+    .with_tokenizer("tokenizer-v1");
+    let registry = ModelProfileRegistry::new()
+        .with_worker(profile)
+        .expect("valid profile");
+    let binding = registry
+        .bind_worker(&CredentialBroker::new().with_secret_provider(Arc::new(LocalSecret)))
+        .expect("local binding");
+    let protocol = PromptProtocol::new(
+        "stable policy",
+        vec![],
+        schema,
+        json!({"safe": true}),
+        TrustDomain::TrustedGoal,
+    )
+    .unwrap();
+    let spec = ModelInvocationSpec::new(
+        protocol,
+        "task",
+        ProviderRouteIdentity::from_binding(&binding),
+        InferenceBudget::low(),
+        contract(),
+    )
+    .expect("matching protocol and output schema");
+    let prompt = spec.prompt();
+
+    spec.invoke(&binding)
+        .await
+        .expect("local structured output");
+
+    let after = spec.prompt();
+    assert_eq!(prompt.prefix(), after.prefix());
+    assert_eq!(prompt.prompt(), after.prompt());
+    server.join().unwrap();
 }
 
 #[tokio::test]
