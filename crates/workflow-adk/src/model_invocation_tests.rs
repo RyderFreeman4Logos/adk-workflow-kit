@@ -185,23 +185,46 @@ async fn normal_stop_optional_metadata_and_partial_chunks_remain_valid() {
         usage_metadata: Some(Default::default()),
         ..Default::default()
     };
-    for responses in [
+    let stop = LlmResponse {
+        turn_complete: true,
+        finish_reason: Some(FinishReason::Stop),
+        ..Default::default()
+    };
+    let continuation = LlmResponse {
+        content: Some(Content::new("assistant").with_text(r#"private-output"}"#)),
+        partial: false,
+        turn_complete: false,
+        finish_reason: None,
+        ..Default::default()
+    };
+    let cases = [
         vec![text(OUTPUT)],
         vec![text(OUTPUT), usage.clone()],
-        vec![missing_metadata],
-        vec![partial, text(r#"private-output"}"#), usage],
-    ] {
+        vec![missing_metadata.clone(), stop.clone()],
+        vec![partial, continuation, stop, usage],
+    ];
+    for (index, responses) in cases.into_iter().enumerate() {
         let probe = Arc::new(Probe {
             responses,
             transport_error: false,
             calls: AtomicUsize::new(0),
         });
         let (spec, binding) = invocation(probe);
-        let result = spec.invoke(&binding).await.unwrap();
+        let result = spec.invoke(&binding).await.unwrap_or_else(|error| {
+            panic!("case {index} rejected a completed response: {error:?}")
+        });
         assert_eq!(
             result.output(),
             &json!({"answer":"synthetic-private-output"})
         );
         assert_eq!(result.attempts(), 1);
     }
+}
+
+#[tokio::test]
+async fn answer_without_terminal_stop_is_rejected() {
+    let mut unfinished = text(r#"{"answer":"predicate =="}"#);
+    unfinished.finish_reason = None;
+    unfinished.turn_complete = false;
+    rejected(vec![unfinished], false).await;
 }

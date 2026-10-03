@@ -937,7 +937,6 @@ impl ModelInvocationSpec {
                 // or explicit progress does invalidate it until a fresh complete Stop.
                 if response.content.is_some()
                     || response.partial
-                    || response.turn_complete
                     || response.finish_reason.is_some()
                 {
                     complete = response.turn_complete
@@ -967,9 +966,9 @@ impl ModelInvocationSpec {
                     }
                 }
             }
-            if policy == ResponsePolicy::CompleteText && !complete {
-                return Err(ModelInvocationError::structured(
-                    StructuredOutputError::InvalidJson,
+            if !complete {
+                return Err(ModelInvocationError::model(
+                    ModelProfileErrorKind::Provider,
                     attempts,
                 ));
             }
