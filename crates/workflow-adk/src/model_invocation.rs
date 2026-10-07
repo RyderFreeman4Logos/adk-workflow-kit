@@ -5,7 +5,8 @@
 
 pub use crate::model_profiles::ModelProfileIdentity;
 use crate::model_profiles::{ModelBinding, ModelProfileErrorKind};
-use adk_rust::{Content, FinishReason, LlmRequest, Part, futures::StreamExt as _};
+pub use adk_rust::FinishReason;
+use adk_rust::{Content, LlmRequest, Part, futures::StreamExt as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -611,11 +612,37 @@ impl InvocationProvenance {
     }
 }
 
+/// Content-free facts copied from the final meaningful ADK response chunk.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ModelCompletionEvidence {
+    finish_reason: Option<FinishReason>,
+    turn_complete: bool,
+    partial: bool,
+}
+
+impl ModelCompletionEvidence {
+    /// The ADK finish reason, if the terminal response supplied one.
+    pub const fn finish_reason(&self) -> Option<FinishReason> {
+        self.finish_reason
+    }
+
+    /// Whether the terminal response marked the turn complete.
+    pub const fn turn_complete(&self) -> bool {
+        self.turn_complete
+    }
+
+    /// Whether the terminal response marked the content partial.
+    pub const fn partial(&self) -> bool {
+        self.partial
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelInvocationResult {
     output: Value,
     attempts: u8,
     provenance: InvocationProvenance,
+    completion_evidence: ModelCompletionEvidence,
 }
 
 impl ModelInvocationResult {
@@ -634,6 +661,11 @@ impl ModelInvocationResult {
 
     pub fn provenance(&self) -> &InvocationProvenance {
         &self.provenance
+    }
+
+    /// Content-free terminal metadata from the final meaningful ADK response.
+    pub fn completion_evidence(&self) -> &ModelCompletionEvidence {
+        &self.completion_evidence
     }
 }
 
@@ -918,6 +950,7 @@ impl ModelInvocationSpec {
                 .map_err(|error| ModelInvocationError::model(error.kind(), attempts))?;
             let mut output = String::new();
             let mut complete = false;
+            let mut completion_evidence = ModelCompletionEvidence::default();
             while let Some(response) = stream.next().await {
                 let response = response
                     .map_err(|error| ModelInvocationError::model(error.kind(), attempts))?;
@@ -942,6 +975,11 @@ impl ModelInvocationSpec {
                     complete = response.turn_complete
                         && !response.partial
                         && response.finish_reason == Some(FinishReason::Stop);
+                    completion_evidence = ModelCompletionEvidence {
+                        finish_reason: response.finish_reason,
+                        turn_complete: response.turn_complete,
+                        partial: response.partial,
+                    };
                 }
                 if let Some(content) = response.content {
                     for part in content.parts {
@@ -978,6 +1016,7 @@ impl ModelInvocationSpec {
                         output,
                         attempts,
                         provenance: self.provenance(),
+                        completion_evidence,
                     });
                 }
                 Err(_error) if attempts < max_attempts => continue,

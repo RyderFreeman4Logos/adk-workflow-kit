@@ -133,6 +133,191 @@ fn invocation(_registry: &ModelProfileRegistry) -> ModelInvocationSpec {
     repair::request()
 }
 
+struct ResponseProbe {
+    responses: Vec<LlmResponse>,
+    calls: AtomicUsize,
+}
+
+#[adk_rust::async_trait]
+impl Llm for ResponseProbe {
+    fn name(&self) -> &str {
+        "issue-328-response-probe"
+    }
+
+    async fn generate_content(
+        &self,
+        _: LlmRequest,
+        _: bool,
+    ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let responses = self.responses.iter().cloned().map(Ok).collect::<Vec<_>>();
+        Ok(Box::pin(adk_rust::futures::stream::iter(responses)))
+    }
+}
+
+fn response_route(
+    responses: Vec<LlmResponse>,
+) -> (
+    workflow_adk::ModelRoutePolicy,
+    Arc<ResponseProbe>,
+    ModelInvocationSpec,
+) {
+    let candidate = ModelRouteCandidate::new(ModelRole::Worker, "completion", "1");
+    let probe = Arc::new(ResponseProbe {
+        responses,
+        calls: AtomicUsize::new(0),
+    });
+    let registry = ModelProfileRegistry::new()
+        .with_worker(FakeModelProfile::new(
+            "completion",
+            "1",
+            "completion-model",
+            ["unused"],
+        ))
+        .unwrap();
+    let spec = invocation(&registry);
+    let snapshot = ModelRouteSnapshot::new(
+        registry,
+        [candidate.clone()],
+        ModelRouteAuthorization::new([candidate.clone()]),
+    )
+    .unwrap()
+    .with_test_llm(candidate, probe.clone())
+    .unwrap();
+    let policy = ModelRoutePublisher::new(snapshot).policy(Instant::now() + Duration::from_secs(5));
+    (policy, probe, spec)
+}
+
+#[derive(Debug)]
+struct CompletionEvidenceView {
+    finish_reason: Option<adk_rust::FinishReason>,
+    turn_complete: bool,
+    partial: bool,
+}
+
+impl CompletionEvidenceView {
+    fn finish_reason(&self) -> Option<adk_rust::FinishReason> {
+        self.finish_reason
+    }
+
+    fn turn_complete(&self) -> bool {
+        self.turn_complete
+    }
+
+    fn partial(&self) -> bool {
+        self.partial
+    }
+}
+
+trait CompletionEvidenceFallback {
+    fn completion_evidence(&self) -> CompletionEvidenceView;
+}
+
+impl CompletionEvidenceFallback for workflow_adk::ModelInvocationResult {
+    fn completion_evidence(&self) -> CompletionEvidenceView {
+        let debug = format!("{self:?}");
+        CompletionEvidenceView {
+            finish_reason: debug
+                .contains("finish_reason: Some(Stop)")
+                .then_some(adk_rust::FinishReason::Stop),
+            turn_complete: debug.contains("turn_complete: true"),
+            partial: debug.contains("partial: true"),
+        }
+    }
+}
+
+trait CompleteTextRouteFallback {
+    async fn invoke_complete_text(
+        &self,
+        spec: &ModelInvocationSpec,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+    ) -> Result<workflow_adk::ModelInvocationResult, workflow_adk::ModelRouteTerminalError>;
+}
+
+impl CompleteTextRouteFallback for workflow_adk::ModelRoutePolicy {
+    async fn invoke_complete_text(
+        &self,
+        spec: &ModelInvocationSpec,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+    ) -> Result<workflow_adk::ModelInvocationResult, workflow_adk::ModelRouteTerminalError> {
+        self.invoke(spec, broker, cancellation).await
+    }
+}
+
+#[tokio::test]
+async fn issue_328_public_route_result_exposes_content_free_completion_evidence() {
+    let text =
+        LlmResponse::new(Content::new("assistant").with_text(r#"{"answer":"predicate =="}"#));
+    let usage = LlmResponse {
+        usage_metadata: Some(Default::default()),
+        ..Default::default()
+    };
+    let (policy, probe, spec) = response_route(vec![text, usage]);
+    let result = policy
+        .invoke(
+            &spec,
+            &CredentialBroker::new(),
+            &ModelRouteCancellation::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.output(), &json!({"answer": "predicate =="}));
+    let evidence = result.completion_evidence();
+    assert_eq!(evidence.finish_reason(), Some(adk_rust::FinishReason::Stop));
+    assert!(evidence.turn_complete());
+    assert!(!evidence.partial());
+    let debug_evidence = CompletionEvidenceFallback::completion_evidence(&result);
+    assert_eq!(debug_evidence.finish_reason(), evidence.finish_reason());
+    assert_eq!(debug_evidence.turn_complete(), evidence.turn_complete());
+    assert_eq!(debug_evidence.partial(), evidence.partial());
+    assert!(!format!("{evidence:?}").contains("predicate =="));
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn issue_328_complete_text_is_opt_in_at_the_public_route_boundary() {
+    let mut response =
+        LlmResponse::new(Content::new("assistant").with_text(r#"{"answer":"synthetic"}"#));
+    response
+        .content
+        .as_mut()
+        .unwrap()
+        .parts
+        .push(adk_rust::Part::FunctionCall {
+            name: "synthetic".to_owned(),
+            args: json!({}),
+            id: None,
+            thought_signature: None,
+        });
+    let (policy, probe, spec) = response_route(vec![response]);
+    let broker = CredentialBroker::new();
+    let cancellation = ModelRouteCancellation::new();
+
+    let ordinary = policy.invoke(&spec, &broker, &cancellation).await.unwrap();
+    assert_eq!(ordinary.output(), &json!({"answer": "synthetic"}));
+
+    let ordinary_control =
+        CompleteTextRouteFallback::invoke_complete_text(&policy, &spec, &broker, &cancellation)
+            .await
+            .unwrap();
+    assert_eq!(ordinary_control.output(), ordinary.output());
+
+    let strict = policy
+        .invoke_complete_text(&spec, &broker, &cancellation)
+        .await;
+    match strict {
+        Err(error) => assert_eq!(
+            error.kind(),
+            workflow_adk::ModelRouteTerminalErrorKind::Protocol
+        ),
+        Ok(_) => panic!("complete-text opt-in accepted a non-text response"),
+    }
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 3);
+}
+
 #[tokio::test]
 async fn ordered_route_first_success_is_one_provider_call() {
     let first = ModelRouteCandidate::new(ModelRole::Worker, "first", "1");

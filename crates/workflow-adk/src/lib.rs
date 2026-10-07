@@ -7,15 +7,15 @@ pub mod firewall;
 pub mod model_invocation;
 pub mod semantic_firewall;
 pub use model_invocation::{
-    EscalationPolicy, InferenceBudget, InferenceBudgetError, InvocationProvenance,
-    MAX_INVOCATION_RETRIES, MAX_MODEL_ROUTE_CANDIDATES, ModelInvocationError,
-    ModelInvocationErrorKind, ModelInvocationResult, ModelInvocationSpec, ModelRouteAttempt,
-    ModelRouteAttemptKind, ModelRouteAuthorization, ModelRouteCancellation, ModelRouteCandidate,
-    ModelRouteIdentity, ModelRoutePolicy, ModelRoutePublisher, ModelRouteSnapshot,
-    ModelRouteSnapshotError, ModelRouteSnapshotErrorKind, ModelRouteTerminalError,
-    ModelRouteTerminalErrorKind, PROMPT_PROTOCOL_VERSION, PromptProtocol, PromptProtocolError,
-    PromptTool, ProviderRouteIdentity, ReasoningEffort, RenderedPrompt, StructuredOutputContract,
-    StructuredOutputContractError, ToolDefinition, ToolSpec,
+    EscalationPolicy, FinishReason, InferenceBudget, InferenceBudgetError, InvocationProvenance,
+    MAX_INVOCATION_RETRIES, MAX_MODEL_ROUTE_CANDIDATES, ModelCompletionEvidence,
+    ModelInvocationError, ModelInvocationErrorKind, ModelInvocationResult, ModelInvocationSpec,
+    ModelRouteAttempt, ModelRouteAttemptKind, ModelRouteAuthorization, ModelRouteCancellation,
+    ModelRouteCandidate, ModelRouteIdentity, ModelRoutePolicy, ModelRoutePublisher,
+    ModelRouteSnapshot, ModelRouteSnapshotError, ModelRouteSnapshotErrorKind,
+    ModelRouteTerminalError, ModelRouteTerminalErrorKind, PROMPT_PROTOCOL_VERSION, PromptProtocol,
+    PromptProtocolError, PromptTool, ProviderRouteIdentity, ReasoningEffort, RenderedPrompt,
+    StructuredOutputContract, StructuredOutputContractError, ToolDefinition, ToolSpec,
 };
 pub mod model_profiles;
 pub use model_profiles::{

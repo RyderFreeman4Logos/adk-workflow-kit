@@ -1,6 +1,7 @@
 //! Ordered, authorized model routes over the existing ModelBinding adapter.
 use super::{
     ModelInvocationErrorKind, ModelInvocationResult, ModelInvocationSpec, ProviderRouteIdentity,
+    ResponsePolicy,
 };
 use crate::model_profiles::{
     CredentialBroker, ModelBinding, ModelProfileErrorKind, ModelProfileIdentity,
@@ -378,6 +379,30 @@ impl ModelRoutePolicy {
         broker: &CredentialBroker,
         cancellation: &ModelRouteCancellation,
     ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
+        self.invoke_with_response_policy(spec, broker, cancellation, ResponsePolicy::Ordinary)
+            .await
+    }
+
+    /// Explicitly opts into the collector's text-only response admission.
+    /// Authorization, candidate order, deadline, cancellation, and schema
+    /// validation match [`Self::invoke`].
+    pub async fn invoke_complete_text(
+        &self,
+        spec: &ModelInvocationSpec,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+    ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
+        self.invoke_with_response_policy(spec, broker, cancellation, ResponsePolicy::CompleteText)
+            .await
+    }
+
+    async fn invoke_with_response_policy(
+        &self,
+        spec: &ModelInvocationSpec,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+        response_policy: ResponsePolicy,
+    ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
         let mut attempts = Vec::new();
         for (index, candidate) in self.snapshot.candidates.iter().enumerate() {
             if let Some(kind) = route_stop(self.deadline, cancellation) {
@@ -415,13 +440,16 @@ impl ModelRoutePolicy {
                 }
             };
             let candidate_spec = spec.with_route(ProviderRouteIdentity::from_binding(&binding));
-            let result =
-                match await_route(candidate_spec.invoke(&binding), self.deadline, cancellation)
-                    .await
-                {
-                    Err(kind) => return Err(route_terminal(kind, attempts)),
-                    Ok(result) => result,
-                };
+            let result = match await_route(
+                candidate_spec.invoke_with_policy(&binding, |_| Ok(()), response_policy),
+                self.deadline,
+                cancellation,
+            )
+            .await
+            {
+                Err(kind) => return Err(route_terminal(kind, attempts)),
+                Ok(result) => result,
+            };
             let error = match result {
                 Ok(result) => return Ok(result),
                 Err(error) => error,
