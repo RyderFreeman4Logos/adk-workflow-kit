@@ -9,7 +9,7 @@ license.workspace = true
 jsonschema.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml = "0.9.34"
+yaml_serde = "=0.10.7"
 sha2.workspace = true
 toml.workspace = true
 workflow-ir = { path = "../workflow-ir" }

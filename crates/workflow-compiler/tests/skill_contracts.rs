@@ -299,3 +299,49 @@ fn activation_cannot_expand_policy_001_capabilities() {
         Ok(_) => panic!("allowed-tools must not authorize network or process spawning"),
     }
 }
+
+#[test]
+fn yaml_parser_compatibility_contract() {
+    let cases = [
+        ("description: yes", Some("yes")),
+        ("description: OFF", Some("OFF")),
+        ("description: 01", Some("01")),
+        ("description: true", None),
+        ("description: TRUE", None),
+        ("description: null", None),
+        ("description: 42", None),
+        ("description: .nan", None),
+        ("description: !!str 42", Some("42")),
+        ("description: !private SECRET_VALUE", None),
+        ("description: !!binary aGVsbG8=", Some("aGVsbG8=")),
+        ("description: one\ndescription: two", None),
+        ("description: ok\nmetadata: {key: one, key: two}", None),
+        ("description: ok\nmetadata: {42: value}", None),
+        ("description: ok\nmetadata: {yes: no}", Some("ok")),
+        ("description: ok\nmetadata: {<<: value}", Some("ok")),
+        (
+            "description: &text anchored\nlicense: *text",
+            Some("anchored"),
+        ),
+        ("description: ok\nmetadata: {<<: {key: value}}", None),
+        ("description: one\n...\n--- {description: two}", None),
+    ];
+    for (fields, expected) in cases {
+        let document = format!("---\nname: valid-skill\n{fields}\n---\nprivate instructions");
+        let result = SkillManifest::parse(Path::new("valid-skill"), document.as_bytes());
+        match (result, expected) {
+            (Ok(manifest), Some(expected)) => {
+                assert_eq!(
+                    manifest.discovery_metadata().description(),
+                    expected,
+                    "{fields}"
+                );
+            }
+            (Err(error), None) => {
+                assert_eq!(error, SkillManifestError::InvalidFrontmatter, "{fields}")
+            }
+            (Ok(_), None) => panic!("unexpected accepted frontmatter: {fields}"),
+            (Err(error), Some(_)) => panic!("unexpected rejected frontmatter: {fields}: {error}"),
+        }
+    }
+}
