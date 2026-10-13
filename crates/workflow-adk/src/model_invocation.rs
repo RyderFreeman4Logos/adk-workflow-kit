@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::fmt;
-use workflow_runtime::{StructuredOutputError, TrustDomain};
+use workflow_runtime::{SchemaKeyword, StructuredOutputError, TrustDomain};
 
 #[cfg(test)]
 #[path = "model_invocation_tests.rs"]
@@ -520,6 +520,8 @@ impl StructuredOutputContract {
         &self.schema_hash
     }
 
+    /// Decode one bounded UTF-8 JSON value, distinguishing syntax, trailing bytes,
+    /// and the first schema violation using content-free diagnostics.
     pub fn decode(&self, bytes: &[u8]) -> Result<Value, StructuredOutputError> {
         if bytes.len() > self.max_output_bytes {
             return Err(StructuredOutputError::OutputTooLarge);
@@ -533,10 +535,75 @@ impl StructuredOutputContract {
             .map_err(|_| StructuredOutputError::TrailingBytes)?;
         let validator = jsonschema::validator_for(&self.schema)
             .map_err(|_| StructuredOutputError::InvalidJson)?;
-        if !validator.is_valid(&value) {
-            return Err(StructuredOutputError::InvalidJson);
+        if let Err(error) = validator.validate(&value) {
+            return Err(schema_violation(&error, &value));
         }
         Ok(value)
+    }
+}
+
+fn schema_violation(
+    error: &jsonschema::ValidationError<'_>,
+    value: &Value,
+) -> StructuredOutputError {
+    use jsonschema::error::ValidationErrorKind;
+    let keyword = match error.kind() {
+        ValidationErrorKind::AdditionalItems { .. } => SchemaKeyword::AdditionalItems,
+        ValidationErrorKind::AdditionalProperties { .. } => SchemaKeyword::AdditionalProperties,
+        ValidationErrorKind::AnyOf { .. } => SchemaKeyword::AnyOf,
+        ValidationErrorKind::Constant { .. } => SchemaKeyword::Const,
+        ValidationErrorKind::Contains => SchemaKeyword::Contains,
+        ValidationErrorKind::ContentEncoding { .. } | ValidationErrorKind::FromUtf8 { .. } => {
+            SchemaKeyword::ContentEncoding
+        }
+        ValidationErrorKind::ContentMediaType { .. } => SchemaKeyword::ContentMediaType,
+        ValidationErrorKind::Enum { .. } => SchemaKeyword::Enum,
+        ValidationErrorKind::ExclusiveMaximum { .. } => SchemaKeyword::ExclusiveMaximum,
+        ValidationErrorKind::ExclusiveMinimum { .. } => SchemaKeyword::ExclusiveMinimum,
+        ValidationErrorKind::FalseSchema => SchemaKeyword::FalseSchema,
+        ValidationErrorKind::Format { .. } => SchemaKeyword::Format,
+        ValidationErrorKind::MaxItems { .. } => SchemaKeyword::MaxItems,
+        ValidationErrorKind::Maximum { .. } => SchemaKeyword::Maximum,
+        ValidationErrorKind::MaxLength { .. } => SchemaKeyword::MaxLength,
+        ValidationErrorKind::MaxProperties { .. } => SchemaKeyword::MaxProperties,
+        ValidationErrorKind::MinItems { .. } => SchemaKeyword::MinItems,
+        ValidationErrorKind::Minimum { .. } => SchemaKeyword::Minimum,
+        ValidationErrorKind::MinLength { .. } => SchemaKeyword::MinLength,
+        ValidationErrorKind::MinProperties { .. } => SchemaKeyword::MinProperties,
+        ValidationErrorKind::MultipleOf { .. } => SchemaKeyword::MultipleOf,
+        ValidationErrorKind::Not { .. } => SchemaKeyword::Not,
+        ValidationErrorKind::OneOfMultipleValid { .. }
+        | ValidationErrorKind::OneOfNotValid { .. } => SchemaKeyword::OneOf,
+        ValidationErrorKind::Pattern { .. }
+        | ValidationErrorKind::BacktrackLimitExceeded { .. } => SchemaKeyword::Pattern,
+        ValidationErrorKind::PropertyNames { .. } => SchemaKeyword::PropertyNames,
+        ValidationErrorKind::Required { .. } => SchemaKeyword::Required,
+        ValidationErrorKind::Type { .. } => SchemaKeyword::Type,
+        ValidationErrorKind::UnevaluatedItems { .. } => SchemaKeyword::UnevaluatedItems,
+        ValidationErrorKind::UnevaluatedProperties { .. } => SchemaKeyword::UnevaluatedProperties,
+        ValidationErrorKind::UniqueItems => SchemaKeyword::UniqueItems,
+        ValidationErrorKind::Referencing(_) => SchemaKeyword::Reference,
+        ValidationErrorKind::Custom { .. } => SchemaKeyword::Unknown,
+    };
+    // Match literal root prefixes: Location::iter drops empty property segments
+    // and converts numeric object keys to indices. Never expose the raw pointer.
+    let root_index = |prefix: &str, field: &str| -> Option<usize> {
+        let index = error
+            .instance_path()
+            .as_str()
+            .strip_prefix(prefix)?
+            .split('/')
+            .next()?
+            .parse::<usize>()
+            .ok()?;
+        value.get(field)?.as_array()?.get(index)?;
+        Some(index)
+    };
+
+    StructuredOutputError::SchemaViolation {
+        keyword,
+        citation_index: root_index("/citations/", "citations"),
+        window_index: root_index("/windows/", "windows"),
     }
 }
 

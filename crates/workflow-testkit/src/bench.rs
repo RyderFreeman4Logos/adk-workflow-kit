@@ -76,6 +76,7 @@ fn runtime_diagnostic_code(error: &StructuredOutputError) -> &'static str {
         StructuredOutputError::InvalidUtf8 => "runtime.output.invalid_utf8",
         StructuredOutputError::InvalidJson => "runtime.output.invalid",
         StructuredOutputError::TrailingBytes => "runtime.output.trailing_bytes",
+        StructuredOutputError::SchemaViolation { .. } => "runtime.output.schema_violation",
     }
 }
 

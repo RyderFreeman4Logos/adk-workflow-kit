@@ -559,6 +559,7 @@ pub(super) async fn fallback_matrix(transient_first: bool) {
         assert_eq!(error.attempts().len(), usize::from(transient_first));
         assert_eq!(error.profile_error(), None);
         assert_eq!(error.upstream_status_code(), None);
+        assert_eq!(error.output_error(), None);
         if transient_first {
             assert_eq!(
                 error.attempts()[0].profile_error(),

@@ -16,6 +16,7 @@ use std::{
     },
     time::Instant,
 };
+use workflow_runtime::StructuredOutputError;
 
 pub const MAX_MODEL_ROUTE_CANDIDATES: usize = 8;
 
@@ -261,6 +262,7 @@ pub struct ModelRouteAttempt {
     kind: ModelRouteAttemptKind,
     profile_error: Option<ModelProfileErrorKind>,
     upstream_status_code: Option<u16>,
+    output_error: Option<StructuredOutputError>,
 }
 
 impl ModelRouteAttempt {
@@ -280,6 +282,11 @@ impl ModelRouteAttempt {
     /// Actual SDK upstream HTTP status in 100..=599, or unknown.
     pub fn upstream_status_code(&self) -> Option<u16> {
         self.upstream_status_code
+    }
+
+    /// Content-free structured-output rejection for this failed attempt.
+    pub fn output_error(&self) -> Option<StructuredOutputError> {
+        self.output_error
     }
 }
 
@@ -321,6 +328,12 @@ impl ModelRouteTerminalError {
     pub fn upstream_status_code(&self) -> Option<u16> {
         self.failed_attempt()
             .and_then(ModelRouteAttempt::upstream_status_code)
+    }
+
+    /// Final structured-output failure; absent for cancellation/deadline.
+    pub fn output_error(&self) -> Option<StructuredOutputError> {
+        self.failed_attempt()
+            .and_then(ModelRouteAttempt::output_error)
     }
 
     fn failed_attempt(&self) -> Option<&ModelRouteAttempt> {
@@ -422,6 +435,7 @@ impl ModelRoutePolicy {
                 kind: ModelRouteAttemptKind::AuthorizationDenied,
                 profile_error: None,
                 upstream_status_code: None,
+                output_error: None,
             });
             return Err(route_terminal(
                 ModelRouteTerminalErrorKind::AuthorizationDenied,
@@ -443,6 +457,7 @@ impl ModelRoutePolicy {
                     kind: ModelRouteAttemptKind::Configuration,
                     profile_error: Some(error.kind()),
                     upstream_status_code: error.upstream_status_code(),
+                    output_error: None,
                 });
                 Err(ModelRouteTerminalError {
                     kind: ModelRouteTerminalErrorKind::Configuration,
@@ -499,6 +514,7 @@ impl ModelRoutePolicy {
                     kind: ModelRouteAttemptKind::AuthorizationDenied,
                     profile_error: None,
                     upstream_status_code: None,
+                    output_error: None,
                 });
                 return Err(route_terminal(
                     ModelRouteTerminalErrorKind::AuthorizationDenied,
@@ -520,6 +536,7 @@ impl ModelRoutePolicy {
                         kind: ModelRouteAttemptKind::Configuration,
                         profile_error: Some(error.kind()),
                         upstream_status_code: error.upstream_status_code(),
+                        output_error: None,
                     });
                     return Err(ModelRouteTerminalError {
                         kind: ModelRouteTerminalErrorKind::Configuration,
@@ -548,6 +565,7 @@ impl ModelRoutePolicy {
                     kind: ModelRouteAttemptKind::RetryableProvider,
                     profile_error: error.model_error(),
                     upstream_status_code: error.upstream_status_code(),
+                    output_error: error.output_error(),
                 });
                 continue;
             }
@@ -578,6 +596,7 @@ impl ModelRoutePolicy {
                 kind: attempt_kind,
                 profile_error: error.model_error(),
                 upstream_status_code: error.upstream_status_code(),
+                output_error: error.output_error(),
             });
             return Err(route_terminal(terminal_kind, attempts));
         }

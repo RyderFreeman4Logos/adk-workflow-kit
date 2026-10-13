@@ -170,9 +170,9 @@ pub use session::{
     RunSessionIds, SessionId, SessionIdentityError, SessionIdentityErrorKind, SessionRole,
 };
 pub use tool::{
-    ActivateSkillInput, ReadSkillResourceInput, RunSkillScriptInput, StructuredOutputError,
-    ToolEnvelope, ToolFailure, ToolFlags, ToolIdempotency, ToolProvenance, ToolRegistration,
-    ToolRegistrationError, decode_structured_tool_output,
+    ActivateSkillInput, ReadSkillResourceInput, RunSkillScriptInput, SchemaKeyword,
+    StructuredOutputError, ToolEnvelope, ToolFailure, ToolFlags, ToolIdempotency, ToolProvenance,
+    ToolRegistration, ToolRegistrationError, decode_structured_tool_output,
 };
 pub use tool_registry::{
     ReadSourceRangeTool, SearchCodeTool, ToolImplementationRegistry,
