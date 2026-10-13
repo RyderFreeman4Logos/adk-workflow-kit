@@ -7,8 +7,8 @@ use serde::{
     },
 };
 use workflow_adk::model_profiles::{
-    CredentialError, CredentialHandle, ModelProfile, ModelProfileIdentity, ModelRuntimeConfig,
-    OpenAiCompatibleProfile, SecretProvider, SecretValue,
+    CredentialError, CredentialHandle, ModelProfile, ModelProfileErrorKind, ModelProfileIdentity,
+    ModelRuntimeConfig, OpenAiCompatibleProfile, SecretProvider, SecretValue,
 };
 use workflow_adk::{
     MAX_MODEL_ROUTE_CANDIDATES, ModelRouteSnapshotErrorKind, ModelRouteTerminalErrorKind,
@@ -347,6 +347,72 @@ async fn route_never_calls_unbounded_sync_resolver() {
     assert_eq!(resolver.0.load(Ordering::SeqCst), 0);
 }
 
+struct FailingResolver(CredentialError);
+impl SecretProvider for FailingResolver {
+    fn resolve(&self, _: &str) -> Result<SecretValue, CredentialError> {
+        panic!("route used sync resolver")
+    }
+    fn resolve_for_route<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SecretValue, CredentialError>> + Send + 'a>,
+    > {
+        Box::pin(std::future::ready(Err(self.0)))
+    }
+}
+fn environment_registry() -> ModelProfileRegistry {
+    ModelProfileRegistry::new()
+        .with_worker(OpenAiCompatibleProfile::new(
+            "first",
+            "1",
+            "synthetic",
+            "https://synthetic.invalid",
+            CredentialHandle::environment("ADK_WORKFLOW_KIT_BIND_SUBTYPE_ABSENT"),
+        ))
+        .unwrap()
+}
+#[tokio::test]
+async fn configuration_bind_preserves_profile_error_kind() {
+    let cases = [
+        (
+            compatible_registry(),
+            CredentialBroker::new(),
+            ModelProfileErrorKind::Credential,
+        ),
+        (
+            compatible_registry(),
+            CredentialBroker::new()
+                .with_secret_provider(Arc::new(FailingResolver(CredentialError::missing()))),
+            ModelProfileErrorKind::Credential,
+        ),
+        (
+            environment_registry(),
+            CredentialBroker::new(),
+            ModelProfileErrorKind::Credential,
+        ),
+    ];
+    for (registry, broker, expected) in cases {
+        let error = ModelRoutePublisher::new(snapshot(registry.clone(), &["first"]))
+            .policy(Instant::now() + Duration::from_secs(5))
+            .invoke(&request(), &broker, &ModelRouteCancellation::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ModelRouteTerminalErrorKind::Configuration);
+        assert_eq!(error.profile_error(), Some(expected));
+        let bound = ModelRoutePublisher::new(snapshot(registry, &["first"]))
+            .policy(Instant::now() + Duration::from_secs(5))
+            .bind_authorized(&broker, &ModelRouteCancellation::new())
+            .await
+            .unwrap_err();
+        assert_eq!(bound.profile_error(), Some(expected));
+        let rendered = format!("{error:?}{error}");
+        for marker in ["ADK_WORKFLOW_KIT_BIND_SUBTYPE_ABSENT", "synthetic.invalid"] {
+            assert!(!rendered.contains(marker), "{rendered}");
+        }
+    }
+}
+
 struct DropWitness(Arc<AtomicUsize>);
 impl Drop for DropWitness {
     fn drop(&mut self) {
@@ -662,5 +728,172 @@ async fn explicit_async_credentials_bind_and_success_completion_obeys_stop() {
             );
             assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
         }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn bind_authorized_obeys_deadline_and_cancellation() {
+    for mode in 0..3 {
+        let token = ModelRouteCancellation::new();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let resolver = Arc::new(AsyncResolver {
+            calls: AtomicUsize::new(0),
+            drops: drops.clone(),
+            cancel: (mode == 2).then(|| token.clone()),
+        });
+        let broker = CredentialBroker::new().with_secret_provider(resolver.clone());
+        let policy = ModelRoutePublisher::new(snapshot(compatible_registry(), &["first"]))
+            .policy((tokio::time::Instant::now() + Duration::from_secs(10)).into_std());
+        let future = policy.bind_authorized(&broker, &token);
+        tokio::pin!(future);
+        if mode != 2 {
+            assert!(adk_rust::futures::poll!(&mut future).is_pending());
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+            if mode == 0 {
+                tokio::time::advance(Duration::from_secs(10)).await;
+            } else {
+                token.cancel();
+            }
+        }
+        let error = tokio::time::timeout(Duration::from_secs(1), &mut future)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            if mode == 0 {
+                ModelRouteTerminalErrorKind::DeadlineExceeded
+            } else {
+                ModelRouteTerminalErrorKind::Cancelled
+            }
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn bind_authorized_never_invokes_and_rechecks_success_cancellation() {
+    for cancel in [false, true] {
+        let token = ModelRouteCancellation::new();
+        let probe = Arc::new(SuccessProbe {
+            calls: AtomicUsize::new(0),
+        });
+        let broker = CredentialBroker::new().with_secret_provider(Arc::new(ReadyResolver {
+            cancellation: cancel.then(|| token.clone()),
+        }));
+        let policy = ModelRoutePublisher::new(
+            snapshot(compatible_registry(), &["first"])
+                .with_test_llm(candidate("first"), probe.clone())
+                .unwrap(),
+        )
+        .policy(Instant::now() + Duration::from_secs(5));
+        let outcome = policy.bind_authorized(&broker, &token).await;
+        if cancel {
+            assert_eq!(
+                outcome.unwrap_err().kind(),
+                ModelRouteTerminalErrorKind::Cancelled
+            );
+        } else {
+            outcome.unwrap();
+        }
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+struct OrderedResolver {
+    first: AtomicUsize,
+    second: AtomicUsize,
+    fail_first: bool,
+}
+impl SecretProvider for OrderedResolver {
+    fn resolve(&self, _: &str) -> Result<SecretValue, CredentialError> {
+        panic!("route used sync resolver")
+    }
+    fn resolve_for_route<'a>(
+        &'a self,
+        handle: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SecretValue, CredentialError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            match handle {
+                "first" => {
+                    self.first.fetch_add(1, Ordering::SeqCst);
+                    if self.fail_first {
+                        return Err(CredentialError::missing());
+                    }
+                }
+                "second" => {
+                    self.second.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => panic!("unexpected credential handle"),
+            }
+            Ok(SecretValue::new("synthetic-inert-credential"))
+        })
+    }
+}
+
+#[tokio::test]
+async fn bind_authorized_checks_authorization_and_only_binds_first_candidate() {
+    for (deny_first, fail_first) in [(true, false), (false, false), (false, true)] {
+        let resolver = Arc::new(OrderedResolver {
+            first: AtomicUsize::new(0),
+            second: AtomicUsize::new(0),
+            fail_first,
+        });
+        let broker = CredentialBroker::new().with_secret_provider(resolver.clone());
+        let probe = Arc::new(SuccessProbe {
+            calls: AtomicUsize::new(0),
+        });
+        let mut registry = ModelProfileRegistry::new();
+        for name in ["first", "second"] {
+            registry
+                .register(OpenAiCompatibleProfile::new(
+                    name,
+                    "1",
+                    "synthetic",
+                    "https://synthetic.invalid",
+                    CredentialHandle::secret_provider(name),
+                ))
+                .unwrap();
+        }
+        let candidates = [candidate("first"), candidate("second")];
+        let authorization =
+            ModelRouteAuthorization::new(candidates.iter().skip(usize::from(deny_first)).cloned());
+        let snap = ModelRouteSnapshot::new(registry, candidates, authorization)
+            .unwrap()
+            .with_test_llm(candidate("first"), probe.clone())
+            .unwrap()
+            .with_test_llm(candidate("second"), probe.clone())
+            .unwrap();
+        let outcome = ModelRoutePublisher::new(snap)
+            .policy(Instant::now() + Duration::from_secs(5))
+            .bind_authorized(&broker, &ModelRouteCancellation::new())
+            .await;
+        if deny_first || fail_first {
+            let error = outcome.unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if deny_first {
+                    ModelRouteTerminalErrorKind::AuthorizationDenied
+                } else {
+                    ModelRouteTerminalErrorKind::Configuration
+                }
+            );
+            assert_eq!(
+                error.profile_error(),
+                fail_first.then_some(ModelProfileErrorKind::Credential)
+            );
+            assert_eq!(error.attempts().len(), 1);
+            assert_eq!(error.attempts()[0].ordinal(), 1);
+        } else {
+            outcome.unwrap();
+        }
+        assert_eq!(
+            resolver.first.load(Ordering::SeqCst),
+            usize::from(!deny_first)
+        );
+        assert_eq!(resolver.second.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
     }
 }

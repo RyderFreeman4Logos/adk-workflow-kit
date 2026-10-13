@@ -4,7 +4,7 @@ use super::{
     ResponsePolicy,
 };
 use crate::model_profiles::{
-    CredentialBroker, ModelBinding, ModelProfileErrorKind, ModelProfileIdentity,
+    CredentialBroker, ModelBinding, ModelProfileError, ModelProfileErrorKind, ModelProfileIdentity,
     ModelProfileRegistry, ModelRole,
 };
 use std::{
@@ -190,14 +190,11 @@ impl ModelRouteSnapshot {
         &self,
         candidate: &ModelRouteCandidate,
         broker: &CredentialBroker,
-    ) -> Result<ModelBinding, ModelRouteSnapshotError> {
+    ) -> Result<ModelBinding, ModelProfileError> {
         let binding = self
             .registry
             .bind_route(candidate.role(), candidate.profile(), broker)
-            .await
-            .map_err(|_| ModelRouteSnapshotError {
-                kind: ModelRouteSnapshotErrorKind::InvalidRegistry,
-            })?;
+            .await?;
         #[cfg(any(test, feature = "test-support"))]
         if let Some(llm) = self.test_llms.get(candidate) {
             return Ok(binding.with_test_llm(Arc::clone(llm)));
@@ -290,6 +287,7 @@ pub enum ModelRouteTerminalErrorKind {
 pub struct ModelRouteTerminalError {
     kind: ModelRouteTerminalErrorKind,
     attempts: Vec<ModelRouteAttempt>,
+    profile_error: Option<ModelProfileErrorKind>,
 }
 
 impl ModelRouteTerminalError {
@@ -299,6 +297,11 @@ impl ModelRouteTerminalError {
 
     pub fn attempts(&self) -> &[ModelRouteAttempt] {
         &self.attempts
+    }
+
+    /// Profile bind subtype. `None` unless `kind` is `Configuration` from bind.
+    pub fn profile_error(&self) -> Option<ModelProfileErrorKind> {
+        self.profile_error
     }
 }
 
@@ -368,6 +371,57 @@ impl ModelRoutePolicy {
         self.deadline
     }
 
+    /// Authorize and bind the first candidate without constructing a provider request.
+    /// The policy's absolute deadline and cancellation cover credential resolution.
+    pub async fn bind_authorized(
+        &self,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+    ) -> Result<(), ModelRouteTerminalError> {
+        let mut attempts = Vec::new();
+        let Some((index, candidate)) = self.snapshot.candidates.iter().enumerate().next() else {
+            return Err(route_terminal(
+                ModelRouteTerminalErrorKind::Exhausted,
+                attempts,
+            ));
+        };
+        if let Some(kind) = route_stop(self.deadline, cancellation) {
+            return Err(route_terminal(kind, attempts));
+        }
+        let ordinal = u8::try_from(index + 1).expect("bounded model route ordinal");
+        if !self.snapshot.authorization.allows(candidate) {
+            attempts.push(ModelRouteAttempt {
+                ordinal,
+                kind: ModelRouteAttemptKind::AuthorizationDenied,
+            });
+            return Err(route_terminal(
+                ModelRouteTerminalErrorKind::AuthorizationDenied,
+                attempts,
+            ));
+        }
+        match await_route(
+            self.snapshot.bind(candidate, broker),
+            self.deadline,
+            cancellation,
+        )
+        .await
+        {
+            Err(kind) => Err(route_terminal(kind, attempts)),
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => {
+                attempts.push(ModelRouteAttempt {
+                    ordinal,
+                    kind: ModelRouteAttemptKind::Configuration,
+                });
+                Err(ModelRouteTerminalError {
+                    kind: ModelRouteTerminalErrorKind::Configuration,
+                    attempts,
+                    profile_error: Some(error.kind()),
+                })
+            }
+        }
+    }
+
     /// Explicit host opt-in. Authorization precedes all resolution/construction.
     /// Rebinds the request's placeholder route to each admitted candidate. One
     /// absolute deadline covers binding and every fallback; a profile timeout
@@ -428,15 +482,16 @@ impl ModelRoutePolicy {
             {
                 Err(kind) => return Err(route_terminal(kind, attempts)),
                 Ok(Ok(binding)) => binding,
-                Ok(Err(_)) => {
+                Ok(Err(error)) => {
                     attempts.push(ModelRouteAttempt {
                         ordinal,
                         kind: ModelRouteAttemptKind::Configuration,
                     });
-                    return Err(route_terminal(
-                        ModelRouteTerminalErrorKind::Configuration,
+                    return Err(ModelRouteTerminalError {
+                        kind: ModelRouteTerminalErrorKind::Configuration,
                         attempts,
-                    ));
+                        profile_error: Some(error.kind()),
+                    });
                 }
             };
             let candidate_spec = spec.with_route(ProviderRouteIdentity::from_binding(&binding));
@@ -535,5 +590,9 @@ fn route_terminal(
     kind: ModelRouteTerminalErrorKind,
     attempts: Vec<ModelRouteAttempt>,
 ) -> ModelRouteTerminalError {
-    ModelRouteTerminalError { kind, attempts }
+    ModelRouteTerminalError {
+        kind,
+        attempts,
+        profile_error: None,
+    }
 }
