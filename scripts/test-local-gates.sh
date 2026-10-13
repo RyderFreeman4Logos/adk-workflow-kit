@@ -2,6 +2,9 @@
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
+# Fixtures own their Git state, including when invoked by a commit hook.
+mapfile -t git_local_env < <(git rev-parse --local-env-vars)
+unset "${git_local_env[@]}"
 source_runner="$repo_root/scripts/local-gates.sh"
 if [[ ! -x "$source_runner" ]]; then
     printf 'FAIL local-gates helper is missing or not executable: %s\n' "$source_runner" >&2
@@ -218,7 +221,7 @@ release_gate_rc=$?
 set -e
 if [[ $release_gate_rc -ne 42 ||
     "$release_gate_output" != *"$release_command"* ||
-    "$release_gate_output" != *'recipe `issue-323-release-consumer` failed'* ]]; then
+    "$release_gate_output" != *[Rr]'ecipe `issue-323-release-consumer` failed'* ]]; then
     printf 'FAIL aggregate did not propagate release-consumer failure: exit=%s output=%s\n' \
         "$release_gate_rc" "$release_gate_output" >&2
     exit 1
