@@ -1134,6 +1134,10 @@ fn map_adk_error(profile: &ModelProfileIdentity, error: AdkError) -> ModelProfil
     ModelProfileError {
         kind,
         profile: Some(profile.clone()),
+        upstream_status_code: error
+            .details
+            .upstream_status_code
+            .filter(|status| (100..=599).contains(status)),
     }
 }
 
@@ -1150,10 +1154,11 @@ pub enum ModelProfileErrorKind {
     Timeout,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ModelProfileError {
     kind: ModelProfileErrorKind,
     profile: Option<ModelProfileIdentity>,
+    upstream_status_code: Option<u16>,
 }
 
 impl ModelProfileError {
@@ -1161,18 +1166,21 @@ impl ModelProfileError {
         Self {
             kind: ModelProfileErrorKind::InvalidProfile,
             profile: None,
+            upstream_status_code: None,
         }
     }
     fn duplicate() -> Self {
         Self {
             kind: ModelProfileErrorKind::DuplicateProfile,
             profile: None,
+            upstream_status_code: None,
         }
     }
     fn missing() -> Self {
         Self {
             kind: ModelProfileErrorKind::MissingProfile,
             profile: None,
+            upstream_status_code: None,
         }
     }
     fn credential(error: CredentialError) -> Self {
@@ -1180,31 +1188,50 @@ impl ModelProfileError {
         Self {
             kind: ModelProfileErrorKind::Credential,
             profile: None,
+            upstream_status_code: None,
         }
     }
     fn provider() -> Self {
         Self {
             kind: ModelProfileErrorKind::Provider,
             profile: None,
+            upstream_status_code: None,
         }
     }
     fn timeout() -> Self {
         Self {
             kind: ModelProfileErrorKind::Timeout,
             profile: None,
+            upstream_status_code: None,
         }
     }
     fn timeout_for(profile: ModelProfileIdentity) -> Self {
         Self {
             kind: ModelProfileErrorKind::Timeout,
             profile: Some(profile),
+            upstream_status_code: None,
         }
     }
     pub fn kind(&self) -> ModelProfileErrorKind {
         self.kind
     }
+    /// Actual SDK upstream HTTP status in 100..=599; never inferred from category.
+    pub fn upstream_status_code(&self) -> Option<u16> {
+        self.upstream_status_code
+    }
+    /// Explicit profile identity; omitted from generic diagnostic formatting.
     pub fn profile(&self) -> Option<&ModelProfileIdentity> {
         self.profile.as_ref()
+    }
+}
+
+impl fmt::Debug for ModelProfileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModelProfileError")
+            .field("kind", &self.kind)
+            .field("upstream_status_code", &self.upstream_status_code)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1329,16 +1356,20 @@ fn retryable_provider_error(error: &AdkError) -> bool {
 }
 
 fn provider_adk_error(error: AdkError) -> AdkError {
-    if error.category == ErrorCategory::Timeout {
-        error
+    let code = if error.category == ErrorCategory::Timeout {
+        "model.profile.timeout"
     } else {
-        AdkError::new(
-            ErrorComponent::Model,
-            error.category,
-            "model.profile.unreachable",
-            "model.profile.unreachable",
-        )
+        "model.profile.unreachable"
+    };
+    let mut sanitized = AdkError::new(ErrorComponent::Model, error.category, code, code);
+    if error.category == ErrorCategory::Timeout {
+        sanitized.retry = error.retry;
     }
+    sanitized.details.upstream_status_code = error
+        .details
+        .upstream_status_code
+        .filter(|status| (100..=599).contains(status));
+    sanitized
 }
 
 #[cfg(test)]

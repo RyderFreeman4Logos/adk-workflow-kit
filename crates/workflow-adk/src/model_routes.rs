@@ -259,6 +259,8 @@ pub enum ModelRouteAttemptKind {
 pub struct ModelRouteAttempt {
     ordinal: u8,
     kind: ModelRouteAttemptKind,
+    profile_error: Option<ModelProfileErrorKind>,
+    upstream_status_code: Option<u16>,
 }
 
 impl ModelRouteAttempt {
@@ -268,6 +270,16 @@ impl ModelRouteAttempt {
 
     pub fn kind(&self) -> ModelRouteAttemptKind {
         self.kind
+    }
+
+    /// Sanitized profile/request/provider subtype for this failed attempt.
+    pub fn profile_error(&self) -> Option<ModelProfileErrorKind> {
+        self.profile_error
+    }
+
+    /// Actual SDK upstream HTTP status in 100..=599, or unknown.
+    pub fn upstream_status_code(&self) -> Option<u16> {
+        self.upstream_status_code
     }
 }
 
@@ -287,7 +299,6 @@ pub enum ModelRouteTerminalErrorKind {
 pub struct ModelRouteTerminalError {
     kind: ModelRouteTerminalErrorKind,
     attempts: Vec<ModelRouteAttempt>,
-    profile_error: Option<ModelProfileErrorKind>,
 }
 
 impl ModelRouteTerminalError {
@@ -299,9 +310,25 @@ impl ModelRouteTerminalError {
         &self.attempts
     }
 
-    /// Profile bind subtype. `None` unless `kind` is `Configuration` from bind.
+    /// Final failed attempt subtype, including binding failures. Cancellation and
+    /// route deadline termination have no cause; prior attempts remain inspectable.
     pub fn profile_error(&self) -> Option<ModelProfileErrorKind> {
-        self.profile_error
+        self.failed_attempt()
+            .and_then(ModelRouteAttempt::profile_error)
+    }
+
+    /// Actual SDK status of the final failure; absent for cancellation/deadline.
+    pub fn upstream_status_code(&self) -> Option<u16> {
+        self.failed_attempt()
+            .and_then(ModelRouteAttempt::upstream_status_code)
+    }
+
+    fn failed_attempt(&self) -> Option<&ModelRouteAttempt> {
+        match self.kind {
+            ModelRouteTerminalErrorKind::Cancelled
+            | ModelRouteTerminalErrorKind::DeadlineExceeded => None,
+            _ => self.attempts.last(),
+        }
     }
 }
 
@@ -393,6 +420,8 @@ impl ModelRoutePolicy {
             attempts.push(ModelRouteAttempt {
                 ordinal,
                 kind: ModelRouteAttemptKind::AuthorizationDenied,
+                profile_error: None,
+                upstream_status_code: None,
             });
             return Err(route_terminal(
                 ModelRouteTerminalErrorKind::AuthorizationDenied,
@@ -412,11 +441,12 @@ impl ModelRoutePolicy {
                 attempts.push(ModelRouteAttempt {
                     ordinal,
                     kind: ModelRouteAttemptKind::Configuration,
+                    profile_error: Some(error.kind()),
+                    upstream_status_code: error.upstream_status_code(),
                 });
                 Err(ModelRouteTerminalError {
                     kind: ModelRouteTerminalErrorKind::Configuration,
                     attempts,
-                    profile_error: Some(error.kind()),
                 })
             }
         }
@@ -467,6 +497,8 @@ impl ModelRoutePolicy {
                 attempts.push(ModelRouteAttempt {
                     ordinal,
                     kind: ModelRouteAttemptKind::AuthorizationDenied,
+                    profile_error: None,
+                    upstream_status_code: None,
                 });
                 return Err(route_terminal(
                     ModelRouteTerminalErrorKind::AuthorizationDenied,
@@ -486,11 +518,12 @@ impl ModelRoutePolicy {
                     attempts.push(ModelRouteAttempt {
                         ordinal,
                         kind: ModelRouteAttemptKind::Configuration,
+                        profile_error: Some(error.kind()),
+                        upstream_status_code: error.upstream_status_code(),
                     });
                     return Err(ModelRouteTerminalError {
                         kind: ModelRouteTerminalErrorKind::Configuration,
                         attempts,
-                        profile_error: Some(error.kind()),
                     });
                 }
             };
@@ -513,6 +546,8 @@ impl ModelRoutePolicy {
                 attempts.push(ModelRouteAttempt {
                     ordinal,
                     kind: ModelRouteAttemptKind::RetryableProvider,
+                    profile_error: error.model_error(),
+                    upstream_status_code: error.upstream_status_code(),
                 });
                 continue;
             }
@@ -541,6 +576,8 @@ impl ModelRoutePolicy {
             attempts.push(ModelRouteAttempt {
                 ordinal,
                 kind: attempt_kind,
+                profile_error: error.model_error(),
+                upstream_status_code: error.upstream_status_code(),
             });
             return Err(route_terminal(terminal_kind, attempts));
         }
@@ -590,9 +627,5 @@ fn route_terminal(
     kind: ModelRouteTerminalErrorKind,
     attempts: Vec<ModelRouteAttempt>,
 ) -> ModelRouteTerminalError {
-    ModelRouteTerminalError {
-        kind,
-        attempts,
-        profile_error: None,
-    }
+    ModelRouteTerminalError { kind, attempts }
 }

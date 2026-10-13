@@ -682,6 +682,7 @@ pub struct ModelInvocationError {
     attempts: u8,
     model_error: Option<ModelProfileErrorKind>,
     output_error: Option<StructuredOutputError>,
+    upstream_status_code: Option<u16>,
 }
 
 impl ModelInvocationError {
@@ -691,15 +692,21 @@ impl ModelInvocationError {
             attempts: 0,
             model_error: None,
             output_error: None,
+            upstream_status_code: None,
         }
     }
 
-    fn model(error: ModelProfileErrorKind, attempts: u8) -> Self {
+    fn model(
+        error: ModelProfileErrorKind,
+        attempts: u8,
+        upstream_status_code: Option<u16>,
+    ) -> Self {
         Self {
             kind: ModelInvocationErrorKind::ModelProfile,
             attempts,
             model_error: Some(error),
             output_error: None,
+            upstream_status_code,
         }
     }
 
@@ -709,6 +716,7 @@ impl ModelInvocationError {
             attempts,
             model_error: None,
             output_error: Some(error),
+            upstream_status_code: None,
         }
     }
 
@@ -722,6 +730,11 @@ impl ModelInvocationError {
 
     pub fn model_error(&self) -> Option<ModelProfileErrorKind> {
         self.model_error
+    }
+
+    /// Actual SDK upstream HTTP status in 100..=599, or unknown.
+    pub fn upstream_status_code(&self) -> Option<u16> {
+        self.upstream_status_code
     }
 
     pub fn output_error(&self) -> Option<StructuredOutputError> {
@@ -947,13 +960,24 @@ impl ModelInvocationSpec {
             let mut stream = binding
                 .generate_content(request.clone(), false)
                 .await
-                .map_err(|error| ModelInvocationError::model(error.kind(), attempts))?;
+                .map_err(|error| {
+                    ModelInvocationError::model(
+                        error.kind(),
+                        attempts,
+                        error.upstream_status_code(),
+                    )
+                })?;
             let mut output = String::new();
             let mut complete = false;
             let mut completion_evidence = ModelCompletionEvidence::default();
             while let Some(response) = stream.next().await {
-                let response = response
-                    .map_err(|error| ModelInvocationError::model(error.kind(), attempts))?;
+                let response = response.map_err(|error| {
+                    ModelInvocationError::model(
+                        error.kind(),
+                        attempts,
+                        error.upstream_status_code(),
+                    )
+                })?;
                 if response.interrupted
                     || response.error_code.is_some()
                     || response.error_message.is_some()
@@ -964,6 +988,7 @@ impl ModelInvocationSpec {
                     return Err(ModelInvocationError::model(
                         ModelProfileErrorKind::Provider,
                         attempts,
+                        None,
                     ));
                 }
                 // A harmless metadata trailer must not erase terminal evidence. New content
@@ -1008,6 +1033,7 @@ impl ModelInvocationSpec {
                 return Err(ModelInvocationError::model(
                     ModelProfileErrorKind::Provider,
                     attempts,
+                    None,
                 ));
             }
             match validate(output.as_bytes()).and_then(|()| self.output.decode(output.as_bytes())) {

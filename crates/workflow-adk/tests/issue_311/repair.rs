@@ -201,9 +201,48 @@ fn snapshot_stops_collecting_at_candidate_limit() {
     assert_eq!(calls.load(Ordering::SeqCst), MAX_MODEL_ROUTE_CANDIDATES + 1);
 }
 struct CompletionProbe {
+    category: ErrorCategory,
     cancel: Option<ModelRouteCancellation>,
     status: Option<u16>,
     streamed: bool,
+}
+#[tokio::test]
+async fn issue_329_route_preserves_provider_subtypes() {
+    for (category, expected) in [
+        (
+            ErrorCategory::InvalidInput,
+            ModelProfileErrorKind::InvalidRequest,
+        ),
+        (ErrorCategory::Internal, ModelProfileErrorKind::Provider),
+        (
+            ErrorCategory::RateLimited,
+            ModelProfileErrorKind::RetryableProvider,
+        ),
+        (ErrorCategory::Timeout, ModelProfileErrorKind::Timeout),
+    ] {
+        let probe = Arc::new(ErrorProbe {
+            calls: AtomicUsize::new(0),
+            category,
+        });
+        let snap = snapshot(registry(&["first"]), &["first"])
+            .with_test_llm(candidate("first"), probe.clone())
+            .unwrap();
+        let error = ModelRoutePublisher::new(snap)
+            .policy(Instant::now() + Duration::from_secs(5))
+            .invoke(
+                &request(),
+                &CredentialBroker::new(),
+                &ModelRouteCancellation::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.profile_error(), Some(expected));
+        assert_eq!(error.upstream_status_code(), None);
+        assert_eq!(error.attempts()[0].profile_error(), Some(expected));
+        assert_eq!(error.attempts().len(), 1);
+        assert_eq!(error.attempts()[0].ordinal(), 1);
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    }
 }
 #[adk_rust::async_trait]
 impl Llm for CompletionProbe {
@@ -220,11 +259,17 @@ impl Llm for CompletionProbe {
         }
         let mut error = AdkError::new(
             ErrorComponent::Model,
-            ErrorCategory::Internal,
+            self.category,
             "SYNTHETIC_ERROR_PAYLOAD",
             "https://synthetic:credential@invalid.invalid/payload",
         );
         error.details.upstream_status_code = self.status;
+        error.details.request_id = Some("SYNTHETIC_REQUEST_SECRET".into());
+        error.details.provider = Some("SYNTHETIC_PROVIDER_SECRET".into());
+        error.details.metadata.insert(
+            "SYNTHETIC_ENV_SECRET".into(),
+            json!("SYNTHETIC_TOKEN_SECRET"),
+        );
         if self.streamed {
             Ok(Box::pin(adk_rust::futures::stream::iter([Err(error)])))
         } else {
@@ -240,6 +285,7 @@ async fn error_completion_obeys_same_poll_cancellation() {
             .with_test_llm(
                 candidate("first"),
                 Arc::new(CompletionProbe {
+                    category: ErrorCategory::Internal,
                     cancel: Some(token.clone()),
                     status: None,
                     streamed,
@@ -261,6 +307,7 @@ async fn provider_classification_preserves_status_only_429() {
             .with_test_llm(
                 candidate("first"),
                 Arc::new(CompletionProbe {
+                    category: ErrorCategory::Internal,
                     cancel: None,
                     status: Some(429),
                     streamed,
@@ -510,6 +557,14 @@ pub(super) async fn fallback_matrix(transient_first: bool) {
             }
         );
         assert_eq!(error.attempts().len(), usize::from(transient_first));
+        assert_eq!(error.profile_error(), None);
+        assert_eq!(error.upstream_status_code(), None);
+        if transient_first {
+            assert_eq!(
+                error.attempts()[0].profile_error(),
+                Some(ModelProfileErrorKind::RetryableProvider)
+            );
+        }
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_eq!(third.calls.load(Ordering::SeqCst), 0);
         if !cancel {
@@ -626,6 +681,7 @@ async fn terminal_and_streamed_exhaustion_diagnostics_are_private() {
                 .with_test_llm(
                     candidate("first"),
                     Arc::new(CompletionProbe {
+                        category: ErrorCategory::Internal,
                         cancel: None,
                         status,
                         streamed,
@@ -895,5 +951,381 @@ async fn bind_authorized_checks_authorization_and_only_binds_first_candidate() {
         );
         assert_eq!(resolver.second.load(Ordering::SeqCst), 0);
         assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn issue_329_sdk_sanitization_retains_only_valid_status() {
+    for status in [
+        None,
+        Some(99),
+        Some(100),
+        Some(400),
+        Some(401),
+        Some(429),
+        Some(503),
+        Some(599),
+        Some(600),
+        Some(u16::MAX),
+    ] {
+        for streamed in [false, true] {
+            let binding = registry(&["first"])
+                .bind_candidate(
+                    ModelRole::Worker,
+                    candidate("first").profile(),
+                    &CredentialBroker::new(),
+                )
+                .unwrap()
+                .with_test_llm(Arc::new(CompletionProbe {
+                    category: ErrorCategory::Internal,
+                    cancel: None,
+                    status,
+                    streamed,
+                }));
+            let error = match Llm::generate_content(
+                &binding,
+                LlmRequest::new("model", vec![]),
+                false,
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("synthetic provider must fail"),
+            };
+            assert_eq!(
+                error.details.upstream_status_code,
+                status.filter(|value| (100..=599).contains(value))
+            );
+            let diagnostics = format!(
+                "{error:?}{error}{}",
+                serde_json::to_string(&error.details).unwrap()
+            );
+            for marker in [
+                "SYNTHETIC_REQUEST_SECRET",
+                "SYNTHETIC_PROVIDER_SECRET",
+                "SYNTHETIC_ENV_SECRET",
+                "SYNTHETIC_TOKEN_SECRET",
+            ] {
+                assert!(!diagnostics.contains(marker));
+            }
+            assert!(!diagnostics.contains("SYNTHETIC_ERROR_PAYLOAD"));
+            assert!(!diagnostics.contains("synthetic:credential"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn issue_329_status_survives_route_attempts_and_exhaustion() {
+    for status in [
+        None,
+        Some(99),
+        Some(100),
+        Some(400),
+        Some(401),
+        Some(429),
+        Some(503),
+        Some(599),
+        Some(600),
+        Some(u16::MAX),
+    ] {
+        for streamed in [false, true] {
+            let snap = snapshot(registry(&["first", "second"]), &["first", "second"])
+                .with_test_llm(
+                    candidate("first"),
+                    Arc::new(CompletionProbe {
+                        category: ErrorCategory::Internal,
+                        cancel: None,
+                        status: Some(429),
+                        streamed,
+                    }),
+                )
+                .unwrap()
+                .with_test_llm(
+                    candidate("second"),
+                    Arc::new(CompletionProbe {
+                        category: ErrorCategory::Internal,
+                        cancel: None,
+                        status,
+                        streamed,
+                    }),
+                )
+                .unwrap();
+            let error = ModelRoutePublisher::new(snap)
+                .policy(Instant::now() + Duration::from_secs(5))
+                .invoke(
+                    &request(),
+                    &CredentialBroker::new(),
+                    &ModelRouteCancellation::new(),
+                )
+                .await
+                .unwrap_err();
+            let expected_status = status.filter(|value| (100..=599).contains(value));
+            let expected_kind = if status == Some(429) {
+                ModelProfileErrorKind::RetryableProvider
+            } else {
+                ModelProfileErrorKind::Provider
+            };
+            assert_eq!(
+                error.kind(),
+                if status == Some(429) {
+                    ModelRouteTerminalErrorKind::Exhausted
+                } else {
+                    ModelRouteTerminalErrorKind::Provider
+                }
+            );
+            assert_eq!(error.profile_error(), Some(expected_kind));
+            assert_eq!(error.upstream_status_code(), expected_status);
+            assert_eq!(error.attempts().len(), 2);
+            let first = &error.attempts()[0];
+            assert_eq!(first.ordinal(), 1);
+            assert_eq!(
+                first.profile_error(),
+                Some(ModelProfileErrorKind::RetryableProvider)
+            );
+            assert_eq!(first.upstream_status_code(), Some(429));
+            let second = &error.attempts()[1];
+            assert_eq!(second.ordinal(), 2);
+            assert_eq!(second.profile_error(), Some(expected_kind));
+            assert_eq!(second.upstream_status_code(), expected_status);
+            let diagnostics = format!("{error:?}{error}{:?}", error.attempts());
+            for marker in [
+                "SYNTHETIC_PROMPT_MARKER",
+                "SYNTHETIC_ERROR_PAYLOAD",
+                "synthetic:credential",
+                "invalid.invalid",
+                "deterministic evidence",
+            ] {
+                assert!(!diagnostics.contains(marker));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn issue_329_streamed_invalid_request_and_timeout_are_private() {
+    for (category, expected) in [
+        (
+            ErrorCategory::InvalidInput,
+            ModelProfileErrorKind::InvalidRequest,
+        ),
+        (ErrorCategory::Timeout, ModelProfileErrorKind::Timeout),
+    ] {
+        let probe = Arc::new(CompletionProbe {
+            category,
+            cancel: None,
+            status: Some(400),
+            streamed: true,
+        });
+        let binding = registry(&["first"])
+            .bind_candidate(
+                ModelRole::Worker,
+                candidate("first").profile(),
+                &CredentialBroker::new(),
+            )
+            .unwrap()
+            .with_test_llm(probe.clone());
+        let sdk_error =
+            match Llm::generate_content(&binding, LlmRequest::new("model", vec![]), false).await {
+                Err(error) => error,
+                Ok(_) => panic!("synthetic stream must fail"),
+            };
+        assert_eq!(sdk_error.category, category);
+        assert_eq!(sdk_error.details.upstream_status_code, Some(400));
+        let snap = snapshot(registry(&["first"]), &["first"])
+            .with_test_llm(candidate("first"), probe)
+            .unwrap();
+        let error = ModelRoutePublisher::new(snap)
+            .policy(Instant::now() + Duration::from_secs(5))
+            .invoke(
+                &request(),
+                &CredentialBroker::new(),
+                &ModelRouteCancellation::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.profile_error(), Some(expected));
+        assert_eq!(error.upstream_status_code(), Some(400));
+        assert_eq!(error.attempts()[0].profile_error(), Some(expected));
+        let diagnostics = format!(
+            "{sdk_error:?}{sdk_error}{error:?}{error}{}",
+            serde_json::to_string(&sdk_error.details).unwrap()
+        );
+        for marker in [
+            "SYNTHETIC_ERROR_PAYLOAD",
+            "synthetic:credential",
+            "invalid.invalid",
+            "SYNTHETIC_PROMPT_MARKER",
+            "SYNTHETIC_REQUEST_SECRET",
+            "SYNTHETIC_PROVIDER_SECRET",
+            "SYNTHETIC_ENV_SECRET",
+            "SYNTHETIC_TOKEN_SECRET",
+        ] {
+            assert!(!diagnostics.contains(marker));
+        }
+    }
+}
+
+struct PrivateTimeoutProbe {
+    calls: AtomicUsize,
+    streamed: bool,
+    pending: bool,
+}
+#[adk_rust::async_trait]
+impl Llm for PrivateTimeoutProbe {
+    fn name(&self) -> &str {
+        "private-timeout-probe"
+    }
+    async fn generate_content(
+        &self,
+        _: LlmRequest,
+        _: bool,
+    ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.pending {
+            return Ok(Box::pin(adk_rust::futures::stream::pending()));
+        }
+        let mut error = AdkError::new(
+            ErrorComponent::Model,
+            ErrorCategory::Timeout,
+            "PRIVATE_TIMEOUT_CODE",
+            "PRIVATE_TIMEOUT_BODY",
+        );
+        error.retry.should_retry = false;
+        error.retry.retry_after_ms = Some(1234);
+        error.retry.max_attempts = Some(1);
+        error.details.upstream_status_code = Some(408);
+        error.details.request_id = Some("PRIVATE_TIMEOUT_REQUEST_ID".into());
+        if self.streamed {
+            Ok(Box::pin(adk_rust::futures::stream::iter([Err(error)])))
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[tokio::test]
+async fn issue_329_review_timeout_keeps_explicit_retry_guidance() {
+    for streamed in [false, true] {
+        let probe = Arc::new(PrivateTimeoutProbe {
+            calls: AtomicUsize::new(0),
+            streamed,
+            pending: false,
+        });
+        let binding = registry(&["first"])
+            .bind_candidate(
+                ModelRole::Worker,
+                candidate("first").profile(),
+                &CredentialBroker::new(),
+            )
+            .unwrap()
+            .with_test_llm(probe.clone());
+        let error =
+            match Llm::generate_content(&binding, LlmRequest::new("model", vec![]), false).await {
+                Err(error) => error,
+                Ok(_) => panic!("timeout probe must fail"),
+            };
+        assert!(!error.retry.should_retry);
+        assert_eq!(error.retry.retry_after_ms, Some(1234));
+        assert_eq!(error.retry.max_attempts, Some(1));
+        assert_eq!(error.category, ErrorCategory::Timeout);
+        assert_eq!(error.details.upstream_status_code, Some(408));
+        assert_eq!(error.code, "model.profile.timeout");
+        assert_eq!(error.message, "model.profile.timeout");
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !format!(
+                "{error:?}{error}{}",
+                serde_json::to_string(&error.details).unwrap()
+            )
+            .contains("PRIVATE_TIMEOUT")
+        );
+    }
+}
+
+#[tokio::test]
+async fn issue_329_review_profile_identity_is_not_diagnostic() {
+    use adk_rust::futures::StreamExt as _;
+    const NAME: &str = "PRIVATE_PROFILE_NAME";
+    const VERSION: &str = "PRIVATE_PROFILE_VERSION";
+    let reg = ModelProfileRegistry::new()
+        .with_worker(FakeModelProfile::new(NAME, VERSION, "model", ["unused"]))
+        .unwrap();
+    let binding = reg.bind_worker(&CredentialBroker::new()).unwrap();
+    let mut sdk_error = AdkError::new(
+        ErrorComponent::Model,
+        ErrorCategory::InvalidInput,
+        "PRIVATE_CODE",
+        "PRIVATE_BODY",
+    );
+    sdk_error.details.upstream_status_code = Some(400);
+    let mapped = binding.map_adk_error(sdk_error);
+    assert_eq!(mapped.kind(), ModelProfileErrorKind::InvalidRequest);
+    assert_eq!(mapped.upstream_status_code(), Some(400));
+    assert_eq!(mapped.profile().unwrap().name(), NAME);
+    assert_eq!(mapped.profile().unwrap().version(), VERSION);
+    let mut errors = vec![mapped];
+    for streamed in [false, true] {
+        let binding = reg
+            .bind_worker(&CredentialBroker::new())
+            .unwrap()
+            .with_test_llm(Arc::new(PrivateTimeoutProbe {
+                calls: AtomicUsize::new(0),
+                streamed,
+                pending: false,
+            }));
+        let error = match binding
+            .generate_content(LlmRequest::new("model", vec![]), false)
+            .await
+        {
+            Err(error) => error,
+            Ok(mut stream) => stream.next().await.unwrap().unwrap_err(),
+        };
+        assert_eq!(error.kind(), ModelProfileErrorKind::Timeout);
+        assert_eq!(error.upstream_status_code(), Some(408));
+        assert_eq!(error.profile().unwrap().name(), NAME);
+        errors.push(error);
+    }
+    let reg = ModelProfileRegistry::new()
+        .with_worker(
+            FakeModelProfile::new(NAME, VERSION, "model", ["unused"]).with_runtime(
+                ModelRuntimeConfig::default().with_timeout(Duration::from_millis(10)),
+            ),
+        )
+        .unwrap();
+    let binding = reg
+        .bind_worker(&CredentialBroker::new())
+        .unwrap()
+        .with_test_llm(Arc::new(PrivateTimeoutProbe {
+            calls: AtomicUsize::new(0),
+            streamed: true,
+            pending: true,
+        }));
+    let mut stream = binding
+        .generate_content(LlmRequest::new("model", vec![]), false)
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), ModelProfileErrorKind::Timeout);
+    assert_eq!(error.upstream_status_code(), None);
+    assert_eq!(error.profile().unwrap().name(), NAME);
+    errors.push(error);
+    for error in errors {
+        let diagnostic = format!("{error:?}{error}");
+        for marker in [
+            NAME,
+            VERSION,
+            "PRIVATE_CODE",
+            "PRIVATE_BODY",
+            "PRIVATE_TIMEOUT",
+        ] {
+            assert!(
+                !diagnostic.contains(marker),
+                "profile error diagnostics must omit {marker}"
+            );
+        }
     }
 }
