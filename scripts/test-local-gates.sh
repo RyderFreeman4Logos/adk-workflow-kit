@@ -346,9 +346,14 @@ printf '%s\n' \
 FAKE_CSA_FAIL=1 assert_pre_push_fails native-receipt-stale-head \
     'CSA review for main...HEAD or a valid native review receipt' "$current_record"
 write_native_receipt
+: > "$csa_log"
 native_output="$(printf '%s\n' "$current_record" | FAKE_CSA_FAIL=1 invoke "$runner" pre-push 2>&1)"
 [[ "$native_output" == *'PASS native review receipt for main...'* ]]
-((assertions += 1))
+[[ ! -s "$csa_log" ]] || { printf 'FAIL valid native receipt invoked CSA\n' >&2; exit 1; }
+((assertions += 2))
+printf '%s\n' tampered >> "$fixture/.csa/native-review.report"
+FAKE_CSA_FAIL=1 assert_pre_push_fails native-report-tampered \
+    'CSA review for main...HEAD or a valid native review receipt' "$current_record"
 rm -rf -- "$fixture/.csa"
 
 printf '%s\n' malformed > "$fixture/.local-gates/quality-gate.receipt"

@@ -177,11 +177,11 @@ pre_push() {
         || push_blocked 'remote object ID is malformed'
     before_head="$SNAPSHOT_HEAD"
     before_tree="$SNAPSHOT_TREE"
-    if command -v csa >/dev/null 2>&1 \
+    if native_review_receipt_valid; then
+        printf 'PASS native review receipt for main...%s.\n' "$SNAPSHOT_HEAD"
+    elif command -v csa >/dev/null 2>&1 \
         && csa review --check-verdict --range main...HEAD; then
         printf 'PASS CSA review for main...%s.\n' "$SNAPSHOT_HEAD"
-    elif native_review_receipt_valid; then
-        printf 'PASS native review receipt for main...%s.\n' "$SNAPSHOT_HEAD"
     else
         fail 'pre-push requires a passing CSA review for main...HEAD or a valid native review receipt at .csa/native-review.receipt'
     fi
