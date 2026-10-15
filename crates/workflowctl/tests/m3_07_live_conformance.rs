@@ -187,10 +187,118 @@ fn publish_script() -> Vec<String> {
     ]
 }
 
+// A complete response head is required before the peer can cancel its pending body.
+fn write_rate_limit(writer: &mut impl Write) -> std::io::Result<Instant> {
+    writer.write_all(b"HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n")?;
+    writer.flush()?;
+    Ok(Instant::now())
+}
+
+// Observe peer cancellation while this endpoint remains open. Local stop/deadline
+// expiry never supplies a witness, and each read consumes one absolute budget.
+fn observe_body_cancellation(
+    socket: &mut std::net::TcpStream,
+    done: &AtomicBool,
+    deadline: Instant,
+) -> Option<Instant> {
+    let mut byte = [0];
+    loop {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        if done.load(Ordering::Acquire) || remaining.is_zero() {
+            return None;
+        }
+        socket
+            .set_read_timeout(Some(remaining.min(Duration::from_millis(20))))
+            .ok()?;
+        let result = socket.read(&mut byte);
+        let observed = Instant::now();
+        if done.load(Ordering::Acquire) || observed >= deadline {
+            return None;
+        }
+        match result {
+            Ok(0) => return Some(observed),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Some(observed);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            _ => return None,
+        }
+    }
+}
+
+#[test]
+fn body_cancellation_witness_rejects_stop_expiry_and_live_peer() {
+    fn pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let peer =
+            std::net::TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+        (listener.accept().expect("queued connection").0, peer)
+    }
+    let (mut socket, peer) = pair();
+    let deadline = Instant::now() + Duration::from_millis(100);
+    assert!(
+        observe_body_cancellation(&mut socket, &AtomicBool::new(false), deadline).is_none(),
+        "a live peer is not a cancellation"
+    );
+    drop(peer);
+    assert!(
+        observe_body_cancellation(&mut socket, &AtomicBool::new(false), Instant::now()).is_none(),
+        "expiry is not a cancellation"
+    );
+    assert!(
+        observe_body_cancellation(
+            &mut socket,
+            &AtomicBool::new(true),
+            Instant::now() + Duration::from_secs(1)
+        )
+        .is_none(),
+        "local stop is not a cancellation"
+    );
+    assert!(
+        observe_body_cancellation(
+            &mut socket,
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(1)
+        )
+        .is_some(),
+        "peer EOF is a cancellation"
+    );
+}
+
+#[test]
+fn rate_limit_witness_requires_successful_write_and_flush() {
+    struct FailingWriter {
+        fail_write: bool,
+    }
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(bytes.len())
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    for fail_write in [true, false] {
+        assert!(write_rate_limit(&mut FailingWriter { fail_write }).is_err());
+    }
+}
+
 struct ScriptedServer {
     base_url: String,
     requests: Arc<AtomicU64>,
     first_rate_limit_sent: Arc<OnceLock<Instant>>,
+    stalled_body_cancelled: std::sync::mpsc::Receiver<Option<Instant>>,
     extra: Arc<AtomicU64>,
     done: Arc<AtomicBool>,
     first_response_released: Arc<AtomicBool>,
@@ -273,6 +381,7 @@ fn serve_provider(
     let address = listener.local_addr().expect("addr");
     let requests = Arc::new(AtomicU64::new(0));
     let first_rate_limit_sent = Arc::new(OnceLock::new());
+    let (body_cancelled, stalled_body_cancelled) = std::sync::mpsc::channel();
     let extra = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
     let first_response_released = Arc::new(AtomicBool::new(!hold_first_response));
@@ -344,6 +453,7 @@ fn serve_provider(
                     break;
                 }
             }
+            let mut complete_request = false;
             if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
                 let header_end = header_end + 4;
                 let content_length = String::from_utf8_lossy(&request[..header_end])
@@ -355,12 +465,19 @@ fn serve_provider(
                     })
                     .and_then(|value| value.parse::<usize>().ok())
                     .unwrap_or(0);
-                while request.len() < header_end + content_length {
+                let Some(request_end) = header_end.checked_add(content_length) else {
+                    return;
+                };
+                while request.len() < request_end {
                     match socket.read(&mut buffer) {
                         Ok(0) | Err(_) => break,
                         Ok(bytes) => request.extend_from_slice(&buffer[..bytes]),
                     }
                 }
+                complete_request = request.len() == request_end;
+            }
+            if !complete_request {
+                return;
             }
             if let Ok(mut bodies) = captured.lock() {
                 bodies.push(String::from_utf8_lossy(&request).into_owned());
@@ -379,26 +496,20 @@ fn serve_provider(
                     if !rate_limit_delay.is_zero() {
                         thread::sleep(rate_limit_delay);
                     }
-                    let _ = write!(
-                        socket,
-                        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n"
-                    );
-                    let _ = socket.flush();
-                    let _ = rate_limit_sent.set(Instant::now());
+                    let Ok(sent) = write_rate_limit(&mut socket) else {
+                        return;
+                    };
+                    let _ = rate_limit_sent.set(sent);
                 }
                 Some(_) if stall_body => {
                     let partial = r#"{"choices":[{"message":{"role":"assistant","content":""#;
-                    let _ = write!(
-                        socket,
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2048\r\nconnection: close\r\n\r\n{partial}"
+                    if write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2048\r\nconnection: close\r\n\r\n{partial}").and_then(|()| socket.flush()).is_err() { return; }
+                    let cancelled = observe_body_cancellation(
+                        &mut socket,
+                        &finished,
+                        Instant::now() + Duration::from_secs(8),
                     );
-                    let _ = socket.flush();
-                    let hold = Instant::now();
-                    while !finished.load(Ordering::Acquire)
-                        && hold.elapsed() < Duration::from_secs(8)
-                    {
-                        thread::sleep(Duration::from_millis(20));
-                    }
+                    let _ = body_cancelled.send(cancelled);
                     break;
                 }
                 Some(body) => {
@@ -417,6 +528,7 @@ fn serve_provider(
         base_url: format!("http://{address}/v1"),
         requests,
         first_rate_limit_sent,
+        stalled_body_cancelled,
         extra,
         done,
         first_response_released,
@@ -584,11 +696,21 @@ fn provider_retry_does_not_reset_timeout_on_body_stall() {
     fs::create_dir(&workdir).expect("run workdir");
     let profile = write_profile(&root.0, &timeout_profile(&server.base_url, 2_000, 5_000));
     let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
+    // Measure cancellation of the pending provider body, before independent
+    // terminal-artifact durability and CLI report processing. The fixture never
+    // closes this connection until it has recorded the peer's EOF/reset.
     let since_rate_limit = server
-        .first_rate_limit_sent
-        .get()
-        .expect("first 429 was sent")
-        .elapsed();
+        .stalled_body_cancelled
+        .recv_timeout(Duration::from_secs(8))
+        .expect("bounded cancellation observer completed")
+        .expect("client cancelled the stalled body")
+        .checked_duration_since(
+            *server
+                .first_rate_limit_sent
+                .get()
+                .expect("first 429 was sent"),
+        )
+        .expect("cancellation followed the rate limit");
     assert!(
         since_rate_limit < Duration::from_millis(1_400),
         "since_rate_limit={since_rate_limit:?} must keep one absolute deadline across retry"
