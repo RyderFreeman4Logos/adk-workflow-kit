@@ -194,6 +194,16 @@ fn write_rate_limit(writer: &mut impl Write) -> std::io::Result<Instant> {
     Ok(Instant::now())
 }
 
+fn write_partial_body(writer: &mut impl Write) -> std::io::Result<Instant> {
+    let partial = r#"{"choices":[{"message":{"role":"assistant","content":""#;
+    write!(
+        writer,
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2048\r\nconnection: close\r\n\r\n{partial}"
+    )?;
+    writer.flush()?;
+    Ok(Instant::now())
+}
+
 // Observe peer cancellation while this endpoint remains open. Local stop/deadline
 // expiry never supplies a witness, and each read consumes one absolute budget.
 fn observe_body_cancellation(
@@ -273,7 +283,7 @@ fn body_cancellation_witness_rejects_stop_expiry_and_live_peer() {
 }
 
 #[test]
-fn rate_limit_witness_requires_successful_write_and_flush() {
+fn response_witness_requires_successful_write_and_flush() {
     struct FailingWriter {
         fail_write: bool,
     }
@@ -291,6 +301,7 @@ fn rate_limit_witness_requires_successful_write_and_flush() {
     }
     for fail_write in [true, false] {
         assert!(write_rate_limit(&mut FailingWriter { fail_write }).is_err());
+        assert!(write_partial_body(&mut FailingWriter { fail_write }).is_err());
     }
 }
 
@@ -298,7 +309,7 @@ struct ScriptedServer {
     base_url: String,
     requests: Arc<AtomicU64>,
     first_rate_limit_sent: Arc<OnceLock<Instant>>,
-    stalled_body_cancelled: std::sync::mpsc::Receiver<Option<Instant>>,
+    stalled_body_cancelled: std::sync::mpsc::Receiver<Option<(Instant, Instant)>>,
     extra: Arc<AtomicU64>,
     done: Arc<AtomicBool>,
     first_response_released: Arc<AtomicBool>,
@@ -308,6 +319,19 @@ struct ScriptedServer {
 }
 
 impl ScriptedServer {
+    fn body_cancellation(&self) -> (Instant, Instant) {
+        let (sent, cancelled) = self
+            .stalled_body_cancelled
+            .recv_timeout(Duration::from_secs(8))
+            .expect("bounded cancellation observer completed")
+            .expect("client cancelled the stalled body");
+        assert!(
+            sent <= cancelled,
+            "cancellation followed partial body publication"
+        );
+        (sent, cancelled)
+    }
+
     fn request_count(&self) -> u64 {
         self.requests.load(Ordering::Acquire)
     }
@@ -502,14 +526,15 @@ fn serve_provider(
                     let _ = rate_limit_sent.set(sent);
                 }
                 Some(_) if stall_body => {
-                    let partial = r#"{"choices":[{"message":{"role":"assistant","content":""#;
-                    if write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2048\r\nconnection: close\r\n\r\n{partial}").and_then(|()| socket.flush()).is_err() { return; }
+                    let Ok(sent) = write_partial_body(&mut socket) else {
+                        return;
+                    };
                     let cancelled = observe_body_cancellation(
                         &mut socket,
                         &finished,
                         Instant::now() + Duration::from_secs(8),
                     );
-                    let _ = body_cancelled.send(cancelled);
+                    let _ = body_cancelled.send(cancelled.map(|cancelled| (sent, cancelled)));
                     break;
                 }
                 Some(body) => {
@@ -679,11 +704,20 @@ fn provider_body_stall_fails_closed_at_timeout() {
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
     let profile = write_profile(&root.0, &timeout_profile(&server.base_url, 400, 4_000));
+    // Include CLI startup in the original two-second budget, stopping at real
+    // peer cancellation before independent terminal persistence/report work.
+    let started = Instant::now();
     let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
-    let elapsed_ms = report.metrics().expect("metrics").elapsed_ms();
+    let (partial_sent, cancelled) = server.body_cancellation();
+    let partial_since_start = partial_sent
+        .checked_duration_since(started)
+        .expect("partial body followed the run start");
+    let cancelled_since_start = cancelled
+        .checked_duration_since(started)
+        .expect("cancellation followed the run start");
     assert!(
-        elapsed_ms < 2_000,
-        "elapsed_ms={elapsed_ms} body stall must fail at runtime.timeout_ms, not loop wall/idle"
+        cancelled_since_start < Duration::from_secs(2),
+        "partial_since_start={partial_since_start:?} cancelled_since_start={cancelled_since_start:?} body stall must fail at runtime.timeout_ms, not loop wall/idle"
     );
     assert_scripted_fail(&report, "timeout", server, 1);
 }
@@ -700,10 +734,8 @@ fn provider_retry_does_not_reset_timeout_on_body_stall() {
     // terminal-artifact durability and CLI report processing. The fixture never
     // closes this connection until it has recorded the peer's EOF/reset.
     let since_rate_limit = server
-        .stalled_body_cancelled
-        .recv_timeout(Duration::from_secs(8))
-        .expect("bounded cancellation observer completed")
-        .expect("client cancelled the stalled body")
+        .body_cancellation()
+        .1
         .checked_duration_since(
             *server
                 .first_rate_limit_sent
