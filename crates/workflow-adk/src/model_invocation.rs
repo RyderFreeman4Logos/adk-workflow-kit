@@ -846,7 +846,8 @@ impl fmt::Display for ModelInvocationSpecError {
 
 impl std::error::Error for ModelInvocationSpecError {}
 
-/// Ordinary callers permit optional completion metadata; Sentinel requires complete text.
+/// Both policies require a non-partial, completed terminal Stop.
+/// CompleteText additionally rejects non-text parts.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResponsePolicy {
     Ordinary,
@@ -998,8 +999,8 @@ impl ModelInvocationSpec {
     }
 
     /// Domain validators see bounded raw bytes before Value can collapse duplicate keys.
-    /// Provider failures abort before validation without retry. Optional completion metadata,
-    /// partial chunks and usage-only trailers retain the ordinary invocation contract.
+    /// Provider failures abort before validation without retry. A completed terminal Stop
+    /// is required; intermediate chunks and usage-only trailers may omit completion metadata.
     pub async fn invoke_validated(
         &self,
         binding: &ModelBinding,
@@ -1009,7 +1010,8 @@ impl ModelInvocationSpec {
             .await
     }
 
-    /// One bounded collector; strict completion/text-only admission is opt-in.
+    /// One bounded collector; completed terminal Stop is mandatory and text-only admission
+    /// is opt-in.
     pub(crate) async fn invoke_with_policy(
         &self,
         binding: &ModelBinding,
