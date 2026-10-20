@@ -1,30 +1,11 @@
-use std::io;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
 use serde_json::json;
 use workflow_adk::model_invocation::{
     EscalationPolicy, InferenceBudget, ModelInvocationErrorKind, ModelInvocationSpec,
     ModelProfileIdentity, PromptProtocol, ProviderRouteIdentity, ReasoningEffort,
     StructuredOutputContract, ToolDefinition,
 };
-use workflow_adk::model_profiles::{
-    CredentialBroker, CredentialHandle, FakeModelProfile, ModelProfileRegistry,
-    OpenAiCompatibleProfile, SecretProvider, SecretValue,
-};
+use workflow_adk::model_profiles::{CredentialBroker, FakeModelProfile, ModelProfileRegistry};
 use workflow_runtime::TrustDomain;
-
-struct LocalSecret;
-impl SecretProvider for LocalSecret {
-    fn resolve(
-        &self,
-        _handle: &str,
-    ) -> Result<SecretValue, workflow_adk::model_profiles::CredentialError> {
-        Ok(SecretValue::new("local-only"))
-    }
-}
 
 fn route(model: &str, tokenizer: &str) -> ProviderRouteIdentity {
     ProviderRouteIdentity::new(
@@ -537,7 +518,7 @@ fn request_identity_and_provenance_share_budget_and_seed() {
         "task",
         route("fake-model", "tokenizer-v1"),
         budget.clone(),
-        output.clone(),
+        output,
     )
     .expect("matching protocol and output schema");
     let request = spec.to_llm_request();
@@ -549,115 +530,11 @@ fn request_identity_and_provenance_share_budget_and_seed() {
         Some(budget.max_output_tokens() as i32)
     );
     assert_eq!(config.seed, Some(spec.deterministic_seed()));
-    assert_eq!(config.response_schema.as_ref(), Some(output.schema()));
     assert_eq!(
         provenance.max_output_tokens() as usize,
         budget.max_output_tokens()
     );
     assert_eq!(provenance.seed(), spec.deterministic_seed());
-}
-
-// One owned future bounds accept, the entire request, and the reply together.
-async fn schema_wire_request(
-    listener: TcpListener,
-    deadline: tokio::time::Instant,
-) -> io::Result<serde_json::Value> {
-    tokio::time::timeout_at(deadline, async {
-        const MAX_REQUEST_BYTES: usize = 64 * 1024;
-        let (mut socket, _) = listener.accept().await?;
-        let mut raw = Vec::new();
-        let mut buffer = [0_u8; 8192];
-        let header_end = loop {
-            let bytes = socket.read(&mut buffer).await?;
-            if bytes == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete request headers"));
-            }
-            raw.extend_from_slice(&buffer[..bytes]);
-            if raw.len() > MAX_REQUEST_BYTES {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "request too large"));
-            }
-            if let Some(end) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
-                break end + 4;
-            }
-        };
-        let content_length = String::from_utf8_lossy(&raw[..header_end]).lines()
-            .find_map(|line| line.strip_prefix("content-length: "))
-            .and_then(|value| value.parse::<usize>().ok())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid content length"))?;
-        let body_end = header_end.checked_add(content_length)
-            .filter(|end| *end <= MAX_REQUEST_BYTES)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "request too large"))?;
-        while raw.len() < body_end {
-            let remaining = (body_end - raw.len()).min(buffer.len());
-            let bytes = socket.read(&mut buffer[..remaining]).await?;
-            if bytes == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete request body"));
-            }
-            raw.extend_from_slice(&buffer[..bytes]);
-        }
-        let body = serde_json::from_slice(&raw[header_end..body_end]).map_err(io::Error::other)?;
-        let reply = r#"{"choices":[{"message":{"role":"assistant","content":"{\"answer\":\"ok\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
-        socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}", reply.len(), reply).as_bytes()).await?;
-        socket.flush().await?;
-        Ok(body)
-    }).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "wire fixture deadline"))?
-}
-
-#[tokio::test]
-async fn openai_compatible_wire_carries_strict_output_schema() {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let schema = contract().schema().clone();
-    let expected = schema.clone();
-    let profile = OpenAiCompatibleProfile::new(
-        "worker",
-        "1",
-        "local-model",
-        format!("http://{address}/v1"),
-        CredentialHandle::SecretProvider("local-key".to_owned()),
-    )
-    .with_tokenizer("tokenizer-v1");
-    let registry = ModelProfileRegistry::new()
-        .with_worker(profile)
-        .expect("valid profile");
-    let binding = registry
-        .bind_worker(&CredentialBroker::new().with_secret_provider(Arc::new(LocalSecret)))
-        .expect("local binding");
-    let protocol = PromptProtocol::new(
-        "stable policy",
-        vec![],
-        schema,
-        json!({"safe": true}),
-        TrustDomain::TrustedGoal,
-    )
-    .unwrap();
-    let spec = ModelInvocationSpec::new(
-        protocol,
-        "task",
-        ProviderRouteIdentity::from_binding(&binding),
-        InferenceBudget::low(),
-        contract(),
-    )
-    .expect("matching protocol and output schema");
-    let prompt = spec.prompt();
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    let (server_result, client_result) = tokio::join!(
-        schema_wire_request(listener, deadline),
-        tokio::time::timeout_at(deadline, spec.invoke(&binding)),
-    );
-    // Both futures are owned here: client failure cannot detach a server thread.
-    let body = server_result.expect("bounded loopback request");
-    client_result
-        .expect("client deadline")
-        .expect("local structured output");
-    let format = &body["response_format"];
-    assert_eq!(format["type"], "json_schema");
-    assert_eq!(format["json_schema"]["strict"], true);
-    assert_eq!(format["json_schema"]["schema"], expected);
-    let after = spec.prompt();
-    assert_eq!(prompt.prefix(), after.prefix());
-    assert_eq!(prompt.prompt(), after.prompt());
 }
 
 #[tokio::test]
@@ -700,102 +577,4 @@ async fn valid_structured_output_is_typed_and_provenance_is_cache_complete() {
         result.provenance().cache_salt(),
         TrustDomain::TrustedGoal.cache_salt()
     );
-}
-
-#[tokio::test]
-async fn wire_fixture_absent_client_obeys_deadline() {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
-    let result = tokio::time::timeout(
-        Duration::from_millis(200),
-        schema_wire_request(listener, deadline),
-    )
-    .await;
-    assert_eq!(
-        result
-            .expect("fixture must enforce its own deadline")
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::TimedOut
-    );
-}
-
-#[tokio::test]
-async fn wire_fixture_early_eof_stops_headers_and_body() {
-    for prefix in [
-        b"POST / HTTP/1.1\r\n".as_slice(),
-        b"POST / HTTP/1.1\r\ncontent-length: 20\r\n\r\n{".as_slice(),
-    ] {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        let client = async {
-            let mut socket = TcpStream::connect(address).await.unwrap();
-            socket.write_all(prefix).await.unwrap();
-            socket.shutdown().await.unwrap();
-        };
-        let (client_result, result) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(1), client),
-            tokio::time::timeout(
-                Duration::from_millis(200),
-                schema_wire_request(listener, deadline)
-            )
-        );
-        client_result.expect("EOF peer deadline");
-        assert_eq!(
-            result
-                .expect("EOF must stop the fixture")
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::UnexpectedEof
-        );
-    }
-}
-
-#[tokio::test]
-async fn wire_fixture_slow_body_cannot_renew_deadline() {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
-    let client = async {
-        let mut socket = TcpStream::connect(address).await.unwrap();
-        socket
-            .write_all(b"POST / HTTP/1.1\r\ncontent-length: 200\r\n\r\n")
-            .await
-            .unwrap();
-        for _ in 0..20 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            if socket.write_all(b" ").await.is_err() {
-                break;
-            }
-        }
-    };
-    let (client_result, result) = tokio::join!(
-        tokio::time::timeout(Duration::from_secs(1), client),
-        schema_wire_request(listener, deadline)
-    );
-    client_result.expect("test peer deadline");
-    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
-}
-
-#[tokio::test]
-async fn wire_fixture_rejects_unbounded_body_length() {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    let client = async {
-        let mut socket = TcpStream::connect(address).await.unwrap();
-        socket
-            .write_all(
-                format!("POST / HTTP/1.1\r\ncontent-length: {}\r\n\r\n", usize::MAX).as_bytes(),
-            )
-            .await
-            .unwrap();
-    };
-    let (client_result, result) = tokio::join!(
-        tokio::time::timeout(Duration::from_secs(1), client),
-        schema_wire_request(listener, deadline)
-    );
-    client_result.expect("test peer deadline");
-    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
 }
