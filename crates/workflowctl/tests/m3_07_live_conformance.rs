@@ -314,11 +314,36 @@ struct ScriptedServer {
     done: Arc<AtomicBool>,
     first_response_released: Arc<AtomicBool>,
     bodies: Arc<std::sync::Mutex<Vec<String>>>,
+    stall_admission: Option<std::sync::mpsc::Sender<Instant>>,
+    stall_acceptance: Arc<OnceLock<Result<Instant, &'static str>>>,
     handle: Option<thread::JoinHandle<()>>,
     _run_guard: MutexGuard<'static, ()>,
 }
 
 impl ScriptedServer {
+    fn arm_stall_accept(&mut self, admitted_at: Instant) {
+        self.stall_admission
+            .take()
+            .expect("stall admission is one-shot")
+            .send(admitted_at + Duration::from_secs(2))
+            .expect("prepared stall worker");
+    }
+
+    fn assert_stall_accepted(&self, admitted_at: Instant) {
+        let accepted = self
+            .stall_acceptance
+            .get()
+            .expect("stall worker reported admission")
+            .expect("stall worker accepted the provider");
+        assert!(
+            accepted
+                .checked_duration_since(admitted_at)
+                .expect("accept followed admission")
+                < Duration::from_secs(2),
+            "stall accept retained its two-second admission budget"
+        );
+    }
+
     fn body_cancellation(&self) -> (Instant, Instant) {
         let (sent, cancelled) = self
             .stalled_body_cancelled
@@ -359,6 +384,152 @@ impl ScriptedServer {
             let _ = handle.join();
         }
     }
+}
+
+// Setup owns the unarmed wait; only run admission starts the finite accept budget.
+fn accept_stall(
+    listener: &TcpListener,
+    done: &AtomicBool,
+    admission: std::sync::mpsc::Receiver<Instant>,
+) -> Result<(std::net::TcpStream, Instant), &'static str> {
+    let deadline = loop {
+        if done.load(Ordering::Acquire) {
+            return Err("stopped");
+        }
+        match admission.recv_timeout(Duration::from_millis(20)) {
+            Ok(deadline) => break deadline,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err("stopped"),
+        }
+    };
+    loop {
+        if done.load(Ordering::Acquire) {
+            return Err("stopped");
+        }
+        if Instant::now() >= deadline {
+            return Err("accept_deadline");
+        }
+        match listener.accept() {
+            Ok((socket, _)) => {
+                let accepted = Instant::now();
+                if done.load(Ordering::Acquire) {
+                    return Err("stopped");
+                }
+                return if accepted < deadline {
+                    Ok((socket, accepted))
+                } else {
+                    Err("accept_deadline")
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err("io"),
+        }
+    }
+}
+
+#[test]
+fn stall_accept_waits_for_run_admission_after_slow_setup() {
+    let mut server = serve_script(Vec::new(), true);
+    let setup_started = Instant::now();
+    thread::sleep(Duration::from_millis(2_100));
+    assert!(setup_started.elapsed() > Duration::from_secs(2));
+    let admitted_at = Instant::now();
+    server.arm_stall_accept(admitted_at);
+    let address = server
+        .base_url
+        .strip_prefix("http://")
+        .and_then(|value| value.strip_suffix("/v1"))
+        .expect("local provider address");
+    let response_started = Instant::now();
+    let mut socket =
+        std::net::TcpStream::connect(address).expect("prepared listener survives setup");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("read timeout");
+    let mut response = String::new();
+    socket
+        .read_to_string(&mut response)
+        .expect("stall response");
+    assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+    assert!(response_started.elapsed() >= Duration::from_secs(2));
+    assert_eq!(server.request_count(), 1);
+    server.assert_stall_accepted(admitted_at);
+    server.finish();
+}
+
+#[test]
+fn stall_accept_expires_after_admission_without_a_request() {
+    let mut server = serve_script(Vec::new(), true);
+    server.arm_stall_accept(Instant::now());
+    thread::sleep(Duration::from_millis(2_100));
+    let address = server
+        .base_url
+        .strip_prefix("http://")
+        .and_then(|value| value.strip_suffix("/v1"))
+        .expect("local provider address");
+    let _late_connection = std::net::TcpStream::connect(address);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while server.stall_acceptance.get().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(server.stall_acceptance.get(), Some(&Err("accept_deadline")));
+    server.stop();
+    assert!(server.handle.is_none());
+    assert_eq!(server.request_count(), 0);
+    server.finish();
+}
+
+#[test]
+fn stall_accept_rejects_queued_connection_with_expired_admission() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let _socket = std::net::TcpStream::connect(listener.local_addr().expect("address"))
+        .expect("queued connection");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    sender
+        .send(Instant::now() - Duration::from_secs(1))
+        .expect("expired absolute admission deadline");
+    assert!(matches!(
+        accept_stall(&listener, &AtomicBool::new(false), receiver),
+        Err("accept_deadline")
+    ));
+}
+
+#[test]
+fn stall_accept_stop_and_drop_join_before_or_after_admission() {
+    for armed in [false, true] {
+        let mut server = serve_script(Vec::new(), true);
+        if armed {
+            server.arm_stall_accept(Instant::now());
+        }
+        server.stop();
+        assert!(server.handle.is_none());
+        assert_eq!(server.stall_acceptance.get(), Some(&Err("stopped")));
+        assert_eq!(server.request_count(), 0);
+    }
+    let server = serve_script(Vec::new(), true);
+    let acceptance = Arc::clone(&server.stall_acceptance);
+    let requests = Arc::clone(&server.requests);
+    drop(server);
+    assert_eq!(acceptance.get(), Some(&Err("stopped")));
+    assert_eq!(requests.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn stall_accept_disconnected_admission_joins_without_accepting() {
+    let mut server = serve_script(Vec::new(), true);
+    drop(server.stall_admission.take());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while server.stall_acceptance.get().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(server.stall_acceptance.get(), Some(&Err("stopped")));
+    server.stop();
+    assert!(server.handle.is_none());
+    assert_eq!(server.request_count(), 0);
 }
 
 impl Drop for ScriptedServer {
@@ -408,6 +579,14 @@ fn serve_provider(
     let (body_cancelled, stalled_body_cancelled) = std::sync::mpsc::channel();
     let extra = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
+    let (stall_admission, admission) = if stall {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
+    let stall_acceptance = Arc::new(OnceLock::new());
+    let accepted_stall = Arc::clone(&stall_acceptance);
     let first_response_released = Arc::new(AtomicBool::new(!hold_first_response));
     let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
     let request_count = Arc::clone(&requests);
@@ -444,11 +623,16 @@ fn serve_provider(
                 }
             }
         };
-        if stall {
-            let Some(mut socket) = accept(Some(Duration::from_secs(2))) else {
+        if let Some(admission) = admission {
+            let result = accept_stall(&listener, &finished, admission);
+            if result.is_ok() {
+                request_count.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ =
+                accepted_stall.set(result.as_ref().map(|(_, at)| *at).map_err(|reason| *reason));
+            let Ok((mut socket, _)) = result else {
                 return;
             };
-            request_count.fetch_add(1, Ordering::Relaxed);
             thread::sleep(Duration::from_secs(2));
             let _ = write!(
                 socket,
@@ -558,6 +742,8 @@ fn serve_provider(
         done,
         first_response_released,
         bodies,
+        stall_admission,
+        stall_acceptance,
         handle: Some(handle),
         _run_guard: run_guard,
     }
@@ -642,7 +828,7 @@ fn unreachable_endpoint_fails_closed() {
 
 #[test]
 fn provider_timeout_fails_closed() {
-    let server = serve_script(Vec::new(), true);
+    let mut server = serve_script(Vec::new(), true);
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
@@ -665,7 +851,9 @@ fn provider_timeout_fails_closed() {
         ),
     );
     let started = Instant::now();
+    server.arm_stall_accept(started);
     let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
+    server.assert_stall_accepted(started);
     let elapsed_ms = report.metrics().expect("metrics").elapsed_ms();
     assert!(
         elapsed_ms >= 200,
@@ -752,12 +940,15 @@ fn provider_retry_does_not_reset_timeout_on_body_stall() {
 
 #[test]
 fn elapsed_ms_includes_delayed_local_server() {
-    let server = serve_script(Vec::new(), true);
+    let mut server = serve_script(Vec::new(), true);
     let root = temp_root();
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
     let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
+    let admitted_at = Instant::now();
+    server.arm_stall_accept(admitted_at);
     let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
+    server.assert_stall_accepted(admitted_at);
     let elapsed_ms = report.metrics().expect("metrics").elapsed_ms();
     assert!(
         elapsed_ms >= 1_500,
