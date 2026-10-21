@@ -176,6 +176,10 @@ runtime-hot-reload:
 issue-311-adk test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_311_model_routes {{test_name}} --locked -- --nocapture --test-threads=1
 
+# Caller-owned ADK conversations through the production invocation/route boundaries.
+issue-325-adk test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_325_model_sessions {{test_name}} --locked -- --nocapture --test-threads=1
+
 # Focused #314 ToolCall Debug privacy regression.
 issue-314-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_314_tool_call_debug {{test_name}} --locked -- --exact --nocapture
@@ -429,7 +433,7 @@ check-branch:
 
 pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit pattern-catalog-test m2-02-green test-local-gates
 
-_quality-gates: fmt-check issue-323-release-consumer check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk test-local-gates
+_quality-gates: fmt-check issue-323-release-consumer check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk issue-325-adk test-local-gates
 
 quality-gates:
     scripts/local-gates.sh produce

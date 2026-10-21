@@ -15,8 +15,9 @@ fi
 selection="$(just --justfile "$repo_root/justfile" --dry-run _quality-gates 2>&1)"
 if [[ "$selection" != *'cargo +1.98.0 test -p workflow-adk --locked -- --test-threads=1'* ||
     "$selection" != *'cargo +1.98.0 test -p workflow-adk --features test-support --test issue_233_behavioral --test issue_233_translation --locked -- --nocapture --test-threads=1'* ||
-    "$selection" != *'cargo +1.98.0 test -p workflow-adk --features test-support --test issue_311_model_routes '* ]]; then
-    printf 'FAIL canonical gate must select default ADK and feature-enabled authored behavioral tests\n' >&2
+    "$selection" != *'cargo +1.98.0 test -p workflow-adk --features test-support --test issue_311_model_routes '* ||
+    "$selection" != *'cargo +1.98.0 test -p workflow-adk --features test-support --test issue_325_model_sessions '* ]]; then
+    printf 'FAIL canonical gate must select default ADK and feature-enabled behavioral, route, and session tests\n' >&2
     exit 1
 fi
 
@@ -139,7 +140,7 @@ fi
 
 justfile_contract="$(<"$repo_root/justfile")"
 if [[ "$justfile_contract" != *'pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit pattern-catalog-test m2-02-green test-local-gates'* ||
-    "$justfile_contract" != *'_quality-gates: fmt-check issue-323-release-consumer check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk test-local-gates'* ||
+    "$justfile_contract" != *'_quality-gates: fmt-check issue-323-release-consumer check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk issue-325-adk test-local-gates'* ||
     "$justfile_contract" == *'pre-commit-fast: '*m2-02-red* ||
     "$justfile_contract" == *'_quality-gates: '*m2-02-red* ]]; then
     printf 'FAIL quality gates omit the required release or canonical M2-02/#269 consumer contracts\n' >&2
