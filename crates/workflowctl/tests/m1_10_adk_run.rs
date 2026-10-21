@@ -18,6 +18,8 @@ use workflow_runtime::{
     SqliteCheckpointStore, WorkflowRuntimeEventV1,
 };
 
+#[path = "support/m1_10_owned_child.rs"]
+mod m1_10_owned_child;
 #[path = "support/oracle_reap_witness.rs"]
 mod oracle_reap_witness;
 #[path = "support/owned_tree.rs"]
@@ -2425,6 +2427,95 @@ fn oracle_supervisor_fixture_blocks() {
 const UNPROVEN_REAP_FIXTURE_ENV: &str = "WORKFLOWCTL_ORACLE_UNPROVEN_REAP_FIXTURE";
 const UNPROVEN_REAP_ROOT_ENV: &str = "WORKFLOWCTL_ORACLE_UNPROVEN_REAP_ROOT";
 
+// Group signaling requires retained child status; never alter process-wide disposition.
+fn retained_child_status() -> bool {
+    // SAFETY: zero initializes the query buffer; null only reads SIGCHLD.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    let queried = unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) };
+    queried == 0
+        && action.sa_sigaction == libc::SIG_DFL
+        && action.sa_flags & libc::SA_NOCLDWAIT == 0
+}
+
+fn abort_fixture_output(command: &mut Command, root: &Path) -> Result<Output, String> {
+    use std::os::unix::process::CommandExt;
+
+    fn exited_without_reap(child: &Child) -> bool {
+        // SAFETY: zero initializes the kernel output structure.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: inspect our direct child without consuming its PID custody.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            eprintln!("abort fixture group custody unproven; aborting");
+            std::process::abort();
+        }
+        // SAFETY: successful waitid initialized the siginfo child fields.
+        unsafe { info.si_pid() == child.id() as i32 }
+    }
+
+    if !retained_child_status() {
+        return Err("abort fixture requires retained child status".to_string());
+    }
+    let deadline = Instant::now() + ORACLE_TIMEOUT;
+    let stdout_path = root.join("abort-fixture.stdout");
+    let stderr_path = root.join("abort-fixture.stderr");
+    let stdout = fs::File::create(&stdout_path)
+        .map_err(|_| "abort fixture stdout create failed".to_string())?;
+    let stderr = fs::File::create(&stderr_path)
+        .map_err(|_| "abort fixture stderr create failed".to_string())?;
+    let child = command
+        .process_group(0)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .map_err(|_| "abort fixture spawn failed".to_string())?;
+    let exited = loop {
+        if exited_without_reap(&child) {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::yield_now();
+    };
+    if !retained_child_status() {
+        eprintln!("abort fixture group custody unproven; aborting");
+        std::process::abort();
+    }
+    let pid = child.id() as i32;
+    // SAFETY: WNOWAIT and default SIGCHLD retain our exclusive group leader.
+    if unsafe { libc::getpgid(pid) } != pid {
+        eprintln!("abort fixture group custody unproven; aborting");
+        std::process::abort();
+    }
+    // SAFETY: the direct group leader has not been reaped or released.
+    let signaled = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    if signaled != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+        eprintln!("abort fixture group signal failed; aborting");
+        std::process::abort();
+    }
+    // The group signal reaches inherited descendants; only this wait proves
+    // the direct fixture child was reaped.
+    let output = wait_bounded_child(
+        child,
+        &stdout_path,
+        &stderr_path,
+        deadline,
+        "abort-fixture-outer",
+    );
+    if !exited && output.is_ok() {
+        return Err("oracle child timed out; oracle child reaped after kill".to_string());
+    }
+    output
+}
+
 #[test]
 fn oracle_unproven_reap_abort_fixture() {
     if std::env::var_os(UNPROVEN_REAP_FIXTURE_ENV).is_none() {
@@ -2464,16 +2555,16 @@ fn oracle_unproven_reap_abort_fixture() {
 fn oracle_unproven_reap_aborts_without_root_cleanup() {
     let receipt_root = temp_root("oracle-unproven-reap-parent");
     let receipt_path = receipt_root.join("root-path");
-    let output = Command::new(std::env::current_exe().expect("test binary"))
+    let mut command = Command::new(std::env::current_exe().expect("test binary"));
+    command
         .args([
             "--exact",
             "oracle_unproven_reap_abort_fixture",
             "--nocapture",
         ])
         .env(UNPROVEN_REAP_FIXTURE_ENV, "1")
-        .env(UNPROVEN_REAP_ROOT_ENV, &receipt_path)
-        .output()
-        .expect("abort fixture child");
+        .env(UNPROVEN_REAP_ROOT_ENV, &receipt_path);
+    let output = abort_fixture_output(&mut command, &receipt_root).expect("abort fixture child");
     let fixture_root = PathBuf::from(
         std::str::from_utf8(&fs::read(&receipt_path).expect("abort root receipt"))
             .expect("UTF-8 abort root"),
@@ -2563,6 +2654,15 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
         "terminal must be esrch, state+starttime, errno, or unavailable"
     );
     assert!(sentinel_survived, "abort must not unwind root cleanup");
+    if let Some(pid) = evidence
+        .split(' ')
+        .find_map(|field| field.strip_prefix("pid=")?.parse::<u32>().ok())
+    {
+        eprintln!(
+            "abort fixture descendant after group signal: {}",
+            format_terminal(pid)
+        );
+    }
     oracle_reap_witness::assert_abort_witness(stderr);
     assert_eq!(
         std::os::unix::process::ExitStatusExt::signal(&output.status),
