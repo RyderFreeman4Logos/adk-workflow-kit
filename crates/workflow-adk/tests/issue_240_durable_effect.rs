@@ -1,10 +1,10 @@
 use std::{
     fs,
     num::NonZeroU64,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -24,6 +24,8 @@ use workflow_runtime::{
     firewall::{FirewallPolicy, ToolProposal, TrustedGoal},
 };
 
+#[path = "issue_240_durable_effect/cleanup.rs"]
+mod cleanup;
 #[path = "issue_240_durable_effect/completion.rs"]
 mod completion;
 #[path = "issue_240_durable_effect/resume.rs"]
@@ -207,12 +209,15 @@ fn production_root() -> PathBuf {
 fn remove_production_root(root: &Path) {
     fn make_writable(path: &Path) {
         let metadata = fs::symlink_metadata(path).expect("production cleanup metadata");
+        if metadata.file_type().is_symlink() {
+            return;
+        }
         if metadata.file_type().is_dir() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("production directory writable");
             for entry in fs::read_dir(path).expect("production cleanup directory") {
                 make_writable(&entry.expect("production cleanup entry").path());
             }
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                .expect("production directory writable");
         } else {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))
                 .expect("production file writable");
@@ -475,23 +480,37 @@ fn adk_bridge_retries_nonterminal_durable_result_without_caching_it() {
 
 #[test]
 fn adk_bridge_refreshes_expiry_clock_between_recovery_phases() {
+    const HOST_NOW: u64 = 1_700_000_000_000;
     let root = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .expect("HOME is set")
         .join("tmp")
-        .join(format!("issue-240-expiry-{}", std::process::id()));
-    fs::create_dir_all(&root).expect("ledger root");
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private root");
-    let expiry = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_millis() as u64
-        + 1_000;
-    let request = request(expiry);
+        .join(format!(
+            "issue-240-expiry-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+            NEXT_PRODUCTION_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .expect("exclusive private ledger root");
+    let expiry = HOST_NOW + 1_000;
+    let clock = Arc::new(AtomicU64::new(HOST_NOW));
+    let clock_samples = Arc::new(Mutex::new(Vec::new()));
+    let bound_request = request(expiry);
     let mut ledger = EffectLedger::open(root.join("ledger.db")).expect("ledger");
-    ledger.propose(&request).expect("proposal");
+    ledger.propose(&bound_request).expect("proposal");
     ledger
-        .approve(&request, request.approval_digest(), "operator", 1)
+        .approve(
+            &bound_request,
+            bound_request.approval_digest(),
+            "operator",
+            1,
+        )
         .expect("approval");
     let executions = Arc::new(AtomicUsize::new(0));
     let reconciles = Arc::new(AtomicUsize::new(0));
@@ -504,6 +523,8 @@ fn adk_bridge_refreshes_expiry_clock_between_recovery_phases() {
             CrossingExpiryExecutor {
                 reconciles: Arc::clone(&reconciles),
                 executions: Arc::clone(&executions),
+                clock: Arc::clone(&clock),
+                advanced_now: HOST_NOW + 1_100,
             },
         )
         .expect("executor");
@@ -516,8 +537,15 @@ fn adk_bridge_refreshes_expiry_clock_between_recovery_phases() {
     .with_required_capabilities([SandboxCapability::Network])
     .with_required_scopes(["fake"])
     .with_idempotency(ToolIdempotency::StableKey);
-    let handler =
-        DurableEffectHandler::new(request, ledger, executors, registration).expect("handler");
+    let sample_clock = Arc::clone(&clock);
+    let record_samples = Arc::clone(&clock_samples);
+    let handler = DurableEffectHandler::new(bound_request, ledger, executors, registration)
+        .expect("handler")
+        .with_clock(move || {
+            let now = sample_clock.load(Ordering::SeqCst);
+            record_samples.lock().expect("clock samples").push(now);
+            now
+        });
     let approvals = ApprovalLedger::new().grant(
         "increment",
         "call-1",
@@ -546,10 +574,14 @@ fn adk_bridge_refreshes_expiry_clock_between_recovery_phases() {
     )
     .expect("bridge");
     let call = ToolCall::new("increment", "call-1", "actor-1", json!({"count": 1}));
-    // The first reconciliation is an immediate Unknown before the +1 s expiry;
-    // the next is Absent after its bounded 1.1 s crossing delay.
+    // The second reconciliation crosses the same 1 s expiry during its 1.1 s delay.
+    // The fourth phase must sample the advanced host clock before another retry.
     let response = bridge.invoke(call);
-    assert!(reconciles.load(Ordering::SeqCst) >= 2);
+    assert_eq!(reconciles.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        *clock_samples.lock().expect("clock samples"),
+        [HOST_NOW, HOST_NOW, HOST_NOW, HOST_NOW + 1_100]
+    );
     assert_eq!(executions.load(Ordering::SeqCst), 0);
     assert_eq!(
         response
@@ -557,18 +589,33 @@ fn adk_bridge_refreshes_expiry_clock_between_recovery_phases() {
             .kind(),
         workflow_runtime::ToolBridgeErrorKind::HandlerFailed
     );
+    drop(bridge);
+    let reopened = EffectLedger::open(root.join("ledger.db")).expect("reopen ledger");
+    assert_eq!(
+        reopened.history(&request(expiry)).expect("durable history"),
+        [
+            workflow_runtime::effect_ledger::EffectState::Proposed,
+            workflow_runtime::effect_ledger::EffectState::Approved,
+            workflow_runtime::effect_ledger::EffectState::Started,
+            workflow_runtime::effect_ledger::EffectState::Indeterminate,
+        ]
+    );
+    drop(reopened);
     fs::remove_dir_all(root).expect("cleanup");
 }
 
 struct CrossingExpiryExecutor {
     reconciles: Arc<AtomicUsize>,
     executions: Arc<AtomicUsize>,
+    clock: Arc<AtomicU64>,
+    advanced_now: u64,
 }
 
 impl EffectExecutor for CrossingExpiryExecutor {
     fn reconcile(&mut self, _request: &ApprovalRequest) -> RemoteObservation {
         if self.reconciles.fetch_add(1, Ordering::SeqCst) == 1 {
             std::thread::sleep(Duration::from_millis(1_100));
+            self.clock.store(self.advanced_now, Ordering::SeqCst);
             RemoteObservation::Absent
         } else if self.reconciles.load(Ordering::SeqCst) == 1 {
             RemoteObservation::Unknown

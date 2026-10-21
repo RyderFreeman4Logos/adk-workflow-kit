@@ -1,11 +1,13 @@
-use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 use adk_rust::futures::StreamExt;
 use adk_rust::{Content, LlmRequest};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{Instant, timeout, timeout_at};
 use workflow_adk::model_profiles::{
     CredentialBroker, CredentialHandle, CredentialSource, FakeModelProfile, ModelProfileErrorKind,
     ModelProfileIdentity, ModelProfileRegistry, ModelRole, ModelRuntimeConfig,
@@ -130,53 +132,64 @@ fn worker_and_reviewer_profiles_keep_distinct_requested_and_resolved_identities(
     );
 }
 
-#[tokio::test]
-async fn local_openai_compatible_binding_forwards_runtime_configuration() {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+const MAX_WIRE_REQUEST_BYTES: usize = 64 * 1024;
+
+// One owned future bounds accept, all request bytes, and the reply together.
+async fn model_profile_wire_request(
+    listener: TcpListener,
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
+    timeout_at(deadline, async move {
+        let (mut socket, _) = listener.accept().await?;
         let mut request = Vec::new();
         let mut buffer = [0_u8; 8192];
-        loop {
-            let bytes = socket.read(&mut buffer).unwrap();
-            request.extend_from_slice(&buffer[..bytes]);
-            if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
+        let header_end = loop {
+            let remaining = (MAX_WIRE_REQUEST_BYTES - request.len()).min(buffer.len());
+            if remaining == 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "request too large"));
             }
-        }
-        let header_end = request
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .unwrap()
-            + 4;
+            let bytes = socket.read(&mut buffer[..remaining]).await?;
+            if bytes == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete headers"));
+            }
+            request.extend_from_slice(&buffer[..bytes]);
+            if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
         let content_length = String::from_utf8_lossy(&request[..header_end])
             .lines()
             .find_map(|line| line.strip_prefix("content-length: "))
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        while request.len() < header_end + content_length {
-            let bytes = socket.read(&mut buffer).unwrap();
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid content length"))?;
+        let body_end = header_end.checked_add(content_length)
+            .filter(|end| *end <= MAX_WIRE_REQUEST_BYTES)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "request too large"))?;
+        while request.len() < body_end {
+            let remaining = (body_end - request.len()).min(buffer.len());
+            let bytes = socket.read(&mut buffer[..remaining]).await?;
+            if bytes == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete body"));
+            }
             request.extend_from_slice(&buffer[..bytes]);
         }
-        let text = String::from_utf8_lossy(&request);
-        assert!(text.contains("authorization: Bearer test-only-token"));
-        assert!(text.contains("\"temperature\":0.2"));
-        assert!(text.contains("\"trace\":\"local\""));
         let body = r#"{"choices":[{"message":{"role":"assistant","content":"wire-ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
-        write!(
-            socket,
+        let reply = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        )
-        .unwrap();
-        socket.flush().unwrap();
-    });
+            body.len(), body,
+        );
+        socket.write_all(reply.as_bytes()).await?;
+        socket.flush().await?;
+        Ok(request)
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "wire fixture deadline"))?
+}
 
+#[tokio::test]
+async fn local_openai_compatible_binding_forwards_runtime_configuration() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
     let runtime = ModelRuntimeConfig::default()
         .with_timeout(Duration::from_secs(2))
         .with_sampling(|sampling| sampling.with_temperature(0.2))
@@ -194,12 +207,26 @@ async fn local_openai_compatible_binding_forwards_runtime_configuration() {
         .bind_worker(&CredentialBroker::new().with_secret_provider(Arc::new(TestSecrets)))
         .unwrap();
     let request = LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
-    let mut stream = binding.generate_content(request, false).await.unwrap();
-    assert_eq!(
-        stream.next().await.unwrap().unwrap().content.unwrap().parts[0].text(),
-        Some("wire-ok")
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let client = async {
+        let mut stream = binding.generate_content(request, false).await?;
+        stream.next().await.transpose()
+    };
+    let (server_result, client_result) = tokio::join!(
+        model_profile_wire_request(listener, deadline),
+        timeout_at(deadline, client),
     );
-    server.join().unwrap();
+    // Assert only after both owned futures settle, including either error path.
+    let request = server_result.expect("bounded loopback request");
+    let text = String::from_utf8_lossy(&request);
+    assert!(text.contains("authorization: Bearer test-only-token"));
+    assert!(text.contains("\"temperature\":0.2"));
+    assert!(text.contains("\"trace\":\"local\""));
+    let response = client_result
+        .expect("client deadline")
+        .expect("model response")
+        .expect("one model response");
+    assert_eq!(response.content.unwrap().parts[0].text(), Some("wire-ok"));
 }
 
 #[tokio::test]
@@ -216,4 +243,144 @@ async fn provider_status_and_timeout_are_typed() {
 
     let source = CredentialSource::Environment("M1_06_MISSING_TEST_KEY".to_owned());
     assert_eq!(source.handle(), "M1_06_MISSING_TEST_KEY");
+}
+
+async fn wire_peer(address: SocketAddr, request: &[u8]) -> TcpStream {
+    timeout(Duration::from_secs(1), async {
+        let mut peer = TcpStream::connect(address).await.unwrap();
+        peer.write_all(request).await.unwrap();
+        peer
+    })
+    .await
+    .expect("bounded peer setup")
+}
+
+async fn assert_wire_resources_closed(mut peer: TcpStream, address: SocketAddr) {
+    let result = timeout(Duration::from_secs(1), peer.read(&mut [0]))
+        .await
+        .expect("server socket must close");
+    match result {
+        Ok(0) => {}
+        Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+        other => panic!("server socket not closed: {other:?}"),
+    }
+    drop(peer);
+    drop(TcpListener::bind(address).await.expect("listener released"));
+}
+
+#[tokio::test]
+async fn wire_fixture_no_client_times_out_and_releases_listener() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let result = timeout(
+        Duration::from_secs(1),
+        model_profile_wire_request(listener, Instant::now() + Duration::from_millis(20)),
+    )
+    .await
+    .expect("fixture must enforce its own deadline");
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    drop(TcpListener::bind(address).await.expect("listener released"));
+}
+
+#[tokio::test]
+async fn wire_fixture_header_and_body_eof_release_socket_and_listener() {
+    for prefix in [
+        b"POST / HTTP/1.1\r\n".as_slice(),
+        b"POST / HTTP/1.1\r\ncontent-length: 40\r\n\r\n{}".as_slice(),
+    ] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut peer = wire_peer(address, prefix).await;
+        peer.shutdown().await.unwrap();
+        let result = timeout(
+            Duration::from_secs(1),
+            model_profile_wire_request(listener, Instant::now() + Duration::from_secs(2)),
+        )
+        .await
+        .expect("EOF must stop before the server deadline");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_wire_resources_closed(peer, address).await;
+    }
+}
+
+#[tokio::test]
+async fn wire_fixture_rejects_oversized_headers_and_body_lengths() {
+    for request in [
+        vec![b'x'; MAX_WIRE_REQUEST_BYTES],
+        format!(
+            "POST / HTTP/1.1\r\ncontent-length: {}\r\n\r\n",
+            MAX_WIRE_REQUEST_BYTES
+        )
+        .into_bytes(),
+        format!("POST / HTTP/1.1\r\ncontent-length: {}\r\n\r\n", usize::MAX).into_bytes(),
+        format!("POST / HTTP/1.1\r\ncontent-length: {}0\r\n\r\n", usize::MAX).into_bytes(),
+    ] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = wire_peer(address, &request).await;
+        let result = timeout(
+            Duration::from_secs(1),
+            model_profile_wire_request(listener, Instant::now() + Duration::from_secs(2)),
+        )
+        .await
+        .expect("oversized request must fail without awaiting its body");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_wire_resources_closed(peer, address).await;
+    }
+}
+
+#[tokio::test]
+async fn wire_fixture_slow_body_does_not_renew_deadline() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut peer = wire_peer(address, b"POST / HTTP/1.1\r\ncontent-length: 200\r\n\r\n").await;
+    let deadline = Instant::now() + Duration::from_millis(30);
+    let client = async {
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if peer.write_all(b" ").await.is_err() {
+                break;
+            }
+        }
+    };
+    let result = tokio::select! {
+        biased;
+        result = timeout(Duration::from_secs(1), model_profile_wire_request(listener, deadline)) => {
+            result.expect("absolute server deadline")
+        }
+        () = client => panic!("slow request bytes renewed the server deadline"),
+    };
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert_wire_resources_closed(peer, address).await;
+}
+
+#[tokio::test]
+async fn wire_fixture_client_failure_settles_socket_and_listener() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut peer = wire_peer(address, b"").await;
+    let client = async {
+        peer.write_all(b"POST / HTTP/1.1\r\n").await?;
+        Err::<(), _>(io::Error::other("scripted client failure"))
+    };
+    let deadline = Instant::now() + Duration::from_millis(20);
+    let (server_result, client_result) = tokio::join!(
+        timeout(
+            Duration::from_secs(1),
+            model_profile_wire_request(listener, deadline)
+        ),
+        timeout_at(deadline, client),
+    );
+    assert_eq!(
+        client_result.expect("client deadline").unwrap_err().kind(),
+        io::ErrorKind::Other
+    );
+    assert_eq!(
+        server_result
+            .expect("server settlement")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert_wire_resources_closed(peer, address).await;
 }

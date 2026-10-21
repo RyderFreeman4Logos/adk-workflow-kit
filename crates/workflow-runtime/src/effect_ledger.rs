@@ -326,6 +326,7 @@ pub struct DurableEffectHandler {
     ledger: std::sync::Mutex<EffectLedger>,
     registry: std::sync::Mutex<ExecutorRegistry>,
     registration: ToolRegistration,
+    clock: Box<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl DurableEffectHandler {
@@ -346,7 +347,16 @@ impl DurableEffectHandler {
             ledger: std::sync::Mutex::new(ledger),
             registry: std::sync::Mutex::new(registry),
             registration,
+            clock: Box::new(Self::now_unix_ms),
         })
+    }
+
+    /// Uses a trusted host clock returning absolute Unix milliseconds. The host
+    /// must handle clock rollback and keep this callback nonblocking; it runs
+    /// while the ledger and executor registry are locked.
+    pub fn with_clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
     }
 
     /// Returns the exact registration used by the handler.
@@ -451,7 +461,7 @@ impl ToolHandler for DurableEffectHandler {
                 break;
             }
             state = ledger
-                .advance(&self.request, &mut registry, Self::now_unix_ms())
+                .advance(&self.request, &mut registry, (self.clock)())
                 .map_err(Self::bridge_error)?;
         }
 

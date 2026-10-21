@@ -44,6 +44,10 @@ m1-03-red:
 m1-03-green:
     {{_io}} cargo +1.98.0 test -p workflow-compiler --test runtime_plan --locked
 
+# Focused skill frontmatter compatibility during the YAML parser migration.
+issue-332-compiler test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-compiler --test skill_contracts {{test_name}} --locked -- --nocapture
+
 # Focused M3-02 per-node binding tests.
 m3-02-spec test_name:
     {{_io}} cargo +1.98.0 test -p workflow-spec --test m3_02_node_bindings {{test_name}} --locked -- --exact --nocapture
@@ -378,6 +382,14 @@ conformance-live:
 lock:
     {{_io}} cargo generate-lockfile
 
+# Refresh only workspace-driven dependency changes, retaining unrelated locked versions.
+lock-refresh:
+    {{_io}} cargo +1.98.0 update --workspace
+
+# Update one locked dependency to an explicit version without refreshing the workspace.
+lock-update $package $version:
+    {{_io}} cargo +1.98.0 update --package "$package" --precise "$version"
+
 # Verify Cargo.lock already matches the workspace manifests without rewriting it.
 lock-check:
     {{_io}} cargo metadata --format-version 1 --locked > /dev/null
@@ -389,7 +401,7 @@ dependency-audit:
     {{_io}} cargo deny check licenses advisories
 
 test-local-gates:
-    bash scripts/test-local-gates.sh
+    bash scripts/test-local-gates-git-env.sh
 
 test-releasing:
     bash scripts/test-releasing.sh

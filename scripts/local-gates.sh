@@ -124,7 +124,7 @@ native_review_receipt_valid() {
     [[ ! -L .csa && -f "$native_receipt" && ! -L "$native_receipt" && -O "$native_receipt" ]] \
         || return 1
     mapfile -t lines < "$native_receipt" || return 1
-    [[ ${#lines[@]} -eq 6 || ${#lines[@]} -eq 7 ]] || return 1
+    [[ ${#lines[@]} -eq 7 ]] || return 1
     [[ "${lines[0]}" == 'schema=adk-workflow-kit-native-review-v1' ]] || return 1
     [[ "${lines[1]}" == 'status=PASS' ]] || return 1
     [[ "${lines[2]}" == "head=$SNAPSHOT_HEAD" ]] || return 1
@@ -133,13 +133,16 @@ native_review_receipt_valid() {
     report_sha256="${lines[5]#report_sha256=}"
     [[ "${lines[5]}" == report_sha256=* && "$report_sha256" =~ ^[0-9a-f]{64}$ ]] \
         || return 1
-    if [[ ${#lines[@]} -eq 7 ]]; then
-        report_path="${lines[6]#report_path=}"
-        [[ "${lines[6]}" == report_path=* && "$report_path" == /* && -f "$report_path" && ! -L "$report_path" ]] \
-            || return 1
-        actual_sha256="$(sha256sum < "$report_path")" || return 1
-        [[ "${actual_sha256%% *}" == "$report_sha256" ]] || return 1
-    fi
+    report_path="${lines[6]#report_path=}"
+    [[ "${lines[6]}" == report_path=* && "$report_path" == /* && -f "$report_path" && ! -L "$report_path" ]] \
+        || return 1
+    actual_sha256="$(sha256sum < "$report_path")" || return 1
+    [[ "${actual_sha256%% *}" == "$report_sha256" ]] || return 1
+    # The report itself must carry the terminal PASS attested by the receipt.
+    awk '
+        NR == 1 { first = $0 }
+        END { exit !(first == "VERDICT: PASS" && $0 == "VERDICT: PASS") }
+    ' "$report_path"
 }
 
 pre_push() {
@@ -177,11 +180,11 @@ pre_push() {
         || push_blocked 'remote object ID is malformed'
     before_head="$SNAPSHOT_HEAD"
     before_tree="$SNAPSHOT_TREE"
-    if command -v csa >/dev/null 2>&1 \
+    if native_review_receipt_valid; then
+        printf 'PASS native review receipt for main...%s.\n' "$SNAPSHOT_HEAD"
+    elif command -v csa >/dev/null 2>&1 \
         && csa review --check-verdict --range main...HEAD; then
         printf 'PASS CSA review for main...%s.\n' "$SNAPSHOT_HEAD"
-    elif native_review_receipt_valid; then
-        printf 'PASS native review receipt for main...%s.\n' "$SNAPSHOT_HEAD"
     else
         fail 'pre-push requires a passing CSA review for main...HEAD or a valid native review receipt at .csa/native-review.receipt'
     fi

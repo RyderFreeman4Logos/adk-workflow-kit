@@ -5,12 +5,13 @@
 
 pub use crate::model_profiles::ModelProfileIdentity;
 use crate::model_profiles::{ModelBinding, ModelProfileErrorKind};
-use adk_rust::{Content, FinishReason, LlmRequest, Part, futures::StreamExt as _};
+pub use adk_rust::FinishReason;
+use adk_rust::{Content, LlmRequest, Part, futures::StreamExt as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::fmt;
-use workflow_runtime::{StructuredOutputError, TrustDomain};
+use workflow_runtime::{SchemaKeyword, StructuredOutputError, TrustDomain};
 
 #[cfg(test)]
 #[path = "model_invocation_tests.rs"]
@@ -519,6 +520,8 @@ impl StructuredOutputContract {
         &self.schema_hash
     }
 
+    /// Decode one bounded UTF-8 JSON value, distinguishing syntax, trailing bytes,
+    /// and the first schema violation using content-free diagnostics.
     pub fn decode(&self, bytes: &[u8]) -> Result<Value, StructuredOutputError> {
         if bytes.len() > self.max_output_bytes {
             return Err(StructuredOutputError::OutputTooLarge);
@@ -532,10 +535,75 @@ impl StructuredOutputContract {
             .map_err(|_| StructuredOutputError::TrailingBytes)?;
         let validator = jsonschema::validator_for(&self.schema)
             .map_err(|_| StructuredOutputError::InvalidJson)?;
-        if !validator.is_valid(&value) {
-            return Err(StructuredOutputError::InvalidJson);
+        if let Err(error) = validator.validate(&value) {
+            return Err(schema_violation(&error, &value));
         }
         Ok(value)
+    }
+}
+
+fn schema_violation(
+    error: &jsonschema::ValidationError<'_>,
+    value: &Value,
+) -> StructuredOutputError {
+    use jsonschema::error::ValidationErrorKind;
+    let keyword = match error.kind() {
+        ValidationErrorKind::AdditionalItems { .. } => SchemaKeyword::AdditionalItems,
+        ValidationErrorKind::AdditionalProperties { .. } => SchemaKeyword::AdditionalProperties,
+        ValidationErrorKind::AnyOf { .. } => SchemaKeyword::AnyOf,
+        ValidationErrorKind::Constant { .. } => SchemaKeyword::Const,
+        ValidationErrorKind::Contains => SchemaKeyword::Contains,
+        ValidationErrorKind::ContentEncoding { .. } | ValidationErrorKind::FromUtf8 { .. } => {
+            SchemaKeyword::ContentEncoding
+        }
+        ValidationErrorKind::ContentMediaType { .. } => SchemaKeyword::ContentMediaType,
+        ValidationErrorKind::Enum { .. } => SchemaKeyword::Enum,
+        ValidationErrorKind::ExclusiveMaximum { .. } => SchemaKeyword::ExclusiveMaximum,
+        ValidationErrorKind::ExclusiveMinimum { .. } => SchemaKeyword::ExclusiveMinimum,
+        ValidationErrorKind::FalseSchema => SchemaKeyword::FalseSchema,
+        ValidationErrorKind::Format { .. } => SchemaKeyword::Format,
+        ValidationErrorKind::MaxItems { .. } => SchemaKeyword::MaxItems,
+        ValidationErrorKind::Maximum { .. } => SchemaKeyword::Maximum,
+        ValidationErrorKind::MaxLength { .. } => SchemaKeyword::MaxLength,
+        ValidationErrorKind::MaxProperties { .. } => SchemaKeyword::MaxProperties,
+        ValidationErrorKind::MinItems { .. } => SchemaKeyword::MinItems,
+        ValidationErrorKind::Minimum { .. } => SchemaKeyword::Minimum,
+        ValidationErrorKind::MinLength { .. } => SchemaKeyword::MinLength,
+        ValidationErrorKind::MinProperties { .. } => SchemaKeyword::MinProperties,
+        ValidationErrorKind::MultipleOf { .. } => SchemaKeyword::MultipleOf,
+        ValidationErrorKind::Not { .. } => SchemaKeyword::Not,
+        ValidationErrorKind::OneOfMultipleValid { .. }
+        | ValidationErrorKind::OneOfNotValid { .. } => SchemaKeyword::OneOf,
+        ValidationErrorKind::Pattern { .. }
+        | ValidationErrorKind::BacktrackLimitExceeded { .. } => SchemaKeyword::Pattern,
+        ValidationErrorKind::PropertyNames { .. } => SchemaKeyword::PropertyNames,
+        ValidationErrorKind::Required { .. } => SchemaKeyword::Required,
+        ValidationErrorKind::Type { .. } => SchemaKeyword::Type,
+        ValidationErrorKind::UnevaluatedItems { .. } => SchemaKeyword::UnevaluatedItems,
+        ValidationErrorKind::UnevaluatedProperties { .. } => SchemaKeyword::UnevaluatedProperties,
+        ValidationErrorKind::UniqueItems => SchemaKeyword::UniqueItems,
+        ValidationErrorKind::Referencing(_) => SchemaKeyword::Reference,
+        ValidationErrorKind::Custom { .. } => SchemaKeyword::Unknown,
+    };
+    // Match literal root prefixes: Location::iter drops empty property segments
+    // and converts numeric object keys to indices. Never expose the raw pointer.
+    let root_index = |prefix: &str, field: &str| -> Option<usize> {
+        let index = error
+            .instance_path()
+            .as_str()
+            .strip_prefix(prefix)?
+            .split('/')
+            .next()?
+            .parse::<usize>()
+            .ok()?;
+        value.get(field)?.as_array()?.get(index)?;
+        Some(index)
+    };
+
+    StructuredOutputError::SchemaViolation {
+        keyword,
+        citation_index: root_index("/citations/", "citations"),
+        window_index: root_index("/windows/", "windows"),
     }
 }
 
@@ -611,11 +679,37 @@ impl InvocationProvenance {
     }
 }
 
+/// Content-free facts copied from the final meaningful ADK response chunk.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ModelCompletionEvidence {
+    finish_reason: Option<FinishReason>,
+    turn_complete: bool,
+    partial: bool,
+}
+
+impl ModelCompletionEvidence {
+    /// The ADK finish reason, if the terminal response supplied one.
+    pub const fn finish_reason(&self) -> Option<FinishReason> {
+        self.finish_reason
+    }
+
+    /// Whether the terminal response marked the turn complete.
+    pub const fn turn_complete(&self) -> bool {
+        self.turn_complete
+    }
+
+    /// Whether the terminal response marked the content partial.
+    pub const fn partial(&self) -> bool {
+        self.partial
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelInvocationResult {
     output: Value,
     attempts: u8,
     provenance: InvocationProvenance,
+    completion_evidence: ModelCompletionEvidence,
 }
 
 impl ModelInvocationResult {
@@ -635,6 +729,11 @@ impl ModelInvocationResult {
     pub fn provenance(&self) -> &InvocationProvenance {
         &self.provenance
     }
+
+    /// Content-free terminal metadata from the final meaningful ADK response.
+    pub fn completion_evidence(&self) -> &ModelCompletionEvidence {
+        &self.completion_evidence
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -650,6 +749,7 @@ pub struct ModelInvocationError {
     attempts: u8,
     model_error: Option<ModelProfileErrorKind>,
     output_error: Option<StructuredOutputError>,
+    upstream_status_code: Option<u16>,
 }
 
 impl ModelInvocationError {
@@ -659,15 +759,21 @@ impl ModelInvocationError {
             attempts: 0,
             model_error: None,
             output_error: None,
+            upstream_status_code: None,
         }
     }
 
-    fn model(error: ModelProfileErrorKind, attempts: u8) -> Self {
+    fn model(
+        error: ModelProfileErrorKind,
+        attempts: u8,
+        upstream_status_code: Option<u16>,
+    ) -> Self {
         Self {
             kind: ModelInvocationErrorKind::ModelProfile,
             attempts,
             model_error: Some(error),
             output_error: None,
+            upstream_status_code,
         }
     }
 
@@ -677,6 +783,7 @@ impl ModelInvocationError {
             attempts,
             model_error: None,
             output_error: Some(error),
+            upstream_status_code: None,
         }
     }
 
@@ -690,6 +797,11 @@ impl ModelInvocationError {
 
     pub fn model_error(&self) -> Option<ModelProfileErrorKind> {
         self.model_error
+    }
+
+    /// Actual SDK upstream HTTP status in 100..=599, or unknown.
+    pub fn upstream_status_code(&self) -> Option<u16> {
+        self.upstream_status_code
     }
 
     pub fn output_error(&self) -> Option<StructuredOutputError> {
@@ -734,7 +846,8 @@ impl fmt::Display for ModelInvocationSpecError {
 
 impl std::error::Error for ModelInvocationSpecError {}
 
-/// Ordinary callers permit optional completion metadata; Sentinel requires complete text.
+/// Both policies require a non-partial, completed terminal Stop.
+/// CompleteText additionally rejects non-text parts.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResponsePolicy {
     Ordinary,
@@ -885,8 +998,8 @@ impl ModelInvocationSpec {
     }
 
     /// Domain validators see bounded raw bytes before Value can collapse duplicate keys.
-    /// Provider failures abort before validation without retry. Optional completion metadata,
-    /// partial chunks and usage-only trailers retain the ordinary invocation contract.
+    /// Provider failures abort before validation without retry. A completed terminal Stop
+    /// is required; intermediate chunks and usage-only trailers may omit completion metadata.
     pub async fn invoke_validated(
         &self,
         binding: &ModelBinding,
@@ -896,7 +1009,8 @@ impl ModelInvocationSpec {
             .await
     }
 
-    /// One bounded collector; strict completion/text-only admission is opt-in.
+    /// One bounded collector; completed terminal Stop is mandatory and text-only admission
+    /// is opt-in.
     pub(crate) async fn invoke_with_policy(
         &self,
         binding: &ModelBinding,
@@ -914,12 +1028,24 @@ impl ModelInvocationSpec {
             let mut stream = binding
                 .generate_content(request.clone(), false)
                 .await
-                .map_err(|error| ModelInvocationError::model(error.kind(), attempts))?;
+                .map_err(|error| {
+                    ModelInvocationError::model(
+                        error.kind(),
+                        attempts,
+                        error.upstream_status_code(),
+                    )
+                })?;
             let mut output = String::new();
             let mut complete = false;
+            let mut completion_evidence = ModelCompletionEvidence::default();
             while let Some(response) = stream.next().await {
-                let response = response
-                    .map_err(|error| ModelInvocationError::model(error.kind(), attempts))?;
+                let response = response.map_err(|error| {
+                    ModelInvocationError::model(
+                        error.kind(),
+                        attempts,
+                        error.upstream_status_code(),
+                    )
+                })?;
                 if response.interrupted
                     || response.error_code.is_some()
                     || response.error_message.is_some()
@@ -930,18 +1056,23 @@ impl ModelInvocationSpec {
                     return Err(ModelInvocationError::model(
                         ModelProfileErrorKind::Provider,
                         attempts,
+                        None,
                     ));
                 }
                 // A harmless metadata trailer must not erase terminal evidence. New content
                 // or explicit progress does invalidate it until a fresh complete Stop.
                 if response.content.is_some()
                     || response.partial
-                    || response.turn_complete
                     || response.finish_reason.is_some()
                 {
                     complete = response.turn_complete
                         && !response.partial
                         && response.finish_reason == Some(FinishReason::Stop);
+                    completion_evidence = ModelCompletionEvidence {
+                        finish_reason: response.finish_reason,
+                        turn_complete: response.turn_complete,
+                        partial: response.partial,
+                    };
                 }
                 if let Some(content) = response.content {
                     for part in content.parts {
@@ -966,10 +1097,11 @@ impl ModelInvocationSpec {
                     }
                 }
             }
-            if policy == ResponsePolicy::CompleteText && !complete {
-                return Err(ModelInvocationError::structured(
-                    StructuredOutputError::InvalidJson,
+            if !complete {
+                return Err(ModelInvocationError::model(
+                    ModelProfileErrorKind::Provider,
                     attempts,
+                    None,
                 ));
             }
             match validate(output.as_bytes()).and_then(|()| self.output.decode(output.as_bytes())) {
@@ -978,6 +1110,7 @@ impl ModelInvocationSpec {
                         output,
                         attempts,
                         provenance: self.provenance(),
+                        completion_evidence,
                     });
                 }
                 Err(_error) if attempts < max_attempts => continue,

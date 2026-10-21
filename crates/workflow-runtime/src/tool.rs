@@ -219,17 +219,97 @@ impl ToolProvenance {
     }
 }
 
-/// A fixed, privacy-safe reason that structured tool output was rejected.
+/// Closed JSON Schema keyword classification; never contains schema or instance text.
+/// Unknown/custom validator failures use `Unknown` without copying their keyword.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchemaKeyword {
+    /// The `additionalItems` constraint.
+    AdditionalItems,
+    /// The `additionalProperties` constraint.
+    AdditionalProperties,
+    /// The `anyOf` constraint.
+    AnyOf,
+    /// The `const` constraint.
+    Const,
+    /// The `contains` constraint.
+    Contains,
+    /// The `contentEncoding` constraint.
+    ContentEncoding,
+    /// The `contentMediaType` constraint.
+    ContentMediaType,
+    /// The `enum` constraint.
+    Enum,
+    /// The `exclusiveMaximum` constraint.
+    ExclusiveMaximum,
+    /// The `exclusiveMinimum` constraint.
+    ExclusiveMinimum,
+    /// The `false schema` constraint.
+    FalseSchema,
+    /// The `format` constraint.
+    Format,
+    /// The `maxItems` constraint.
+    MaxItems,
+    /// The `maximum` constraint.
+    Maximum,
+    /// The `maxLength` constraint.
+    MaxLength,
+    /// The `maxProperties` constraint.
+    MaxProperties,
+    /// The `minItems` constraint.
+    MinItems,
+    /// The `minimum` constraint.
+    Minimum,
+    /// The `minLength` constraint.
+    MinLength,
+    /// The `minProperties` constraint.
+    MinProperties,
+    /// The `multipleOf` constraint.
+    MultipleOf,
+    /// The `not` constraint.
+    Not,
+    /// The `oneOf` constraint.
+    OneOf,
+    /// The `pattern` constraint.
+    Pattern,
+    /// The `propertyNames` constraint.
+    PropertyNames,
+    /// The `required` constraint.
+    Required,
+    /// The `type` constraint.
+    Type,
+    /// The `unevaluatedItems` constraint.
+    UnevaluatedItems,
+    /// The `unevaluatedProperties` constraint.
+    UnevaluatedProperties,
+    /// The `uniqueItems` constraint.
+    UniqueItems,
+    /// The `$ref` constraint.
+    Reference,
+    /// A validator failure outside the admitted keyword set.
+    Unknown,
+}
+
+/// A fixed, privacy-safe reason that structured output was rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StructuredOutputError {
     /// The output exceeded the caller-supplied byte ceiling.
     OutputTooLarge,
     /// The output was not valid UTF-8.
     InvalidUtf8,
-    /// The output was not a valid tool envelope document.
+    /// The output was not valid JSON or a valid tool envelope document.
     InvalidJson,
-    /// The output contained non-whitespace bytes after its envelope.
+    /// The output contained non-whitespace bytes after its JSON value.
     TrailingBytes,
+    /// JSON parsed, but failed its schema. Only the first validation failure is
+    /// classified; no values, property names, schema paths, or messages survive.
+    SchemaViolation {
+        /// Closed keyword classification of the first validation failure.
+        keyword: SchemaKeyword,
+        /// Index below the root `citations` array, otherwise unknown.
+        citation_index: Option<usize>,
+        /// Index below the root `windows` array, otherwise unknown.
+        window_index: Option<usize>,
+    },
 }
 
 impl fmt::Display for StructuredOutputError {
@@ -239,6 +319,7 @@ impl fmt::Display for StructuredOutputError {
             Self::InvalidUtf8 => "structured tool output is not valid UTF-8",
             Self::InvalidJson => "structured tool output is invalid",
             Self::TrailingBytes => "structured tool output has trailing bytes",
+            Self::SchemaViolation { .. } => "structured output violates its schema",
         })
     }
 }

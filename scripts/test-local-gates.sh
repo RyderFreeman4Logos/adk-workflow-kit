@@ -2,6 +2,9 @@
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
+# Fixtures own their Git state, including when invoked by a commit hook.
+mapfile -t git_local_env < <(git rev-parse --local-env-vars)
+unset "${git_local_env[@]}"
 source_runner="$repo_root/scripts/local-gates.sh"
 if [[ ! -x "$source_runner" ]]; then
     printf 'FAIL local-gates helper is missing or not executable: %s\n' "$source_runner" >&2
@@ -218,7 +221,7 @@ release_gate_rc=$?
 set -e
 if [[ $release_gate_rc -ne 42 ||
     "$release_gate_output" != *"$release_command"* ||
-    "$release_gate_output" != *'recipe `issue-323-release-consumer` failed'* ]]; then
+    "$release_gate_output" != *[Rr]'ecipe `issue-323-release-consumer` failed'* ]]; then
     printf 'FAIL aggregate did not propagate release-consumer failure: exit=%s output=%s\n' \
         "$release_gate_rc" "$release_gate_output" >&2
     exit 1
@@ -270,7 +273,8 @@ assert_pre_push_fails() {
 write_native_receipt() {
     local head tree report_sha256
     mkdir -p "$fixture/.csa"
-    printf '%s\n' 'native review report' > "$fixture/.csa/native-review.report"
+    printf '%s\n' "${1-$'VERDICT: PASS\nnative review report\nVERDICT: PASS'}" \
+        > "$fixture/.csa/native-review.report"
     head="$(git -C "$fixture" rev-parse HEAD)"
     tree="$(git -C "$fixture" rev-parse HEAD^{tree})"
     report_sha256="$(sha256sum < "$fixture/.csa/native-review.report")"
@@ -283,6 +287,17 @@ write_native_receipt() {
         "report_sha256=${report_sha256%% *}" \
         "report_path=$fixture/.csa/native-review.report" \
         > "$fixture/.csa/native-review.receipt"
+}
+
+assert_native_rejected() {
+    : > "$csa_log"
+    if (FAKE_CSA_FAIL=1 assert_pre_push_fails "$1" \
+        'CSA review for main...HEAD or a valid native review receipt' "$current_record"); then
+        [[ "$(<"$csa_log")" == 'review --check-verdict --range main...HEAD' ]]
+        ((assertions += 1))
+    else
+        ((native_failures += 1))
+    fi
 }
 
 assert_fails protected-branch 'main' "$runner" check-branch
@@ -332,20 +347,69 @@ mkdir -p "$fixture/.csa"
 printf '%s\n' malformed > "$fixture/.csa/native-review.receipt"
 FAKE_CSA_FAIL=1 assert_pre_push_fails native-receipt-malformed \
     'CSA review for main...HEAD or a valid native review receipt' "$current_record"
-printf '%s\n' \
-    'schema=adk-workflow-kit-native-review-v1' \
-    'status=PASS' \
-    "head=$zero_oid" \
-    "tree=$(git -C "$fixture" rev-parse HEAD^{tree})" \
-    'range=main...HEAD' \
-    'report_sha256=0000000000000000000000000000000000000000000000000000000000000000' \
-    > "$fixture/.csa/native-review.receipt"
-FAKE_CSA_FAIL=1 assert_pre_push_fails native-receipt-stale-head \
-    'CSA review for main...HEAD or a valid native review receipt' "$current_record"
 write_native_receipt
+: > "$csa_log"
 native_output="$(printf '%s\n' "$current_record" | FAKE_CSA_FAIL=1 invoke "$runner" pre-push 2>&1)"
 [[ "$native_output" == *'PASS native review receipt for main...'* ]]
-((assertions += 1))
+[[ ! -s "$csa_log" ]] || { printf 'FAIL valid native receipt invoked CSA\n' >&2; exit 1; }
+((assertions += 2))
+printf '%s\n' tampered >> "$fixture/.csa/native-review.report"
+FAKE_CSA_FAIL=1 assert_pre_push_fails native-report-tampered \
+    'CSA review for main...HEAD or a valid native review receipt' "$current_record"
+
+# Exercise every report refusal against the real pre-push boundary, including
+# cases that the old validator accepted, before reporting the aggregate failure.
+native_failures=0
+write_native_receipt
+sed -i '$d' "$fixture/.csa/native-review.receipt"
+assert_native_rejected native-receipt-six-lines
+write_native_receipt
+rm -- "$fixture/.csa/native-review.report"
+assert_native_rejected native-report-missing
+mkdir "$fixture/.csa/native-review.report"
+assert_native_rejected native-report-directory
+rmdir "$fixture/.csa/native-review.report"
+mkfifo "$fixture/.csa/native-review.report"
+assert_native_rejected native-report-fifo
+rm -- "$fixture/.csa/native-review.report"
+write_native_receipt
+mv "$fixture/.csa/native-review.report" "$fixture/.csa/report-target"
+ln -s report-target "$fixture/.csa/native-review.report"
+assert_native_rejected native-report-symlink
+rm -- "$fixture/.csa/native-review.report"
+mv "$fixture/.csa/report-target" "$fixture/.csa/native-review.report"
+
+for receipt_field in head tree range report_sha256; do
+    write_native_receipt
+    case "$receipt_field" in
+        head|tree) replacement="$zero_oid" ;;
+        range) replacement='HEAD^...HEAD' ;;
+        report_sha256) replacement="$(printf '%064d' 0)" ;;
+    esac
+    sed -i "s/^$receipt_field=.*/$receipt_field=$replacement/" \
+        "$fixture/.csa/native-review.receipt"
+    assert_native_rejected "native-receipt-wrong-$receipt_field"
+done
+
+for report_case in fail missing-header missing-footer conflicting-header conflicting-footer buried missing-colon empty trailing-blank; do
+    case "$report_case" in
+        fail) report_body=$'VERDICT: FAIL\nfinding\nVERDICT: FAIL' ;;
+        missing-header) report_body=$'review body\nVERDICT: PASS' ;;
+        missing-footer) report_body=$'VERDICT: PASS\nreview body' ;;
+        conflicting-header) report_body=$'VERDICT: FAIL\nreview body\nVERDICT: PASS' ;;
+        conflicting-footer) report_body=$'VERDICT: PASS\nreview body\nVERDICT: FAIL' ;;
+        buried) report_body=$'review body\nVERDICT: PASS\nreview body' ;;
+        missing-colon) report_body=$'VERDICT PASS\nreview body\nVERDICT PASS' ;;
+        empty) report_body='' ;;
+        trailing-blank) report_body=$'VERDICT: PASS\nreview body\nVERDICT: PASS\n' ;;
+    esac
+    write_native_receipt "$report_body"
+    assert_native_rejected "native-report-$report_case"
+done
+if [[ "$native_failures" -ne 0 ]]; then
+    printf 'FAIL native report integrity (%d cases accepted)\n' "$native_failures" >&2
+    exit 1
+fi
 rm -rf -- "$fixture/.csa"
 
 printf '%s\n' malformed > "$fixture/.local-gates/quality-gate.receipt"

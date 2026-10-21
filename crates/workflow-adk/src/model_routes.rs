@@ -1,9 +1,10 @@
 //! Ordered, authorized model routes over the existing ModelBinding adapter.
 use super::{
     ModelInvocationErrorKind, ModelInvocationResult, ModelInvocationSpec, ProviderRouteIdentity,
+    ResponsePolicy,
 };
 use crate::model_profiles::{
-    CredentialBroker, ModelBinding, ModelProfileErrorKind, ModelProfileIdentity,
+    CredentialBroker, ModelBinding, ModelProfileError, ModelProfileErrorKind, ModelProfileIdentity,
     ModelProfileRegistry, ModelRole,
 };
 use std::{
@@ -15,6 +16,7 @@ use std::{
     },
     time::Instant,
 };
+use workflow_runtime::StructuredOutputError;
 
 pub const MAX_MODEL_ROUTE_CANDIDATES: usize = 8;
 
@@ -189,14 +191,11 @@ impl ModelRouteSnapshot {
         &self,
         candidate: &ModelRouteCandidate,
         broker: &CredentialBroker,
-    ) -> Result<ModelBinding, ModelRouteSnapshotError> {
+    ) -> Result<ModelBinding, ModelProfileError> {
         let binding = self
             .registry
             .bind_route(candidate.role(), candidate.profile(), broker)
-            .await
-            .map_err(|_| ModelRouteSnapshotError {
-                kind: ModelRouteSnapshotErrorKind::InvalidRegistry,
-            })?;
+            .await?;
         #[cfg(any(test, feature = "test-support"))]
         if let Some(llm) = self.test_llms.get(candidate) {
             return Ok(binding.with_test_llm(Arc::clone(llm)));
@@ -261,6 +260,9 @@ pub enum ModelRouteAttemptKind {
 pub struct ModelRouteAttempt {
     ordinal: u8,
     kind: ModelRouteAttemptKind,
+    profile_error: Option<ModelProfileErrorKind>,
+    upstream_status_code: Option<u16>,
+    output_error: Option<StructuredOutputError>,
 }
 
 impl ModelRouteAttempt {
@@ -270,6 +272,21 @@ impl ModelRouteAttempt {
 
     pub fn kind(&self) -> ModelRouteAttemptKind {
         self.kind
+    }
+
+    /// Sanitized profile/request/provider subtype for this failed attempt.
+    pub fn profile_error(&self) -> Option<ModelProfileErrorKind> {
+        self.profile_error
+    }
+
+    /// Actual SDK upstream HTTP status in 100..=599, or unknown.
+    pub fn upstream_status_code(&self) -> Option<u16> {
+        self.upstream_status_code
+    }
+
+    /// Content-free structured-output rejection for this failed attempt.
+    pub fn output_error(&self) -> Option<StructuredOutputError> {
+        self.output_error
     }
 }
 
@@ -298,6 +315,33 @@ impl ModelRouteTerminalError {
 
     pub fn attempts(&self) -> &[ModelRouteAttempt] {
         &self.attempts
+    }
+
+    /// Final failed attempt subtype, including binding failures. Cancellation and
+    /// route deadline termination have no cause; prior attempts remain inspectable.
+    pub fn profile_error(&self) -> Option<ModelProfileErrorKind> {
+        self.failed_attempt()
+            .and_then(ModelRouteAttempt::profile_error)
+    }
+
+    /// Actual SDK status of the final failure; absent for cancellation/deadline.
+    pub fn upstream_status_code(&self) -> Option<u16> {
+        self.failed_attempt()
+            .and_then(ModelRouteAttempt::upstream_status_code)
+    }
+
+    /// Final structured-output failure; absent for cancellation/deadline.
+    pub fn output_error(&self) -> Option<StructuredOutputError> {
+        self.failed_attempt()
+            .and_then(ModelRouteAttempt::output_error)
+    }
+
+    fn failed_attempt(&self) -> Option<&ModelRouteAttempt> {
+        match self.kind {
+            ModelRouteTerminalErrorKind::Cancelled
+            | ModelRouteTerminalErrorKind::DeadlineExceeded => None,
+            _ => self.attempts.last(),
+        }
     }
 }
 
@@ -367,6 +411,62 @@ impl ModelRoutePolicy {
         self.deadline
     }
 
+    /// Authorize and bind the first candidate without constructing a provider request.
+    /// The policy's absolute deadline and cancellation cover credential resolution.
+    pub async fn bind_authorized(
+        &self,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+    ) -> Result<(), ModelRouteTerminalError> {
+        let mut attempts = Vec::new();
+        let Some((index, candidate)) = self.snapshot.candidates.iter().enumerate().next() else {
+            return Err(route_terminal(
+                ModelRouteTerminalErrorKind::Exhausted,
+                attempts,
+            ));
+        };
+        if let Some(kind) = route_stop(self.deadline, cancellation) {
+            return Err(route_terminal(kind, attempts));
+        }
+        let ordinal = u8::try_from(index + 1).expect("bounded model route ordinal");
+        if !self.snapshot.authorization.allows(candidate) {
+            attempts.push(ModelRouteAttempt {
+                ordinal,
+                kind: ModelRouteAttemptKind::AuthorizationDenied,
+                profile_error: None,
+                upstream_status_code: None,
+                output_error: None,
+            });
+            return Err(route_terminal(
+                ModelRouteTerminalErrorKind::AuthorizationDenied,
+                attempts,
+            ));
+        }
+        match await_route(
+            self.snapshot.bind(candidate, broker),
+            self.deadline,
+            cancellation,
+        )
+        .await
+        {
+            Err(kind) => Err(route_terminal(kind, attempts)),
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => {
+                attempts.push(ModelRouteAttempt {
+                    ordinal,
+                    kind: ModelRouteAttemptKind::Configuration,
+                    profile_error: Some(error.kind()),
+                    upstream_status_code: error.upstream_status_code(),
+                    output_error: None,
+                });
+                Err(ModelRouteTerminalError {
+                    kind: ModelRouteTerminalErrorKind::Configuration,
+                    attempts,
+                })
+            }
+        }
+    }
+
     /// Explicit host opt-in. Authorization precedes all resolution/construction.
     /// Rebinds the request's placeholder route to each admitted candidate. One
     /// absolute deadline covers binding and every fallback; a profile timeout
@@ -378,6 +478,30 @@ impl ModelRoutePolicy {
         broker: &CredentialBroker,
         cancellation: &ModelRouteCancellation,
     ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
+        self.invoke_with_response_policy(spec, broker, cancellation, ResponsePolicy::Ordinary)
+            .await
+    }
+
+    /// Explicitly opts into the collector's text-only response admission.
+    /// Authorization, candidate order, deadline, cancellation, and schema
+    /// validation match [`Self::invoke`].
+    pub async fn invoke_complete_text(
+        &self,
+        spec: &ModelInvocationSpec,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+    ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
+        self.invoke_with_response_policy(spec, broker, cancellation, ResponsePolicy::CompleteText)
+            .await
+    }
+
+    async fn invoke_with_response_policy(
+        &self,
+        spec: &ModelInvocationSpec,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+        response_policy: ResponsePolicy,
+    ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
         let mut attempts = Vec::new();
         for (index, candidate) in self.snapshot.candidates.iter().enumerate() {
             if let Some(kind) = route_stop(self.deadline, cancellation) {
@@ -388,6 +512,9 @@ impl ModelRoutePolicy {
                 attempts.push(ModelRouteAttempt {
                     ordinal,
                     kind: ModelRouteAttemptKind::AuthorizationDenied,
+                    profile_error: None,
+                    upstream_status_code: None,
+                    output_error: None,
                 });
                 return Err(route_terminal(
                     ModelRouteTerminalErrorKind::AuthorizationDenied,
@@ -403,25 +530,31 @@ impl ModelRoutePolicy {
             {
                 Err(kind) => return Err(route_terminal(kind, attempts)),
                 Ok(Ok(binding)) => binding,
-                Ok(Err(_)) => {
+                Ok(Err(error)) => {
                     attempts.push(ModelRouteAttempt {
                         ordinal,
                         kind: ModelRouteAttemptKind::Configuration,
+                        profile_error: Some(error.kind()),
+                        upstream_status_code: error.upstream_status_code(),
+                        output_error: None,
                     });
-                    return Err(route_terminal(
-                        ModelRouteTerminalErrorKind::Configuration,
+                    return Err(ModelRouteTerminalError {
+                        kind: ModelRouteTerminalErrorKind::Configuration,
                         attempts,
-                    ));
+                    });
                 }
             };
             let candidate_spec = spec.with_route(ProviderRouteIdentity::from_binding(&binding));
-            let result =
-                match await_route(candidate_spec.invoke(&binding), self.deadline, cancellation)
-                    .await
-                {
-                    Err(kind) => return Err(route_terminal(kind, attempts)),
-                    Ok(result) => result,
-                };
+            let result = match await_route(
+                candidate_spec.invoke_with_policy(&binding, |_| Ok(()), response_policy),
+                self.deadline,
+                cancellation,
+            )
+            .await
+            {
+                Err(kind) => return Err(route_terminal(kind, attempts)),
+                Ok(result) => result,
+            };
             let error = match result {
                 Ok(result) => return Ok(result),
                 Err(error) => error,
@@ -430,6 +563,9 @@ impl ModelRoutePolicy {
                 attempts.push(ModelRouteAttempt {
                     ordinal,
                     kind: ModelRouteAttemptKind::RetryableProvider,
+                    profile_error: error.model_error(),
+                    upstream_status_code: error.upstream_status_code(),
+                    output_error: error.output_error(),
                 });
                 continue;
             }
@@ -458,6 +594,9 @@ impl ModelRoutePolicy {
             attempts.push(ModelRouteAttempt {
                 ordinal,
                 kind: attempt_kind,
+                profile_error: error.model_error(),
+                upstream_status_code: error.upstream_status_code(),
+                output_error: error.output_error(),
             });
             return Err(route_terminal(terminal_kind, attempts));
         }

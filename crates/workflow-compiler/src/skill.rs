@@ -306,9 +306,9 @@ fn strip_cr(line: &str) -> &str {
 
 fn parse_frontmatter(frontmatter: &str) -> Result<FrontmatterFields, SkillManifestError> {
     let frontmatter =
-        serde_yaml::from_str(frontmatter).map_err(|_| SkillManifestError::InvalidFrontmatter)?;
+        yaml_serde::from_str(frontmatter).map_err(|_| SkillManifestError::InvalidFrontmatter)?;
     let mapping = match frontmatter {
-        serde_yaml::Value::Mapping(mapping) => mapping,
+        yaml_serde::Value::Mapping(mapping) => mapping,
         _ => return Err(SkillManifestError::InvalidFrontmatter),
     };
     let mut fields = FrontmatterFields {
@@ -380,9 +380,9 @@ fn set_field(field: &mut Option<String>, value: String) -> Result<(), SkillManif
     Ok(())
 }
 
-fn validate_metadata(value: serde_yaml::Value) -> Result<(), SkillManifestError> {
+fn validate_metadata(value: yaml_serde::Value) -> Result<(), SkillManifestError> {
     let mapping = match value {
-        serde_yaml::Value::Mapping(mapping) => mapping,
+        yaml_serde::Value::Mapping(mapping) => mapping,
         _ => return Err(SkillManifestError::InvalidFrontmatter),
     };
     for (key, value) in mapping {
@@ -392,9 +392,9 @@ fn validate_metadata(value: serde_yaml::Value) -> Result<(), SkillManifestError>
     Ok(())
 }
 
-fn yaml_string(value: serde_yaml::Value) -> Result<String, SkillManifestError> {
+fn yaml_string(value: yaml_serde::Value) -> Result<String, SkillManifestError> {
     match value {
-        serde_yaml::Value::String(value) => Ok(value),
+        yaml_serde::Value::String(value) => Ok(value),
         _ => Err(SkillManifestError::InvalidFrontmatter),
     }
 }

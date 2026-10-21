@@ -9,13 +9,49 @@ use super::{
 use std::{os::unix::process::ExitStatusExt, process::Command, sync::atomic::AtomicBool};
 use workflow_adk::execution::PendingToolApproval;
 
+#[path = "child_cleanup.rs"]
+mod child_cleanup;
+
 pub(super) struct ChildGuard(pub(super) Option<std::process::Child>);
+impl ChildGuard {
+    /// Preserve the owned child until reap is proven within one cleanup budget.
+    /// Local callbacks let disposable tests withhold that proof without kernel faults.
+    fn cleanup_with(
+        &mut self,
+        kill: impl FnOnce(&mut std::process::Child) -> std::io::Result<()>,
+        mut observe: impl FnMut(
+            &mut std::process::Child,
+        ) -> std::io::Result<Option<std::process::ExitStatus>>,
+    ) {
+        let Some(child) = &mut self.0 else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let kill_failed = kill(child).is_err();
+        loop {
+            let observation = match observe(child) {
+                Ok(Some(_)) => {
+                    self.0.take(); // Reaped: never signal this numeric PID again.
+                    return;
+                }
+                Ok(None) => "pending",
+                Err(_) => "error",
+            };
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "durable child cleanup unproven: kill_failed={kill_failed} wait={observation}; aborting"
+                );
+                // Returning would discard an unreaped child; panic may already be unwinding.
+                std::process::abort();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Some(child) = &mut self.0 {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.cleanup_with(std::process::Child::kill, std::process::Child::try_wait);
     }
 }
 
