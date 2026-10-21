@@ -1109,10 +1109,13 @@ fn timed_response_stream(
             async move {
                 let mut inner = stream.take()?;
                 match adk_rust::tokio::time::timeout_at(deadline, inner.next()).await {
-                    Ok(Some(result)) => Some((
-                        result.map_err(|error| map_adk_error(&identity, error)),
-                        Some(inner),
-                    )),
+                    Ok(Some(Ok(response))) => match response_failure(&response) {
+                        Some(error) => Some((Err(map_adk_error(&identity, error)), None)),
+                        None => Some((Ok(response), Some(inner))),
+                    },
+                    Ok(Some(Err(error))) => {
+                        Some((Err(map_adk_error(&identity, error)), Some(inner)))
+                    }
                     Ok(None) => None,
                     Err(_) => Some((Err(ModelProfileError::timeout_for(identity)), None)),
                 }
@@ -1312,6 +1315,9 @@ async fn collect_payloads(
     let mut items = Vec::new();
     while let Some(item) = inner.next().await {
         let response = item?;
+        if let Some(error) = response_failure(&response) {
+            return Err(error);
+        }
         if !response_has_model_payload(&response) {
             continue;
         }
@@ -1349,6 +1355,30 @@ fn response_has_model_payload(response: &LlmResponse) -> bool {
             _ => false,
         })
     })
+}
+
+fn response_failure(response: &LlmResponse) -> Option<AdkError> {
+    let failed_finish = match response.finish_reason {
+        None | Some(adk_rust::FinishReason::Stop) => false,
+        Some(
+            adk_rust::FinishReason::MaxTokens
+            | adk_rust::FinishReason::Safety
+            | adk_rust::FinishReason::Recitation
+            | adk_rust::FinishReason::Other,
+        ) => true,
+    };
+    (response.error_code.is_some()
+        || response.error_message.is_some()
+        || response.interrupted
+        || failed_finish)
+        .then(|| {
+            AdkError::new(
+                ErrorComponent::Model,
+                ErrorCategory::Internal,
+                "model.profile.unreachable",
+                "model.profile.unreachable",
+            )
+        })
 }
 
 fn retryable_provider_error(error: &AdkError) -> bool {
