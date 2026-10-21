@@ -20,6 +20,7 @@ workflow-spec = { path = "../workflow-spec" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+url = "=2.5.8"
 
 [dev-dependencies]
 rusqlite.workspace = true

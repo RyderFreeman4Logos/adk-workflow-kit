@@ -337,7 +337,22 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                     .split("[[package]]")
                     .find(|block| block.contains("\nname = \"adk-rust\"\n"))
                     .expect("ADK-Rust must be locked");
-                assert!(package.contains("\nversion = \"2.1.0\"\n"), "{}", case.name);
+                assert!(
+                    package.contains(&format!(
+                        "\nversion = \"{}\"\n",
+                        workflow_adk::ADK_RUST_VERSION
+                    )),
+                    "{}",
+                    case.name
+                );
+                assert!(include_str!("../../../Cargo.toml").contains(&format!(
+                    "adk-rust = {{ version = \"={}\"",
+                    workflow_adk::ADK_RUST_VERSION
+                )));
+                assert_eq!(
+                    workflow_testkit::code_investigation::ADK_RUST_VERSION,
+                    workflow_adk::ADK_RUST_VERSION
+                );
                 let binding = ModelProfileRegistry::new()
                     .with_worker(fake_profile(vec![json!("engine-ok")]))
                     .unwrap()

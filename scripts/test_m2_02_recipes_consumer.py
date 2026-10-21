@@ -46,7 +46,7 @@ class M202RecipesConsumerTests(unittest.TestCase):
             "published crate or an exact git revision pin",
             "run/resume/inspect/replay",
             "local-only gates",
-            "adk-rust = \"=2.1.0\"",
+            "adk-rust = \"=2.3.0\"",
             "ADK implementation types",
         ):
             self.assertIn(marker, text, f"ADR missing future gate: {marker}")

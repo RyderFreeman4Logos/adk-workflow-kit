@@ -885,6 +885,100 @@ fn execution_persists_resolved_runtime_plan_identity() {
     );
 }
 
+fn selected_adk_version() -> &'static str {
+    include_str!("../../../Cargo.lock")
+        .split("[[package]]")
+        .find(|block| block.contains("\nname = \"adk-rust\"\n"))
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("version = \"")?.strip_suffix('"'))
+        .unwrap()
+}
+
+#[test]
+fn model_foundations_sdk_provenance_matches_selected_dependency() {
+    let root = TestRoot::new();
+    let receipt =
+        ExecutionBackend::run(workflow(), profile(), json!({"request":"public"}), &root.0).unwrap();
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(receipt.run_root().join("run-manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["adk_rust_version"], selected_adk_version());
+    assert_eq!(
+        manifest["checkpoint_manifest"]["implementation_identities"]["adk-rust"],
+        selected_adk_version()
+    );
+}
+
+#[test]
+fn model_foundations_old_sdk_checkpoint_is_rejected_before_resume() {
+    let root = TestRoot::new();
+    let receipt =
+        ExecutionBackend::run(workflow(), profile(), json!({"request":"public"}), &root.0).unwrap();
+    let run_manifest = receipt.run_root().join("run-manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&run_manifest).unwrap()).unwrap();
+    manifest["adk_rust_version"] = json!("2.1.0");
+    manifest["checkpoint_manifest"]["implementation_identities"]["adk-rust"] = json!("2.1.0");
+    let checkpoint_manifest = manifest["checkpoint_manifest"].clone();
+    fs::write(&run_manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    fs::write(
+        receipt.run_root().join("checkpoint-manifest.json"),
+        serde_json::to_vec(&checkpoint_manifest).unwrap(),
+    )
+    .unwrap();
+    let checkpoint_path = receipt.run_root().join("checkpoint.sqlite");
+    Connection::open(&checkpoint_path)
+        .unwrap()
+        .execute(
+            "UPDATE kit_checkpoint_meta SET manifest_json = ?1 WHERE id = 1",
+            [serde_json::to_string(&checkpoint_manifest).unwrap()],
+        )
+        .unwrap();
+    // The old SDK fixture is internally coherent; rejection must come from the live SDK identity.
+    let store = SqliteCheckpointStore::open(
+        &checkpoint_path,
+        serde_json::from_value(checkpoint_manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        store
+            .load_latest(&RunId::new(receipt.run_id().to_owned()).unwrap())
+            .unwrap()
+            .is_some()
+    );
+    drop(store);
+    let events = receipt.run_root().join("events.jsonl");
+    let before = fs::read(&events).unwrap();
+    let error = ExecutionBackend::resume(&root.0, receipt.run_id())
+        .expect_err("old SDK must be incompatible");
+    assert_eq!(error.kind(), ExecutionErrorKind::InvalidRunState);
+    assert_eq!(fs::read(events).unwrap(), before);
+}
+
+#[test]
+fn model_foundations_no_auth_template_identity_binds_to_example_workflow() {
+    let root = TestRoot::new();
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/00-runtime-smoke");
+    let bytes = fs::read(example.join("profiles/openai-compatible-no-auth.template.json")).unwrap();
+    ExecutionProfileV1::parse(&bytes).expect("production NoAuth template");
+    let mut offline: Value = serde_json::from_slice(&bytes).unwrap();
+    let model = offline["model"].as_object_mut().unwrap();
+    // Replace only the provider transport; preserve the template's actual binding identity.
+    model.insert("provider".to_owned(), json!("fake"));
+    model.remove("auth");
+    model.remove("base_url");
+    model.insert("responses".to_owned(), json!([finish(json!("binding-ok"))]));
+    let profile = ExecutionProfileV1::parse(&serde_json::to_vec(&offline).unwrap()).unwrap();
+    let receipt = ExecutionBackend::run(
+        example.join("workflow.toml"),
+        profile,
+        json!({"request":"public"}),
+        &root.0,
+    )
+    .expect("template identity must bind to the documented workflow");
+    assert_eq!(receipt.status(), "succeeded");
+}
+
 #[test]
 fn inspect_missing_run_remains_not_found() {
     let root = TestRoot::new();
@@ -990,6 +1084,69 @@ fn checkpoint_tool_identity_comes_from_the_resolved_projection() {
         manifest["checkpoint_manifest"]["implementation_identities"]["toolset"],
         receipt.resume_identity()
     );
+}
+
+#[test]
+fn openai_compatible_auth_policy_is_explicit_for_worker_and_reviewer() {
+    let cases = [
+        (json!({"auth": "none"}), true),
+        (json!({"credential_env": "SYNTHETIC_HANDLE"}), true),
+        (json!({}), false),
+        (
+            json!({"auth": "none", "credential_env": "SYNTHETIC_HANDLE"}),
+            false,
+        ),
+        (json!({"auth": "none", "credential_env": ""}), false),
+        (json!({"auth": "none", "credential_env": null}), false),
+        (json!({"auth": "unknown"}), false),
+        (json!({"auth": {"none": null}}), false),
+        (json!({"auth": {"none": {}}}), false),
+        (json!({"auth": {}}), false),
+        (json!({"auth": []}), false),
+        (json!({"auth": ["none"]}), false),
+        (json!({"auth": true}), false),
+        (json!({"auth": 0}), false),
+        (json!({"auth": "None"}), false),
+        (json!({"auth": " none "}), false),
+        (json!({"auth": ""}), false),
+        (json!({"auth": null}), false),
+        (
+            json!({"auth": null, "credential_env": "SYNTHETIC_HANDLE"}),
+            false,
+        ),
+        (json!({"credential_env": null}), false),
+        (json!({"credential_env": ""}), false),
+        (json!({"credential_env": "  "}), false),
+    ];
+    for role in ["model", "reviewer_model"] {
+        for (policy, accepted) in &cases {
+            let mut wire = json!({
+                "schema_version": 1,
+                "model": {"provider":"fake", "name":"worker", "version":"1", "model":"fake", "responses":["ok"]},
+                "sandbox": {"capabilities": []}
+            });
+            let mut model = json!({
+                "provider":"openai-compatible", "name":role, "version":"1",
+                "model":"synthetic", "base_url":"http://example.invalid/v1"
+            });
+            model
+                .as_object_mut()
+                .unwrap()
+                .extend(policy.as_object().unwrap().clone());
+            wire[role] = model;
+            let outcome = ExecutionProfileV1::parse(&serde_json::to_vec(&wire).unwrap());
+            assert_eq!(outcome.is_ok(), *accepted, "role={role}, policy={policy}");
+            if let Ok(profile) = outcome {
+                let serialized = serde_json::to_value(profile).unwrap();
+                assert_eq!(serialized[role].get("auth"), policy.get("auth"));
+                assert_eq!(
+                    serialized[role].get("credential_env"),
+                    policy.get("credential_env")
+                );
+                ExecutionProfileV1::parse(&serde_json::to_vec(&serialized).unwrap()).unwrap();
+            }
+        }
+    }
 }
 
 #[test]

@@ -109,3 +109,5 @@ bundle; it does not re-execute a model or tool. Live mode is an explicit opt-in:
 missing variable names without retaining credential values. Set
 `WORKFLOW_KIT_LIVE_MODEL` only when the local OpenAI-compatible server needs a
 model name other than `local-model`.
+
+For an explicitly authorized unauthenticated endpoint, prepare `profiles/openai-compatible-no-auth.template.json` with its endpoint/model and run `workflowctl run examples/00-runtime-smoke/workflow.toml --profile <prepared-profile>` from the repository root. Its `m3-00-fake` profile name and version `1` match the workflow binding; `auth` selects transport authentication. `auth: "none"` omits Authorization and performs no credential lookup; omit `credential_env` entirely. The same policy works for `reviewer_model`; omitted `auth` retains required nonempty `credential_env` authentication. Public Rust callers use `OpenAiCompatibleProfile::new_no_auth`; `new` always requires a resolved nonempty credential. Version a profile whenever its endpoint, model, or auth policy changes and update its workflow binding to match.

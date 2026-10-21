@@ -198,11 +198,11 @@ mod tests {
     }
 
     #[test]
-    fn workspace_uses_adk_2_1_and_rust_2024_toolchain() {
+    fn workspace_pins_released_adk_and_rust_2024_toolchain() {
         let manifest = include_str!("../../../Cargo.toml");
         assert!(manifest.contains("edition = \"2024\""));
         assert!(manifest.contains("rust-version = \"1.98.0\""));
-        assert!(manifest.contains("adk-rust = { version = \"=2.1.0\""));
+        assert!(manifest.contains("adk-rust = { version = \"=2.3.0\""));
     }
 
     #[tokio::test]

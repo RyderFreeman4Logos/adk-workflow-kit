@@ -15,9 +15,9 @@ dependencies = [
 
 [[package]]
 name = "adk-agent"
-version = "2.1.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da8c2c4894eab69797b17850315ae27535dfa43b4dda43f7ff7c91824af18b8d"
+checksum = "24e216ce9361811c6f9737aaca0a71bc84bd5f78f6ea855c8ea0f3a561181f8d"
 dependencies = [
  "adk-core",
  "adk-telemetry",
@@ -37,9 +37,9 @@ dependencies = [
 
 [[package]]
 name = "adk-core"
-version = "2.1.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db3f16b5fbb32945b277a83d6cd3f8c37abf210052b2258d604ec5749a5bf9ee"
+checksum = "892f30b3b10c28340a748c3142d0b1c7ad02b4500356c5ca80b8f6481a618ea4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -54,9 +54,9 @@ dependencies = [
 
 [[package]]
 name = "adk-graph"
-version = "2.1.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bda1d11c2cfa51b2dcd5d8a024bb604e3cd7aab86970552f0cb52f991cd405a2"
+checksum = "4d2ad7c9036852c0d8164b2c3efe2c7c5e7cda148d741e792dac42b242927317"
 dependencies = [
  "adk-core",
  "async-stream",
@@ -73,9 +73,9 @@ dependencies = [
 
 [[package]]
 name = "adk-guardrail"
-version = "2.1.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c5829809802dbc239dff39a20e5104a7223af973676fe5391a6420ccde5570f"
+checksum = "72ae3213439d46d78db13fb44a03716069c0f2603c873aa3937f9c174e6c0709"
 dependencies = [
  "adk-core",
  "async-trait",
@@ -90,9 +90,9 @@ dependencies = [
 
 [[package]]
 name = "adk-model"
-version = "2.1.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc0c979791e694c205142ca6eb86c26f9559411ddbc19e85fa74b1b8fafd38b1"
+checksum = "719d5c9867218440e64c9b2b7df20444e40c2d34ddf9208cc46bcb54eacfd6ff"
 dependencies = [
  "adk-core",
  "adk-telemetry",
@@ -114,16 +114,38 @@ dependencies = [
 ]
 
 [[package]]
-name = "adk-rust"
-version = "2.1.0"
+name = "adk-runner"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5244ddd601fb2f9a9671a2407312d8c25914b211381e6e6bf62e0b8eadba72e"
+checksum = "f359e6760f53e27d35d70a15b469eb4401341e6a96897d564262f59524b597ad"
+dependencies = [
+ "adk-core",
+ "adk-session",
+ "async-stream",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "adk-rust"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "505a83604d4e5919b011cdb59c0aa93ec40bec86ea86e3b2930c32a122408a52"
 dependencies = [
  "adk-agent",
  "adk-core",
  "adk-graph",
  "adk-guardrail",
  "adk-model",
+ "adk-runner",
+ "adk-session",
  "adk-telemetry",
  "anyhow",
  "async-trait",
@@ -135,10 +157,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "adk-telemetry"
-version = "2.1.0"
+name = "adk-session"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09592e9f3d8238e882beb2891af5dd1996aec4579df513a23d953eb0939e0f6b"
+checksum = "631237f2080e4921009a4dbfd920e18e04dafc277de85e690c1682690ba9009b"
+dependencies = [
+ "adk-core",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "adk-telemetry"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e075f0cdf10076fb13b4ecd78486cca1572f0465da5f6e0770e8f7093ece028"
 dependencies = [
  "thiserror",
  "tracing",
@@ -2653,6 +2690,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",
@@ -3353,6 +3391,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "url",
  "workflow-compiler",
  "workflow-ir",
  "workflow-runtime",

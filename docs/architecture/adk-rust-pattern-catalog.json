@@ -7,15 +7,15 @@
     "repository": "https://github.com/RyderFreeman4Logos/adk-workflow-kit",
     "license": "Apache-2.0",
     "adk_rust": {
-      "requirement": "=2.1.0",
+      "requirement": "=2.3.0",
       "version": "2.1.0",
       "commit": "993126f18b8038123efe98566d4e058bd69c0f4e",
       "license": "Apache-2.0",
       "cargo_lock": {
         "package": "adk-rust",
-        "version": "2.1.0",
+        "version": "2.3.0",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "checksum": "b5244ddd601fb2f9a9671a2407312d8c25914b211381e6e6bf62e0b8eadba72e"
+        "checksum": "505a83604d4e5919b011cdb59c0aa93ec40bec86ea86e3b2930c32a122408a52"
       }
     },
     "policy": {

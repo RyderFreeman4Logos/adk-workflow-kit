@@ -1,5 +1,8 @@
 //! Domain-neutral Verbatim boundary for platform-owned workflow calls.
 
+/// The released SDK version recorded in runtime provenance and resume identities.
+pub const ADK_RUST_VERSION: &str = "2.3.0";
+
 pub mod behavioral;
 pub mod events;
 pub mod execution;
@@ -746,7 +749,7 @@ impl AdkGraph {
                     if let Some(error) = terminal_error {
                         return Err(error);
                     }
-                    if event.content().is_none() {
+                    if event.content().is_none() && !events::is_tool_started(&event) {
                         return Err(AdkGraphError::InvalidOutput { node });
                     }
                     if cache_hit_event(&event) {

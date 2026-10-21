@@ -166,8 +166,8 @@ issue-289-adk:
 adk-default-test:
     {{_io}} cargo +1.98.0 test -p workflow-adk --locked -- --test-threads=1
 
-adk-model-profiles:
-    {{_io}} cargo +1.98.0 test -p workflow-adk --test model_profiles --locked
+adk-model-profiles test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test model_profiles {{test_name}} --locked
 
 runtime-hot-reload:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --lib hot_reload::tests:: --locked
@@ -328,10 +328,10 @@ m1-15-test:
     {{_io}} cargo +1.98.0 test -p workflow-testkit --test m1_15_conformance --locked
 
 # Focused M1-15 production-boundary translation tests.
-m1-15-translation:
-    {{_io}} cargo +1.98.0 test -p workflow-adk --test translation --locked
+m1-15-translation test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test translation {{test_name}} --locked
 
-# Focused #223 ADK-Rust 2.1.0 production-path probe.
+# Focused #223 compatibility probe against the current released ADK-Rust pin.
 adk-2-1-probe:
     {{_io}} cargo +1.98.0 test -p workflow-adk --test adk_2_1_compat --locked -- --nocapture
 
@@ -344,8 +344,8 @@ m1-15-tool-bridge:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test m1_07_tool_bridge --locked
 
 # Focused M1-15 checkpoint terminal-mapping tests.
-m1-15-checkpoint:
-    {{_io}} cargo +1.98.0 test -p workflow-adk --test m1_11_execution_checkpoints --locked
+m1-15-checkpoint test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test m1_11_execution_checkpoints {{test_name}} --locked
 
 # Focused M1-16 README, CLI decomposition, and secure-open regression tests.
 m1-16-test:

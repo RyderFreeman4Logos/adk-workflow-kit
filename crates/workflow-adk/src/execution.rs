@@ -2373,10 +2373,45 @@ enum ModelWire {
         version: String,
         model: String,
         base_url: String,
-        credential_env: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_present"
+        )]
+        auth: Option<OpenAiCompatibleAuthWire>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_present"
+        )]
+        credential_env: Option<String>,
         #[serde(default)]
         runtime: Option<ModelRuntimeWire>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum OpenAiCompatibleAuthWire {
+    None,
+}
+
+impl<'de> Deserialize<'de> for OpenAiCompatibleAuthWire {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "none" => Ok(Self::None),
+            _ => Err(serde::de::Error::custom(
+                "unsupported authentication policy",
+            )),
+        }
+    }
+}
+
+// Missing operands retain defaults; explicit null is never an authentication policy.
+fn deserialize_present<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
 }
 
 impl ModelWire {
@@ -2451,16 +2486,23 @@ fn openai_compatible_profile(
     version: &str,
     model: &str,
     base_url: &str,
-    credential_env: &str,
+    auth: Option<OpenAiCompatibleAuthWire>,
+    credential_env: &Option<String>,
     runtime: &Option<ModelRuntimeWire>,
 ) -> Result<OpenAiCompatibleProfile, ExecutionError> {
-    let profile = OpenAiCompatibleProfile::new(
-        name,
-        version,
-        model,
-        base_url,
-        CredentialHandle::environment(credential_env),
-    );
+    let profile = match (auth, credential_env.as_deref()) {
+        (Some(OpenAiCompatibleAuthWire::None), None) => {
+            OpenAiCompatibleProfile::new_no_auth(name, version, model, base_url)
+        }
+        (None, Some(handle)) if !handle.trim().is_empty() => OpenAiCompatibleProfile::new(
+            name,
+            version,
+            model,
+            base_url,
+            CredentialHandle::environment(handle),
+        ),
+        _ => return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile)),
+    };
     Ok(match runtime {
         Some(runtime) => profile.with_runtime(runtime.to_config()?),
         None => profile,
@@ -2613,18 +2655,25 @@ impl ExecutionProfileV1 {
                     version,
                     model,
                     base_url,
+                    auth,
                     credential_env,
                     runtime,
                 } => {
-                    if [name, version, model, base_url, credential_env]
+                    if [name, version, model, base_url]
                         .into_iter()
                         .any(|value| value.is_empty())
                     {
                         return Err(ExecutionError::new(ExecutionErrorKind::InvalidProfile));
                     }
-                    if let Some(runtime) = runtime {
-                        runtime.to_config()?;
-                    }
+                    openai_compatible_profile(
+                        name,
+                        version,
+                        model,
+                        base_url,
+                        *auth,
+                        credential_env,
+                        runtime,
+                    )?;
                 }
             }
         }
@@ -2966,6 +3015,7 @@ impl ExecutionProfileV1 {
                     version,
                     model,
                     base_url,
+                    auth,
                     credential_env,
                     runtime,
                 },
@@ -2974,6 +3024,7 @@ impl ExecutionProfileV1 {
                 version,
                 model,
                 base_url,
+                *auth,
                 credential_env,
                 runtime,
             )?),
@@ -2984,6 +3035,7 @@ impl ExecutionProfileV1 {
                     version,
                     model,
                     base_url,
+                    auth,
                     credential_env,
                     runtime,
                 },
@@ -2992,6 +3044,7 @@ impl ExecutionProfileV1 {
                 version,
                 model,
                 base_url,
+                *auth,
                 credential_env,
                 runtime,
             )?),
@@ -4843,7 +4896,7 @@ impl ExecutionBackend {
                     workflow_version: compiled.ir().workflow_version().to_owned(),
                     workdir_id: workdir_id.clone(),
                     profile_identity: profile_identity.clone(),
-                    adk_rust_version: "2.1.0".to_owned(),
+                    adk_rust_version: crate::ADK_RUST_VERSION.to_owned(),
                     status: "running".to_owned(),
                     artifact_id: "unavailable".to_owned(),
                     resume_count: 0,
@@ -5206,7 +5259,7 @@ impl ExecutionBackend {
             workflow_version: compiled.ir().workflow_version().to_owned(),
             workdir_id,
             profile_identity: profile_identity.clone(),
-            adk_rust_version: "2.1.0".to_owned(),
+            adk_rust_version: crate::ADK_RUST_VERSION.to_owned(),
             status: status.to_owned(),
             artifact_id,
             resume_count: 0,
@@ -5743,7 +5796,7 @@ fn build_checkpoint_manifest(
         .with_workflow_hash(workflow_hash.clone())
         .with_resource_hash("workflow.ir", workflow_hash)
         .with_implementation("model", profile.profile_identity())
-        .with_implementation("adk-rust", "2.1.0")
+        .with_implementation("adk-rust", crate::ADK_RUST_VERSION)
         .with_implementation("loop-ledger", "v3")
         .with_implementation(
             "execution-profile",

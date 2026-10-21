@@ -314,7 +314,7 @@ impl AdkEventMapper {
     ) -> Result<WorkflowRuntimeEventV1, AdkEventMappingError> {
         let kind = if event.llm_response.error_code.is_some() {
             AdkRuntimeObservationKindV1::WorkflowFailed
-        } else if event.tool_progress_stream().is_some() {
+        } else if event.tool_progress_stream().is_some() || is_tool_started(&event) {
             AdkRuntimeObservationKindV1::ToolStarted
         } else if !event.tool_results().is_empty() {
             AdkRuntimeObservationKindV1::ToolCompleted
@@ -365,17 +365,21 @@ impl AdkEventMapper {
                 calls
                     .into_iter()
                     .filter(|call| {
+                        let Some(call_id) = call.call_id.filter(|id| !id.is_empty()) else {
+                            return true;
+                        };
                         !self.log.events().iter().any(|prior| {
-                            prior
-                                .payload()
-                                .get("structured_output")
-                                .and_then(Value::as_array)
-                                .is_some_and(|items| {
-                                    items.iter().any(|item| {
-                                        item.get("tool_call_id").and_then(Value::as_str)
-                                            == call.call_id
+                            prior.kind() == WorkflowRuntimeEventKindV1::ToolRequested
+                                && prior
+                                    .payload()
+                                    .get("structured_output")
+                                    .and_then(Value::as_array)
+                                    .is_some_and(|items| {
+                                        items.iter().any(|item| {
+                                            item.get("tool_call_id").and_then(Value::as_str)
+                                                == Some(call_id)
+                                        })
                                     })
-                                })
                         })
                     })
                     .map(|call| {
@@ -695,6 +699,35 @@ fn tool_call_kind(kind: AdkRuntimeObservationKindV1) -> bool {
     )
 }
 
+/// Recognizes only ADK's partial, contentless tool-start notification.
+pub(crate) fn is_tool_started(event: &adk_rust::Event) -> bool {
+    if event.content().is_some()
+        || !event.llm_response.partial
+        || event.llm_response.interrupted
+        || event.llm_response.error_code.is_some()
+        || event.llm_response.error_message.is_some()
+        || event.llm_response.finish_reason.is_some()
+    {
+        return false;
+    }
+    let Some(marker) = event.provider_metadata.get("adk_tool_started") else {
+        return false;
+    };
+    let Ok(Value::Object(marker)) = serde_json::from_str(marker) else {
+        return false;
+    };
+    let valid_string = |value: &Value| {
+        value
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+    };
+    marker.len() == 2
+        && marker.get("name").is_some_and(valid_string)
+        && marker
+            .get("id")
+            .is_some_and(|id| id.is_null() || valid_string(id))
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
@@ -704,6 +737,160 @@ mod tests {
     use workflow_runtime::{ArtifactId, ArtifactStore, InMemoryArtifactStore, PageRequest};
 
     use super::*;
+
+    #[test]
+    fn sdk_tool_started_requires_valid_partial_metadata() {
+        let mut artifacts = InMemoryArtifactStore::new(
+            NonZeroU64::new(16 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024).unwrap(),
+        );
+        let mut mapper = AdkEventMapper::new("run", "workflow").unwrap();
+        for (marker, partial, failure) in [
+            (None, true, ""),
+            (Some("not-json"), true, ""),
+            (Some(r#"{"id":"","name":"lookup"}"#), true, ""),
+            (Some(r#"{"id":"call"}"#), true, ""),
+            (Some(r#"{"id":"call","name":"  "}"#), true, ""),
+            (Some(r#"{"name":"lookup"}"#), true, ""),
+            (Some(r#"{"id":false,"name":"lookup"}"#), true, ""),
+            (Some(r#"{"id":1,"name":"lookup"}"#), true, ""),
+            (Some(r#"{"id":{},"name":"lookup"}"#), true, ""),
+            (Some(r#"{"id":[],"name":"lookup"}"#), true, ""),
+            (
+                Some(r#"{"id":"call","name":"lookup","extra":true}"#),
+                true,
+                "",
+            ),
+            (Some(r#"{"id":"call","name":"lookup"}"#), false, ""),
+            (Some(r#"{"id":"call","name":"lookup"}"#), true, "error"),
+            (
+                Some(r#"{"id":"call","name":"lookup"}"#),
+                true,
+                "interrupted",
+            ),
+            (Some(r#"{"id":"call","name":"lookup"}"#), true, "stop"),
+        ] {
+            let mut event = Event::new("invocation");
+            event.llm_response.partial = partial;
+            if let Some(marker) = marker {
+                event
+                    .provider_metadata
+                    .insert("adk_tool_started".to_owned(), marker.to_owned());
+            }
+            match failure {
+                "error" => event.llm_response.error_code = Some("provider-error".to_owned()),
+                "interrupted" => event.llm_response.interrupted = true,
+                "stop" => event.llm_response.finish_reason = Some(FinishReason::Stop),
+                _ => {}
+            }
+            assert!(
+                !mapper
+                    .map_adk_event("agent".to_owned(), event, &mut artifacts)
+                    .is_ok_and(|event| event.kind() == WorkflowRuntimeEventKindV1::ToolStarted)
+            );
+        }
+        for id in [json!("call"), Value::Null] {
+            let mut started = Event::new("invocation");
+            started.llm_response.partial = true;
+            started.provider_metadata.insert(
+                "adk_tool_started".to_owned(),
+                json!({"id": id, "name": "lookup"}).to_string(),
+            );
+            let mapped = mapper
+                .map_adk_event("agent".to_owned(), started, &mut artifacts)
+                .unwrap();
+            assert_eq!(mapped.kind(), WorkflowRuntimeEventKindV1::ToolStarted);
+            assert!(mapped.payload().get("structured_output").is_none());
+        }
+    }
+
+    fn request_event(name: &str, args: Value, id: Option<&str>) -> Event {
+        let mut event = Event::new("invocation");
+        event.set_content(Content {
+            role: "assistant".to_owned(),
+            parts: vec![Part::FunctionCall {
+                name: name.to_owned(),
+                args,
+                id: id.map(str::to_owned),
+                thought_signature: None,
+            }],
+        });
+        event
+    }
+
+    #[test]
+    fn idless_tool_requests_keep_distinct_payloads() {
+        let mut mapper = AdkEventMapper::new("run-idless", "workflow").unwrap();
+        let mut artifacts = InMemoryArtifactStore::new(
+            NonZeroU64::new(16 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024).unwrap(),
+        );
+        for (index, name) in ["first", "second"].into_iter().enumerate() {
+            let args = json!({"index": index});
+            let requested = mapper
+                .map_adk_event(
+                    "agent".to_owned(),
+                    request_event(name, args.clone(), None),
+                    &mut artifacts,
+                )
+                .unwrap();
+            assert_eq!(requested.kind(), WorkflowRuntimeEventKindV1::ToolRequested);
+            assert_eq!(
+                requested.payload()["structured_output"],
+                json!([{
+                    "tool_call_id": null, "tool_name": name,
+                    "argument_fingerprint": argument_fingerprint(&args),
+                }])
+            );
+            let mut completed = Event::new("invocation");
+            completed.set_content(Content {
+                role: "function".to_owned(),
+                parts: vec![Part::FunctionResponse {
+                    function_response: FunctionResponseData::new(name, json!({"ok": true})),
+                    id: None,
+                    annotations: None,
+                }],
+            });
+            mapper
+                .map_adk_event("agent".to_owned(), completed, &mut artifacts)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn only_prior_requests_with_nonempty_provider_ids_are_deduplicated() {
+        let mut mapper = AdkEventMapper::new("run-dedup", "workflow").unwrap();
+        let mut artifacts = InMemoryArtifactStore::new(
+            NonZeroU64::new(16 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024).unwrap(),
+        );
+        mapper
+            .map(
+                AdkRuntimeObservationV1::new(
+                    "prior-result",
+                    "2026-09-02T00:00:00Z",
+                    AdkRuntimeObservationKindV1::ToolCompleted,
+                )
+                .with_structured_output(json!([{"tool_call_id": "call"}])),
+            )
+            .unwrap();
+        for (id, expected) in [("call", 1), ("call", 0), ("", 1), ("", 1)] {
+            let requested = mapper
+                .map_adk_event(
+                    "agent".to_owned(),
+                    request_event("lookup", json!({"query": "value"}), Some(id)),
+                    &mut artifacts,
+                )
+                .unwrap();
+            assert_eq!(
+                requested.payload()["structured_output"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn real_adk_model_and_tool_events_keep_their_categories_and_metadata() {

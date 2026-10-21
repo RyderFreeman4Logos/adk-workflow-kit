@@ -542,20 +542,31 @@ impl FakeModelProfile {
     }
 }
 
-/// OpenAI-compatible local or cloud profile. The credential remains a handle until binding.
+/// Explicit transport authentication. NoAuth never resolves a credential handle.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum OpenAiCompatibleAuth {
+    /// Resolve this handle and require a nonempty bearer credential.
+    Credential(CredentialHandle),
+    /// Omit Authorization without resolving any credential.
+    NoAuth,
+}
+
+/// OpenAI-compatible local or cloud profile with an explicit authentication policy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenAiCompatibleProfile {
     identity: ModelProfileIdentity,
     provider: String,
     model: String,
     base_url: String,
-    credential: CredentialHandle,
+    auth: OpenAiCompatibleAuth,
     runtime: ModelRuntimeConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tokenizer: Option<String>,
 }
 
 impl OpenAiCompatibleProfile {
+    /// Requires a nonempty resolved credential; endpoint locality never changes this policy.
     pub fn new(
         name: impl Into<String>,
         version: impl Into<String>,
@@ -563,15 +574,33 @@ impl OpenAiCompatibleProfile {
         base_url: impl Into<String>,
         credential: CredentialHandle,
     ) -> Self {
+        let mut profile = Self::new_no_auth(name, version, model, base_url);
+        profile.auth = OpenAiCompatibleAuth::Credential(credential);
+        profile
+    }
+
+    /// Explicitly omits Authorization and skips the credential broker.
+    /// URL credentials are rejected. Hosts must still authorize the endpoint/model
+    /// and version authentication policy changes.
+    pub fn new_no_auth(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
         Self {
             identity: ModelProfileIdentity::new(name, version),
             provider: "openai-compatible".to_owned(),
             model: model.into(),
             base_url: base_url.into(),
-            credential,
+            auth: OpenAiCompatibleAuth::NoAuth,
             runtime: ModelRuntimeConfig::default(),
             tokenizer: None,
         }
+    }
+    /// Returns the profile's explicit transport authentication policy.
+    pub fn auth(&self) -> &OpenAiCompatibleAuth {
+        &self.auth
     }
     pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
         self.provider = provider.into();
@@ -633,7 +662,22 @@ impl ModelProfile {
                 }
                 (&value.model, None)
             }
-            Self::OpenAiCompatible(value) => (&value.model, Some(value.base_url.as_str())),
+            Self::OpenAiCompatible(value) => {
+                if value.auth == OpenAiCompatibleAuth::NoAuth {
+                    let endpoint = url::Url::parse(&value.base_url)
+                        .map_err(|_| ModelProfileError::invalid())?;
+                    // URL credentials make the HTTP client add Basic authorization.
+                    if !endpoint.username().is_empty() || endpoint.password().is_some() {
+                        return Err(ModelProfileError::invalid());
+                    }
+                }
+                if let OpenAiCompatibleAuth::Credential(handle) = &value.auth
+                    && handle.handle().trim().is_empty()
+                {
+                    return Err(ModelProfileError::invalid());
+                }
+                (&value.model, Some(value.base_url.as_str()))
+            }
         };
         if model.is_empty()
             || url.is_some_and(|value| {
@@ -820,13 +864,16 @@ impl ModelProfileRegistry {
             .ok_or_else(ModelProfileError::missing)?;
         Self::validate_entry(identity, profile)?;
         let secret = match profile {
-            ModelProfile::Fake(_) => None,
-            ModelProfile::OpenAiCompatible(value) => Some(
+            ModelProfile::OpenAiCompatible(OpenAiCompatibleProfile {
+                auth: OpenAiCompatibleAuth::Credential(handle),
+                ..
+            }) => Some(
                 broker
-                    .resolve_for_route(&value.credential)
+                    .resolve_for_route(handle)
                     .await
                     .map_err(ModelProfileError::credential)?,
             ),
+            ModelProfile::Fake(_) | ModelProfile::OpenAiCompatible(_) => None,
         };
         profile.bind_resolved(role, secret)
     }
@@ -877,12 +924,15 @@ impl ModelProfile {
     ) -> Result<ModelBinding, ModelProfileError> {
         self.validate()?;
         let secret = match self {
-            Self::Fake(_) => None,
-            Self::OpenAiCompatible(value) => Some(
+            Self::OpenAiCompatible(OpenAiCompatibleProfile {
+                auth: OpenAiCompatibleAuth::Credential(handle),
+                ..
+            }) => Some(
                 broker
-                    .resolve(&value.credential)
+                    .resolve(handle)
                     .map_err(ModelProfileError::credential)?,
             ),
+            Self::Fake(_) | Self::OpenAiCompatible(_) => None,
         };
         self.bind_resolved(role, secret)
     }
@@ -934,9 +984,17 @@ impl ModelProfile {
                 )
             }
             Self::OpenAiCompatible(value) => {
-                let secret = secret
-                    .ok_or_else(|| ModelProfileError::credential(CredentialError::missing()))?;
-                let config = OpenAICompatibleConfig::new(secret.expose(), &value.model)
+                let api_key = match (&value.auth, secret.as_ref()) {
+                    // ADK 2.3 uses an empty key as its explicit no-header transport sentinel.
+                    (OpenAiCompatibleAuth::NoAuth, None) => "",
+                    (OpenAiCompatibleAuth::Credential(_), Some(secret))
+                        if !secret.expose().trim().is_empty() =>
+                    {
+                        secret.expose()
+                    }
+                    _ => return Err(ModelProfileError::credential(CredentialError::missing())),
+                };
+                let config = OpenAICompatibleConfig::new(api_key, &value.model)
                     .with_provider_name(&value.provider)
                     .with_base_url(&value.base_url);
                 let llm = OpenAICompatible::new(config)

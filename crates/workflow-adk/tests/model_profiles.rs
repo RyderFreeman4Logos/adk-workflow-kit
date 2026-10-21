@@ -15,6 +15,9 @@ use workflow_adk::model_profiles::{
 };
 use workflow_compiler::ModelRegistry;
 
+#[path = "model_profiles/auth.rs"]
+mod auth;
+
 struct TestSecrets;
 impl SecretProvider for TestSecrets {
     fn resolve(
@@ -22,6 +25,16 @@ impl SecretProvider for TestSecrets {
         _handle: &str,
     ) -> Result<SecretValue, workflow_adk::model_profiles::CredentialError> {
         Ok(SecretValue::new("test-only-token"))
+    }
+}
+
+struct EmptySecrets;
+impl SecretProvider for EmptySecrets {
+    fn resolve(
+        &self,
+        _: &str,
+    ) -> Result<SecretValue, workflow_adk::model_profiles::CredentialError> {
+        Ok(SecretValue::new(""))
     }
 }
 
@@ -173,7 +186,7 @@ async fn model_profile_wire_request(
             }
             request.extend_from_slice(&buffer[..bytes]);
         }
-        let body = r#"{"choices":[{"message":{"role":"assistant","content":"wire-ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"answer\":\"wire-ok\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
         let reply = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
             body.len(), body,
@@ -226,7 +239,46 @@ async fn local_openai_compatible_binding_forwards_runtime_configuration() {
         .expect("client deadline")
         .expect("model response")
         .expect("one model response");
-    assert_eq!(response.content.unwrap().parts[0].text(), Some("wire-ok"));
+    assert_eq!(
+        response.content.unwrap().parts[0].text(),
+        Some(r#"{"answer":"wire-ok"}"#)
+    );
+}
+
+#[tokio::test]
+async fn authenticated_empty_secret_is_rejected_before_egress() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let registry = ModelProfileRegistry::new()
+        .with_worker(OpenAiCompatibleProfile::new(
+            "worker",
+            "1",
+            "local-model",
+            format!("http://{address}/v1"),
+            CredentialHandle::secret_provider("empty-key"),
+        ))
+        .unwrap();
+    let binding =
+        registry.bind_worker(&CredentialBroker::new().with_secret_provider(Arc::new(EmptySecrets)));
+    let rejected_at_bind = binding
+        .as_ref()
+        .is_err_and(|error| error.kind() == ModelProfileErrorKind::Credential);
+    let client = async {
+        if let Ok(binding) = binding {
+            let request = LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+            if let Ok(mut stream) = binding.generate_content(request, false).await {
+                while stream.next().await.is_some() {}
+            }
+        }
+    };
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let (server, client) = tokio::join!(
+        model_profile_wire_request(listener, deadline),
+        timeout_at(deadline, client),
+    );
+    client.expect("bounded client settlement");
+    assert!(rejected_at_bind, "authenticated empty secret was admitted");
+    assert_eq!(server.unwrap_err().kind(), io::ErrorKind::TimedOut);
 }
 
 #[tokio::test]
