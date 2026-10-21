@@ -6,6 +6,9 @@ mod repair;
 #[path = "issue_311/structured.rs"]
 mod structured;
 
+#[path = "issue_311/provider_responses.rs"]
+mod provider_responses;
+
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
