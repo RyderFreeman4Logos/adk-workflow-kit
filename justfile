@@ -386,6 +386,10 @@ lock:
 lock-refresh:
     {{_io}} cargo +1.98.0 update --workspace
 
+# Update one locked dependency to an explicit version without refreshing the workspace.
+lock-update $package $version:
+    {{_io}} cargo +1.98.0 update --package "$package" --precise "$version"
+
 # Verify Cargo.lock already matches the workspace manifests without rewriting it.
 lock-check:
     {{_io}} cargo metadata --format-version 1 --locked > /dev/null
