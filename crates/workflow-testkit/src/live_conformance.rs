@@ -7,7 +7,10 @@ use std::fs;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+mod child;
+mod profile;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -138,15 +141,33 @@ impl LiveConformance {
         }
     }
 
-    /// Runs the canonical example through `workflowctl`. Extra env is child-only.
+    /// Calculates a command admission cap from validated profile bytes plus calibrated
+    /// setup/finalization headroom (1s from an offline fake-profile calibration).
+    /// This allowance is admission policy, not a host scheduling guarantee.
+    /// This does no I/O and does not change the default 60s or custom workflow limit.
+    pub fn command_budget(profile: &[u8]) -> Option<Duration> {
+        profile::budget(profile)
+    }
+
+    /// Runs the canonical example under one positive, finite child-command cap.
+    /// The cap must admit the executed profile's wall limit plus calibrated headroom.
+    /// Extra env is child-only; default returns SKIP before all I/O.
     pub fn run_canonical(
         self,
         workflowctl: &Path,
         example_root: &Path,
         profile: &Path,
         workdir: &Path,
+        command_budget: Duration,
     ) -> ConformanceReport {
-        self.run_canonical_with_env(workflowctl, example_root, profile, workdir, &[])
+        self.run_canonical_with_env(
+            workflowctl,
+            example_root,
+            profile,
+            workdir,
+            &[],
+            command_budget,
+        )
     }
 
     /// Runs the canonical example, setting only the supplied child env pairs.
@@ -157,18 +178,23 @@ impl LiveConformance {
         profile: &Path,
         workdir: &Path,
         env: &[(&str, &str)],
+        command_budget: Duration,
     ) -> ConformanceReport {
         if !self.enabled {
             return report(ConformanceDisposition::Skip, None);
         }
+        if command_budget.is_zero() || Instant::now().checked_add(command_budget).is_none() {
+            return fail_closed(workdir, Instant::now(), None, None);
+        }
+        let snapshot = match profile::Snapshot::new(profile, command_budget) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return fail_closed(workdir, Instant::now(), None, None),
+        };
         let Some(workflow) = example_root
             .join("workflow.toml")
             .to_str()
             .map(str::to_owned)
         else {
-            return fail_closed(workdir, Instant::now(), None, None);
-        };
-        let Some(profile) = profile.to_str().map(str::to_owned) else {
             return fail_closed(workdir, Instant::now(), None, None);
         };
         let Some(workdir_s) = workdir.to_str().map(str::to_owned) else {
@@ -179,6 +205,7 @@ impl LiveConformance {
             Err(_) => return fail_closed(workdir, Instant::now(), None, None),
         };
         let mut command = Command::new(workflowctl);
+        let profile = snapshot.bind(&mut command);
         command.args([
             "--json",
             "run",
@@ -197,7 +224,11 @@ impl LiveConformance {
             command.env(key, value);
         }
         let started = Instant::now();
-        classify(command.output(), workdir, started)
+        classify(
+            child::output(&mut command, command_budget),
+            workdir,
+            started,
+        )
     }
 }
 

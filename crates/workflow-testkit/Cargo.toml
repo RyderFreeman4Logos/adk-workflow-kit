@@ -11,6 +11,7 @@ path = "src/bin/issue-267-effect-child.rs"
 
 [dependencies]
 adk-rust.workspace = true
+libc = "=0.2.189"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -19,10 +20,9 @@ workflow-adk = { path = "../workflow-adk" }
 workflow-ir = { path = "../workflow-ir" }
 workflow-review = { path = "../workflow-review" }
 workflow-runtime = { path = "../workflow-runtime" }
+workflow-spec = { path = "../workflow-spec" }
 
 [dev-dependencies]
-libc = "=0.2.189"
 parquet = { version = "=60.0.0", default-features = false, features = ["snap"] }
 workflow-adk = { path = "../workflow-adk", features = ["test-support"] }
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
-workflow-spec = { path = "../workflow-spec" }
