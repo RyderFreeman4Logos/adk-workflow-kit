@@ -17,8 +17,9 @@ pub use model_invocation::{
     ModelRouteCandidate, ModelRouteIdentity, ModelRoutePolicy, ModelRoutePublisher,
     ModelRouteSnapshot, ModelRouteSnapshotError, ModelRouteSnapshotErrorKind,
     ModelRouteTerminalError, ModelRouteTerminalErrorKind, PROMPT_PROTOCOL_VERSION, PromptProtocol,
-    PromptProtocolError, PromptTool, ProviderRouteIdentity, ReasoningEffort, RenderedPrompt,
-    StructuredOutputContract, StructuredOutputContractError, ToolDefinition, ToolSpec,
+    PromptProtocolError, PromptTool, ProviderRouteIdentity, ProviderTokenUsage, ReasoningEffort,
+    RenderedPrompt, StructuredOutputContract, StructuredOutputContractError, ToolDefinition,
+    ToolSpec,
 };
 pub mod model_profiles;
 pub use model_profiles::{

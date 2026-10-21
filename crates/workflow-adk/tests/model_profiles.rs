@@ -18,6 +18,9 @@ use workflow_compiler::ModelRegistry;
 #[path = "model_profiles/auth.rs"]
 mod auth;
 
+#[path = "model_profiles/usage.rs"]
+mod usage;
+
 struct TestSecrets;
 impl SecretProvider for TestSecrets {
     fn resolve(
@@ -152,6 +155,15 @@ async fn model_profile_wire_request(
     listener: TcpListener,
     deadline: Instant,
 ) -> io::Result<Vec<u8>> {
+    let body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"answer\":\"wire-ok\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+    model_profile_wire_response(listener, deadline, body).await
+}
+
+async fn model_profile_wire_response(
+    listener: TcpListener,
+    deadline: Instant,
+    body: &str,
+) -> io::Result<Vec<u8>> {
     timeout_at(deadline, async move {
         let (mut socket, _) = listener.accept().await?;
         let mut request = Vec::new();
@@ -159,11 +171,17 @@ async fn model_profile_wire_request(
         let header_end = loop {
             let remaining = (MAX_WIRE_REQUEST_BYTES - request.len()).min(buffer.len());
             if remaining == 0 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "request too large"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "request too large",
+                ));
             }
             let bytes = socket.read(&mut buffer[..remaining]).await?;
             if bytes == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete headers"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete headers",
+                ));
             }
             request.extend_from_slice(&buffer[..bytes]);
             if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -175,21 +193,25 @@ async fn model_profile_wire_request(
             .find_map(|line| line.strip_prefix("content-length: "))
             .and_then(|value| value.parse::<usize>().ok())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid content length"))?;
-        let body_end = header_end.checked_add(content_length)
+        let body_end = header_end
+            .checked_add(content_length)
             .filter(|end| *end <= MAX_WIRE_REQUEST_BYTES)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "request too large"))?;
         while request.len() < body_end {
             let remaining = (body_end - request.len()).min(buffer.len());
             let bytes = socket.read(&mut buffer[..remaining]).await?;
             if bytes == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete body"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete body",
+                ));
             }
             request.extend_from_slice(&buffer[..bytes]);
         }
-        let body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"answer\":\"wire-ok\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
         let reply = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-            body.len(), body,
+            body.len(),
+            body,
         );
         socket.write_all(reply.as_bytes()).await?;
         socket.flush().await?;

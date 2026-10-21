@@ -1,4 +1,6 @@
 //! Offline tests through the public invocation and binding APIs.
+#[path = "model_usage_tests.rs"]
+mod usage;
 use crate::model_invocation::{
     InferenceBudget, ModelInvocationError, ModelInvocationErrorKind, ModelInvocationSpec,
     PromptProtocol, ProviderRouteIdentity, StructuredOutputContract,

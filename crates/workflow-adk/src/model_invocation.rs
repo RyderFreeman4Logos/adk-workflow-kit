@@ -704,12 +704,76 @@ impl ModelCompletionEvidence {
     }
 }
 
+/// Provider-reported token counters. Missing counters are never estimated or imputed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderTokenUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+}
+
+impl ProviderTokenUsage {
+    fn from_provider_usage(raw: &Value) -> Option<Self> {
+        let raw = raw.as_object()?;
+        let details = raw.get("prompt_tokens_details");
+        let usage = Self {
+            input_tokens: raw.get("prompt_tokens").and_then(Value::as_u64),
+            output_tokens: raw.get("completion_tokens").and_then(Value::as_u64),
+            total_tokens: raw.get("total_tokens").and_then(Value::as_u64),
+            cache_read_tokens: details
+                .and_then(|value| value.get("cached_tokens"))
+                .and_then(Value::as_u64),
+            cache_write_tokens: details
+                .and_then(|value| value.get("cache_write_tokens"))
+                .and_then(Value::as_u64),
+        };
+        [
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.total_tokens,
+            usage.cache_read_tokens,
+            usage.cache_write_tokens,
+        ]
+        .iter()
+        .any(Option::is_some)
+        .then_some(usage)
+    }
+
+    /// Raw OpenAI-compatible `prompt_tokens`, including genuine zero.
+    pub fn input_tokens(&self) -> Option<u64> {
+        self.input_tokens
+    }
+
+    /// Raw OpenAI-compatible `completion_tokens`, including genuine zero.
+    pub fn output_tokens(&self) -> Option<u64> {
+        self.output_tokens
+    }
+
+    /// Raw provider `total_tokens`; never calculated from input and output.
+    pub fn total_tokens(&self) -> Option<u64> {
+        self.total_tokens
+    }
+
+    /// Raw `prompt_tokens_details.cached_tokens`.
+    pub fn cache_read_tokens(&self) -> Option<u64> {
+        self.cache_read_tokens
+    }
+
+    /// Raw `prompt_tokens_details.cache_write_tokens`.
+    pub fn cache_write_tokens(&self) -> Option<u64> {
+        self.cache_write_tokens
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelInvocationResult {
     output: Value,
     attempts: u8,
     provenance: InvocationProvenance,
     completion_evidence: ModelCompletionEvidence,
+    usage: Option<ProviderTokenUsage>,
 }
 
 impl ModelInvocationResult {
@@ -733,6 +797,14 @@ impl ModelInvocationResult {
     /// Content-free terminal metadata from the final meaningful ADK response.
     pub fn completion_evidence(&self) -> &ModelCompletionEvidence {
         &self.completion_evidence
+    }
+
+    /// The successful attempt's latest snapshot containing a valid allowlisted
+    /// raw provider counter. Snapshots replace rather than merge or sum; trailers
+    /// without valid counters do not erase the last snapshot. Normalized SDK
+    /// defaults and unsupported metadata are never exposed as measured usage.
+    pub fn usage(&self) -> Option<&ProviderTokenUsage> {
+        self.usage.as_ref()
     }
 }
 
@@ -1038,6 +1110,7 @@ impl ModelInvocationSpec {
             let mut output = String::new();
             let mut complete = false;
             let mut completion_evidence = ModelCompletionEvidence::default();
+            let mut usage = None;
             while let Some(response) = stream.next().await {
                 let response = response.map_err(|error| {
                     ModelInvocationError::model(
@@ -1058,6 +1131,14 @@ impl ModelInvocationSpec {
                         attempts,
                         None,
                     ));
+                }
+                if let Some(snapshot) = response
+                    .usage_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.provider_usage.as_ref())
+                    .and_then(ProviderTokenUsage::from_provider_usage)
+                {
+                    usage = Some(snapshot);
                 }
                 // A harmless metadata trailer must not erase terminal evidence. New content
                 // or explicit progress does invalidate it until a fresh complete Stop.
@@ -1111,6 +1192,7 @@ impl ModelInvocationSpec {
                         attempts,
                         provenance: self.provenance(),
                         completion_evidence,
+                        usage,
                     });
                 }
                 Err(_error) if attempts < max_attempts => continue,
