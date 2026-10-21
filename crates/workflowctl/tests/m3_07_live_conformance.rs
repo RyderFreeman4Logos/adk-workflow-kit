@@ -18,6 +18,12 @@ use workflow_testkit::live_conformance::{ConformanceDisposition, LiveConformance
 #[path = "support/owned_tree.rs"]
 mod owned_tree;
 
+#[path = "support/m3_07_server_owner.rs"]
+mod server_owner;
+
+#[path = "support/m3_07_server_io.rs"]
+mod server_io;
+
 const HANDLE: &str = "ADK_WORKFLOW_KIT_M3_07_TEST_KEY";
 const CANARY: &str = "synthetic-m3-07-canary-not-a-secret";
 
@@ -126,6 +132,13 @@ fn run_opt_in(
         profile,
         workdir,
         &child_env,
+        workflow_spec::read_bounded_regular_file(
+            &workflow_spec::SourcePath::from(profile),
+            64 * 1024,
+        )
+        .ok()
+        .and_then(|bytes| LiveConformance::command_budget(&bytes))
+        .unwrap_or(Duration::ZERO),
     )
 }
 
@@ -236,7 +249,10 @@ fn observe_body_cancellation(
                     std::io::ErrorKind::WouldBlock
                         | std::io::ErrorKind::TimedOut
                         | std::io::ErrorKind::Interrupted
-                ) => {}
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(2))
+            }
             _ => return None,
         }
     }
@@ -317,6 +333,7 @@ struct ScriptedServer {
     stall_admission: Option<std::sync::mpsc::Sender<Instant>>,
     stall_acceptance: Arc<OnceLock<Result<Instant, &'static str>>>,
     handle: Option<thread::JoinHandle<()>>,
+    stop_deadline: Option<Instant>,
     _run_guard: MutexGuard<'static, ()>,
 }
 
@@ -380,8 +397,21 @@ impl ScriptedServer {
 
     fn stop(&mut self) {
         self.done.store(true, Ordering::Release);
+        let deadline = *self
+            .stop_deadline
+            .get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
+        if let Some(handle) = self.handle.as_ref() {
+            while !handle.is_finished() {
+                if Instant::now() >= deadline {
+                    // Test-only terminal failure: never detach an unproven worker.
+                    eprintln!("scripted server stop deadline exceeded; worker not joined");
+                    std::process::abort();
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            handle.join().expect("scripted server worker completed");
         }
     }
 }
@@ -630,10 +660,15 @@ fn serve_provider(
             }
             let _ =
                 accepted_stall.set(result.as_ref().map(|(_, at)| *at).map_err(|reason| *reason));
-            let Ok((mut socket, _)) = result else {
+            let Ok((socket, _)) = result else {
                 return;
             };
-            thread::sleep(Duration::from_secs(2));
+            if !server_io::delay(Duration::from_secs(2), &finished) {
+                return;
+            }
+            let Ok(mut socket) = server_io::Socket::new(socket, &finished) else {
+                return;
+            };
             let _ = write!(
                 socket,
                 "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
@@ -644,12 +679,13 @@ fn serve_provider(
             .chain(responses.into_iter().map(Some))
             .enumerate()
         {
-            let Some(mut socket) = accept(None) else {
+            let Some(socket) = accept(None) else {
                 return;
             };
             request_count.fetch_add(1, Ordering::Relaxed);
-            socket.set_nonblocking(false).ok();
-            socket.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let Ok(mut socket) = server_io::Socket::new(socket, &finished) else {
+                return;
+            };
             let mut request = Vec::new();
             let mut buffer = [0_u8; 8192];
             while let Ok(bytes) = socket.read(&mut buffer) {
@@ -699,10 +735,11 @@ fn serve_provider(
             if finished.load(Ordering::Acquire) {
                 return;
             }
+            socket.response();
             match body {
                 None => {
-                    if !rate_limit_delay.is_zero() {
-                        thread::sleep(rate_limit_delay);
+                    if !server_io::delay(rate_limit_delay, &finished) {
+                        return;
                     }
                     let Ok(sent) = write_rate_limit(&mut socket) else {
                         return;
@@ -714,7 +751,7 @@ fn serve_provider(
                         return;
                     };
                     let cancelled = observe_body_cancellation(
-                        &mut socket,
+                        &mut socket.stream,
                         &finished,
                         Instant::now() + Duration::from_secs(8),
                     );
@@ -745,6 +782,7 @@ fn serve_provider(
         stall_admission,
         stall_acceptance,
         handle: Some(handle),
+        stop_deadline: None,
         _run_guard: run_guard,
     }
 }

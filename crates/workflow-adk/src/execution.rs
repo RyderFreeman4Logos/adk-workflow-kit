@@ -3246,6 +3246,11 @@ impl ExecutionProfileV1 {
         )
     }
 
+    /// Effective whole-workflow wall allowance; setup/finalization are outside it.
+    pub fn wall_time_limit(&self) -> Duration {
+        Duration::from_millis(self.run_limits().max_wall_time_ms().get())
+    }
+
     fn run_limits(&self) -> RunLimits {
         let positive = |value| NonZeroU64::new(value).expect("validated positive loop policy");
         let policy = self.loop_policy.as_ref();

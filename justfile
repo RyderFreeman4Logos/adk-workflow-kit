@@ -117,6 +117,18 @@ m3-06-cli test_name:
 m3-07-cli test_name="":
     {{_io}} cargo +1.98.0 test -p workflowctl --test m3_07_live_conformance {{test_name}} --locked -- --nocapture
 
+# Disposable subprocess ownership regressions, without a model provider.
+issue-337-owner test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --test issue_337_live_owner {{test_name}} --locked -- --nocapture
+
+# Private fault-path ownership contracts, without providers.
+issue-337-faults:
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --lib live_conformance::child::tests --locked -- --nocapture
+
+# Sealed-profile unit contract, without providers.
+issue-337-profile:
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --lib live_conformance::profile::tests --locked -- --nocapture
+
 # Opt in without inspecting credentials; SKIP unless explicitly requested.
 m3-07-live profile="":
     if test "${WORKFLOW_KIT_M3_07_LIVE:-0}" != 1; then echo "M3-07 live conformance: SKIP (set WORKFLOW_KIT_M3_07_LIVE=1 to opt in)"; exit 0; fi; if test -z "{{profile}}"; then echo "M3-07 live conformance: FAIL (missing profile)"; exit 2; fi; {{_io}} cargo +1.98.0 build -p workflowctl --locked; {{_io}} cargo +1.98.0 run -p workflow-testkit --bin m3-07-live --locked -- ./target/debug/workflowctl "{{profile}}"

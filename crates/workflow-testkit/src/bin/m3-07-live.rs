@@ -29,11 +29,22 @@ fn main() -> ExitCode {
         eprintln!("M3-07 live conformance: FAIL (workdir)");
         return ExitCode::from(2);
     }
+    let command_budget = workflow_spec::read_bounded_regular_file(
+        &workflow_spec::SourcePath::from(profile.as_str()),
+        64 * 1024,
+    )
+    .ok()
+    .and_then(|bytes| LiveConformance::command_budget(&bytes));
+    let Some(command_budget) = command_budget else {
+        eprintln!("M3-07 live conformance: FAIL (profile admission)");
+        return ExitCode::from(2);
+    };
     let report = LiveConformance::opt_in().run_canonical(
         workflowctl.as_ref(),
         &example_root(),
         profile.as_ref(),
         &workdir,
+        command_budget,
     );
     match report.disposition() {
         ConformanceDisposition::Skip => {
