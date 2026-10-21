@@ -24,6 +24,8 @@ use workflow_runtime::{
     firewall::{FirewallPolicy, ToolProposal, TrustedGoal},
 };
 
+#[path = "issue_240_durable_effect/cleanup.rs"]
+mod cleanup;
 #[path = "issue_240_durable_effect/completion.rs"]
 mod completion;
 #[path = "issue_240_durable_effect/resume.rs"]
@@ -207,12 +209,15 @@ fn production_root() -> PathBuf {
 fn remove_production_root(root: &Path) {
     fn make_writable(path: &Path) {
         let metadata = fs::symlink_metadata(path).expect("production cleanup metadata");
+        if metadata.file_type().is_symlink() {
+            return;
+        }
         if metadata.file_type().is_dir() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("production directory writable");
             for entry in fs::read_dir(path).expect("production cleanup directory") {
                 make_writable(&entry.expect("production cleanup entry").path());
             }
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                .expect("production directory writable");
         } else {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))
                 .expect("production file writable");
