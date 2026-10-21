@@ -18,6 +18,8 @@ use workflow_runtime::{
     SqliteCheckpointStore, WorkflowRuntimeEventV1,
 };
 
+#[path = "support/m1_10_artifact_owner.rs"]
+mod m1_10_artifact_owner;
 #[path = "support/m1_10_owned_child.rs"]
 mod m1_10_owned_child;
 #[path = "support/oracle_reap_witness.rs"]
@@ -1712,53 +1714,20 @@ fn post_execution_artifact_failure_still_persists_the_returned_receipt() {
         Sha256::digest(serde_json::to_vec(&input_value).expect("node output must serialize"))
     );
 
-    let mut child = binary()
-        .args([
-            "--json",
-            "run",
-            workflow.to_str().expect("UTF-8 workflow path"),
-            "--profile",
-            profile.to_str().expect("UTF-8 profile path"),
-            "--input",
-            &input,
-            "--workdir",
-            runs.to_str().expect("UTF-8 run base"),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("workflowctl run must start");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let artifact_root = loop {
-        let candidate = fs::read_dir(&runs)
-            .expect("run base must be readable")
-            .find(|entry| {
-                entry
-                    .as_ref()
-                    .map(|entry| entry.file_name() != ".node-result-cache")
-                    .unwrap_or(true)
-            })
-            .transpose()
-            .expect("run entry must be readable")
-            .map(|entry| entry.path().join("artifacts"));
-        if let Some(path) = candidate
-            && path.is_dir()
-        {
-            break path;
-        }
-        if Instant::now() >= deadline {
-            child.kill().expect("timed-out child must stop");
-            let _ = child.wait();
-            panic!("artifact store was not allocated before the deadline");
-        }
-        thread::yield_now();
-    };
-    fs::create_dir(artifact_root.join(output_digest))
+    let mut command = binary();
+    command.args([
+        "--json",
+        "run",
+        workflow.to_str().expect("UTF-8 workflow path"),
+        "--profile",
+        profile.to_str().expect("UTF-8 profile path"),
+        "--input",
+        &input,
+        "--workdir",
+        runs.to_str().expect("UTF-8 run base"),
+    ]);
+    let failed = run_with_artifact_collision(command, &runs, &root, &output_digest, None)
         .expect("collision fixture must make node artifact persistence fail");
-
-    let failed = child
-        .wait_with_output()
-        .expect("workflowctl run must finish after persistence failure");
     assert_child_exit_code(
         &failed,
         2,
@@ -1777,18 +1746,123 @@ fn post_execution_artifact_failure_still_persists_the_returned_receipt() {
     let run_id = failed_receipt["run_id"]
         .as_str()
         .expect("persistence failure must return the allocated run ID");
-    let inspect = command_json(&[
-        "--json",
-        "inspect",
-        "--run-id",
-        run_id,
-        "--workdir",
-        runs.to_str().expect("UTF-8 run base"),
-    ]);
+    let inspect = command_json_bounded(
+        &root,
+        &[
+            "--json",
+            "inspect",
+            "--run-id",
+            run_id,
+            "--workdir",
+            runs.to_str().expect("UTF-8 run base"),
+        ],
+    );
     assert!(
         json_stdout(&inspect) == failed_receipt,
         "inspect receipt must equal persisted failure receipt"
     );
+}
+
+/// Own the spawned run through allocation and collision setup failures.
+struct ArtifactRunChild(Option<Child>);
+
+impl Drop for ArtifactRunChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.take() {
+            let _ = clean_up_child_with_reap(child, "artifact-run");
+        }
+    }
+}
+
+fn run_with_artifact_collision(
+    mut command: Command,
+    runs: &Path,
+    output_root: &Path,
+    output_digest: &str,
+    entered: Option<&Path>,
+) -> Result<Output, String> {
+    let started_at = Instant::now();
+    let allocation_deadline = started_at + ORACLE_TIMEOUT;
+    let completion_deadline = started_at + 2 * ORACLE_TIMEOUT;
+    let stdout_path = output_root.join("artifact-run.stdout");
+    let stderr_path = output_root.join("artifact-run.stderr");
+    let stdout = fs::File::create(&stdout_path)
+        .map_err(|_| "artifact run stdout create failed".to_string())?;
+    let stderr = fs::File::create(&stderr_path)
+        .map_err(|_| "artifact run stderr create failed".to_string())?;
+    let child = command
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .map_err(|_| "workflowctl run must start".to_string())?;
+    let mut child = ArtifactRunChild(Some(child));
+    let artifact_root = loop {
+        let candidate = fs::read_dir(runs)
+            .map_err(|_| "run base must be readable".to_string())?
+            .find(|entry| {
+                entry
+                    .as_ref()
+                    .map(|entry| entry.file_name() != ".node-result-cache")
+                    .unwrap_or(true)
+            })
+            .transpose()
+            .map_err(|_| "run entry must be readable".to_string())?
+            .map(|entry| entry.path().join("artifacts"));
+        if let Some(path) = candidate
+            && path.is_dir()
+        {
+            break path;
+        }
+        if Instant::now() >= allocation_deadline {
+            return Err("artifact store was not allocated before the deadline".to_string());
+        }
+        thread::yield_now();
+    };
+    fs::create_dir(artifact_root.join(output_digest))
+        .map_err(|_| "collision fixture must make node artifact persistence fail".to_string())?;
+    if let Some(path) = entered {
+        fs::write(path, b"entered").map_err(|_| "completion entry witness failed".to_string())?;
+    }
+
+    let output = wait_bounded_child(
+        child.0.take().expect("owned artifact run"),
+        &stdout_path,
+        &stderr_path,
+        completion_deadline,
+        "artifact-run",
+    )?;
+    if Instant::now() >= completion_deadline {
+        return Err("oracle child timed out".to_string());
+    }
+    Ok(output)
+}
+
+fn command_json_bounded(output_root: &Path, args: &[&str]) -> Output {
+    let deadline = Instant::now() + ORACLE_TIMEOUT;
+    let stdout_path = output_root.join("artifact-inspect.stdout");
+    let stderr_path = output_root.join("artifact-inspect.stderr");
+    let stdout = fs::File::create(&stdout_path).expect("inspect stdout file");
+    let stderr = fs::File::create(&stderr_path).expect("inspect stderr file");
+    let child = binary()
+        .args(args)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .expect("workflowctl inspect must start");
+    let output = wait_bounded_child(
+        child,
+        &stdout_path,
+        &stderr_path,
+        deadline,
+        "artifact-inspect",
+    )
+    .expect("workflowctl inspect must finish");
+    assert!(
+        Instant::now() < deadline,
+        "workflowctl inspect exceeded deadline"
+    );
+    assert_child_success(&output, "command must succeed");
+    output
 }
 
 #[test]
