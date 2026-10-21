@@ -3433,6 +3433,7 @@ name = "workflow-testkit"
 version = "0.2.4"
 dependencies = [
  "adk-rust",
+ "libc",
  "parquet",
  "serde",
  "serde_json",

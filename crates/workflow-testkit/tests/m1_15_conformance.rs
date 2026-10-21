@@ -25,6 +25,9 @@ use workflow_runtime::{
 };
 use workflow_testkit::conformance::documented_failure_matrix;
 
+#[path = "support/m1_15_command.rs"]
+mod m1_15_command;
+
 static NEXT_REPORT: AtomicU64 = AtomicU64::new(0);
 
 fn report_path() -> PathBuf {
@@ -596,13 +599,14 @@ fn report_binary_rejects_caller_supplied_selector_only_passes() {
 
 #[test]
 fn conformance_probe_requires_a_test_owned_structured_receipt() {
-    let output = Command::new("just")
-        .args([
+    let output = m1_15_command::output(
+        Command::new("just").args([
             "conformance-probe",
             "workflow-testkit --test sandbox_conformance hostile_requests_are_rejected_without_exposing_input",
-        ])
-        .output()
-        .expect("conformance probe starts");
+        ]),
+        false,
+    )
+    .expect("conformance probe starts");
     assert!(output.status.success(), "fixture contract test passes");
     let receipt = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -623,10 +627,11 @@ fn conformance_probe_emits_structured_receipt() {
     let Ok(selector) = std::env::var("M1_15_PROBE_SELECTOR") else {
         return;
     };
-    let output = Command::new("just")
-        .args(["conformance-contract", &selector])
-        .output()
-        .expect("selected contract test starts");
+    let output = m1_15_command::output(
+        Command::new("just").args(["conformance-contract", &selector]),
+        true,
+    )
+    .expect("selected contract test starts");
     let output_text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
