@@ -1446,6 +1446,12 @@ fn retryable_provider_error(error: &AdkError) -> bool {
 fn provider_adk_error(error: AdkError) -> AdkError {
     let code = if error.category == ErrorCategory::Timeout {
         "model.profile.timeout"
+    } else if error.component == ErrorComponent::Model
+        && error.category == ErrorCategory::Internal
+        && error.code == "model.openai_compat.invalid_tool_arguments"
+    {
+        // The released decoder rejects malformed arguments before model callbacks.
+        "model.call.malformed_tool"
     } else {
         "model.profile.unreachable"
     };
@@ -1463,6 +1469,96 @@ fn provider_adk_error(error: AdkError) -> AdkError {
 #[cfg(test)]
 mod retry_admission_tests {
     use super::*;
+
+    #[test]
+    fn issue_350_provider_error_projection_is_exact_and_private() {
+        for (component, category, code, expected) in [
+            (
+                ErrorComponent::Model,
+                ErrorCategory::Internal,
+                "prefix.model.openai_compat.invalid_tool_arguments",
+                "model.profile.unreachable",
+            ),
+            (
+                ErrorComponent::Model,
+                ErrorCategory::Internal,
+                "model.openai_compat.invalid_tool_arguments.suffix",
+                "model.profile.unreachable",
+            ),
+            (
+                ErrorComponent::Tool,
+                ErrorCategory::Internal,
+                "model.openai_compat.invalid_tool_arguments",
+                "model.profile.unreachable",
+            ),
+            (
+                ErrorComponent::Model,
+                ErrorCategory::InvalidInput,
+                "model.openai_compat.invalid_tool_arguments",
+                "model.profile.unreachable",
+            ),
+            (
+                ErrorComponent::Model,
+                ErrorCategory::Internal,
+                "private-provider-code",
+                "model.profile.unreachable",
+            ),
+            (
+                ErrorComponent::Model,
+                ErrorCategory::Timeout,
+                "model.openai_compat.invalid_tool_arguments",
+                "model.profile.timeout",
+            ),
+            (
+                ErrorComponent::Model,
+                ErrorCategory::Internal,
+                "model.openai_compat.invalid_tool_arguments",
+                "model.call.malformed_tool",
+            ),
+        ] {
+            let mut error = AdkError::new(
+                component,
+                category,
+                code,
+                "private-provider-message model.openai_compat.invalid_tool_arguments",
+            );
+            error.retry.should_retry = true;
+            error.retry.retry_after_ms = Some(17);
+            error.details.upstream_status_code = Some(400);
+            error.details.provider = Some("private-provider-name".to_owned());
+            error.details.request_id = Some("private-request-id".to_owned());
+            error.details.metadata.insert(
+                "private-metadata".to_owned(),
+                serde_json::json!("private-value"),
+            );
+
+            let projected = provider_adk_error(error);
+            assert_eq!(
+                projected.code, expected,
+                "{component:?}/{category:?}/{code}"
+            );
+            assert_eq!(projected.message, expected);
+            assert_eq!(projected.component, ErrorComponent::Model);
+            assert_eq!(projected.category, category);
+            assert_eq!(projected.details.upstream_status_code, Some(400));
+            assert_eq!(
+                projected.retry.retry_after_ms,
+                (category == ErrorCategory::Timeout).then_some(17)
+            );
+            assert_eq!(
+                projected.retry.should_retry,
+                category == ErrorCategory::Timeout
+            );
+            assert!(projected.details.provider.is_none());
+            assert!(projected.details.request_id.is_none());
+            assert!(projected.details.metadata.is_empty());
+            let rendered = format!(
+                "{projected:?} {projected} {}",
+                serde_json::to_string(&projected.details).expect("error details JSON")
+            );
+            assert!(!rendered.contains("private-"));
+        }
+    }
 
     async fn expect_profile_timeout(binding: &ModelBinding, request: LlmRequest) -> AdkError {
         match Llm::generate_content(binding, request, true).await {
@@ -1841,97 +1937,271 @@ mod retry_admission_tests {
         }
     }
 
+    // One finite HTTP exchange, shared only by the projection fixture and its failure checks.
+    fn serve_profile_fixture_request(
+        listener: &std::net::TcpListener,
+        body: &str,
+    ) -> std::io::Result<()> {
+        use std::io::{Read, Write};
+        use std::time::Instant;
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let remaining = || {
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|duration| !duration.is_zero())
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))
+        };
+        let (mut socket, _) = loop {
+            let budget = remaining()?;
+            match listener.accept() {
+                Ok(peer) => break peer,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(budget.min(Duration::from_millis(2)));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let mut request = Vec::new();
+        let mut request_end = None;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            socket.set_read_timeout(Some(remaining()?))?;
+            let read = socket.read(&mut buffer);
+            remaining()?;
+            let bytes = read?;
+            if bytes == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            request.extend_from_slice(&buffer[..bytes]);
+            if request_end.is_none()
+                && let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+            {
+                let header_end = header_end + 4;
+                let content_length = String::from_utf8_lossy(&request[..header_end])
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::trim)
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                request_end = Some(
+                    header_end
+                        .checked_add(content_length)
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?,
+                );
+            }
+            if request_end.is_some_and(|end| request.len() >= end) {
+                break;
+            }
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut pending = response.as_bytes();
+        while !pending.is_empty() {
+            socket.set_write_timeout(Some(remaining()?))?;
+            let write = socket.write(pending);
+            remaining()?;
+            let written = write?;
+            if written == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            pending = &pending[written..];
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn issue_350_tcp_fixture_joins_on_eof_and_preserves_client_panic() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicBool;
+
+        let mut errors = Vec::new();
+        for partial in [
+            b"POST / HTTP/1.1\r\n".as_slice(),
+            b"POST / HTTP/1.1\r\ncontent-length: 4\r\n\r\n{".as_slice(),
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let address = listener.local_addr().expect("address");
+            let returned = AtomicBool::new(false);
+            let result = Mutex::new(None);
+            let panic = std::panic::catch_unwind(|| {
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        *result.lock().expect("result lock") =
+                            serve_profile_fixture_request(&listener, "unused")
+                                .err()
+                                .map(|error| error.kind());
+                        returned.store(true, Ordering::Release);
+                    });
+                    let mut client = std::net::TcpStream::connect(address).expect("client");
+                    client.write_all(partial).expect("partial request");
+                    drop(client);
+                    std::panic::panic_any("fixture client sentinel");
+                });
+            })
+            .expect_err("client failure must survive scoped cleanup");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"fixture client sentinel")
+            );
+            assert!(
+                returned.load(Ordering::Acquire),
+                "scoped server returned before unwind escaped"
+            );
+            errors.push(*result.lock().expect("result lock"));
+        }
+        assert_eq!(errors, [Some(std::io::ErrorKind::UnexpectedEof); 2]);
+    }
+
+    #[test]
+    fn issue_350_tcp_fixture_progress_does_not_renew_request_deadline() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let address = listener.local_addr().expect("address");
+        std::thread::scope(|scope| {
+            let (started, admitted) = std::sync::mpsc::channel();
+            let (completed, result) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let at = Instant::now();
+                started.send(()).expect("admission notification");
+                let error = serve_profile_fixture_request(&listener, "unused")
+                    .expect_err("partial request");
+                completed
+                    .send((error.kind(), at.elapsed()))
+                    .expect("completion notification");
+            });
+            admitted.recv().expect("server owns request budget");
+            // Accept and each successful body read consume the same two-second budget.
+            std::thread::sleep(Duration::from_secs(1));
+            let mut client = std::net::TcpStream::connect(address).expect("client");
+            client
+                .write_all(b"POST / HTTP/1.1\r\ncontent-length: 4\r\n\r\na")
+                .expect("headers and first byte");
+            for byte in [b"b", b"c"] {
+                std::thread::sleep(Duration::from_millis(300));
+                client.write_all(byte).expect("partial body progress");
+            }
+            let (kind, elapsed) = result
+                .recv_timeout(Duration::from_millis(900))
+                .expect("absolute request deadline");
+            assert_eq!(kind, std::io::ErrorKind::TimedOut);
+            assert!(
+                elapsed < Duration::from_millis(2500),
+                "request budget renewed: {elapsed:?}"
+            );
+        });
+    }
+
     #[test]
     fn streamed_openai_compatible_binding_reads_non_sse_json_completion() {
-        use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
         let address = listener.local_addr().expect("addr");
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().expect("accept");
-            socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("read timeout");
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 8192];
-            loop {
-                let bytes = socket.read(&mut buffer).expect("read");
-                request.extend_from_slice(&buffer[..bytes]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        std::thread::scope(|scope| {
+            let server = scope.spawn(|| {
+            for malformed in [false, true, true] {
+                let body = if malformed {
+                    r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"bad","type":"function","function":{"name":"search_code","arguments":"[1]"}}]},"finish_reason":"tool_calls"}]}"#
+                } else {
+                    r#"{"choices":[{"message":{"role":"assistant","content":"{\"status\":\"finished\",\"output\":\"oracle-ok\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#
+                };
+                serve_profile_fixture_request(&listener, body).expect("fixture request");
             }
-            let header_end = request
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .expect("headers")
-                + 4;
-            let content_length = String::from_utf8_lossy(&request[..header_end])
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length: ")
-                        .map(str::trim)
-                        .map(str::to_owned)
-                })
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(0);
-            while request.len() < header_end + content_length {
-                let bytes = socket.read(&mut buffer).expect("body");
-                request.extend_from_slice(&buffer[..bytes]);
-            }
-            let body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"status\":\"finished\",\"output\":\"oracle-ok\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
-            write!(
-                socket,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .expect("write");
         });
 
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime")
-            .block_on(async {
-                let profile = OpenAiCompatibleProfile::new(
-                    "worker",
-                    "1",
-                    "oracle",
-                    format!("http://{address}/v1"),
-                    CredentialHandle::SecretProvider("fixture-key".to_owned()),
-                )
-                .with_runtime(ModelRuntimeConfig::default().with_timeout(Duration::from_secs(2)));
-                let registry = ModelProfileRegistry::new().with_worker(profile).unwrap();
-                let binding = registry
-                    .bind_worker(
-                        &CredentialBroker::new().with_secret_provider(Arc::new(FixtureSecrets)),
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(async {
+                    let profile = OpenAiCompatibleProfile::new(
+                        "worker",
+                        "1",
+                        "oracle",
+                        format!("http://{address}/v1"),
+                        CredentialHandle::SecretProvider("fixture-key".to_owned()),
                     )
-                    .unwrap();
-                let request =
-                    LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
-                let mut items = Llm::generate_content(&binding, request, true)
-                    .await
-                    .expect("non-SSE JSON completion must be readable when the agent streams");
-                let text = items
-                    .next()
-                    .await
-                    .expect("completion chunk")
-                    .expect("completion ok")
-                    .content
-                    .expect("content")
-                    .parts[0]
-                    .text()
-                    .map(str::to_owned);
-                assert_eq!(
-                    text.as_deref(),
-                    Some("{\"status\":\"finished\",\"output\":\"oracle-ok\"}")
-                );
-                assert!(items.next().await.is_none(), "single completion");
-            });
-        server.join().expect("server");
+                    .with_runtime(
+                        ModelRuntimeConfig::default().with_timeout(Duration::from_secs(2)),
+                    );
+                    let registry = ModelProfileRegistry::new().with_worker(profile).unwrap();
+                    let binding = registry
+                        .bind_worker(
+                            &CredentialBroker::new().with_secret_provider(Arc::new(FixtureSecrets)),
+                        )
+                        .unwrap();
+                    let request =
+                        LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+                    let mut items = Llm::generate_content(&binding, request, true)
+                        .await
+                        .expect("non-SSE JSON completion must be readable when the agent streams");
+                    let text = items
+                        .next()
+                        .await
+                        .expect("completion chunk")
+                        .expect("completion ok")
+                        .content
+                        .expect("content")
+                        .parts[0]
+                        .text()
+                        .map(str::to_owned);
+                    assert_eq!(
+                        text.as_deref(),
+                        Some("{\"status\":\"finished\",\"output\":\"oracle-ok\"}")
+                    );
+                    assert!(items.next().await.is_none(), "single completion");
+
+                    let request = || {
+                        LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")])
+                    };
+                    let mut raw = binding
+                        .llm
+                        .generate_content(request(), false)
+                        .await
+                        .expect("SDK stream");
+                    let raw_error = raw
+                        .next()
+                        .await
+                        .expect("SDK result")
+                        .expect_err("malformed arguments");
+                    assert_eq!(raw_error.component, ErrorComponent::Model);
+                    assert_eq!(raw_error.category, ErrorCategory::Internal);
+                    assert_eq!(raw_error.code, "model.openai_compat.invalid_tool_arguments");
+                    assert!(raw.next().await.is_none(), "single SDK failure");
+                    let projected = match Llm::generate_content(&binding, request(), true).await {
+                        Err(error) => error,
+                        Ok(_) => panic!("malformed arguments must fail before model callbacks"),
+                    };
+                    assert_eq!(projected.component, ErrorComponent::Model);
+                    assert_eq!(projected.category, ErrorCategory::Internal);
+                    assert_eq!(projected.code, "model.call.malformed_tool");
+                    assert_eq!(projected.message, "model.call.malformed_tool");
+                    assert!(projected.details.provider.is_none());
+                    assert!(projected.details.request_id.is_none());
+                    assert!(projected.details.metadata.is_empty());
+                });
+            server.join().expect("server");
+        });
     }
 
     #[test]
