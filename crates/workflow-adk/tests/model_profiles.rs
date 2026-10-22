@@ -15,6 +15,15 @@ use workflow_adk::model_profiles::{
 };
 use workflow_compiler::ModelRegistry;
 
+#[path = "model_profiles/auth.rs"]
+mod auth;
+
+#[path = "model_profiles/usage.rs"]
+mod usage;
+
+#[path = "model_profiles/schema.rs"]
+mod schema;
+
 struct TestSecrets;
 impl SecretProvider for TestSecrets {
     fn resolve(
@@ -22,6 +31,16 @@ impl SecretProvider for TestSecrets {
         _handle: &str,
     ) -> Result<SecretValue, workflow_adk::model_profiles::CredentialError> {
         Ok(SecretValue::new("test-only-token"))
+    }
+}
+
+struct EmptySecrets;
+impl SecretProvider for EmptySecrets {
+    fn resolve(
+        &self,
+        _: &str,
+    ) -> Result<SecretValue, workflow_adk::model_profiles::CredentialError> {
+        Ok(SecretValue::new(""))
     }
 }
 
@@ -96,6 +115,72 @@ async fn fake_profile_returns_the_script_without_a_provider() {
     assert!(stream.next().await.is_none());
 }
 
+#[tokio::test]
+async fn explicit_blank_text_reaches_output_validation_on_both_binding_interfaces() {
+    for text in ["", " ", "\n\t", "valid"] {
+        for streaming in [false, true] {
+            let binding = ModelProfileRegistry::new()
+                .with_worker(FakeModelProfile::new("worker", "1", "fake-model", [text]))
+                .unwrap()
+                .bind_worker(&CredentialBroker::new())
+                .unwrap();
+            let request =
+                || LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+            let mut direct = binding
+                .generate_content(request(), streaming)
+                .await
+                .unwrap();
+            assert_eq!(
+                direct.next().await.unwrap().unwrap().content.unwrap().parts[0].text(),
+                Some(text)
+            );
+            assert!(direct.next().await.is_none());
+            // A fresh binding keeps the script identical across the two public interfaces.
+            let binding = ModelProfileRegistry::new()
+                .with_worker(FakeModelProfile::new("worker", "1", "fake-model", [text]))
+                .unwrap()
+                .bind_worker(&CredentialBroker::new())
+                .unwrap();
+            let mut adapted = adk_rust::Llm::generate_content(&binding, request(), streaming)
+                .await
+                .expect("explicit Text belongs to output validation, including blank Text");
+            assert_eq!(
+                adapted
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content
+                    .unwrap()
+                    .parts[0]
+                    .text(),
+                Some(text)
+            );
+            assert!(adapted.next().await.is_none());
+            assert_eq!(binding.take_retries(), 0);
+        }
+    }
+    let binding = ModelProfileRegistry::new()
+        .with_worker(FakeModelProfile::new(
+            "worker",
+            "1",
+            "fake-model",
+            Vec::<String>::new(),
+        ))
+        .unwrap()
+        .bind_worker(&CredentialBroker::new())
+        .unwrap();
+    let result = adk_rust::Llm::generate_content(
+        &binding,
+        LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]),
+        false,
+    )
+    .await;
+    let error = result.err().expect("a provider error is still unreachable");
+    assert_eq!(error.code, "model.profile.unreachable");
+    assert_eq!(binding.take_retries(), 0);
+}
+
 #[test]
 fn openai_profile_serialization_contains_handles_but_never_secret_values() {
     let profile = OpenAiCompatibleProfile::new(
@@ -139,6 +224,15 @@ async fn model_profile_wire_request(
     listener: TcpListener,
     deadline: Instant,
 ) -> io::Result<Vec<u8>> {
+    let body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"answer\":\"wire-ok\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+    model_profile_wire_response(listener, deadline, body).await
+}
+
+async fn model_profile_wire_response(
+    listener: TcpListener,
+    deadline: Instant,
+    body: &str,
+) -> io::Result<Vec<u8>> {
     timeout_at(deadline, async move {
         let (mut socket, _) = listener.accept().await?;
         let mut request = Vec::new();
@@ -146,11 +240,17 @@ async fn model_profile_wire_request(
         let header_end = loop {
             let remaining = (MAX_WIRE_REQUEST_BYTES - request.len()).min(buffer.len());
             if remaining == 0 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "request too large"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "request too large",
+                ));
             }
             let bytes = socket.read(&mut buffer[..remaining]).await?;
             if bytes == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete headers"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete headers",
+                ));
             }
             request.extend_from_slice(&buffer[..bytes]);
             if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -162,21 +262,25 @@ async fn model_profile_wire_request(
             .find_map(|line| line.strip_prefix("content-length: "))
             .and_then(|value| value.parse::<usize>().ok())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid content length"))?;
-        let body_end = header_end.checked_add(content_length)
+        let body_end = header_end
+            .checked_add(content_length)
             .filter(|end| *end <= MAX_WIRE_REQUEST_BYTES)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "request too large"))?;
         while request.len() < body_end {
             let remaining = (body_end - request.len()).min(buffer.len());
             let bytes = socket.read(&mut buffer[..remaining]).await?;
             if bytes == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete body"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete body",
+                ));
             }
             request.extend_from_slice(&buffer[..bytes]);
         }
-        let body = r#"{"choices":[{"message":{"role":"assistant","content":"wire-ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
         let reply = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-            body.len(), body,
+            body.len(),
+            body,
         );
         socket.write_all(reply.as_bytes()).await?;
         socket.flush().await?;
@@ -184,6 +288,79 @@ async fn model_profile_wire_request(
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "wire fixture deadline"))?
+}
+
+#[tokio::test]
+async fn loopback_blank_text_is_distinct_from_absent_or_failed_response() {
+    for (content, finish, expected_text) in [
+        (serde_json::Value::Null, "stop", None),
+        (serde_json::json!(" "), "stop", Some(" ")),
+        (serde_json::json!(" "), "length", None),
+    ] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let binding = ModelProfileRegistry::new()
+            .with_worker(OpenAiCompatibleProfile::new_no_auth(
+                "blank",
+                "1",
+                "blank-model",
+                format!("http://{address}/v1"),
+            ))
+            .unwrap()
+            .bind_worker(&CredentialBroker::new())
+            .unwrap();
+        let body = serde_json::json!({
+            "choices":[{"message":{"role":"assistant","content":content},"finish_reason":finish}]
+        })
+        .to_string();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (request, result) = tokio::join!(
+            model_profile_wire_response(listener, deadline, &body),
+            timeout_at(
+                deadline,
+                adk_rust::Llm::generate_content(
+                    &binding,
+                    LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]),
+                    true,
+                )
+            ),
+        );
+        let request = String::from_utf8(request.expect("one bounded SDK request")).unwrap();
+        assert!(
+            !request
+                .split_once("\r\n\r\n")
+                .unwrap()
+                .0
+                .lines()
+                .any(|line| {
+                    line.split_once(':')
+                        .is_some_and(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                })
+        );
+        let result = result.expect("unchanged fixture deadline");
+        if let Some(text) = expected_text {
+            let mut responses = result.expect("explicit blank Text reaches output validation");
+            assert_eq!(
+                responses
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content
+                    .unwrap()
+                    .parts[0]
+                    .text(),
+                Some(text)
+            );
+            assert!(responses.next().await.is_none());
+        } else {
+            let error = result
+                .err()
+                .expect("absent or failed response is not blank success");
+            assert_eq!(error.code, "model.profile.unreachable");
+        }
+        assert_eq!(binding.take_retries(), 0);
+    }
 }
 
 #[tokio::test]
@@ -226,7 +403,46 @@ async fn local_openai_compatible_binding_forwards_runtime_configuration() {
         .expect("client deadline")
         .expect("model response")
         .expect("one model response");
-    assert_eq!(response.content.unwrap().parts[0].text(), Some("wire-ok"));
+    assert_eq!(
+        response.content.unwrap().parts[0].text(),
+        Some(r#"{"answer":"wire-ok"}"#)
+    );
+}
+
+#[tokio::test]
+async fn authenticated_empty_secret_is_rejected_before_egress() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let registry = ModelProfileRegistry::new()
+        .with_worker(OpenAiCompatibleProfile::new(
+            "worker",
+            "1",
+            "local-model",
+            format!("http://{address}/v1"),
+            CredentialHandle::secret_provider("empty-key"),
+        ))
+        .unwrap();
+    let binding =
+        registry.bind_worker(&CredentialBroker::new().with_secret_provider(Arc::new(EmptySecrets)));
+    let rejected_at_bind = binding
+        .as_ref()
+        .is_err_and(|error| error.kind() == ModelProfileErrorKind::Credential);
+    let client = async {
+        if let Ok(binding) = binding {
+            let request = LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+            if let Ok(mut stream) = binding.generate_content(request, false).await {
+                while stream.next().await.is_some() {}
+            }
+        }
+    };
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let (server, client) = tokio::join!(
+        model_profile_wire_request(listener, deadline),
+        timeout_at(deadline, client),
+    );
+    client.expect("bounded client settlement");
+    assert!(rejected_at_bind, "authenticated empty secret was admitted");
+    assert_eq!(server.unwrap_err().kind(), io::ErrorKind::TimedOut);
 }
 
 #[tokio::test]

@@ -166,8 +166,8 @@ issue-289-adk:
 adk-default-test:
     {{_io}} cargo +1.98.0 test -p workflow-adk --locked -- --test-threads=1
 
-adk-model-profiles:
-    {{_io}} cargo +1.98.0 test -p workflow-adk --test model_profiles --locked
+adk-model-profiles test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test model_profiles {{test_name}} --locked
 
 runtime-hot-reload:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --lib hot_reload::tests:: --locked
@@ -175,6 +175,10 @@ runtime-hot-reload:
 # Focused #311 offline ordered model-route snapshot and fallback boundary.
 issue-311-adk test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_311_model_routes {{test_name}} --locked -- --nocapture --test-threads=1
+
+# Caller-owned ADK conversations through the production invocation/route boundaries.
+issue-325-adk test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_325_model_sessions {{test_name}} --locked -- --nocapture --test-threads=1
 
 # Focused #314 ToolCall Debug privacy regression.
 issue-314-runtime test_name="":
@@ -328,10 +332,10 @@ m1-15-test:
     {{_io}} cargo +1.98.0 test -p workflow-testkit --test m1_15_conformance --locked
 
 # Focused M1-15 production-boundary translation tests.
-m1-15-translation:
-    {{_io}} cargo +1.98.0 test -p workflow-adk --test translation --locked
+m1-15-translation test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test translation {{test_name}} --locked
 
-# Focused #223 ADK-Rust 2.1.0 production-path probe.
+# Focused #223 compatibility probe against the current released ADK-Rust pin.
 adk-2-1-probe:
     {{_io}} cargo +1.98.0 test -p workflow-adk --test adk_2_1_compat --locked -- --nocapture
 
@@ -344,8 +348,8 @@ m1-15-tool-bridge:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test m1_07_tool_bridge --locked
 
 # Focused M1-15 checkpoint terminal-mapping tests.
-m1-15-checkpoint:
-    {{_io}} cargo +1.98.0 test -p workflow-adk --test m1_11_execution_checkpoints --locked
+m1-15-checkpoint test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test m1_11_execution_checkpoints {{test_name}} --locked
 
 # Focused M1-16 README, CLI decomposition, and secure-open regression tests.
 m1-16-test:
@@ -409,6 +413,13 @@ lock-check:
 metadata:
     {{_io}} cargo metadata --format-version 1 --locked
 
+# Resolve and compile the optional ADK action graph without changing default features.
+adk-action-check:
+    {{_io}} cargo +1.98.0 --version --verbose
+    {{_io}} cargo +1.98.0 metadata --format-version 1 --features adk-rust/action --locked
+    {{_io}} cargo +1.98.0 check -p workflow-adk --features adk-rust/action --locked
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test adk_action_identity --features adk-rust/action --locked
+
 dependency-audit:
     {{_io}} cargo deny check licenses advisories
 
@@ -429,7 +440,7 @@ check-branch:
 
 pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit pattern-catalog-test m2-02-green test-local-gates
 
-_quality-gates: fmt-check issue-323-release-consumer check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk test-local-gates
+_quality-gates: fmt-check issue-323-release-consumer check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk issue-325-adk adk-action-check test-local-gates
 
 quality-gates:
     scripts/local-gates.sh produce

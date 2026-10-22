@@ -1,5 +1,9 @@
 //! Domain-neutral Verbatim boundary for platform-owned workflow calls.
 
+/// The released SDK version recorded in runtime provenance and resume identities.
+pub const ADK_RUST_VERSION: &str = "2.3.0";
+
+mod agent_admission;
 pub mod behavioral;
 pub mod events;
 pub mod execution;
@@ -14,8 +18,9 @@ pub use model_invocation::{
     ModelRouteCandidate, ModelRouteIdentity, ModelRoutePolicy, ModelRoutePublisher,
     ModelRouteSnapshot, ModelRouteSnapshotError, ModelRouteSnapshotErrorKind,
     ModelRouteTerminalError, ModelRouteTerminalErrorKind, PROMPT_PROTOCOL_VERSION, PromptProtocol,
-    PromptProtocolError, PromptTool, ProviderRouteIdentity, ReasoningEffort, RenderedPrompt,
-    StructuredOutputContract, StructuredOutputContractError, ToolDefinition, ToolSpec,
+    PromptProtocolError, PromptTool, ProviderRouteIdentity, ProviderTokenUsage, ReasoningEffort,
+    RenderedPrompt, StructuredOutputContract, StructuredOutputContractError, ToolDefinition,
+    ToolSpec,
 };
 pub mod model_profiles;
 pub use model_profiles::{
@@ -504,7 +509,6 @@ pub struct AdkGraph {
     visit_bound: Option<usize>,
     unknown_route_nodes: BTreeMap<String, String>,
     fan_in_guard_nodes: BTreeMap<String, String>,
-    agent_nodes: BTreeSet<String>,
     plan_binding: Option<PlanBinding>,
     cache_dispositions: Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
     untrusted_text: Option<sentinel_workflow::PreparationWorkflow>,
@@ -557,7 +561,7 @@ impl AdkGraph {
                 );
         }
         match self.graph.invoke(state, config).await {
-            Ok(state) => self.validate_output(self.output.map(state)),
+            Ok(state) => Ok(self.output.map(state)),
             Err(GraphError::RecursionLimitExceeded(steps))
                 if self.visit_bound == Some(limit) && steps == limit =>
             {
@@ -568,6 +572,9 @@ impl AdkGraph {
             }
             Err(error) => {
                 if let GraphError::NodeExecutionFailed { node, message } = &error {
+                    if let Some(error) = self.invalid_agent_output(node, message) {
+                        return Err(error);
+                    }
                     if let Some(error) = terminal_graph_error(message) {
                         return Err(error);
                     }
@@ -746,7 +753,7 @@ impl AdkGraph {
                     if let Some(error) = terminal_error {
                         return Err(error);
                     }
-                    if event.content().is_none() {
+                    if event.content().is_none() && !events::is_tool_started(&event) {
                         return Err(AdkGraphError::InvalidOutput { node });
                     }
                     if cache_hit_event(&event) {
@@ -757,7 +764,7 @@ impl AdkGraph {
                         .map_err(|error| AdkGraphError::Observation(error.kind()))?;
                 }
                 StreamEvent::Done { state, total_steps } => {
-                    let state = self.validate_output(self.output.map(state))?;
+                    let state = self.output.map(state);
                     mapper
                         .map_stream_observation(
                             None,
@@ -794,10 +801,12 @@ impl AdkGraph {
                         )
                         .map_err(|error| AdkGraphError::Observation(error.kind()))?;
                 }
-                StreamEvent::Error { message, .. } => {
-                    return Err(
-                        terminal_graph_error(&message).unwrap_or(AdkGraphError::Unreachable)
-                    );
+                StreamEvent::Error { message, node } => {
+                    return Err(node
+                        .as_deref()
+                        .and_then(|node| self.invalid_agent_output(node, &message))
+                        .or_else(|| terminal_graph_error(&message))
+                        .unwrap_or(AdkGraphError::Unreachable));
                 }
                 StreamEvent::State { .. }
                 | StreamEvent::Updates { .. }
@@ -853,6 +862,9 @@ impl AdkGraph {
     fn map_observed_error(&self, error: &GraphError) -> AdkGraphError {
         match error {
             GraphError::NodeExecutionFailed { node, message } => {
+                if let Some(error) = self.invalid_agent_output(node, message) {
+                    return error;
+                }
                 if let Some(error) = terminal_graph_error(message) {
                     return error;
                 }
@@ -897,17 +909,16 @@ impl AdkGraph {
             .unwrap_or(AdkGraphError::Failed)
     }
 
-    fn validate_output(&self, state: State) -> Result<State, AdkGraphError> {
-        match self.agent_nodes.iter().find(|id| {
-            state
-                .get(&format!("node:{id}"))
-                .and_then(|value| value.get("__workflow_invalid_output"))
-                .and_then(Value::as_bool)
-                == Some(true)
-        }) {
-            Some(node) => Err(AdkGraphError::InvalidOutput { node: node.clone() }),
-            None => Ok(state),
-        }
+    fn invalid_agent_output(&self, node: &str, message: &str) -> Option<AdkGraphError> {
+        agent_admission::is_invalid_output(node, message).then(|| {
+            if self.unknown_route_nodes.values().any(|from| from == node) {
+                AdkGraphError::Unreachable
+            } else {
+                AdkGraphError::InvalidOutput {
+                    node: node.to_owned(),
+                }
+            }
+        })
     }
 
     pub(crate) fn with_cache_dispositions(
@@ -1342,7 +1353,6 @@ impl AdkGraphTranslator {
             .map(|(guard, target)| (target.clone(), guard.clone()))
             .collect::<BTreeMap<_, _>>();
         let mut terminals = Vec::new();
-        let mut agent_nodes = BTreeSet::new();
         let mut order = Vec::new();
         let mut unknown_route_nodes = BTreeMap::new();
         for node in ir.nodes() {
@@ -1363,7 +1373,6 @@ impl AdkGraphTranslator {
                     }
                 });
             } else if node.kind() == IrNodeKind::Agent {
-                agent_nodes.insert(id.clone());
                 let agent: Arc<dyn Agent> = match agents {
                     Some(agents) => agents
                         .get(&id)
@@ -1394,26 +1403,18 @@ impl AdkGraphTranslator {
                     .unwrap_or_default();
                 let preds = predecessors.get(&id).cloned().unwrap_or_default();
                 builder = builder.node(
-                    AgentNode::new(agent)
+                    AgentNode::new(agent_admission::admit(agent))
                         .with_input_mapper(move |state| {
                             agent_node_input(state, &preds, &input_keys)
                         })
                         .with_output_mapper(move |events| {
-                            let value = events
-                                .iter()
-                                .rev()
-                                .find_map(|event| {
-                                    event
-                                        .content()
-                                        .and_then(|content| content.parts.first()?.text())
-                                })
-                                .map_or_else(
-                                    || json!({ "__workflow_invalid_output": true }),
-                                    |text| {
-                                        serde_json::from_str(text).unwrap_or_else(|_| json!(text))
-                                    },
-                                );
                             let mut output = std::collections::HashMap::new();
+                            // OutputAdmission has accepted the complete stream before
+                            // AgentNode calls this infallible state projection.
+                            let Some(text) = final_agent_text(events) else {
+                                return output;
+                            };
+                            let value = serde_json::from_str(&text).unwrap_or_else(|_| json!(text));
                             let node_value = value
                                 .get("output")
                                 .cloned()
@@ -1589,7 +1590,6 @@ impl AdkGraphTranslator {
                     }
                 };
                 let state_key = format!("route:{from}");
-                let node_key = format!("node:{from}");
                 let node_name = unknown_route_node.clone();
                 builder = builder.node_fn(&node_name, move |context| {
                     let selector = context
@@ -1598,16 +1598,7 @@ impl AdkGraphTranslator {
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_owned();
-                    let invalid_output = context
-                        .state
-                        .get(&node_key)
-                        .and_then(|value| value.get("__workflow_invalid_output"))
-                        .and_then(Value::as_bool)
-                        == Some(true);
                     async move {
-                        if invalid_output {
-                            return Err(GraphError::Other("model.profile.unreachable".to_owned()));
-                        }
                         Err(GraphError::Other(format!(
                             "{UNKNOWN_ROUTE_ERROR_PREFIX}{selector}"
                         )))
@@ -1684,7 +1675,6 @@ impl AdkGraphTranslator {
             visit_bound,
             unknown_route_nodes,
             fan_in_guard_nodes,
-            agent_nodes,
             plan_binding,
             cache_dispositions: Arc::new(Mutex::new(BTreeMap::new())),
             untrusted_text,
@@ -1729,6 +1719,37 @@ fn agent_node_input(
     Content::new("user").with_text(
         serde_json::to_string(&Value::Object(payload)).unwrap_or_else(|_| "{}".to_owned()),
     )
+}
+
+/// Joins only visible Text in one response, preserving provider part order.
+fn model_text(content: &Content) -> Option<String> {
+    let mut parts = content.parts.iter().filter_map(adk_rust::Part::text);
+    let first = parts.next()?;
+    Some(parts.fold(first.to_owned(), |mut text, part| {
+        text.push_str(part);
+        text
+    }))
+}
+
+fn final_agent_text(events: &[Event]) -> Option<String> {
+    if events
+        .iter()
+        .any(|event| model_profiles::response_failure(&event.llm_response).is_some())
+    {
+        return None;
+    }
+    // Progress and metadata alone never complete a node or resurrect an older answer.
+    let event = events.last()?;
+    if event.llm_response.partial
+        || !event.tool_calls().is_empty()
+        || !event.tool_results().is_empty()
+        || event.actions.tool_confirmation.is_some()
+        || !event.long_running_tool_ids.is_empty()
+        || !event.is_final_response()
+    {
+        return None;
+    }
+    model_text(event.content()?)
 }
 
 fn cache_hit_event(event: &Event) -> bool {

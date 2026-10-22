@@ -88,10 +88,28 @@ fn rejects_unselected_unknown_schema_invalid_and_widened_calls_before_handler() 
         value: "schema".to_owned(),
     };
     assert_eq!(value, "schema");
+    let profile: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../examples/01-code-investigation/profiles/fake.json"
+    ))
+    .expect("production fixture profile");
+    let query_schema = profile
+        .pointer("/tools/0/input_schema")
+        .expect("search_code input schema")
+        .clone();
+    assert_eq!(
+        profile.pointer("/tools/0/name"),
+        Some(&json!("search_code"))
+    );
+    assert_eq!(query_schema.get("required"), Some(&json!(["query"])));
     let calls = Arc::new(Mutex::new(0));
     let mut registry = ToolBridge::new(sandbox());
     registry
-        .register(registration("alpha"), CountingTool(Arc::clone(&calls)))
+        .register(
+            registration("alpha")
+                .with_input_schema(query_schema)
+                .expect("required-query registration"),
+            CountingTool(Arc::clone(&calls)),
+        )
         .expect("alpha registers");
     registry
         .register(registration("beta"), CountingTool(Arc::clone(&calls)))
@@ -105,15 +123,21 @@ fn rejects_unselected_unknown_schema_invalid_and_widened_calls_before_handler() 
     for (name, arguments, authority, expected) in [
         (
             "unknown",
-            json!({"value": "ok"}),
+            json!({"query": "ok"}),
             authority(),
             ToolBridgeErrorKind::UnknownTool,
         ),
         (
             "beta",
-            json!({"value": "ok"}),
+            json!({"query": "ok"}),
             authority(),
             ToolBridgeErrorKind::UnknownTool,
+        ),
+        (
+            "alpha",
+            json!({}),
+            authority(),
+            ToolBridgeErrorKind::InvalidInput,
         ),
         (
             "alpha",
@@ -123,7 +147,7 @@ fn rejects_unselected_unknown_schema_invalid_and_widened_calls_before_handler() 
         ),
         (
             "alpha",
-            json!({"value": "ok"}),
+            json!({"query": "ok"}),
             authority().with_runtime_capabilities(std::iter::empty()),
             ToolBridgeErrorKind::CapabilityDenied,
         ),
@@ -146,7 +170,7 @@ fn rejects_unselected_unknown_schema_invalid_and_widened_calls_before_handler() 
 
     bridge
         .invoke(
-            ToolCall::new("alpha", "allowed", "actor", json!({"value": "ok"})),
+            ToolCall::new("alpha", "allowed", "actor", json!({"query": "ok"})),
             &authority(),
             None,
             Duration::ZERO,

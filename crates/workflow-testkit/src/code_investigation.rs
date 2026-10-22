@@ -32,7 +32,7 @@ const FIXTURE_RETRY: &str = include_str!("../tests/fixtures/code_investigation/r
 const FIXTURE_LIB: &str = include_str!("../tests/fixtures/code_investigation/repo/src/lib.rs");
 
 /// The published ADK version exercised by this dogfood.
-pub const ADK_RUST_VERSION: &str = "2.1.0";
+pub use workflow_adk::ADK_RUST_VERSION;
 /// The schema version of an investigation answer artifact.
 pub const ANSWER_SCHEMA_VERSION: u8 = 1;
 

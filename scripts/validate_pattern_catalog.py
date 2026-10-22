@@ -120,9 +120,9 @@ def _validate_record(record: dict[str, Any], official: bool, expected_commit: st
 
 def _validate_local_dependency_evidence(metadata: dict[str, Any]) -> None:
     manifest = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
-    expected_requirement = 'adk-rust = { version = "=2.1.0"'
+    expected_requirement = 'adk-rust = { version = "=2.3.0"'
     if expected_requirement not in manifest:
-        raise CatalogError("Cargo.toml does not retain the exact adk-rust = =2.1.0 pin")
+        raise CatalogError("Cargo.toml does not retain the exact adk-rust = =2.3.0 pin")
     lock = (ROOT / "Cargo.lock").read_text(encoding="utf-8")
     match = re.search(
         r'(?ms)^\[\[package\]\]\nname = "adk-rust"\n(.*?)(?=^\[\[package\]\]|\Z)',

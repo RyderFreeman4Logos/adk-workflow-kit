@@ -254,6 +254,8 @@ pub enum ModelRouteAttemptKind {
     TerminalProvider,
     Timeout,
     Protocol,
+    /// The caller-owned session could not be loaded or appended safely.
+    Session,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -300,6 +302,8 @@ pub enum ModelRouteTerminalErrorKind {
     Protocol,
     Provider,
     Exhausted,
+    /// A session operation failed; no stateless or provider fallback is attempted.
+    Session,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -478,8 +482,15 @@ impl ModelRoutePolicy {
         broker: &CredentialBroker,
         cancellation: &ModelRouteCancellation,
     ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
-        self.invoke_with_response_policy(spec, broker, cancellation, ResponsePolicy::Ordinary)
-            .await
+        self.invoke_with_response_policy(
+            spec,
+            broker,
+            cancellation,
+            ResponsePolicy::Ordinary,
+            None,
+            |_| Ok(()),
+        )
+        .await
     }
 
     /// Explicitly opts into the collector's text-only response admission.
@@ -491,8 +502,55 @@ impl ModelRoutePolicy {
         broker: &CredentialBroker,
         cancellation: &ModelRouteCancellation,
     ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
-        self.invoke_with_response_policy(spec, broker, cancellation, ResponsePolicy::CompleteText)
+        self.invoke_with_response_policy(
+            spec,
+            broker,
+            cancellation,
+            ResponsePolicy::CompleteText,
+            None,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Invoke in a caller-created ADK session. Candidate authorization precedes
+    /// store/broker/provider I/O. One load and user append prepare fixed history
+    /// for all validation attempts and fallbacks under this policy's deadline.
+    /// Only accepted assistant JSON is appended; failed calls may retain a user.
+    /// Callers serialize calls per identity and use a backend with full-identity
+    /// typed append semantics, such as ADK InMemorySessionService.
+    pub async fn invoke_in_session(
+        &self,
+        spec: &ModelInvocationSpec,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+        service: &dyn adk_rust::session::SessionService,
+        identity: &adk_rust::AdkIdentity,
+    ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
+        self.invoke_in_session_validated(spec, broker, cancellation, service, identity, |_| Ok(()))
             .await
+    }
+
+    /// Domain validation runs before the accepted assistant append. Store errors
+    /// are terminal Session failures, never stateless or provider fallbacks.
+    pub async fn invoke_in_session_validated(
+        &self,
+        spec: &ModelInvocationSpec,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+        service: &dyn adk_rust::session::SessionService,
+        identity: &adk_rust::AdkIdentity,
+        validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
+    ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
+        self.invoke_with_response_policy(
+            spec,
+            broker,
+            cancellation,
+            ResponsePolicy::Ordinary,
+            Some((service, identity)),
+            validate,
+        )
+        .await
     }
 
     async fn invoke_with_response_policy(
@@ -501,8 +559,14 @@ impl ModelRoutePolicy {
         broker: &CredentialBroker,
         cancellation: &ModelRouteCancellation,
         response_policy: ResponsePolicy,
+        session: Option<(
+            &dyn adk_rust::session::SessionService,
+            &adk_rust::AdkIdentity,
+        )>,
+        validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
     ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
         let mut attempts = Vec::new();
+        let mut prepared = None;
         for (index, candidate) in self.snapshot.candidates.iter().enumerate() {
             if let Some(kind) = route_stop(self.deadline, cancellation) {
                 return Err(route_terminal(kind, attempts));
@@ -520,6 +584,24 @@ impl ModelRoutePolicy {
                     ModelRouteTerminalErrorKind::AuthorizationDenied,
                     attempts,
                 ));
+            }
+            if let Some((service, identity)) = session
+                && prepared.is_none()
+            {
+                prepared = Some(
+                    match super::sessions::prepare(
+                        spec,
+                        service,
+                        identity,
+                        self.deadline,
+                        cancellation,
+                    )
+                    .await
+                    {
+                        Ok(prepared) => prepared,
+                        Err(kind) => return Err(session_failure(kind, ordinal, attempts)),
+                    },
+                );
             }
             let binding = match await_route(
                 self.snapshot.bind(candidate, broker),
@@ -544,9 +626,11 @@ impl ModelRoutePolicy {
                     });
                 }
             };
-            let candidate_spec = spec.with_route(ProviderRouteIdentity::from_binding(&binding));
+            let active_spec = prepared.as_ref().unwrap_or(spec);
+            let candidate_spec =
+                active_spec.with_route(ProviderRouteIdentity::from_binding(&binding));
             let result = match await_route(
-                candidate_spec.invoke_with_policy(&binding, |_| Ok(()), response_policy),
+                candidate_spec.invoke_with_policy(&binding, &validate, response_policy),
                 self.deadline,
                 cancellation,
             )
@@ -556,7 +640,21 @@ impl ModelRoutePolicy {
                 Ok(result) => result,
             };
             let error = match result {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    if let Some((service, identity)) = session {
+                        super::sessions::append_accepted(
+                            active_spec,
+                            &result,
+                            service,
+                            identity,
+                            self.deadline,
+                            cancellation,
+                        )
+                        .await
+                        .map_err(|kind| session_failure(kind, ordinal, attempts))?;
+                    }
+                    return Ok(result);
+                }
                 Err(error) => error,
             };
             if error.model_error() == Some(ModelProfileErrorKind::RetryableProvider) {
@@ -577,6 +675,18 @@ impl ModelRoutePolicy {
                 ModelInvocationErrorKind::StructuredOutput => (
                     ModelRouteAttemptKind::Protocol,
                     ModelRouteTerminalErrorKind::Protocol,
+                ),
+                ModelInvocationErrorKind::Session => (
+                    ModelRouteAttemptKind::Session,
+                    ModelRouteTerminalErrorKind::Session,
+                ),
+                ModelInvocationErrorKind::DeadlineExceeded => (
+                    ModelRouteAttemptKind::Timeout,
+                    ModelRouteTerminalErrorKind::DeadlineExceeded,
+                ),
+                ModelInvocationErrorKind::Cancelled => (
+                    ModelRouteAttemptKind::Timeout,
+                    ModelRouteTerminalErrorKind::Cancelled,
                 ),
                 ModelInvocationErrorKind::ModelProfile
                     if error.model_error() == Some(ModelProfileErrorKind::Timeout) =>
@@ -607,6 +717,23 @@ impl ModelRoutePolicy {
     }
 }
 
+fn session_failure(
+    kind: ModelRouteTerminalErrorKind,
+    ordinal: u8,
+    mut attempts: Vec<ModelRouteAttempt>,
+) -> ModelRouteTerminalError {
+    if kind == ModelRouteTerminalErrorKind::Session {
+        attempts.push(ModelRouteAttempt {
+            ordinal,
+            kind: ModelRouteAttemptKind::Session,
+            profile_error: None,
+            upstream_status_code: None,
+            output_error: None,
+        });
+    }
+    route_terminal(kind, attempts)
+}
+
 fn route_stop(
     deadline: Instant,
     cancellation: &ModelRouteCancellation,
@@ -620,7 +747,7 @@ fn route_stop(
     }
 }
 
-async fn await_route<T>(
+pub(super) async fn await_route<T>(
     future: impl std::future::Future<Output = T>,
     deadline: Instant,
     cancellation: &ModelRouteCancellation,

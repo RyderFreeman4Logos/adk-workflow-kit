@@ -15,7 +15,7 @@ per-pass timeout no greater than 120 seconds. It performs no provider/credential
 discovery. Start with escalation disabled. No tools, conversation history, raw
 retrieved documents, outer graph state, checkpoints, or approval grants enter a
 judge. Each ADK function node makes its own stateless bounded model invocation.
-ADK-Rust 2.1.0 `GraphAgent` owns parallel dispatch; its executor uses
+The pinned ADK-Rust `GraphAgent` owns parallel dispatch; its executor uses
 `buffer_unordered`. This does not assert any particular provider throughput.
 
 `SemanticFacts` is **trusted host input**, not a place to copy attacker prose or

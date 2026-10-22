@@ -22,8 +22,8 @@
           "additionalProperties": false,
           "required": ["requirement", "version", "commit", "license", "cargo_lock"],
           "properties": {
-            "requirement": {"type": "string", "const": "=2.1.0"},
-            "version": {"type": "string", "const": "2.1.0"},
+            "requirement": {"type": "string", "const": "=2.3.0", "description": "Current exact workspace dependency requirement."},
+            "version": {"type": "string", "const": "2.1.0", "description": "Immutable upstream source baseline for the official pattern records."},
             "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
             "license": {"type": "string", "const": "Apache-2.0"},
             "cargo_lock": {
@@ -32,7 +32,7 @@
               "required": ["package", "version", "source", "checksum"],
               "properties": {
                 "package": {"type": "string", "const": "adk-rust"},
-                "version": {"type": "string", "const": "2.1.0"},
+                "version": {"type": "string", "const": "2.3.0"},
                 "source": {"type": "string", "const": "registry+https://github.com/rust-lang/crates.io-index"},
                 "checksum": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
               }

@@ -17,6 +17,9 @@ use workflow_runtime::{SchemaKeyword, StructuredOutputError, TrustDomain};
 #[path = "model_invocation_tests.rs"]
 mod tests;
 
+#[path = "model_sessions.rs"]
+mod sessions;
+
 pub const PROMPT_PROTOCOL_VERSION: &str = "cache-aware-prompt-v1";
 pub const MAX_INVOCATION_RETRIES: u8 = 3;
 
@@ -622,6 +625,7 @@ pub struct InvocationProvenance {
     seed: i64,
     cache_salt: String,
     provider_route: ProviderRouteIdentity,
+    session_history_digest: Option<String>,
 }
 
 impl InvocationProvenance {
@@ -677,6 +681,12 @@ impl InvocationProvenance {
     pub fn provider_route(&self) -> &ProviderRouteIdentity {
         &self.provider_route
     }
+
+    /// Digest of the full ADK identity and projected prior conversation, only
+    /// for explicitly session-enabled calls. It contains no raw identity/history.
+    pub fn session_history_digest(&self) -> Option<&str> {
+        self.session_history_digest.as_deref()
+    }
 }
 
 /// Content-free facts copied from the final meaningful ADK response chunk.
@@ -704,12 +714,76 @@ impl ModelCompletionEvidence {
     }
 }
 
+/// Provider-reported token counters. Missing counters are never estimated or imputed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderTokenUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+}
+
+impl ProviderTokenUsage {
+    fn from_provider_usage(raw: &Value) -> Option<Self> {
+        let raw = raw.as_object()?;
+        let details = raw.get("prompt_tokens_details");
+        let usage = Self {
+            input_tokens: raw.get("prompt_tokens").and_then(Value::as_u64),
+            output_tokens: raw.get("completion_tokens").and_then(Value::as_u64),
+            total_tokens: raw.get("total_tokens").and_then(Value::as_u64),
+            cache_read_tokens: details
+                .and_then(|value| value.get("cached_tokens"))
+                .and_then(Value::as_u64),
+            cache_write_tokens: details
+                .and_then(|value| value.get("cache_write_tokens"))
+                .and_then(Value::as_u64),
+        };
+        [
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.total_tokens,
+            usage.cache_read_tokens,
+            usage.cache_write_tokens,
+        ]
+        .iter()
+        .any(Option::is_some)
+        .then_some(usage)
+    }
+
+    /// Raw OpenAI-compatible `prompt_tokens`, including genuine zero.
+    pub fn input_tokens(&self) -> Option<u64> {
+        self.input_tokens
+    }
+
+    /// Raw OpenAI-compatible `completion_tokens`, including genuine zero.
+    pub fn output_tokens(&self) -> Option<u64> {
+        self.output_tokens
+    }
+
+    /// Raw provider `total_tokens`; never calculated from input and output.
+    pub fn total_tokens(&self) -> Option<u64> {
+        self.total_tokens
+    }
+
+    /// Raw `prompt_tokens_details.cached_tokens`.
+    pub fn cache_read_tokens(&self) -> Option<u64> {
+        self.cache_read_tokens
+    }
+
+    /// Raw `prompt_tokens_details.cache_write_tokens`.
+    pub fn cache_write_tokens(&self) -> Option<u64> {
+        self.cache_write_tokens
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelInvocationResult {
     output: Value,
     attempts: u8,
     provenance: InvocationProvenance,
     completion_evidence: ModelCompletionEvidence,
+    usage: Option<ProviderTokenUsage>,
 }
 
 impl ModelInvocationResult {
@@ -734,6 +808,14 @@ impl ModelInvocationResult {
     pub fn completion_evidence(&self) -> &ModelCompletionEvidence {
         &self.completion_evidence
     }
+
+    /// The successful attempt's latest snapshot containing a valid allowlisted
+    /// raw provider counter. Snapshots replace rather than merge or sum; trailers
+    /// without valid counters do not erase the last snapshot. Normalized SDK
+    /// defaults and unsupported metadata are never exposed as measured usage.
+    pub fn usage(&self) -> Option<&ProviderTokenUsage> {
+        self.usage.as_ref()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -741,6 +823,12 @@ pub enum ModelInvocationErrorKind {
     RouteMismatch,
     ModelProfile,
     StructuredOutput,
+    /// Session load/append failed or returned a different full identity.
+    Session,
+    /// The explicit session invocation deadline expired.
+    DeadlineExceeded,
+    /// The explicit session invocation cancellation token was cancelled.
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -753,6 +841,13 @@ pub struct ModelInvocationError {
 }
 
 impl ModelInvocationError {
+    fn boundary(kind: ModelInvocationErrorKind) -> Self {
+        Self {
+            kind,
+            ..Self::route_mismatch()
+        }
+    }
+
     fn route_mismatch() -> Self {
         Self {
             kind: ModelInvocationErrorKind::RouteMismatch,
@@ -817,6 +912,13 @@ impl fmt::Display for ModelInvocationError {
             ModelInvocationErrorKind::StructuredOutput => {
                 formatter.write_str("structured model output failed validation")
             }
+            ModelInvocationErrorKind::Session => formatter.write_str("model session failed"),
+            ModelInvocationErrorKind::DeadlineExceeded => {
+                formatter.write_str("model deadline exceeded")
+            }
+            ModelInvocationErrorKind::Cancelled => {
+                formatter.write_str("model invocation cancelled")
+            }
         }
     }
 }
@@ -831,6 +933,7 @@ pub struct ModelInvocationSpec {
     route: ProviderRouteIdentity,
     budget: InferenceBudget,
     output: StructuredOutputContract,
+    history: Option<std::sync::Arc<sessions::PreparedHistory>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -871,6 +974,7 @@ impl ModelInvocationSpec {
             route,
             budget,
             output,
+            history: None,
         })
     }
 
@@ -908,7 +1012,7 @@ impl ModelInvocationSpec {
 
     pub fn invocation_identity(&self) -> String {
         let prompt = self.prompt();
-        let material = [
+        let mut material = [
             frame("PROMPT_PROTOCOL_VERSION", PROMPT_PROTOCOL_VERSION),
             frame("PROTOCOL_HASH", self.protocol.protocol_hash()),
             frame("TOOL_SCHEMA_HASH", self.protocol.tool_schema_hash()),
@@ -944,6 +1048,10 @@ impl ModelInvocationSpec {
             frame("ESCALATION", &self.budget.escalation().to_string()),
         ]
         .join("\n");
+        if let Some(history) = &self.history {
+            material.push('\n');
+            material.push_str(&frame("SESSION_HISTORY_HASH", &history.digest));
+        }
         digest(material.as_bytes())
     }
 
@@ -971,14 +1079,20 @@ impl ModelInvocationSpec {
             seed: self.deterministic_seed(),
             cache_salt: self.protocol.trust_domain().cache_salt().to_owned(),
             provider_route: self.route.clone(),
+            session_history_digest: self.history.as_ref().map(|history| history.digest.clone()),
         }
     }
 
     pub fn to_llm_request(&self) -> LlmRequest {
-        let mut request = LlmRequest::new(self.route.resolved_model(), self.prompt().contents());
+        let mut contents = self.prompt().contents();
+        if let Some(history) = &self.history {
+            contents.splice(1..1, history.contents.iter().cloned());
+        }
+        let mut request = LlmRequest::new(self.route.resolved_model(), contents);
         let config = request.config.get_or_insert_with(Default::default);
         config.max_output_tokens = Some(self.budget.max_output_tokens() as i32);
         config.seed = Some(self.deterministic_seed());
+        config.response_schema = Some(self.output.schema().clone());
         config.extensions.insert(
             "workflow_kit".to_owned(),
             json!({
@@ -1038,6 +1152,7 @@ impl ModelInvocationSpec {
             let mut output = String::new();
             let mut complete = false;
             let mut completion_evidence = ModelCompletionEvidence::default();
+            let mut usage = None;
             while let Some(response) = stream.next().await {
                 let response = response.map_err(|error| {
                     ModelInvocationError::model(
@@ -1058,6 +1173,14 @@ impl ModelInvocationSpec {
                         attempts,
                         None,
                     ));
+                }
+                if let Some(snapshot) = response
+                    .usage_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.provider_usage.as_ref())
+                    .and_then(ProviderTokenUsage::from_provider_usage)
+                {
+                    usage = Some(snapshot);
                 }
                 // A harmless metadata trailer must not erase terminal evidence. New content
                 // or explicit progress does invalidate it until a fresh complete Stop.
@@ -1111,6 +1234,7 @@ impl ModelInvocationSpec {
                         attempts,
                         provenance: self.provenance(),
                         completion_evidence,
+                        usage,
                     });
                 }
                 Err(_error) if attempts < max_attempts => continue,

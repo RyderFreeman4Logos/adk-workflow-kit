@@ -429,6 +429,7 @@ fn require_intended_example_files(files: &BTreeMap<PathBuf, Vec<u8>>) -> Result<
         "expected-output.md",
         "input.example.json",
         "profiles/fake.json",
+        "profiles/openai-compatible-no-auth.template.json",
         "profiles/openai-compatible.template.json",
         "replay.json",
         "run.sh",

@@ -193,13 +193,16 @@ fn events(run_root: &Path) -> Vec<Value> {
         .collect()
 }
 
-fn assert_tool_calls(run_root: &Path, expected: &[Value]) {
+fn assert_tool_calls(case_name: &str, run_root: &Path, expected: &[Value]) {
     let state = node_state(run_root);
     let mut completed = state["completed_calls"].as_array().unwrap().clone();
     let mut expected_calls = expected.to_vec();
     completed.sort_by_key(|entry| entry["call"]["id"].as_str().unwrap().to_owned());
     expected_calls.sort_by_key(|entry| entry["call"]["id"].as_str().unwrap().to_owned());
-    assert_eq!(completed, expected_calls, "exact completed effect ledger");
+    assert_eq!(
+        completed, expected_calls,
+        "case={case_name} stage=completed-ledger"
+    );
     let events = events(run_root);
     assert_eq!(
         events
@@ -207,7 +210,7 @@ fn assert_tool_calls(run_root: &Path, expected: &[Value]) {
             .filter(|event| event["kind"] == "tool_completed")
             .count(),
         expected.len(),
-        "no extra or missing completion events"
+        "case={case_name} stage=tool-completed: no extra or missing completion events"
     );
     let requested: Vec<_> = events
         .iter()
@@ -225,7 +228,10 @@ fn assert_tool_calls(run_root: &Path, expected: &[Value]) {
             })
         })
         .collect();
-    assert_eq!(requested, expected_requests, "exact dispatch attribution");
+    assert_eq!(
+        requested, expected_requests,
+        "case={case_name} stage=tool-requested: exact dispatch attribution"
+    );
 }
 
 // Fake profiles retain synthetic fixture arguments; events must still use fingerprints.
@@ -337,7 +343,22 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                     .split("[[package]]")
                     .find(|block| block.contains("\nname = \"adk-rust\"\n"))
                     .expect("ADK-Rust must be locked");
-                assert!(package.contains("\nversion = \"2.1.0\"\n"), "{}", case.name);
+                assert!(
+                    package.contains(&format!(
+                        "\nversion = \"{}\"\n",
+                        workflow_adk::ADK_RUST_VERSION
+                    )),
+                    "{}",
+                    case.name
+                );
+                assert!(include_str!("../../../Cargo.toml").contains(&format!(
+                    "adk-rust = {{ version = \"={}\"",
+                    workflow_adk::ADK_RUST_VERSION
+                )));
+                assert_eq!(
+                    workflow_testkit::code_investigation::ADK_RUST_VERSION,
+                    workflow_adk::ADK_RUST_VERSION
+                );
                 let binding = ModelProfileRegistry::new()
                     .with_worker(fake_profile(vec![json!("engine-ok")]))
                     .unwrap()
@@ -379,6 +400,7 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                 let receipt = result.unwrap();
                 assert_eq!(receipt.status(), "succeeded", "{}", case.name);
                 assert_tool_calls(
+                    case.name,
                     receipt.run_root(),
                     &[completed_call(
                         "single",
@@ -405,6 +427,7 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                 let receipt = result.unwrap();
                 assert_eq!(receipt.status(), "succeeded", "{}", case.name);
                 assert_tool_calls(
+                    case.name,
                     receipt.run_root(),
                     &[
                         completed_call(
@@ -490,6 +513,7 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                 );
                 let run_root = error.receipt().unwrap().run_root();
                 assert_tool_calls(
+                    case.name,
                     run_root,
                     &[completed_call(
                         "repeat-a",
@@ -498,6 +522,27 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                         json!({"found":true}),
                         1,
                     )],
+                );
+                assert_eq!(error.receipt().unwrap().status(), "failed");
+                assert_eq!(
+                    workflow_runtime::EffectJournal::open(run_root.join("effects.sqlite"))
+                        .unwrap()
+                        .committed_count()
+                        .unwrap(),
+                    1,
+                    "projection must not execute the handler again"
+                );
+                let observed = events(run_root);
+                assert!(
+                    observed
+                        .iter()
+                        .any(|event| event["kind"] == "workflow_failed")
+                );
+                assert!(
+                    !observed
+                        .iter()
+                        .any(|event| event["kind"] == "workflow_completed"
+                            || (event["kind"] == "node_completed" && event["node_id"] == "work"))
                 );
                 let state = node_state(run_root);
                 assert_eq!(
@@ -545,7 +590,7 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                     1,
                 )];
                 assert_finished(receipt.run_root(), json!({"answer":"retained"}));
-                assert_tool_calls(receipt.run_root(), &expected_calls);
+                assert_tool_calls(case.name, receipt.run_root(), &expected_calls);
                 let before = node_state(receipt.run_root());
                 assert_eq!(before["model_iterations"], 2);
                 let before_manifest = read_json(receipt.run_root(), "run-manifest.json");
@@ -557,7 +602,7 @@ fn fake_profile_compatibility_matrix_executes_every_done_when_row() {
                 assert_eq!(resumed.plan_hash(), receipt.plan_hash());
                 // Completed finish is restored, although the graph itself resumes.
                 assert_finished(resumed.run_root(), json!({"answer":"retained"}));
-                assert_tool_calls(resumed.run_root(), &expected_calls);
+                assert_tool_calls(case.name, resumed.run_root(), &expected_calls);
                 assert_eq!(
                     node_state(resumed.run_root()),
                     before,

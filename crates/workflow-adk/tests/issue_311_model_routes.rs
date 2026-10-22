@@ -9,6 +9,9 @@ mod structured;
 #[path = "issue_311/provider_responses.rs"]
 mod provider_responses;
 
+#[path = "issue_311/usage.rs"]
+mod usage;
+
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},

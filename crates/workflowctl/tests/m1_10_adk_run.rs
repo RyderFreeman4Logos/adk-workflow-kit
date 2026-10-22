@@ -27,6 +27,9 @@ mod oracle_reap_witness;
 #[path = "support/owned_tree.rs"]
 mod owned_tree;
 
+#[path = "support/m1_10_auth.rs"]
+mod m1_10_auth;
+
 static TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 const WORKFLOW: &str = r#"

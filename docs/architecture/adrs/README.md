@@ -28,6 +28,6 @@ The following decisions accept the proposed initial set in [planning-pack 18](..
 | [ADR-0022](ADR-0022.md) | #74 | Typed subworkflow invocation is deferred |
 | [ADR-0023](ADR-0023.md) | #170 | Isolate ADK-Rust 2.1 graph ownership at the integration boundary |
 | [ADR-0024](ADR-0024.md) | #187 | Do not create a companion recipes repository |
-| [ADR-0025](ADR-0025.md) | #223 | Freeze ADK-Rust 2.1.0 as the production pin |
+| [ADR-0025](ADR-0025.md) | #223 | Historical ADK-Rust 2.1.0 production pin; now 2.3.0 |
 
-The [architecture boundary](../BOUNDARY.md) makes the ADK/domain separation explicit. ADR-0025 freezes the production pin at `adk-rust =2.1.0`; ADR-0014 still requires exact pins and a committed lockfile.
+The [architecture boundary](../BOUNDARY.md) makes the ADK/domain separation explicit. ADR-0025 records the historical 2.1.0 pin and its subsequent upgrade. The current exact production pin is `adk-rust = "=2.3.0"`; ADR-0014 still requires exact pins and a committed lockfile.
