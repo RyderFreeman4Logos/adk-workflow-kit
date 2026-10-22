@@ -1410,8 +1410,8 @@ async fn generate_once(
 fn response_has_model_payload(response: &LlmResponse) -> bool {
     response.content.as_ref().is_some_and(|content| {
         content.parts.iter().any(|part| match part {
-            Part::Text { text } => !text.trim().is_empty(),
-            Part::FunctionCall { .. } => true,
+            // Explicit Text, including blank Text, belongs to output validation.
+            Part::Text { .. } | Part::FunctionCall { .. } => true,
             _ => false,
         })
     })

@@ -115,6 +115,72 @@ async fn fake_profile_returns_the_script_without_a_provider() {
     assert!(stream.next().await.is_none());
 }
 
+#[tokio::test]
+async fn explicit_blank_text_reaches_output_validation_on_both_binding_interfaces() {
+    for text in ["", " ", "\n\t", "valid"] {
+        for streaming in [false, true] {
+            let binding = ModelProfileRegistry::new()
+                .with_worker(FakeModelProfile::new("worker", "1", "fake-model", [text]))
+                .unwrap()
+                .bind_worker(&CredentialBroker::new())
+                .unwrap();
+            let request =
+                || LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+            let mut direct = binding
+                .generate_content(request(), streaming)
+                .await
+                .unwrap();
+            assert_eq!(
+                direct.next().await.unwrap().unwrap().content.unwrap().parts[0].text(),
+                Some(text)
+            );
+            assert!(direct.next().await.is_none());
+            // A fresh binding keeps the script identical across the two public interfaces.
+            let binding = ModelProfileRegistry::new()
+                .with_worker(FakeModelProfile::new("worker", "1", "fake-model", [text]))
+                .unwrap()
+                .bind_worker(&CredentialBroker::new())
+                .unwrap();
+            let mut adapted = adk_rust::Llm::generate_content(&binding, request(), streaming)
+                .await
+                .expect("explicit Text belongs to output validation, including blank Text");
+            assert_eq!(
+                adapted
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content
+                    .unwrap()
+                    .parts[0]
+                    .text(),
+                Some(text)
+            );
+            assert!(adapted.next().await.is_none());
+            assert_eq!(binding.take_retries(), 0);
+        }
+    }
+    let binding = ModelProfileRegistry::new()
+        .with_worker(FakeModelProfile::new(
+            "worker",
+            "1",
+            "fake-model",
+            Vec::<String>::new(),
+        ))
+        .unwrap()
+        .bind_worker(&CredentialBroker::new())
+        .unwrap();
+    let result = adk_rust::Llm::generate_content(
+        &binding,
+        LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]),
+        false,
+    )
+    .await;
+    let error = result.err().expect("a provider error is still unreachable");
+    assert_eq!(error.code, "model.profile.unreachable");
+    assert_eq!(binding.take_retries(), 0);
+}
+
 #[test]
 fn openai_profile_serialization_contains_handles_but_never_secret_values() {
     let profile = OpenAiCompatibleProfile::new(
@@ -222,6 +288,79 @@ async fn model_profile_wire_response(
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "wire fixture deadline"))?
+}
+
+#[tokio::test]
+async fn loopback_blank_text_is_distinct_from_absent_or_failed_response() {
+    for (content, finish, expected_text) in [
+        (serde_json::Value::Null, "stop", None),
+        (serde_json::json!(" "), "stop", Some(" ")),
+        (serde_json::json!(" "), "length", None),
+    ] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let binding = ModelProfileRegistry::new()
+            .with_worker(OpenAiCompatibleProfile::new_no_auth(
+                "blank",
+                "1",
+                "blank-model",
+                format!("http://{address}/v1"),
+            ))
+            .unwrap()
+            .bind_worker(&CredentialBroker::new())
+            .unwrap();
+        let body = serde_json::json!({
+            "choices":[{"message":{"role":"assistant","content":content},"finish_reason":finish}]
+        })
+        .to_string();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (request, result) = tokio::join!(
+            model_profile_wire_response(listener, deadline, &body),
+            timeout_at(
+                deadline,
+                adk_rust::Llm::generate_content(
+                    &binding,
+                    LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]),
+                    true,
+                )
+            ),
+        );
+        let request = String::from_utf8(request.expect("one bounded SDK request")).unwrap();
+        assert!(
+            !request
+                .split_once("\r\n\r\n")
+                .unwrap()
+                .0
+                .lines()
+                .any(|line| {
+                    line.split_once(':')
+                        .is_some_and(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                })
+        );
+        let result = result.expect("unchanged fixture deadline");
+        if let Some(text) = expected_text {
+            let mut responses = result.expect("explicit blank Text reaches output validation");
+            assert_eq!(
+                responses
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content
+                    .unwrap()
+                    .parts[0]
+                    .text(),
+                Some(text)
+            );
+            assert!(responses.next().await.is_none());
+        } else {
+            let error = result
+                .err()
+                .expect("absent or failed response is not blank success");
+            assert_eq!(error.code, "model.profile.unreachable");
+        }
+        assert_eq!(binding.take_retries(), 0);
+    }
 }
 
 #[tokio::test]
