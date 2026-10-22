@@ -15,6 +15,10 @@ use sha2::{Digest, Sha256};
 
 use crate::encode_hex;
 
+mod bounded_read;
+#[cfg(test)]
+mod bounded_read_tests;
+
 static NEXT_CAPABILITY: AtomicU64 = AtomicU64::new(1);
 
 fn next_capability() -> NonZeroU64 {
@@ -499,12 +503,12 @@ impl ArtifactStore for FilesystemArtifactStore {
 
         let id = ArtifactId(encode_hex(&Sha256::digest(bytes)));
         let final_path = self.path_for(&id);
-        match fs::read(&final_path) {
+        match bounded_read::read_file(&final_path, self.max_content_bytes) {
             Ok(existing) if existing.as_slice() != bytes => {
                 return Err(ArtifactError::new(ArtifactErrorKind::ContentIdCollision));
             }
-            Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                return Err(Self::storage_error(error));
+            Err(error) if error.kind() != ArtifactErrorKind::NotFound => {
+                return Err(error);
             }
             _ => {}
         }
@@ -548,8 +552,10 @@ impl ArtifactStore for FilesystemArtifactStore {
                         let _ = remove_temporary(temporary);
                     }
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        let existing = fs::read(&final_path).map_err(Self::storage_error)?;
-                        let staged_bytes = fs::read(temporary).map_err(Self::storage_error)?;
+                        let existing =
+                            bounded_read::read_file(&final_path, self.max_content_bytes)?;
+                        let staged_bytes =
+                            bounded_read::read_file(temporary, self.max_content_bytes)?;
                         if existing != staged_bytes {
                             return Err(ArtifactError::new(ArtifactErrorKind::ContentIdCollision));
                         }
@@ -573,7 +579,7 @@ impl ArtifactStore for FilesystemArtifactStore {
         id: &ArtifactId,
         request: PageRequest,
     ) -> Result<ArtifactPage, ArtifactError> {
-        let bytes = fs::read(self.path_for(id)).map_err(Self::storage_error)?;
+        let bytes = bounded_read::read_file(&self.path_for(id), self.max_content_bytes)?;
         if encode_hex(&Sha256::digest(&bytes)) != id.as_str() {
             return Err(ArtifactError::new(ArtifactErrorKind::ContentIdCollision));
         }
