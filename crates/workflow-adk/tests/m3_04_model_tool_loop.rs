@@ -1230,10 +1230,32 @@ fn effect_after_crash_before_node_checkpoint_resumes_from_loop_ledger() {
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .find(|event| event["kind"] == "tool_completed")
         .unwrap();
+    let baseline_completed = fs::read_to_string(baseline.run_root().join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["kind"] == "tool_completed")
+        .unwrap();
+    assert_eq!(
+        completed["payload"], baseline_completed["payload"],
+        "resume uses the normal sanitized completion shape"
+    );
     let correlation = &completed["payload"]["structured_output"][0];
-    assert_eq!(correlation["tool_call_id"], "call-crash");
     assert_eq!(correlation["tool_name"], "search_code");
-    assert_eq!(correlation["argument_fingerprint"], expected_fingerprint);
+    assert!(correlation.get("tool_call_id").is_none());
+    assert!(correlation.get("argument_fingerprint").is_none());
+    let requested = fs::read_to_string(run_root.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["kind"] == "tool_requested")
+        .unwrap();
+    assert_eq!(
+        requested["payload"]["structured_output"][0],
+        json!({
+            "tool_call_id":"call-crash", "tool_name":"search_code", "argument_fingerprint":expected_fingerprint,
+        })
+    );
     assert_eq!(function_response_bytes(&run_root), expected_response);
     assert_eq!(
         Connection::open(run_root.join("effects.sqlite"))
@@ -1246,6 +1268,28 @@ fn effect_after_crash_before_node_checkpoint_resumes_from_loop_ledger() {
     );
     let ledger: Value =
         serde_json::from_slice(&fs::read(run_root.join("loop-ledger.json")).unwrap()).unwrap();
+    assert_eq!(
+        ledger["nodes"]["work"]["completed_calls"][0]["call"]["fingerprint"],
+        expected_fingerprint
+    );
+    let audit_id = ledger["nodes"]["work"]["completion_event_ids"]["call-crash"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        completed["event_id"],
+        format!("tool-completed-v1-{audit_id}")
+    );
+    ExecutionBackend::resume(&root, &run_id(&run_root)).unwrap();
+    let repeated = fs::read_to_string(run_root.join("events.jsonl")).unwrap();
+    assert_eq!(
+        repeated
+            .lines()
+            .filter(|line| serde_json::from_str::<Value>(line).unwrap()["kind"] == "tool_completed")
+            .count(),
+        1
+    );
+    assert_eq!(effect_count(&run_root), 1);
+    assert_eq!(function_response_bytes(&run_root), expected_response);
     assert_eq!(ledger["nodes"]["work"]["model_iterations"], 2);
     assert_eq!(ledger["nodes"]["work"]["pending_calls"], json!([]));
     assert!(

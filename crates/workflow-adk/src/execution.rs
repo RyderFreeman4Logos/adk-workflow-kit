@@ -2,6 +2,7 @@
 
 mod behavioral;
 mod effect_audit;
+mod tool_audit;
 pub use behavioral::BehavioralExecutionReceipt;
 use effect_audit::EffectAudits;
 use workflow_runtime::effect_ledger::EffectAuditReceipt;
@@ -99,7 +100,6 @@ type BoundCache = (
     Arc<Mutex<BTreeMap<String, CacheDisposition>>>,
     Arc<Mutex<Option<(NodeCacheKey, Value)>>>,
 );
-type CompletedToolResponse = (String, String, String, String, Value);
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -117,6 +117,13 @@ struct LoopState {
     previous_response_id: Option<String>,
     pending_calls: VecDeque<PendingCall>,
     completed_calls: Vec<CompletedCall>,
+    // Private random identities, checkpoint-bound with their completed calls.
+    // Allocation is not evidence that the corresponding public event was saved.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    completion_event_ids: BTreeMap<String, String>,
+    // Only the normal public-safe per-result projection, never raw skill data.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    completion_event_outputs: BTreeMap<String, Value>,
     #[serde(default)]
     finish_admitted: bool,
     #[serde(default)]
@@ -187,6 +194,8 @@ struct LoopLedgerStore {
     persist_raw_loop_state: bool,
     effect_audits: EffectAudits,
     nodes: Mutex<BTreeMap<String, LoopState>>,
+    durable_nodes: Mutex<BTreeMap<String, LoopState>>,
+    tool_audit_ids: crate::events::ToolAuditIds,
     replaying_skill_resource_reads: Mutex<BTreeSet<(String, String)>>,
 }
 
@@ -208,6 +217,8 @@ impl LoopLedgerStore {
             persist_raw_loop_state,
             effect_audits: EffectAudits::default(),
             nodes: Mutex::new(BTreeMap::new()),
+            durable_nodes: Mutex::new(BTreeMap::new()),
+            tool_audit_ids: Arc::default(),
             replaying_skill_resource_reads: Mutex::new(BTreeSet::new()),
         };
         store.persist_ledger(&BTreeMap::new())?;
@@ -237,9 +248,12 @@ impl LoopLedgerStore {
         } else {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         };
-        if nodes.values().any(|state| !valid_loop_state(state)) {
+        if nodes.values().any(|state| !valid_loop_state(state))
+            || !tool_audit::unique_tokens(&nodes)
+        {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
+        let tool_audit_ids = Arc::new(Mutex::new(tool_audit::identities(&nodes)));
         Ok(Self {
             path,
             checkpoint_path,
@@ -248,6 +262,8 @@ impl LoopLedgerStore {
             run_id,
             persist_raw_loop_state,
             effect_audits: EffectAudits::default(),
+            durable_nodes: Mutex::new(nodes.clone()),
+            tool_audit_ids,
             nodes: Mutex::new(nodes),
             replaying_skill_resource_reads: Mutex::new(BTreeSet::new()),
         })
@@ -421,51 +437,6 @@ impl LoopLedgerStore {
         Ok(())
     }
 
-    fn completed_tool_responses(&self) -> Result<Vec<CompletedToolResponse>, ExecutionError> {
-        let nodes = self
-            .nodes
-            .lock()
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let mut completed = Vec::new();
-        for (node, state) in nodes.iter() {
-            let calls = state
-                .conversation
-                .iter()
-                .flat_map(|content| &content.parts)
-                .filter_map(|part| match part {
-                    adk_rust::Part::FunctionCall {
-                        name,
-                        args,
-                        id: Some(id),
-                        ..
-                    } => Some((
-                        id.clone(),
-                        (name.clone(), workflow_runtime::argument_fingerprint(args)),
-                    )),
-                    _ => None,
-                })
-                .collect::<BTreeMap<_, _>>();
-            for part in state.conversation.iter().flat_map(|content| &content.parts) {
-                if let adk_rust::Part::FunctionResponse {
-                    function_response,
-                    id: Some(id),
-                    ..
-                } = part
-                    && let Some((name, fingerprint)) = calls.get(id)
-                {
-                    completed.push((
-                        node.clone(),
-                        id.clone(),
-                        name.clone(),
-                        fingerprint.clone(),
-                        function_response.response.clone(),
-                    ));
-                }
-            }
-        }
-        Ok(completed)
-    }
-
     fn complete_pending(
         &self,
         node: &str,
@@ -573,6 +544,13 @@ impl LoopLedgerStore {
             return Err(ExecutionError::new(ExecutionErrorKind::Persistence));
         }
         let mut durable_nodes = nodes.clone();
+        {
+            let committed = self
+                .durable_nodes
+                .lock()
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+            tool_audit::prepare(&mut durable_nodes, &committed)?;
+        }
         if !self.persist_raw_loop_state {
             for state in durable_nodes.values_mut() {
                 state.conversation.clear();
@@ -594,7 +572,20 @@ impl LoopLedgerStore {
         }
         self.persist_ledger_with_checkpoint_generation(&durable_nodes)?;
         crash_barrier("after-loop-ledger-before-checkpoint");
-        self.sync_checkpoint(&durable_nodes)
+        self.sync_checkpoint(&durable_nodes)?;
+        // Publish proof only after BOTH durable generations agree. A failed
+        // save may leave `nodes` mutated; it must never authorize audit success.
+        let mut committed = self
+            .durable_nodes
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        let mut ids = self
+            .tool_audit_ids
+            .lock()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        *committed = durable_nodes;
+        *ids = tool_audit::identities(&committed);
+        Ok(())
     }
 
     fn persist_ledger_with_checkpoint_generation(
@@ -695,30 +686,10 @@ impl LoopLedgerStore {
     }
 
     fn bind_current_digest(&self, state: &mut State) -> Result<(), ExecutionError> {
-        let mut nodes = self
-            .nodes
+        let nodes = self
+            .durable_nodes
             .lock()
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?
-            .clone();
-        if !self.persist_raw_loop_state {
-            for state in nodes.values_mut() {
-                state.conversation.clear();
-                state.finished_output = None;
-                for call in &mut state.pending_calls {
-                    call.args = durable_pending_args(call).expect("checked pending calls");
-                }
-                for completed in &mut state.completed_calls {
-                    let call = completed.call_mut();
-                    call.args = durable_pending_args(call).expect("checked completed calls");
-                    if matches!(
-                        call.name.as_str(),
-                        "activate_skill" | "read_skill_resource" | "run_skill_script"
-                    ) {
-                        call.response = None;
-                    }
-                }
-            }
-        }
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
         Self::bind_digest(state, &nodes)
     }
 
@@ -1058,7 +1029,7 @@ fn valid_terminal_state(state: &LoopState) -> bool {
 }
 
 fn valid_loop_state(state: &LoopState) -> bool {
-    if !valid_skill_resource_read_accounting(state) {
+    if !tool_audit::valid_bindings(state) || !valid_skill_resource_read_accounting(state) {
         return false;
     }
     if state.conversation.is_empty() {
@@ -4571,18 +4542,19 @@ where
 
 fn resume_failure(
     root: &Path,
-    events_path: &Path,
     manifest: &mut RunManifestV2,
-    resume_count: u64,
-    mapper: &AdkEventMapper,
+    mapper: &mut AdkEventMapper,
+    ledger: &LoopLedgerStore,
+    artifacts: &mut impl ArtifactStore,
     error: ExecutionError,
 ) -> ExecutionError {
+    let audit_result = tool_audit::reconcile(ledger, mapper, artifacts);
     manifest.status = execution_status(error.kind()).to_owned();
-    manifest.resume_count = resume_count;
-    let events_result = write_events(events_path, mapper.events());
+    manifest.resume_count += 1;
+    let events_result = write_events(&root.join("events.jsonl"), mapper.events());
     let manifest_result = write_json(&root.join("run-manifest.json"), manifest);
     let receipt = manifest.receipt(root.to_path_buf());
-    if events_result.is_err() || manifest_result.is_err() {
+    if audit_result.is_err() || events_result.is_err() || manifest_result.is_err() {
         ExecutionError::new(ExecutionErrorKind::Persistence).with_receipt(receipt)
     } else {
         error.with_receipt(receipt)
@@ -4830,6 +4802,9 @@ impl ExecutionBackend {
                 None
             }
         };
+        if let Some(ledger) = &loop_ledger {
+            mapper.bind_tool_audit(Arc::clone(&ledger.tool_audit_ids));
+        }
         let checkpoint_path = run_root.join("checkpoint.sqlite");
         let mut checkpoint_store = match if FAIL_CHECKPOINT_SAVES.load(Ordering::Relaxed) {
             SqliteCheckpointStore::failing_saves(&checkpoint_path, checkpoint_manifest.clone())
@@ -5058,6 +5033,11 @@ impl ExecutionBackend {
                     .ok_or_else(|| ExecutionError::new(ExecutionErrorKind::Adk))
             })()
         };
+        if let (Some(ledger), Some(artifacts)) = (&loop_ledger, artifacts.as_mut())
+            && let Err(error) = tool_audit::reconcile(ledger, &mut mapper, artifacts)
+        {
+            persistence_error.get_or_insert(error);
+        }
         let mut status = mapper
             .events()
             .iter()
@@ -5460,14 +5440,6 @@ impl ExecutionBackend {
         } else if event_sequence != checkpoint.event_sequence() {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
-        let tool_event_counts = events
-            .iter()
-            .filter(|event| event.kind() == WorkflowRuntimeEventKindV1::ToolCompleted)
-            .filter_map(|event| event.node_id())
-            .fold(BTreeMap::new(), |mut counts, node| {
-                *counts.entry(node.to_owned()).or_insert(0_usize) += 1;
-                counts
-            });
         let mut mapper = AdkEventMapper::resume(run_id, &manifest.workflow_id, events)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
 
@@ -5514,6 +5486,9 @@ impl ExecutionBackend {
         )?;
         loop_ledger.effect_audits = profile.effect_audits.clone();
         let loop_ledger = Arc::new(loop_ledger);
+        mapper.bind_tool_audit(Arc::clone(&loop_ledger.tool_audit_ids));
+        // Reject unprovable historical completion association before replay IO.
+        tool_audit::validate_existing(&loop_ledger, &mapper, &artifacts)?;
         let tool_registry = build_tool_registry(
             &profile,
             &resolved_plan,
@@ -5562,21 +5537,23 @@ impl ExecutionBackend {
                 .collect(&profile, Some(&loop_ledger))?;
             // Missing fresh authority leaves the checkpoint resumable, not terminal.
             if error.kind() == ExecutionErrorKind::AuthorizationDenied {
+                tool_audit::reconcile(&loop_ledger, &mut mapper, &mut artifacts)?;
+                write_events(&events_path, mapper.events())?;
                 return Err(error.with_receipt(manifest.receipt(root)));
             }
             return Err(resume_failure(
                 &root,
-                &events_path,
                 &mut manifest,
-                next,
-                &mapper,
+                &mut mapper,
+                &loop_ledger,
+                &mut artifacts,
                 error,
             ));
         }
         manifest.effect_audits = profile
             .effect_audits
             .collect(&profile, Some(&loop_ledger))?;
-        restore_tool_events(&loop_ledger, &tool_event_counts, &mut mapper)?;
+        tool_audit::reconcile(&loop_ledger, &mut mapper, &mut artifacts)?;
 
         let mut retry_models = Vec::new();
         let node_cache = node_cache_open(workdir_base.as_ref())?;
@@ -5689,14 +5666,15 @@ impl ExecutionBackend {
                     .collect(&profile, Some(&loop_ledger))?;
                 return Err(resume_failure(
                     &root,
-                    &events_path,
                     &mut manifest,
-                    next,
-                    &mapper,
+                    &mut mapper,
+                    &loop_ledger,
+                    &mut artifacts,
                     error,
                 ));
             }
         };
+        tool_audit::reconcile(&loop_ledger, &mut mapper, &mut artifacts)?;
         let mut state = checkpoint_state(
             state,
             &continuation
@@ -6617,42 +6595,6 @@ fn replay_pending_tools(
     Ok(())
 }
 
-fn restore_tool_events(
-    ledger: &LoopLedgerStore,
-    existing: &BTreeMap<String, usize>,
-    mapper: &mut AdkEventMapper,
-) -> Result<(), ExecutionError> {
-    let mut seen = BTreeMap::new();
-    for (node, call_id, tool_name, argument_fingerprint, response) in
-        ledger.completed_tool_responses()?
-    {
-        let count = seen.entry(node.clone()).or_insert(0_usize);
-        if *count >= existing.get(&node).copied().unwrap_or(0) {
-            mapper
-                .map(
-                    AdkRuntimeObservationV1::new(
-                        format!(
-                            "tool-replayed-{:x}",
-                            Sha256::digest(format!("{node}\0{call_id}").as_bytes())
-                        ),
-                        "workflowctl",
-                        AdkRuntimeObservationKindV1::ToolCompleted,
-                    )
-                    .with_node_id(&node)
-                    .with_response(response)
-                    .with_structured_output(json!([{
-                        "tool_call_id": call_id,
-                        "tool_name": tool_name,
-                        "argument_fingerprint": argument_fingerprint,
-                    }])),
-                )
-                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-        }
-        *count += 1;
-    }
-    Ok(())
-}
-
 struct StaticToolHandler {
     result: Value,
     provenance: ToolProvenance,
@@ -6927,9 +6869,10 @@ mod execution_registry_tests {
         assert!(!valid_loop_state(&state));
     }
 
-    fn fanout_ledger() -> (PathBuf, Arc<LoopLedgerStore>) {
+    pub(super) fn fanout_ledger() -> (PathBuf, Arc<LoopLedgerStore>) {
         let root = std::env::temp_dir().join(format!(
-            "workflow-adk-fanout-{}",
+            "workflow-adk-fanout-{}-{}",
+            std::process::id(),
             NEXT_RUN.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&root);

@@ -1,3 +1,6 @@
+mod tool_audit;
+pub(crate) use tool_audit::{TOOL_AUDIT_PREFIX, ToolAuditIds, project_tool_results};
+
 use std::fmt;
 
 use serde_json::{Map, Value};
@@ -177,6 +180,7 @@ impl AdkRuntimeObservationV1 {
 /// Stateful ADK-to-project mapper with one monotonic sequence per run.
 pub struct AdkEventMapper {
     log: WorkflowRuntimeEventLogV1,
+    tool_audit_ids: Option<ToolAuditIds>,
 }
 
 impl AdkEventMapper {
@@ -191,6 +195,7 @@ impl AdkEventMapper {
     ) -> Result<Self, AdkEventMappingError> {
         Ok(Self {
             log: WorkflowRuntimeEventLogV1::new(run_id, workflow_id)?,
+            tool_audit_ids: None,
         })
     }
 
@@ -202,6 +207,7 @@ impl AdkEventMapper {
     ) -> Result<Self, AdkEventMappingError> {
         Ok(Self {
             log: WorkflowRuntimeEventLogV1::resume(run_id, workflow_id, events)?,
+            tool_audit_ids: None,
         })
     }
 
@@ -333,6 +339,7 @@ impl AdkEventMapper {
         };
         let calls = event.tool_calls();
         let results = event.tool_results();
+        let event_id = self.tool_completion_id(&node_id, &event, kind)?;
         let structured_output = if results.is_empty() {
             None
         } else {
@@ -349,9 +356,7 @@ impl AdkEventMapper {
             ))
         };
         let structured_output = if structured_output.is_some() {
-            structured_output
-                .map(redact_skill_tool_results)
-                .transpose()?
+            structured_output.map(project_tool_results).transpose()?
         } else if calls.is_empty() {
             event
                 .content()
@@ -399,7 +404,7 @@ impl AdkEventMapper {
             .transpose()
             .map_err(|_| AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation))?;
         let mut observation =
-            AdkRuntimeObservationV1::new(event.id, event.timestamp.to_rfc3339(), kind)
+            AdkRuntimeObservationV1::new(event_id, event.timestamp.to_rfc3339(), kind)
                 .with_node_id(node_id);
         if let Some(request) = request {
             observation = observation.with_request(request);
