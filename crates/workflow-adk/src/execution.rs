@@ -980,30 +980,21 @@ enum FinishStatus {
 }
 
 fn admitted_finish(content: &adk_rust::Content) -> Result<Option<Value>, ()> {
-    let mut output = None;
-    let mut has_call = false;
-    for part in &content.parts {
-        match part {
-            adk_rust::Part::Text { text } if !text.trim().is_empty() => {
-                let ModelFinish {
-                    status: FinishStatus::Finished,
-                    output: next,
-                } = serde_json::from_str(text).map_err(|_| ())?;
-                if output.replace(next).is_some() {
-                    return Err(());
-                }
-            }
-            adk_rust::Part::FunctionCall { .. } => has_call = true,
-            _ => {}
+    let text = crate::model_text(content).filter(|text| !text.trim().is_empty());
+    let has_call = content
+        .parts
+        .iter()
+        .any(|part| matches!(part, adk_rust::Part::FunctionCall { .. }));
+    match (has_call, text) {
+        (true, None) => Ok(None),
+        (false, Some(text)) => {
+            let ModelFinish {
+                status: FinishStatus::Finished,
+                output,
+            } = serde_json::from_str(&text).map_err(|_| ())?;
+            Ok(Some(output))
         }
-    }
-    if has_call && output.is_some() {
-        return Err(());
-    }
-    if has_call {
-        Ok(None)
-    } else {
-        output.map(Some).ok_or(())
+        _ => Err(()),
     }
 }
 
@@ -1376,10 +1367,12 @@ impl LoopController {
         response: &adk_rust::LlmResponse,
         allowed: &BTreeSet<String>,
     ) -> adk_rust::Result<()> {
-        let content = response
-            .content
-            .as_ref()
-            .ok_or_else(|| adk_rust::AdkError::agent("model response missing content"))?;
+        let content = response.content.as_ref().ok_or_else(|| {
+            self.fail(
+                ExecutionErrorKind::InvalidOutput,
+                "workflow.node.invalid_output",
+            )
+        })?;
         let mut last_progress = self
             .last_progress
             .lock()
@@ -1390,8 +1383,12 @@ impl LoopController {
                 "workflow.loop.timeout.idle",
             ));
         }
-        let finished_output = admitted_finish(content)
-            .map_err(|_| adk_rust::AdkError::agent("model response missing typed finish"))?;
+        let finished_output = admitted_finish(content).map_err(|_| {
+            self.fail(
+                ExecutionErrorKind::InvalidOutput,
+                "workflow.node.invalid_output",
+            )
+        })?;
         let mut state = self
             .state
             .lock()
@@ -6851,6 +6848,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ExecutionError> {
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
     fs::rename(temporary, path).map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
 }
+
+#[cfg(test)]
+mod model_output_tests;
 
 #[cfg(test)]
 mod execution_registry_tests {
