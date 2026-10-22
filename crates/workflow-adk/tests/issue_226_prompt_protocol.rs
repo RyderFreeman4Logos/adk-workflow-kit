@@ -505,6 +505,7 @@ async fn invoke_rejects_a_prompt_and_decode_schema_mismatch() {
 fn request_identity_and_provenance_share_budget_and_seed() {
     let budget = InferenceBudget::new(ReasoningEffort::XHigh, 2048, 1).unwrap();
     let output = contract();
+    let schema = output.schema().clone();
     let protocol = PromptProtocol::new(
         "stable policy",
         vec![],
@@ -530,6 +531,7 @@ fn request_identity_and_provenance_share_budget_and_seed() {
         Some(budget.max_output_tokens() as i32)
     );
     assert_eq!(config.seed, Some(spec.deterministic_seed()));
+    assert_eq!(config.response_schema.as_ref(), Some(&schema));
     assert_eq!(
         provenance.max_output_tokens() as usize,
         budget.max_output_tokens()

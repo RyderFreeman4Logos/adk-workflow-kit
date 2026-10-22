@@ -994,11 +994,13 @@ impl ModelProfile {
                     }
                     _ => return Err(ModelProfileError::credential(CredentialError::missing())),
                 };
+                // Kit admits general JSON Schema and strictly validates the original contract locally.
                 let config = OpenAICompatibleConfig::new(api_key, &value.model)
                     .with_provider_name(&value.provider)
                     .with_base_url(&value.base_url);
                 let llm = OpenAICompatible::new(config)
                     .map_err(|_| ModelProfileError::provider())?
+                    .with_response_schema_strict(false)
                     .with_retry_config(RetryConfig::disabled());
                 (
                     Arc::new(llm) as Arc<dyn Llm>,
@@ -1415,7 +1417,7 @@ fn response_has_model_payload(response: &LlmResponse) -> bool {
     })
 }
 
-fn response_failure(response: &LlmResponse) -> Option<AdkError> {
+pub(crate) fn response_failure(response: &LlmResponse) -> Option<AdkError> {
     let failed_finish = match response.finish_reason {
         None | Some(adk_rust::FinishReason::Stop) => false,
         Some(

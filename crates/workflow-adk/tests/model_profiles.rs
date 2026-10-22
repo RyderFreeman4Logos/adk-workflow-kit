@@ -21,6 +21,9 @@ mod auth;
 #[path = "model_profiles/usage.rs"]
 mod usage;
 
+#[path = "model_profiles/schema.rs"]
+mod schema;
+
 struct TestSecrets;
 impl SecretProvider for TestSecrets {
     fn resolve(
