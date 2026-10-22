@@ -1,5 +1,6 @@
 use super::*;
 use adk_rust::{Llm, LlmRequest, LlmResponse, Part, Tool, ToolContext, agent::LlmAgentBuilder};
+use workflow_adk::events::AdkEventMappingErrorKind;
 use workflow_runtime::argument_fingerprint;
 
 struct IdlessModel(AtomicUsize);
@@ -311,6 +312,51 @@ fn complete_output_event() -> Event {
 }
 
 #[tokio::test]
+async fn issue_358_tool_notifications_do_not_open_or_continue_model_responses() {
+    let mut started = Event::new("agent");
+    started.llm_response.partial = true;
+    started.provider_metadata.insert(
+        "adk_tool_started".into(),
+        r#"{"id":"call","name":"lookup"}"#.into(),
+    );
+    let progress = Event::tool_progress("agent", "", "call", "stdout", "working");
+    let mut rejected = Vec::new();
+    for notification in [started, progress] {
+        let mut distinct = notification.clone();
+        distinct.id = Event::new("agent").id;
+        invoke_output_events(
+            SEQUENTIAL,
+            vec![notification.clone(), distinct, complete_output_event()],
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        let mut partial = complete_output_event();
+        partial.id = notification.id.clone();
+        partial.llm_response.partial = true;
+        for mut events in [
+            vec![notification.clone(), notification.clone()],
+            vec![notification.clone(), partial.clone()],
+            vec![partial, notification],
+        ] {
+            events.push(complete_output_event());
+            rejected.push(matches!(
+                invoke_output_events(SEQUENTIAL, events, false, true).await,
+                Err(AdkGraphError::Observation(
+                    AdkEventMappingErrorKind::DuplicateEventId
+                ))
+            ));
+        }
+    }
+    assert_eq!(
+        rejected,
+        vec![true; 6],
+        "independent tool events never share an LLM response identity"
+    );
+}
+
+#[tokio::test]
 async fn issue_357_nonfinal_and_stale_output_fail_on_both_public_paths() {
     let mut partial = complete_output_event();
     partial.llm_response.content.as_mut().unwrap().parts.insert(
@@ -578,40 +624,79 @@ async fn issue_357_official_agent_joins_content_before_metadata_trailer() {
     .expect("bounded official trailer aggregation")
     .unwrap();
     assert_eq!(state.get("node:agent"), Some(&json!({"answer":"ok"})));
-    let events = events.lock().unwrap();
+    {
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            3,
+            "official streaming context retains both partial chunks and the final event"
+        );
+        assert!(events[..2].iter().all(|event| event.llm_response.partial));
+        assert!(events.iter().all(|event| event.id == events[0].id));
+        let last = events.last().unwrap();
+        assert!(
+            last.is_final_response()
+                && !last.llm_response.partial
+                && last.llm_response.turn_complete
+        );
+        assert_eq!(
+            last.llm_response.finish_reason,
+            Some(adk_rust::FinishReason::Stop)
+        );
+        assert_eq!(
+            last.llm_response.provider_metadata,
+            Some(
+                json!({"provider_usage":{"prompt_tokens":3,"completion_tokens":0,"total_tokens":3},"content_complete":true})
+            )
+        );
+        let text: String = last
+            .content()
+            .unwrap()
+            .parts
+            .iter()
+            .filter_map(Part::text)
+            .collect();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            json!({"output":{"answer":"ok"},"status":"finished"})
+        );
+    }
+    let mut mapper = AdkEventMapper::new("trailer-observed", "sequential").unwrap();
+    let mut artifacts = InMemoryArtifactStore::new(
+        std::num::NonZeroU64::new(64 * 1024).unwrap(),
+        std::num::NonZeroU64::new(64 * 1024).unwrap(),
+    );
+    let state = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        graph.invoke_observed(
+            State::new(),
+            ExecutionConfig::new("trailer-observed"),
+            &mut mapper,
+            &mut artifacts,
+        ),
+    )
+    .await
+    .expect("bounded observed official trailer aggregation")
+    .expect("official partial and final events have distinct audit identities");
+    assert_eq!(state.get("node:agent"), Some(&json!({"answer":"ok"})));
     assert_eq!(
-        events.len(),
+        mapper
+            .events()
+            .iter()
+            .filter(|event| event.kind() == WorkflowRuntimeEventKindV1::ModelRequestCompleted)
+            .count(),
         3,
-        "official streaming context retains both partial chunks and the final event"
-    );
-    assert!(events[..2].iter().all(|event| event.llm_response.partial));
-    assert!(events.iter().all(|event| event.id == events[0].id));
-    let last = events.last().unwrap();
-    assert!(
-        last.is_final_response() && !last.llm_response.partial && last.llm_response.turn_complete
+        "both partial callbacks and the aggregated final remain observable"
     );
     assert_eq!(
-        last.llm_response.finish_reason,
-        Some(adk_rust::FinishReason::Stop)
+        mapper
+            .events()
+            .iter()
+            .map(|event| event.event_id())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        mapper.events().len()
     );
-    assert_eq!(
-        last.llm_response.provider_metadata,
-        Some(
-            json!({"provider_usage":{"prompt_tokens":3,"completion_tokens":0,"total_tokens":3},"content_complete":true})
-        )
-    );
-    let text: String = last
-        .content()
-        .unwrap()
-        .parts
-        .iter()
-        .filter_map(Part::text)
-        .collect();
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&text).unwrap(),
-        json!({"output":{"answer":"ok"},"status":"finished"})
-    );
-    // Observed SSE repeats the SDK event ID across chunks; its independent rejection is tracked in #358.
 }
 
 fn admission_workflow(entry: &str, nodes: &[(&str, &str)], topology: &str) -> String {

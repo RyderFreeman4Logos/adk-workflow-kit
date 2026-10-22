@@ -1,5 +1,7 @@
 #[path = "translation/model_foundations.rs"]
 mod model_foundations;
+#[path = "translation/stream_identity.rs"]
+mod stream_identity;
 
 use std::{
     collections::BTreeMap,

@@ -1,3 +1,6 @@
+mod stream_identity;
+#[cfg(test)]
+mod stream_identity_tests;
 mod tool_audit;
 pub(crate) use tool_audit::{TOOL_AUDIT_PREFIX, ToolAuditIds, project_tool_results};
 
@@ -181,6 +184,7 @@ impl AdkRuntimeObservationV1 {
 pub struct AdkEventMapper {
     log: WorkflowRuntimeEventLogV1,
     tool_audit_ids: Option<ToolAuditIds>,
+    sdk_sources: std::collections::BTreeMap<String, stream_identity::SourceEvent>,
 }
 
 impl AdkEventMapper {
@@ -196,6 +200,7 @@ impl AdkEventMapper {
         Ok(Self {
             log: WorkflowRuntimeEventLogV1::new(run_id, workflow_id)?,
             tool_audit_ids: None,
+            sdk_sources: std::collections::BTreeMap::new(),
         })
     }
 
@@ -208,6 +213,7 @@ impl AdkEventMapper {
         Ok(Self {
             log: WorkflowRuntimeEventLogV1::resume(run_id, workflow_id, events)?,
             tool_audit_ids: None,
+            sdk_sources: std::collections::BTreeMap::new(),
         })
     }
 
@@ -339,7 +345,9 @@ impl AdkEventMapper {
         };
         let calls = event.tool_calls();
         let results = event.tool_results();
-        let event_id = self.tool_completion_id(&node_id, &event, kind)?;
+        let event_id = self.sdk_audit_id(&node_id, &event, kind)?;
+        let source_id = event.id.clone();
+        let source = stream_identity::SourceEvent::new(&node_id, &event);
         let structured_output = if results.is_empty() {
             None
         } else {
@@ -442,7 +450,10 @@ impl AdkEventMapper {
         {
             observation = observation.with_latency_ms(latency_ms);
         }
-        self.map(observation)
+        let mapped = self.map(observation)?;
+        // Failed projection or append must not advance the source lifecycle.
+        self.sdk_sources.insert(source_id, source);
+        Ok(mapped)
     }
 
     pub(crate) fn map_stream_observation<S: ArtifactStore>(
@@ -453,9 +464,8 @@ impl AdkEventMapper {
         latency_ms: Option<u64>,
         artifacts: &mut S,
     ) -> Result<WorkflowRuntimeEventV1, AdkEventMappingError> {
-        let sequence = self.log.events().len() + 1;
         let mut observation =
-            AdkRuntimeObservationV1::new(format!("adk-stream-{sequence}"), "adk-stream", kind);
+            AdkRuntimeObservationV1::new(self.stream_event_id()?, "adk-stream", kind);
         observation.node_id = node_id;
         if let Some(output) = structured_output {
             observation = observation.with_structured_output(output.clone());
