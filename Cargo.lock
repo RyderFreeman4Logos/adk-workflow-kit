@@ -38,8 +38,7 @@ dependencies = [
 [[package]]
 name = "adk-core"
 version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "892f30b3b10c28340a748c3142d0b1c7ad02b4500356c5ca80b8f6481a618ea4"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=c727d33cb662a8fae1c0f4a8f1cdf2f2446ca092#c727d33cb662a8fae1c0f4a8f1cdf2f2446ca092"
 dependencies = [
  "async-trait",
  "chrono",
@@ -55,8 +54,7 @@ dependencies = [
 [[package]]
 name = "adk-graph"
 version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d2ad7c9036852c0d8164b2c3efe2c7c5e7cda148d741e792dac42b242927317"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=c727d33cb662a8fae1c0f4a8f1cdf2f2446ca092#c727d33cb662a8fae1c0f4a8f1cdf2f2446ca092"
 dependencies = [
  "adk-core",
  "async-stream",
@@ -3631,3 +3629,8 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[patch.unused]]
+name = "adk-action"
+version = "2.3.0"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=c727d33cb662a8fae1c0f4a8f1cdf2f2446ca092#c727d33cb662a8fae1c0f4a8f1cdf2f2446ca092"

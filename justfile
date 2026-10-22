@@ -413,6 +413,13 @@ lock-check:
 metadata:
     {{_io}} cargo metadata --format-version 1 --locked
 
+# Resolve and compile the optional ADK action graph without changing default features.
+adk-action-check:
+    {{_io}} cargo +1.98.0 --version --verbose
+    {{_io}} cargo +1.98.0 metadata --format-version 1 --features adk-rust/action --locked
+    {{_io}} cargo +1.98.0 check -p workflow-adk --features adk-rust/action --locked
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test adk_action_identity --features adk-rust/action --locked
+
 dependency-audit:
     {{_io}} cargo deny check licenses advisories
 
@@ -433,7 +440,7 @@ check-branch:
 
 pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit pattern-catalog-test m2-02-green test-local-gates
 
-_quality-gates: fmt-check issue-323-release-consumer check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk issue-325-adk test-local-gates
+_quality-gates: fmt-check issue-323-release-consumer check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk issue-325-adk adk-action-check test-local-gates
 
 quality-gates:
     scripts/local-gates.sh produce

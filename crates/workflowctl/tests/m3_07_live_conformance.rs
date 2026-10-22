@@ -1001,7 +1001,7 @@ fn malformed_tool_call_fails_closed() {
         vec![
             finished("prepared"),
             finished("planned"),
-            tool_call("bad", "search_code", r#""[]""#),
+            tool_call("bad", "search_code", r#""[1]""#),
         ],
         false,
     );
@@ -1009,12 +1009,64 @@ fn malformed_tool_call_fails_closed() {
     let workdir = root.0.join("runs");
     fs::create_dir(&workdir).expect("run workdir");
     let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
-    assert_scripted_fail(
-        &run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]),
-        "malformed_tool",
-        server,
+    let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
+    assert_eq!(
+        server.request_count(),
         3,
+        "malformed response request boundary"
     );
+    assert_scripted_fail(&report, "malformed_tool", server, 3);
+}
+
+#[test]
+fn empty_array_tool_arguments_fail_closed_before_tool_completion() {
+    let server = serve_script(
+        vec![
+            finished("prepared"),
+            finished("planned"),
+            tool_call("empty", "search_code", r#""[]""#),
+        ],
+        false,
+    );
+    let root = temp_root();
+    let workdir = root.0.join("runs");
+    fs::create_dir(&workdir).expect("run workdir");
+    let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
+    let report = run_opt_in(&profile, &workdir, &[(HANDLE, CANARY)]);
+    assert_scripted_fail(&report, "capability_denied", server, 3);
+
+    let run_root = fs::read_dir(&workdir)
+        .expect("run workdir")
+        .map(|entry| entry.expect("run entry").path())
+        .find(|path| path.is_dir())
+        .expect("admitted run root");
+    let events = fs::read_to_string(run_root.join("events.jsonl"))
+        .expect("runtime events")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("runtime event JSON"))
+        .collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["kind"] == "workflow_failed")
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["kind"] != "workflow_completed")
+    );
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(run_root.join("run-manifest.json")).expect("failed run manifest"),
+    )
+    .expect("run manifest JSON");
+    assert_eq!(manifest["status"], "failed");
+    assert!(events.iter().all(|event| event["kind"] != "tool_completed"));
+    assert!(
+        events.iter().all(|event| {
+            event["kind"] != "node_completed" || event["node_id"] != "search_code"
+        })
+    );
+    assert_no_canary(&workdir);
 }
 
 #[test]
