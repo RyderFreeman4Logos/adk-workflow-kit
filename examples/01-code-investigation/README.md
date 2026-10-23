@@ -100,9 +100,11 @@ publish structured source evidence; draft and revision publish an
 `InvestigationAnswer`, not a placeholder string. These contracts are supplied to
 the provider and checked locally before downstream routing.
 
-`input.example.json` carries the checked-in repository's Snapshot ID and whole-file
-digests. The opt-in conformance runner recomputes these facts from `repo/` before
-starting the child; a mismatch fails with `invalid_snapshot` and no provider call.
+`input.example.json` carries the canonical question and `src` path plus the
+checked-in repository's Snapshot ID and whole-file digests. The opt-in
+conformance runner checks the question and path and recomputes the source facts
+from `repo/` before starting the child; a mismatch fails with `invalid_snapshot`
+and no provider call.
 After publication it reads the actual selected `node:revise` or `node:draft` from
 the retained checkpoint and applies `validate_answer`: Snapshot identity, claim
 binding, contained path, whole-file digest, inclusive range and exact source text.

@@ -21,6 +21,9 @@ use crate::code_investigation::{
 
 const FILES: [&str; 3] = ["Cargo.toml", "src/lib.rs", "src/retry.rs"];
 const MAX_BYTES: u64 = 1024 * 1024;
+// The fixed expected-finding check below applies only to this canonical task.
+const CANONICAL_QUESTION: &str = "Where is the default retry path?";
+const CANONICAL_PATH: &str = "src";
 
 fn read(path: &Path, limit: u64) -> Result<Vec<u8>, ()> {
     read_bounded_regular_file(
@@ -52,6 +55,8 @@ pub(super) struct Admission {
 
 #[derive(Deserialize)]
 struct HostInput {
+    question: String,
+    path: String,
     snapshot: HostFacts,
 }
 
@@ -74,7 +79,9 @@ impl Admission {
         let input = String::from_utf8(read(&root.join("input.example.json"), MAX_BYTES)?)
             .map_err(|_| ())?;
         let value: HostInput = serde_json::from_str(&input).map_err(|_| ())?;
-        if value.snapshot.id != snapshot.id()
+        if value.question != CANONICAL_QUESTION
+            || value.path != CANONICAL_PATH
+            || value.snapshot.id != snapshot.id()
             || value.snapshot.files.len() != FILES.len()
             || FILES.iter().any(|path| {
                 value.snapshot.files.get(*path).map(String::as_str) != snapshot.digest_for(path)

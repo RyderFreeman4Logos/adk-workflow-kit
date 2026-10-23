@@ -64,6 +64,50 @@ fn host_file_digests_are_checked_before_child_admission() {
 }
 
 #[test]
+fn canonical_input_fields_are_checked_before_child_admission() {
+    for (field, change) in [
+        ("question", "wrong"),
+        ("question", "missing"),
+        ("question", "type"),
+        ("path", "wrong"),
+        ("path", "missing"),
+        ("path", "type"),
+    ] {
+        let server = serve_script(publish_script(), false);
+        let root = temp_root();
+        let example = root.0.join("example");
+        copy_example(&example_root(), &example);
+        let input_path = example.join("input.example.json");
+        let mut input: Value =
+            serde_json::from_slice(&fs::read(&input_path).expect("input")).expect("input JSON");
+        match change {
+            "wrong" => input[field] = json!("unrelated valid text"),
+            "missing" => {
+                input.as_object_mut().expect("input object").remove(field);
+            }
+            "type" => input[field] = json!(7),
+            _ => unreachable!("fixed test case"),
+        }
+        fs::write(input_path, input.to_string()).expect("changed input");
+        let workdir = root.0.join("runs");
+        fs::create_dir(&workdir).expect("workdir");
+        let profile = write_profile(&root.0, &openai_profile(&server.base_url, json!({})));
+        assert_fail(&run_at(&example, &profile, &workdir), "invalid_snapshot");
+        assert_eq!(
+            server.request_count(),
+            0,
+            "provider entry for {field}/{change}"
+        );
+        assert_eq!(
+            fs::read_dir(&workdir).expect("workdir entries").count(),
+            1,
+            "run root for {field}/{change}"
+        );
+        server.finish();
+    }
+}
+
+#[test]
 fn canonical_snapshot_is_verified_before_provider_admission() {
     let server = serve_script(publish_script(), false);
     let root = temp_root();
