@@ -11,6 +11,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "issue_230_telemetry/measured.rs"]
+mod measured;
 #[path = "issue_230_telemetry/semantic.rs"]
 mod semantic;
 

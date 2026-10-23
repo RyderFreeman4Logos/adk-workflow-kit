@@ -593,10 +593,10 @@ pub fn pareto_frontier(points: &[CaseObservation]) -> Vec<CaseObservation> {
     for point in points {
         let dominated = points.iter().any(|other| {
             other.case_id != point.case_id
-                && other.quality_millis >= point.quality_millis
-                && other.tokens.visible_output <= point.tokens.visible_output
-                && (other.quality_millis > point.quality_millis
-                    || other.tokens.visible_output < point.tokens.visible_output)
+                && dominates(
+                    (other.quality_millis, u64::from(other.tokens.visible_output)),
+                    (point.quality_millis, u64::from(point.tokens.visible_output)),
+                )
         });
         if !dominated {
             kept.push(point.clone());
@@ -604,6 +604,11 @@ pub fn pareto_frontier(points: &[CaseObservation]) -> Vec<CaseObservation> {
     }
     kept.sort_by(|left, right| left.case_id.cmp(&right.case_id));
     kept
+}
+
+// Metric owners choose and name the token dimension; dominance arithmetic is shared.
+pub(crate) fn dominates(other: (u32, u64), point: (u32, u64)) -> bool {
+    other.0 >= point.0 && other.1 <= point.1 && (other.0 > point.0 || other.1 < point.1)
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -644,9 +649,10 @@ pub fn bench230_main() {
                 *mode == "cache-resume",
             )
         }
-        args @ (["measure", _, _] | ["measure-live", _, _] | ["measure-report", _]) => {
-            crate::execution230::measurement::command(args)
-        }
+        args @ (["measure", _, _]
+        | ["measure-live", _, _]
+        | ["measure-report", _]
+        | ["measure-compare", _, _]) => crate::execution230::measurement::command(args),
         ["fixture"] => run_scripted_smoke().map(|report| (report.canonical_json(), false)),
         ["scripted"] => {
             crate::execution230::output_path().and_then(|output| execution_command(&output, false))
@@ -670,7 +676,7 @@ pub fn bench230_main() {
         }
         _ => {
             eprintln!(
-                "usage: bench-230 scripted [--output DIR]|resume DIR|abandon DIR CASE_ID RUN_ID|fixture|init SPLIT.json CAMPAIGN|init-config SPLIT.json CONFIG.json CAMPAIGN|regression CAMPAIGN|adaptive CAMPAIGN elapsed_ns COUNT|soak CAMPAIGN REPEATS|sealed-final CAMPAIGN|compare-plan BASELINE CANDIDATE MAX_REGRESSION_BPS [config-only]|compare CANDIDATE|cache-experiment DIR|cache-resume DIR|measure BINDING.json DIR|measure-live BINDING.json DIR|measure-report DIR"
+                "usage: bench-230 scripted [--output DIR]|resume DIR|abandon DIR CASE_ID RUN_ID|fixture|init SPLIT.json CAMPAIGN|init-config SPLIT.json CONFIG.json CAMPAIGN|regression CAMPAIGN|adaptive CAMPAIGN elapsed_ns COUNT|soak CAMPAIGN REPEATS|sealed-final CAMPAIGN|compare-plan BASELINE CANDIDATE MAX_REGRESSION_BPS [config-only]|compare CANDIDATE|cache-experiment DIR|cache-resume DIR|measure BINDING.json DIR|measure-live BINDING.json DIR|measure-report DIR|measure-compare LEFT_DIR RIGHT_DIR"
             );
             process::exit(2);
         }

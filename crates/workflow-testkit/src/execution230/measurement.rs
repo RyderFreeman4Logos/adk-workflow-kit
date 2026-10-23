@@ -5,6 +5,8 @@ use std::os::unix::fs::DirBuilderExt;
 use workflow_adk::model_telemetry::ModelTelemetryV1;
 use workflow_runtime::{WorkflowRuntimeEventLogV1, WorkflowRuntimeEventV1};
 
+mod measured;
+
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Origin {
@@ -41,6 +43,10 @@ struct Admission {
 pub(crate) fn command(args: &[&str]) -> Result<(String, bool), String> {
     let report = match args {
         ["measure-report", output] => verified_report(Path::new(output))?,
+        ["measure-compare", left, right] => measured::compare(
+            &verified_report(Path::new(left))?,
+            &verified_report(Path::new(right))?,
+        )?,
         [mode @ ("measure" | "measure-live"), binding, output] => run(
             Path::new(binding),
             Path::new(output),
@@ -218,7 +224,7 @@ fn run(path: &Path, output: &Path, live: bool) -> Result<Value, String> {
     }
     let report = build_report(output, &plan, &case)?;
     journal::atomic(output, "measurement.json", &report)?;
-    Ok(report)
+    measured::append(output, &case, report)
 }
 
 fn verified_report(output: &Path) -> Result<Value, String> {
@@ -232,7 +238,7 @@ fn verified_report(output: &Path) -> Result<Value, String> {
     if recorded != expected {
         return Err("measurement projection mismatch".to_owned());
     }
-    Ok(expected)
+    measured::append(output, &case, expected)
 }
 
 fn build_report(output: &Path, plan: &Plan, case: &ExecutedCase) -> Result<Value, String> {

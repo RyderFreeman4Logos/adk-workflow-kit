@@ -1,13 +1,7 @@
 //! Typed provider options and one fixed semantic case; opt-in reuses the retained predicate.
 use super::{PathBuf, Value, fs, json, repo, success, wire_case, wire_options};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{io::Write, os::unix::fs::OpenOptionsExt, path::Path};
-use workflow_runtime::{
-    CheckpointManifestV1, RunId, SqliteCheckpointStore, WorkflowRuntimeEventKindV1 as Kind,
-    WorkflowRuntimeEventLogV1, WorkflowRuntimeEventV1,
-};
-
 fn input() -> Value {
     json!({"request":"Sort [7,2,7,1] ascending and compute their sum. Return the output object with exactly sorted and sum."})
 }
@@ -40,117 +34,33 @@ fn fixture_authorization_observation_preserves_exact_token_bytes() {
     }
 }
 
-#[derive(Deserialize)]
-struct Manifest {
-    run_id: String,
-    status: String,
-    checkpoint_manifest: CheckpointManifestV1,
-}
-
+// The actual CLI already recomputes this projection before returning. Reuse it without
+// another child process or a second checkpoint algorithm inside the fixture's deadline.
 fn check(output: &Path, report: &Value) -> Result<Value, &'static str> {
-    let execution: Value = serde_json::from_slice(
-        &fs::read(output.join("execution.json")).map_err(|_| "execution unavailable")?,
+    let admission: Value = serde_json::from_slice(
+        &fs::read(output.join("measurement-admission.json"))
+            .map_err(|_| "admission unavailable")?,
     )
-    .map_err(|_| "invalid execution")?;
-    let root = Path::new(
-        execution["receipt"]["run_root"]
-            .as_str()
-            .ok_or("missing receipt root")?,
-    );
-    let manifest: Manifest = serde_json::from_slice(
-        &fs::read(root.join("run-manifest.json")).map_err(|_| "manifest unavailable")?,
-    )
-    .map_err(|_| "invalid manifest")?;
-    if report["case"]["manifest"]["workflow_source"] != "templates/minimal/workflow.toml"
-        || report["case"]["status"] != "succeeded"
-        || report["hard_invariant_failed"] != false
-        || manifest.status != "succeeded"
-        || report["case"]["admitted_run_id"] != manifest.run_id
-        || execution["receipt"]["run_id"] != manifest.run_id
-        || !root.join("checkpoint.sqlite").is_file()
+    .map_err(|_| "invalid admission")?;
+    let quality = &report["measured"]["quality"];
+    if admission["run_id"] != report["case"]["admitted_run_id"]
+        || quality["run_id"] != admission["run_id"]
+        || quality["execution_manifest"] != report["case"]["manifest"]
+        || quality["input_digest"] != report["case"]["manifest"]["dataset_digest"]
+        || quality["events_digest"] != report["case"]["events_digest"]
+        || quality["schema_version"] != 1
+        || quality["predicate"] != "sort-7-2-7-1-and-sum-exact-v1"
+        || quality["selected_node"] != "start"
+        || quality["state_key"] != "node:start"
+        || quality["checkpoint_node"] != "done"
+        || !quality["checkpoint_sequence"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
     {
-        return Err("unaccepted minimal run");
+        return Err("semantic run identity rejected");
     }
-    let id = RunId::new(manifest.run_id.clone()).map_err(|_| "invalid run identity")?;
-    // The public store closes before the final semantic evidence is published/sealed.
-    let checkpoint = {
-        let store = SqliteCheckpointStore::open(
-            root.join("checkpoint.sqlite"),
-            manifest.checkpoint_manifest,
-        )
-        .map_err(|_| "checkpoint rejected")?;
-        store
-            .load_latest(&id)
-            .map_err(|_| "checkpoint unavailable")?
-            .ok_or("checkpoint missing")?
-    };
-    let bytes = fs::read(root.join("events.jsonl")).map_err(|_| "events unavailable")?;
-    let events = std::str::from_utf8(&bytes)
-        .map_err(|_| "invalid event encoding")?
-        .lines()
-        .map(serde_json::from_str::<WorkflowRuntimeEventV1>)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "invalid event")?;
-    WorkflowRuntimeEventLogV1::resume(&manifest.run_id, "minimal-workflow", events.clone())
-        .map_err(|_| "event identity rejected")?;
-    let state: Value =
-        serde_json::from_slice(checkpoint.state()).map_err(|_| "invalid checkpoint state")?;
-    let admitted_input: Value = serde_json::from_slice(
-        &fs::read(root.join("execution-input.json")).map_err(|_| "input unavailable")?,
-    )
-    .map_err(|_| "invalid input")?;
-    let input_digest = format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(&admitted_input).map_err(|_| "invalid input")?)
-    );
-    if admitted_input != input() || report["case"]["manifest"]["dataset_digest"] != input_digest {
-        return Err("semantic input identity rejected");
-    }
-    let terminal = events
-        .iter()
-        .rev()
-        .find(|e| {
-            matches!(
-                e.kind(),
-                Kind::WorkflowCompleted
-                    | Kind::WorkflowFailed
-                    | Kind::WorkflowCancelled
-                    | Kind::WorkflowIncomplete
-                    | Kind::WorkflowAbstained
-            )
-        })
-        .ok_or("missing terminal")?;
-    let completed = |node| {
-        events.iter().rev().find(|e| {
-            e.node_id() == Some(node)
-                && matches!(
-                    e.kind(),
-                    Kind::NodeStarted | Kind::NodeCompleted | Kind::NodeFailed
-                )
-        })
-    };
-    let start = completed("start").ok_or("missing model completion")?;
-    let done = completed("done").ok_or("missing terminal completion")?;
-    if checkpoint.run_id() != &id
-        || checkpoint.event_sequence() != events.last().ok_or("empty events")?.sequence()
-        || checkpoint.node_id()
-            != events
-                .iter()
-                .rev()
-                .find_map(|e| e.node_id())
-                .unwrap_or("terminal")
-        || terminal.kind() != Kind::WorkflowCompleted
-        || start.kind() != Kind::NodeCompleted
-        || done.kind() != Kind::NodeCompleted
-        || start.sequence() >= done.sequence()
-        || done.sequence() >= terminal.sequence()
-        || state["terminal"] != "done"
-    {
-        return Err("terminal generation rejected");
-    }
-    Ok(
-        json!({"schema_version":1,"predicate":"sort-7-2-7-1-and-sum-exact-v1","passed":state.get("node:start")==Some(&expected()),"input_digest":input_digest,"run_id":manifest.run_id,"checkpoint_sequence":checkpoint.event_sequence(),"checkpoint_node":checkpoint.node_id(),"events_digest":report["case"]["events_digest"],"manifest":report["case"]["manifest"]}),
-    )
+    quality.as_object().ok_or("unsupported semantic input")?;
+    Ok(quality.clone())
 }
 
 fn retain(output: &Path, evidence: &Value) {

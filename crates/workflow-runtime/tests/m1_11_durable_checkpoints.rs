@@ -45,6 +45,115 @@ fn manifest(run_id: &RunId) -> CheckpointManifestV1 {
 }
 
 #[test]
+fn read_only_checkpoint_reads_committed_wal_without_admitting_writes() {
+    let root = TestRoot::new();
+    let run_id = RunId::new("readonly-wal".to_owned()).unwrap();
+    let mut writer = SqliteCheckpointStore::open(root.database(), manifest(&run_id)).unwrap();
+    let first = DurableCheckpointV1::new(
+        run_id.clone(),
+        "first",
+        1,
+        b"first",
+        std::iter::empty::<String>(),
+    )
+    .unwrap();
+    writer.save_checkpoint(first).unwrap();
+    let expected = DurableCheckpointV1::new(
+        run_id.clone(),
+        "latest",
+        2,
+        b"latest",
+        std::iter::empty::<String>(),
+    )
+    .unwrap();
+    writer.save_checkpoint(expected.clone()).unwrap();
+    assert!(
+        fs::metadata(root.0.join("checkpoint.sqlite-wal"))
+            .unwrap()
+            .len()
+            > 0
+    );
+    let database = fs::read(root.database()).unwrap();
+    let wal = fs::read(root.0.join("checkpoint.sqlite-wal")).unwrap();
+    let manifest_bytes = fs::read(root.0.join("checkpoint-manifest.json")).unwrap();
+    let mut reader =
+        SqliteCheckpointStore::open_read_only(root.database(), manifest(&run_id)).unwrap();
+    assert_eq!(reader.load_latest(&run_id).unwrap(), Some(expected.clone()));
+    assert_eq!(
+        reader
+            .load_latest(&RunId::new("other-run".to_owned()).unwrap())
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        reader.save_checkpoint(expected.clone()).unwrap_err().kind(),
+        CheckpointErrorKind::Unavailable
+    );
+    drop(reader);
+    assert_eq!(writer.load_latest(&run_id).unwrap(), Some(expected));
+    assert_eq!(fs::read(root.database()).unwrap(), database);
+    assert_eq!(fs::read(root.0.join("checkpoint.sqlite-wal")).unwrap(), wal);
+    assert_eq!(
+        fs::read(root.0.join("checkpoint-manifest.json")).unwrap(),
+        manifest_bytes
+    );
+}
+
+#[test]
+fn read_only_checkpoint_rejects_missing_or_invalid_storage_without_repairs() {
+    let root = TestRoot::new();
+    let run_id = RunId::new("readonly-invalid".to_owned()).unwrap();
+    assert!(SqliteCheckpointStore::open_read_only(root.database(), manifest(&run_id)).is_err());
+    assert!(!root.database().exists());
+    assert!(!root.0.join("checkpoint-manifest.json").exists());
+    drop(SqliteCheckpointStore::open(root.database(), manifest(&run_id)).unwrap());
+    let original = fs::read(root.database()).unwrap();
+    let manifest_path = root.0.join("checkpoint-manifest.json");
+    let original_manifest = fs::read(&manifest_path).unwrap();
+    fs::remove_file(&manifest_path).unwrap();
+    assert!(SqliteCheckpointStore::open_read_only(root.database(), manifest(&run_id)).is_err());
+    assert!(!manifest_path.exists());
+    assert_eq!(fs::read(root.database()).unwrap(), original);
+    fs::write(&manifest_path, &original_manifest).unwrap();
+    fs::write(root.database(), []).unwrap();
+    assert!(SqliteCheckpointStore::open_read_only(root.database(), manifest(&run_id)).is_err());
+    assert_eq!(fs::metadata(root.database()).unwrap().len(), 0);
+    fs::write(root.database(), original).unwrap();
+    for statement in [
+        "DELETE FROM kit_checkpoint_meta",
+        "DROP TABLE kit_checkpoints",
+    ] {
+        let connection = Connection::open(root.database()).unwrap();
+        connection.execute_batch(statement).unwrap();
+        drop(connection);
+        let before = fs::read(root.database()).unwrap();
+        assert!(SqliteCheckpointStore::open_read_only(root.database(), manifest(&run_id)).is_err());
+        assert_eq!(fs::read(root.database()).unwrap(), before);
+        // Recreate only through the writer owner for the next independent invalid case.
+        fs::remove_file(root.database()).unwrap();
+        drop(SqliteCheckpointStore::open(root.database(), manifest(&run_id)).unwrap());
+    }
+    assert_eq!(
+        SqliteCheckpointStore::open_read_only(
+            root.database(),
+            manifest(&run_id).with_workflow_hash("other")
+        )
+        .unwrap_err()
+        .kind(),
+        CheckpointErrorKind::ManifestMismatch
+    );
+    assert_eq!(
+        SqliteCheckpointStore::open_read_only(
+            root.database(),
+            manifest(&run_id).with_schema_version(2)
+        )
+        .unwrap_err()
+        .kind(),
+        CheckpointErrorKind::UnknownVersion
+    );
+}
+
+#[test]
 fn sqlite_checkpoint_survives_store_restart_with_run_scoped_state() {
     let root = TestRoot::new();
     let run_id = RunId::new("run-restart".to_owned()).unwrap();

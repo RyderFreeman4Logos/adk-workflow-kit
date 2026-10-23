@@ -430,12 +430,41 @@ The underlying runtime artifacts remain private and may retain workflow data;
 the public report is not a sanitizer for that directory. Do not publish it wholesale.
 
 `bench-230 measure-report DIR` validates the plan/admission, original receipt,
-event-byte digest and typed event sequence/integrity, then recomputes the projection
-and requires exact equality. It never calls a provider. Changed metrics, origins,
+event-byte digest and typed event sequence/integrity, then recomputes the original
+projection and requires exact equality. It never calls a provider. Changed metrics, origins,
 plans, receipts or event bytes fail closed. These are consistency hashes, not
 signed provenance or protection against coordinated owner forgery. Missing
 completion after admission is ambiguous; preserve evidence and use a new directory,
 not replay/resume. This one-case path is not a sealed holdout campaign.
+
+The `measured` schema-version-1 row is derived after those checks. For the exact
+minimal sorting request used below, the production report reads the selected
+`node:start` output through the public checkpoint API, verifies its completed
+terminal event generation, and recomputes predicate
+`sort-7-2-7-1-and-sum-exact-v1`. It binds the output digest, run, input, selected
+node, checkpoint sequence, events and producer source. External `passed` or
+quality sidecars are not authority. A wrong but complete answer has quality 0;
+the exact answer has quality 1000. Other tasks have null quality rather than an
+invented judge. Raw counts from one response remain optional; multiple-response
+runs retain their individual `model_calls` without inventing one combined count.
+Security failures and their confidence bound remain null without a security
+observation. Provider completion is a distinct dimension from visible output.
+The checkpoint reader requires existing compatible data and never initializes or
+repairs its database, schema, metadata or manifest. It reads committed WAL frames;
+SQLite may still coordinate through derived SHM files. Close readers before sealing
+evidence; read-only checkpoint data does not imply zero directory I/O.
+
+`bench-230 measure-compare LEFT_DIR RIGHT_DIR` revalidates both measurements and
+pairs distinct runs of the same case, workflow and canonical input. Its row
+retains each side's fixture/provider origin, opt-in assertion and binding digest,
+each source/config identity, and explicitly lists changed source/config
+fields. It shares the fixture Pareto dominance arithmetic, maximizing observed
+host-predicate quality and minimizing **provider completion count**. Missing
+quality/count points are excluded with a reason. Token deltas use exact signed
+decimal strings. Safety deltas and single-pair confidence intervals are null;
+neither a frontier nor a null safety observation is a security acceptance or a
+causal performance claim. Legacy fixture reports keep their existing visible-token
+and mandatory-observation contracts.
 
 `just issue-230-telemetry` exercises the public binary against a real local HTTP
 script, verifies wire model/effort and runtime-event usage provenance, missing usage,
@@ -448,6 +477,14 @@ separate from `fixture` and from offline fake-model cache/suite execution.
 These observations bind source revision `ad19edb50e294197a642b16fab0a6c9080d4be12`
 and bench executable SHA-256
 `2c366769951205333e4cec4cbbfa09164079bd1d483355db9c9c9867ba8436d2`.
+
+A subsequent report-only analysis used independent byte copies of those retained
+public checkpoints. The measured bridge revalidated both selected outputs at
+sequence 7 with the versioned host predicate, producing quality 1000 for each
+and preserving the original 151/193 provider completion counts. The derived
+output bindings are separate from the unchanged original semantic proofs. This
+is analysis of historical execution evidence, not a new provider invocation or
+live acceptance on the later analyzer source.
 They bind observed client source/binary identities and results, not remote model weights.
 
 - One `just issue-230-smoke` command successfully executed all four registered
@@ -511,10 +548,12 @@ are the measured execution path.
   implied by these capabilities.
 - Automatic checkpoint/effect reconciliation remains deliberately unsupported.
   Completed-case resume and explicit fail-closed abandonment are implemented.
-- Integrate measured safety/quality evaluation and authorized private holdout data;
+- Extend measured host predicates, safety observations and authorized private holdout data;
   offline regression/adaptive/soak/sealed-final execution policy is implemented,
   but the public scripted examples are not unseen semantic holdout evidence.
 - Add measured accuracy/security intervals, independent repeated sampling,
-  paired token/cost/cache vectors and measured Pareto reports. Single-pair source
+  and optional cost/cache dimensions beyond the paired raw-token/quality reports. Single-pair source
   revision and explicit loop-budget config-only elapsed-time thresholds are
-  implemented; arbitrary config changes and joint source/config changes are not.
+  implemented. Those elapsed-time threshold commands do not support arbitrary
+  or joint source/config changes; descriptive measured-pair comparisons do not
+  expand that performance-admission policy.

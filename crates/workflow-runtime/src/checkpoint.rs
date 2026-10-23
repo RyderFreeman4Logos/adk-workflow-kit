@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rusqlite::{Connection, Error as SqliteError, OptionalExtension, params};
+use rusqlite::{Connection, Error as SqliteError, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::{REDACTION_MARKER, RunId, event::contains_sensitive_key};
@@ -312,6 +312,58 @@ pub struct SqliteCheckpointStore {
 pub type SqliteCheckpointBackend = SqliteCheckpointStore;
 
 impl SqliteCheckpointStore {
+    /// Opens existing compatible checkpoint data without creating or repairing it.
+    ///
+    /// The database, manifest, schema, and metadata must already exist. Saves through
+    /// this connection fail. Committed WAL frames remain visible; SQLite may still
+    /// create/update its derived SHM coordination file. This is not a promise of
+    /// zero directory I/O, and readers must close before evidence is sealed.
+    pub fn open_read_only(
+        path: impl Into<PathBuf>,
+        manifest: CheckpointCompatibilityManifestV1,
+    ) -> Result<Self, CheckpointError> {
+        if manifest.schema_version != CHECKPOINT_SCHEMA_VERSION {
+            return Err(CheckpointError::new(CheckpointErrorKind::UnknownVersion));
+        }
+        let path = path.into();
+        secure_parent(&path)?;
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            secure_existing_file(Path::new(&sidecar))?;
+        }
+        let manifest_path = path.with_file_name(CHECKPOINT_MANIFEST_FILE);
+        secure_existing_file(&manifest_path)?;
+        let bytes = fs::read(&manifest_path)
+            .map_err(|_| CheckpointError::new(CheckpointErrorKind::Unavailable))?;
+        validate_manifest(&bytes, &manifest)?;
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(map_sqlite_error)?;
+        let (version, encoded): (i64, String) = connection
+            .query_row(
+                "SELECT schema_version, manifest_json FROM kit_checkpoint_meta WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(map_sqlite_error)?;
+        if version != i64::from(CHECKPOINT_SCHEMA_VERSION) {
+            return Err(CheckpointError::new(CheckpointErrorKind::UnknownVersion));
+        }
+        validate_manifest(encoded.as_bytes(), &manifest)?;
+        connection
+            .prepare("SELECT run_id, node_id, event_sequence, state, artifact_refs_json FROM kit_checkpoints LIMIT 0")
+            .map_err(map_sqlite_error)?;
+        Ok(Self {
+            path,
+            connection,
+            manifest,
+            fail_saves: false,
+        })
+    }
+
     /// Opens or creates a secure, run-scoped SQLite checkpoint database.
     pub fn open(
         path: impl Into<PathBuf>,
@@ -327,15 +379,7 @@ impl SqliteCheckpointStore {
         if manifest_path.exists() {
             let persisted = fs::read(&manifest_path)
                 .map_err(|_| CheckpointError::new(CheckpointErrorKind::Corrupt))?;
-            let persisted: CheckpointCompatibilityManifestV1 =
-                serde_json::from_slice(&persisted)
-                    .map_err(|_| CheckpointError::new(CheckpointErrorKind::Corrupt))?;
-            if persisted.schema_version != CHECKPOINT_SCHEMA_VERSION {
-                return Err(CheckpointError::new(CheckpointErrorKind::UnknownVersion));
-            }
-            if persisted != manifest {
-                return Err(CheckpointError::new(CheckpointErrorKind::ManifestMismatch));
-            }
+            validate_manifest(&persisted, &manifest)?;
         } else {
             write_manifest(&manifest_path, &manifest)?;
         }
@@ -502,6 +546,21 @@ impl SqliteCheckpointStore {
         })
         .transpose()
     }
+}
+
+fn validate_manifest(
+    bytes: &[u8],
+    expected: &CheckpointCompatibilityManifestV1,
+) -> Result<(), CheckpointError> {
+    let persisted: CheckpointCompatibilityManifestV1 = serde_json::from_slice(bytes)
+        .map_err(|_| CheckpointError::new(CheckpointErrorKind::Corrupt))?;
+    if persisted.schema_version != CHECKPOINT_SCHEMA_VERSION {
+        return Err(CheckpointError::new(CheckpointErrorKind::UnknownVersion));
+    }
+    if &persisted != expected {
+        return Err(CheckpointError::new(CheckpointErrorKind::ManifestMismatch));
+    }
+    Ok(())
 }
 
 impl CheckpointBackend for SqliteCheckpointStore {
