@@ -1,0 +1,1 @@
+Search the supplied source repository with search_code using the question and selected plan. On a retry use the previous coverage verdict to refine the query. Return an object with matches copied from actual tool results: path, one-based line and exact snippet. Never fabricate a tool result.

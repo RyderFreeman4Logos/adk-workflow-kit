@@ -1,1 +1,1 @@
-Repair only defects named by the isolated structured review. Preserve valid evidence bindings and remain read-only.
+Repair only the supplied current answer and named grounding/review defects. Use node:revise when present, otherwise node:draft. Return an InvestigationAnswer object with source-supported claims, not a status string. Preserve input.snapshot.id, verified file digests and exact inspected ranges/snippets; bind each evidence.claim_id. Remain read-only and do not invent evidence.

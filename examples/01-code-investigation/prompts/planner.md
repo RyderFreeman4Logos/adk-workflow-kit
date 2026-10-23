@@ -1,1 +1,1 @@
-Plan a bounded read-only investigation. Select source searches that can support each requested claim.
+Plan a bounded read-only investigation for input.question under input.path. Use only supplied host snapshot facts. Return a concise search/read plan string; do not claim evidence before the tools run.

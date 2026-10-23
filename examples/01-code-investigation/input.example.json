@@ -1,1 +1,1 @@
-{"question":"Where is the default retry path?","path":"src"}
+{"question":"Where is the default retry path?","path":"src","snapshot":{"id":"sha256:b670c07a0f85acdbb7d921c5510905d17f498c6f3841f5a3cb5c7cf84e6e775e","files":{"Cargo.toml":"sha256:d2d0ed78f55137df3ce5c29b8dba779774d5a121f367e7685ec2be470ed02978","src/lib.rs":"sha256:7b8ce7a4a46a1e002a54a864a948feeba6eed32849d4bb77a30f74c591be1a8d","src/retry.rs":"sha256:4eba2d51911d695cd6341f0db4e352d82264f1dcc3a7c9d1971ee0dd769230b3"}}}

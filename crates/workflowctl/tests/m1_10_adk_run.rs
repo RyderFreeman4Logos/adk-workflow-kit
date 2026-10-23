@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use workflow_runtime::{
     ArtifactStore, CheckpointManifestV1, FilesystemArtifactStore, PageRequest, RunId,
-    SqliteCheckpointStore, WorkflowRuntimeEventV1,
+    SqliteCheckpointStore, WorkflowRuntimeEventKindV1, WorkflowRuntimeEventV1,
 };
 
 #[path = "support/m1_10_artifact_owner.rs"]
@@ -29,6 +29,10 @@ mod owned_tree;
 
 #[path = "support/m1_10_auth.rs"]
 mod m1_10_auth;
+#[path = "support/oracle_phase.rs"]
+mod oracle_phase;
+#[path = "support/oracle_phase_tests.rs"]
+mod oracle_phase_tests;
 
 static TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -663,18 +667,23 @@ fn record_oracle_failure_boundary(operation: &'static str) -> Option<std::ffi::O
     }
     std::env::var_os(ORACLE_FAILURE_BOUNDARY_SINK_ENV)
 }
-fn write_oracle_failure_boundary(path: std::ffi::OsString, phases: &[&'static str]) {
+fn oracle_failure_file(path: &std::ffi::OsStr) -> Option<fs::File> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let Ok(mut file) = fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-    else {
+        .ok()?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .ok()?;
+    Some(file)
+}
+fn write_oracle_failure_boundary(path: std::ffi::OsString, phases: &[&'static str]) {
+    let Some(mut file) = oracle_failure_file(&path) else {
         return;
     };
-    let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
     for phase in phases {
         let _ = writeln!(file, "phase={phase}");
     }
@@ -926,12 +935,16 @@ fn serve_oracle_request_until_child_done(
     let mut child_observed_at = None;
     let (mut socket, _) = loop {
         match listener.accept() {
-            Ok(connection) => break connection,
+            Ok(connection) => {
+                oracle_phase::mark(33, 0);
+                break connection;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if expected_identity.is_none() {
                     match child_identity.as_ref().map(|rx| rx.try_recv()) {
                         Some(Ok(identity)) => expected_identity = Some(identity),
                         Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                            oracle_phase::mark(65, 0);
                             return Err("oracle listener accept timed out");
                         }
                         Some(Err(mpsc::TryRecvError::Empty)) | None => {}
@@ -943,9 +956,11 @@ fn serve_oracle_request_until_child_done(
                     })
                 {
                     child_observed_at = Some(Instant::now());
+                    oracle_phase::mark(32, expected_identity.map_or(0, |identity| identity.pid));
                 }
                 match oracle_accept_progress(false, child_observed_at, Instant::now(), deadline) {
                     OracleAcceptProgress::TimedOut => {
+                        oracle_phase::mark(65, 1);
                         return Err("oracle listener accept timed out");
                     }
                     OracleAcceptProgress::Wait => thread::yield_now(),
@@ -1426,6 +1441,7 @@ fn wait_bounded_child(
     deadline: Instant,
     operation: &'static str,
 ) -> Result<Output, String> {
+    oracle_phase::mark(29, 0);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1433,8 +1449,14 @@ fn wait_bounded_child(
             Ok(None) => {
                 // Record the boundary locally; emit only after containment so
                 // a refused or blocking sink cannot delay cleanup.
-                let boundary = record_oracle_failure_boundary(operation);
+                oracle_phase::mark(30, 0);
+                let boundary = if oracle_phase::current().is_none() {
+                    record_oracle_failure_boundary(operation)
+                } else {
+                    None
+                };
                 let (cleanup, reaped) = clean_up_child_with_reap(child, operation);
+                oracle_phase::mark(31, u32::from(reaped));
                 let phases = if reaped {
                     &["child_spawned", "wait_deadline", "child_reaped"][..]
                 } else {
@@ -1462,6 +1484,7 @@ fn wait_bounded_child(
             }
         }
     };
+    oracle_phase::mark(34, 1);
     let stdout = read_child_output(stdout_path).map_err(str::to_owned)?;
     let stderr = read_child_output(stderr_path).map_err(str::to_owned)?;
     Ok(Output {
@@ -1488,25 +1511,47 @@ fn run_oracle_operation(
     } else {
         command.env_remove(credential.0);
     }
+    oracle_phase::configure(&mut command);
+    oracle_phase::mark(22, 0);
     let child = command
         .stdout(Stdio::from(
-            fs::File::create(&stdout_path).map_err(|_| "oracle child stdout create failed")?,
+            {
+                oracle_phase::mark(86, 0);
+                let result = fs::File::create(&stdout_path);
+                oracle_phase::mark(87, u32::from(result.is_err()));
+                result
+            }
+            .map_err(|_| "oracle child stdout create failed")?,
         ))
         .stderr(Stdio::from(
-            fs::File::create(&stderr_path).map_err(|_| "oracle child stderr create failed")?,
+            {
+                oracle_phase::mark(88, 0);
+                let result = fs::File::create(&stderr_path);
+                oracle_phase::mark(89, u32::from(result.is_err()));
+                result
+            }
+            .map_err(|_| "oracle child stderr create failed")?,
         ))
         .spawn()
         .map_err(|_| "oracle child spawn failed")?;
+    oracle_phase::mark(23, child.id());
+    let mut phase_identity = None;
     if let Some(tx) = spawned {
         let pid = child.id();
         match owned_child_stat(pid) {
             OwnedChildStat::Ready { starttime, .. } if starttime != 0 => {
-                let _ = tx.send(OracleChildIdentity { pid, starttime });
+                let identity = OracleChildIdentity { pid, starttime };
+                phase_identity = Some(identity);
+                let _ = tx.send(identity);
             }
             _ => {}
         }
     }
     let wait_deadline = Instant::now() + ORACLE_TIMEOUT;
+    oracle_phase::mark(26, 5000);
+    if let (Some(sender), Some(identity)) = (oracle_phase::current(), phase_identity) {
+        sender.child(identity);
+    }
     wait_bounded_child(child, &stdout_path, &stderr_path, wait_deadline, operation)
 }
 
@@ -1742,6 +1787,23 @@ fn post_execution_artifact_failure_still_persists_the_returned_receipt() {
         "artifact persistence failure must report the stable category",
     );
     let failed_receipt = json_stdout(&failed);
+    let events = workflow_events_from_bytes(
+        &fs::read(run_root(&runs).join("events.jsonl"))
+            .expect("post-execution failure events must remain readable"),
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind() == WorkflowRuntimeEventKindV1::WorkflowCompleted),
+        "artifact collision must occur after public workflow completion"
+    );
+    assert!(
+        events
+            .iter()
+            .rfind(|event| event.kind() == WorkflowRuntimeEventKindV1::NodeCompleted)
+            .is_some_and(|event| event.node_id() == Some("done")),
+        "artifact collision must retain the final done-node completion"
+    );
     assert!(
         failed_receipt["status"] == "succeeded",
         "artifact persistence failure must occur after graph execution"

@@ -340,6 +340,7 @@ impl SqliteCheckpointStore {
             write_manifest(&manifest_path, &manifest)?;
         }
 
+        let created_database = !path.exists();
         let connection = Connection::open(&path).map_err(map_sqlite_error)?;
         connection
             .execute_batch(
@@ -389,6 +390,14 @@ impl SqliteCheckpointStore {
                     )
                     .map_err(map_sqlite_error)?;
             }
+        }
+        if created_database {
+            fs::File::open(
+                path.parent()
+                    .ok_or_else(|| CheckpointError::new(CheckpointErrorKind::InsecurePath))?,
+            )
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| CheckpointError::new(CheckpointErrorKind::Unavailable))?;
         }
         Ok(Self {
             path,
@@ -552,6 +561,13 @@ fn write_manifest(
         file.sync_all()
             .map_err(|_| CheckpointError::new(CheckpointErrorKind::Unavailable))?;
         fs::rename(&temporary, path)
+            .and_then(|()| {
+                fs::File::open(
+                    path.parent()
+                        .ok_or_else(|| std::io::Error::other("checkpoint parent unavailable"))?,
+                )?
+                .sync_all()
+            })
             .map_err(|_| CheckpointError::new(CheckpointErrorKind::Unavailable))
     })();
     if result.is_err() {

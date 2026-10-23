@@ -762,7 +762,7 @@ fn execution_backend_runs_host_injected_durable_effect_and_rejects_mismatched_re
     .expect("tampered report");
     let resumed =
         ExecutionBackend::resume_with_implementations(&runs, receipt.run_id(), &implementations)
-            .expect("live projection on completed resume");
+            .expect("checkpoint-bound audit on completed resume");
     assert_eq!(
         serde_json::to_value(&resumed).expect("receipt JSON")["effect_audits"],
         report["effect_audits"]

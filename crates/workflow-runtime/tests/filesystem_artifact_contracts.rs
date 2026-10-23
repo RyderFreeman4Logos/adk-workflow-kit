@@ -322,6 +322,9 @@ fn commit_is_the_single_atomic_visibility_transition() {
     let id = store
         .commit(staged)
         .expect("commit must publish the staged content");
+    store
+        .sync_published()
+        .expect("checkpoint dependency must be durable");
 
     let entries = fs::read_dir(base.path())
         .expect("store root must be readable")
@@ -346,6 +349,27 @@ fn commit_is_the_single_atomic_visibility_transition() {
         store
             .read_page(&id, PageRequest::new(0, nonzero(8)))
             .expect("committed content must be readable")
+            .bytes(),
+        b"abc"
+    );
+}
+
+#[test]
+fn durability_failure_preserves_already_published_content() {
+    let (base, mut store) = new_store(16, 8);
+    let id = store.put(b"abc").unwrap();
+    let moved = base.path().with_extension("retained");
+    fs::rename(base.path(), &moved).unwrap();
+    fs::write(base.path(), b"not a directory").unwrap();
+    assert!(store.sync_published().is_err());
+    assert_eq!(fs::read(moved.join(id.as_str())).unwrap(), b"abc");
+    fs::remove_file(base.path()).unwrap();
+    fs::rename(moved, base.path()).unwrap();
+    store.sync_published().unwrap();
+    assert_eq!(
+        store
+            .read_page(&id, PageRequest::new(0, nonzero(8)))
+            .unwrap()
             .bytes(),
         b"abc"
     );

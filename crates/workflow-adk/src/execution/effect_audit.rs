@@ -1,7 +1,8 @@
 //! Advisory effect provenance, scoped to real invocations and checkpoint-bound completions.
+//! Distinct full snapshots survive collection; identical projections are deduplicated.
 use super::{
-    CompletedCall, ExecutionError, ExecutionErrorKind, ExecutionProfileV1, ExecutionReceipt,
-    LoopLedgerStore, PendingCall, RunManifestV2, node_cache_inventory,
+    CompletedCall, ExecutionError, ExecutionErrorKind, ExecutionReceipt, LoopLedgerStore,
+    PendingCall, RunManifestV2, node_cache_inventory,
 };
 use serde_json::Value;
 use std::{
@@ -13,26 +14,9 @@ use workflow_runtime::effect_ledger::EffectAuditReceipt;
 use workflow_runtime::{ChildSandbox, ToolBridgeError, ToolCallContext, ToolHandler};
 use workflow_runtime::{SandboxCapability, ToolRegistration};
 
-/// Checkpoint-bound advisory identity, never execution authority.
-#[derive(Clone, Debug, serde::Deserialize, PartialEq, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct CompletedEffect {
-    effect_key: String,
-    approval_digest: String,
-    executor_digest: String,
-}
-impl CompletedEffect {
-    fn from_receipt(receipt: &EffectAuditReceipt) -> Self {
-        Self {
-            effect_key: receipt.effect_key.clone(),
-            approval_digest: receipt.approval_digest.clone(),
-            executor_digest: receipt.executor_digest.clone(),
-        }
-    }
-}
 type Invocation = (String, String, String);
 #[derive(Clone, Default)]
-pub(super) struct EffectAudits(Arc<Mutex<BTreeMap<Invocation, Option<CompletedEffect>>>>);
+pub(super) struct EffectAudits(Arc<Mutex<BTreeMap<Invocation, Option<EffectAuditReceipt>>>>);
 
 impl EffectAudits {
     pub(super) fn wrap(
@@ -50,26 +34,18 @@ impl EffectAudits {
 
     pub(super) fn collect(
         &self,
-        profile: &ExecutionProfileV1,
         ledger: Option<&LoopLedgerStore>,
     ) -> Result<Vec<EffectAuditReceipt>, ExecutionError> {
-        let Some(registry) = profile.tool_implementations.as_ref() else {
-            return Ok(Vec::new());
-        };
-        let mut receipts = BTreeMap::new();
+        let mut receipts = Vec::new();
         let calls = self
             .0
             .lock()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-        for (name, version, fingerprint) in calls.keys() {
-            // Invalid live bindings cannot produce evidence or replace the execution verdict.
-            if let Ok(Some(receipt)) = registry.effect_audit(name, version, fingerprint) {
-                receipts.insert(receipt.effect_key.clone(), receipt);
-            }
-        }
+        receipts.extend(calls.values().flatten().cloned());
         drop(calls);
-        // Never consult run-manifest evidence: only checkpoint-bound completed calls
-        // may select a live projection on resume. Reports cannot authorize execution.
+        // Preserve the actual invocation's advisory snapshot. Neither a mutable
+        // run manifest nor a compatible current handler supplies historical truth.
+        // Resume still requires the existing registry and checkpoint admission.
         if let Some(ledger) = ledger {
             let nodes = ledger
                 .nodes
@@ -80,24 +56,27 @@ impl EffectAudits {
                 .flat_map(|state| &state.completed_calls)
                 .map(CompletedCall::call)
             {
-                if let Some(binding) = call.effect.as_ref()
-                    && let Some(version) = call
-                        .response
-                        .as_ref()
-                        .and_then(|response| response.pointer("/provenance/tool_version"))
-                        .and_then(Value::as_str)
-                    && let Ok(Some(receipt)) =
-                        registry.effect_audit(&call.name, version, &call.fingerprint)
-                    && CompletedEffect::from_receipt(&receipt) == *binding
-                {
-                    receipts.insert(receipt.effect_key.clone(), receipt);
+                if let Some(receipt) = &call.effect {
+                    receipts.push(receipt.clone());
                 }
             }
         }
-        Ok(receipts.into_values().collect())
+        // A remote deduplication key does not identify an approval or its history.
+        // Full serialized values provide stable ordering across invocation/replay sources.
+        let mut ordered = receipts
+            .into_iter()
+            .map(|receipt| {
+                serde_json::to_vec(&receipt)
+                    .map(|key| (key, receipt))
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ordered.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        ordered.dedup_by(|(_, left), (_, right)| left == right);
+        Ok(ordered.into_iter().map(|(_, receipt)| receipt).collect())
     }
 
-    // Both ordinary completion and pending replay retain identity from the actual
+    // Both ordinary completion and pending replay retain evidence from the actual
     // invocation, not from a response payload or a newly registered handler.
     pub(super) fn completed(
         &self,
@@ -170,15 +149,9 @@ impl ToolHandler for AuditedHandler {
         let binding = calls
             .entry((self.name.clone(), self.version.clone(), fingerprint.clone()))
             .or_default();
-        if result.is_ok() {
-            *binding = self
-                .handler
-                .effect_audit(&fingerprint)
-                .ok()
-                .flatten()
-                .as_ref()
-                .map(CompletedEffect::from_receipt);
-        }
+        // A handler error may follow a real effect. Retain its advisory evidence
+        // too, while an unavailable audit never replaces the handler's result.
+        *binding = self.handler.effect_audit(&fingerprint).ok().flatten();
         result
     }
 }

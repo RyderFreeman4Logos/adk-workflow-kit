@@ -38,13 +38,21 @@ fn child_identity(root: &Path) -> (u32, u64) {
     )
 }
 
-fn child_instance_gone(pid: u32, starttime: u64) -> bool {
+fn child_instance_state(pid: u32, starttime: u64) -> &'static str {
     match owned_child_stat(pid) {
         OwnedChildStat::Ready {
             starttime: observed,
-            ..
-        } => observed != starttime,
-        OwnedChildStat::Errno(libc::ENOENT | libc::ESRCH) => true,
+            state,
+        } => {
+            if observed != starttime {
+                "gone"
+            } else if state == 'Z' {
+                "zombie"
+            } else {
+                "live"
+            }
+        }
+        OwnedChildStat::Errno(libc::ENOENT | libc::ESRCH) => "gone",
         OwnedChildStat::Errno(_) | OwnedChildStat::Unavailable => {
             eprintln!("artifact fixture descendant identity unknown; aborting");
             std::process::abort();
@@ -139,7 +147,7 @@ impl Outer {
             std::process::abort();
         }
         let (child_pid, child_starttime) = child_identity(&self.root);
-        while !child_instance_gone(child_pid, child_starttime) {
+        while child_instance_state(child_pid, child_starttime) != "gone" {
             if Instant::now() >= self.deadline {
                 eprintln!("artifact fixture descendant exit unproven; aborting");
                 std::process::abort();
@@ -224,6 +232,14 @@ fn artifact_owner_fixture() {
         ("collision-error", Err(error)) if error.contains("collision") => "collision-error",
         _ => "unexpected",
     };
+    if witnessed(&root.join("hold-result")) {
+        assert_eq!(reap, "echild", "hold only after direct child reap");
+        fs::write(root.join("reaped-before-result"), b"reaped").expect("helper reap witness");
+        wait_for(
+            &root.join("release-result"),
+            Instant::now() + Duration::from_secs(40),
+        );
+    }
     fs::write(root.join("helper-result"), format!("{outcome}-{reap}"))
         .expect("helper result witness");
     if witnessed(&root.join("hold-exit")) {
@@ -245,9 +261,20 @@ fn exercise_case(mode: &str, expected: &str, entered: bool, hold_exit: bool) {
         fs::write(root.join("hold-exit"), b"hold").expect("hold helper exit");
     }
     let mut outer = Outer::spawn(&root, &format!("helper-{mode}"));
+    exercise_owned_case(&root, &mut outer, mode, expected, entered, hold_exit);
+}
+
+fn exercise_owned_case(
+    root: &Path,
+    outer: &mut Outer,
+    mode: &str,
+    expected: &str,
+    entered: bool,
+    hold_exit: bool,
+) {
     let ready_deadline = Instant::now() + ORACLE_TIMEOUT;
     wait_for(&root.join("ready"), ready_deadline);
-    let (pid, starttime) = child_identity(&root);
+    let (pid, starttime) = child_identity(root);
     assert!(
         matches!(
             owned_child_stat(pid),
@@ -270,14 +297,21 @@ fn exercise_case(mode: &str, expected: &str, entered: bool, hold_exit: bool) {
         thread::sleep(Duration::from_millis(10));
     }
     let pending_before_rescue = !witnessed(&root.join("helper-result"));
-    if pending_before_rescue {
-        assert!(
-            !child_instance_gone(pid, starttime),
-            "child must still be live before rescue"
-        );
-        eprintln!("artifact owner {mode} pending before rescue after ready/entry");
-        fs::write(root.join("release"), b"release").expect("cooperative rescue");
-    }
+    let pending_child_state = if pending_before_rescue {
+        // H may be between reaping C and publishing its result. Observe C's
+        // identity instead of inferring its lifetime from H's missing record.
+        let state = child_instance_state(pid, starttime);
+        eprintln!("artifact owner mode={mode} pending before rescue; child={state}");
+        if state == "live" {
+            fs::write(root.join("release"), b"release").expect("cooperative rescue");
+        }
+        if witnessed(&root.join("hold-result")) {
+            fs::write(root.join("release-result"), b"release").expect("release held result");
+        }
+        state
+    } else {
+        "not-pending"
+    };
     wait_for(&root.join("helper-result"), outer.deadline);
     if hold_exit {
         wait_for(&root.join("exit-held"), outer.deadline);
@@ -299,7 +333,7 @@ fn exercise_case(mode: &str, expected: &str, entered: bool, hold_exit: bool) {
     assert_eq!(result, expected, "artifact owner result");
     assert!(
         !pending_before_rescue,
-        "artifact owner exceeded its deadline"
+        "artifact owner exceeded its deadline; mode={mode}; child={pending_child_state}"
     );
 }
 
@@ -317,4 +351,69 @@ fn artifact_allocation_owner_reaps_after_collision_failure() {
 #[test]
 fn artifact_allocation_owner_waits_for_helper_exit() {
     exercise_case("collision-error", "collision-error-echild", false, true);
+}
+
+#[test]
+fn artifact_allocation_owner_reports_deadline_after_child_reap() {
+    let root = temp_root("artifact-owner-reaped");
+    fs::write(root.join("hold-result"), b"hold").expect("hold helper result");
+    let mut outer = Outer::spawn(&root, "helper-collision-error");
+    let helper_pid = outer.child.as_ref().expect("owned helper").id();
+    let helper_starttime = match owned_child_stat(helper_pid) {
+        OwnedChildStat::Ready { starttime, .. } => starttime,
+        _ => panic!("helper identity unavailable"),
+    };
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        exercise_owned_case(
+            &root,
+            &mut outer,
+            "collision-error",
+            "collision-error-echild",
+            false,
+            false,
+        );
+    }))
+    .expect_err("held result must preserve the original deadline failure");
+    assert!(witnessed(&root.join("reaped-before-result")));
+    let (pid, starttime) = child_identity(&root);
+    assert_eq!(
+        child_instance_state(pid, starttime),
+        "gone",
+        "C must be reaped"
+    );
+
+    // Also settle the old failing implementation before inspecting its panic.
+    if outer.child.is_some() {
+        fs::write(root.join("release-result"), b"release").expect("release held result");
+        while !observed_without_reap(outer.child.as_ref().expect("owned helper")) {
+            assert!(Instant::now() < outer.deadline, "helper did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(outer.settle().success(), "helper must exit naturally");
+    }
+    assert_eq!(
+        fs::read_to_string(root.join("helper-result")).expect("helper result"),
+        "collision-error-echild"
+    );
+    assert_eq!(child_instance_state(helper_pid, helper_starttime), "gone");
+    // SAFETY: H was our direct child and has been reaped by Outer.
+    assert_eq!(
+        unsafe { libc::waitpid(helper_pid as i32, std::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    // SAFETY: signal zero only checks the previously owned, now settled group.
+    assert_eq!(unsafe { libc::kill(-(helper_pid as i32), 0) }, -1);
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .expect("finite deadline diagnostic");
+    assert!(message.contains("artifact owner exceeded its deadline"));
+    assert!(message.contains("mode=collision-error"));
+    assert!(message.contains("child=gone"));
 }

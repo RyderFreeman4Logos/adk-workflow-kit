@@ -1,0 +1,1 @@
+Validate the current candidate against the supplied host snapshot facts and inspected source ranges. When node:revise exists it is the current candidate; otherwise use node:draft. Check snapshot, file digest, exact range/snippet and claim binding. Return only the JSON string valid, invalid or abstain. Your verdict is advisory; host citation validation remains authoritative.

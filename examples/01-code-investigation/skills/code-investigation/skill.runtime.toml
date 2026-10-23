@@ -19,7 +19,7 @@ sha256 = "sha256:1e51089a115c8998ffa2ed8cc5b1b52c637a156596540a3a98c4152eaf9601b
 
 [[resources]]
 id = "references/investigation-input.json"
-sha256 = "sha256:079e99957548044be0471e22c626114585d9edc01991cc178175145ab745b397"
+sha256 = "sha256:1f5cf8cd79810b15d425741e66d770b94a55c53e2fca53ae86e2500a8d9e8da1"
 
 [[resources]]
 id = "references/investigation-output.json"

@@ -60,8 +60,19 @@ fn load_profile() -> Value {
         .expect("profile JSON")
 }
 
-fn finished(output: &str) -> Value {
-    Value::String(format!(r#"{{"status":"finished","output":"{output}"}}"#))
+fn finished(output: impl Into<Value>) -> Value {
+    Value::String(json!({"status": "finished", "output": output.into()}).to_string())
+}
+
+fn draft_answer() -> Value {
+    let profile = load_profile();
+    let finish: Value = serde_json::from_str(
+        profile["model"]["responses"][12]
+            .as_str()
+            .expect("draft finish"),
+    )
+    .expect("draft finish JSON");
+    finish["output"].clone()
 }
 
 fn input_json() -> String {
@@ -207,11 +218,23 @@ fn canonical_package_validates_graphs_and_locks() {
         "profiles/fake.json",
         "replay.json",
         "workflow.toml",
+        "prompts/prepare.md",
         "prompts/planner.md",
+        "prompts/search.md",
+        "prompts/inspect.md",
+        "prompts/coverage.md",
+        "prompts/draft.md",
+        "prompts/grounding.md",
         "prompts/reviewer.md",
         "prompts/reviser.md",
         "schemas/investigation-input.json",
         "schemas/investigation-output.json",
+        "schemas/summary.json",
+        "schemas/search-hits.json",
+        "schemas/source-range.json",
+        "schemas/coverage.json",
+        "schemas/grounding.json",
+        "schemas/review.json",
         "skills/code-investigation/SKILL.md",
         "skills/code-investigation/references/grounding.md",
         "skills/code-investigation/references/investigation-input.json",
@@ -351,7 +374,7 @@ fn fake_profile_covers_revision() {
         .as_array()
         .expect("worker responses")
         .clone();
-    responses.push(finished("revised"));
+    responses.push(finished(draft_answer()));
     responses.push(finished("valid"));
     profile["model"]["responses"] = Value::Array(responses);
     profile["reviewer_model"]["responses"] = json!([
@@ -516,9 +539,9 @@ fn fake_profile_fails_closed_on_exhausted_review_loop() {
         .as_array()
         .expect("worker responses")
         .clone();
-    responses.push(finished("revised"));
+    responses.push(finished(draft_answer()));
     responses.push(finished("valid"));
-    responses.push(finished("revised"));
+    responses.push(finished(draft_answer()));
     responses.push(finished("valid"));
     profile["model"]["responses"] = Value::Array(responses);
     profile["reviewer_model"]["responses"] = json!([

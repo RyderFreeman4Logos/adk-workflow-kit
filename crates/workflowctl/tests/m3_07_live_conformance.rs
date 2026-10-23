@@ -24,6 +24,12 @@ mod server_owner;
 #[path = "support/m3_07_server_io.rs"]
 mod server_io;
 
+#[path = "m3_07_live_conformance/agent_contracts.rs"]
+mod agent_contracts;
+
+#[path = "m3_07_live_conformance/evidence_admission.rs"]
+mod evidence_admission;
+
 const HANDLE: &str = "ADK_WORKFLOW_KIT_M3_07_TEST_KEY";
 const CANARY: &str = "synthetic-m3-07-canary-not-a-secret";
 
@@ -165,10 +171,20 @@ fn assert_scripted_fail(
     server.finish();
 }
 
-fn finished(output: &str) -> String {
-    format!(
-        r#"{{"choices":[{{"message":{{"role":"assistant","content":"{{\"status\":\"finished\",\"output\":\"{output}\"}}"}},"finish_reason":"stop"}}]}}"#
+fn finished(output: impl Into<Value>) -> String {
+    let content = json!({"status": "finished", "output": output.into()}).to_string();
+    json!({"choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]}).to_string()
+}
+
+fn fixture_output(index: usize) -> Value {
+    let profile = fake_profile();
+    let finish: Value = serde_json::from_str(
+        profile["model"]["responses"][index]
+            .as_str()
+            .expect("fixture finish"),
     )
+    .expect("fixture finish JSON");
+    finish["output"].clone()
 }
 
 fn tool_call(id: &str, name: &str, arguments: &str) -> String {
@@ -186,15 +202,15 @@ fn publish_script() -> Vec<String> {
             "search_code",
             r#""{\"query\":\"retry\",\"path\":\"src\"}""#,
         ),
-        finished("searched"),
+        finished(fixture_output(3)),
         tool_call(
             "read-retry",
             "read_source_range",
             r#""{\"path\":\"src/retry.rs\",\"start_line\":1,\"end_line\":8}""#,
         ),
-        finished("inspected"),
+        finished(fixture_output(5)),
         finished("sufficient"),
-        finished("drafted"),
+        finished(fixture_output(12)),
         finished("valid"),
         finished("pass"),
     ]
@@ -1140,7 +1156,7 @@ fn malformed_final_artifact_fails_closed() {
 fn authored_revise_max_visits_allows_a_second_revision() {
     let mut script = publish_script();
     script[9] = finished("revise");
-    script.push(finished("revised"));
+    script.push(finished(fixture_output(12)));
     script.push(finished("valid"));
     script.push(finished("pass"));
     let server = serve_script(script, false);
