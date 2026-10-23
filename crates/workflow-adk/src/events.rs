@@ -94,6 +94,7 @@ pub struct AdkRuntimeObservationV1 {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     latency_ms: Option<u64>,
+    model_telemetry: Option<crate::model_telemetry::ModelTelemetryV1>,
     structured_output: Option<Value>,
     finish_reason: Option<String>,
     artifact_reference: Option<ProtectedArtifactReferenceV1>,
@@ -117,6 +118,7 @@ impl AdkRuntimeObservationV1 {
             input_tokens: None,
             output_tokens: None,
             latency_ms: None,
+            model_telemetry: None,
             structured_output: None,
             finish_reason: None,
             artifact_reference: None,
@@ -233,6 +235,14 @@ impl AdkEventMapper {
         }
 
         let mut payload = Map::new();
+        if let Some(telemetry) = observation.model_telemetry {
+            payload.insert(
+                "model_telemetry".to_owned(),
+                serde_json::to_value(telemetry).map_err(|_| {
+                    AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
+                })?,
+            );
+        }
         if let Some(request) = observation.request.as_ref() {
             payload.insert(
                 "request_digest".to_owned(),
@@ -318,6 +328,10 @@ impl AdkEventMapper {
     }
 
     /// Maps one real ADK stream event into a sanitized project event.
+    /// Token counts here require allowlisted raw `provider_usage`; normalized SDK
+    /// defaults cannot prove presence. Custom/scripted LLMs without that raw evidence
+    /// report unavailable; explicit `with_tokens` observations retain their own caller
+    /// contract. Synthetic counts are not measurements of a live provider.
     pub(crate) fn map_adk_event<S: ArtifactStore>(
         &mut self,
         node_id: String,
@@ -423,14 +437,23 @@ impl AdkEventMapper {
                 .with_structured_output(output.clone());
             observation = protect_large_payload(observation, &output, artifacts)?;
         }
-        if let Some(usage) = event.llm_response.usage_metadata {
-            let input_tokens = u64::try_from(usage.prompt_token_count).map_err(|_| {
-                AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
-            })?;
-            let output_tokens = u64::try_from(usage.candidates_token_count).map_err(|_| {
-                AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation)
-            })?;
-            observation = observation.with_tokens(input_tokens, output_tokens);
+        observation.model_telemetry = event
+            .llm_response
+            .provider_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(crate::model_telemetry::METADATA_KEY))
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|_| AdkEventMappingError::new(AdkEventMappingErrorKind::InvalidObservation))?;
+        if let Some(usage) = event
+            .llm_response
+            .usage_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.provider_usage.as_ref())
+            .and_then(crate::model_invocation::ProviderTokenUsage::from_provider_usage)
+        {
+            observation.input_tokens = usage.input_tokens();
+            observation.output_tokens = usage.output_tokens();
         }
         if let Some(reason) = event.llm_response.finish_reason {
             observation = observation.with_finish_reason(match reason {
@@ -919,9 +942,10 @@ mod tests {
         model.set_content(Content::new("assistant").with_text("done"));
         model.llm_request = Some(r#"{"prompt":"hello"}"#.to_owned());
         model.llm_response.usage_metadata = Some(UsageMetadata {
-            prompt_token_count: 3,
-            candidates_token_count: 2,
-            total_token_count: 5,
+            prompt_token_count: 99,
+            candidates_token_count: 88,
+            total_token_count: 187,
+            provider_usage: Some(json!({"prompt_tokens":3,"completion_tokens":2,"total_tokens":5})),
             ..UsageMetadata::default()
         });
         model.llm_response.finish_reason = Some(FinishReason::Stop);

@@ -1348,7 +1348,8 @@ impl Llm for ModelBinding {
                 return Err(provider_adk_error(profile_timeout()));
             }
             match generate_once(self, request.clone(), stream, deadline).await {
-                Ok(items) => {
+                Ok(mut items) => {
+                    crate::model_telemetry::attach(self, &request, &mut items, retried)?;
                     return Ok(Box::pin(stream::iter(items.into_iter().map(Ok)))
                         as adk_rust::LlmResponseStream);
                 }
@@ -1376,10 +1377,22 @@ async fn collect_payloads(
 ) -> adk_rust::Result<Vec<LlmResponse>> {
     let mut inner = llm.generate_content(request, false).await?;
     let mut items = Vec::new();
+    let mut latest_usage = None;
     while let Some(item) = inner.next().await {
         let response = item?;
         if let Some(error) = response_failure(&response) {
             return Err(error);
+        }
+        // Usage-only frames are authoritative snapshots even without content. Validate
+        // terminal failure first; retain only a whole, raw-counter-bearing snapshot.
+        if response.usage_metadata.as_ref().is_some_and(|metadata| {
+            metadata
+                .provider_usage
+                .as_ref()
+                .and_then(crate::model_invocation::ProviderTokenUsage::from_provider_usage)
+                .is_some()
+        }) {
+            latest_usage = response.usage_metadata.clone();
         }
         if !response_has_model_payload(&response) {
             continue;
@@ -1388,6 +1401,9 @@ async fn collect_payloads(
     }
     if items.is_empty() {
         return Err(AdkError::agent("model.profile.unreachable"));
+    }
+    if let (Some(last), Some(usage)) = (items.last_mut(), latest_usage) {
+        last.usage_metadata = Some(usage);
     }
     Ok(items)
 }

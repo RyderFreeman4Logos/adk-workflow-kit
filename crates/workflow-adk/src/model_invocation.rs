@@ -722,10 +722,11 @@ pub struct ProviderTokenUsage {
     total_tokens: Option<u64>,
     cache_read_tokens: Option<u64>,
     cache_write_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
 }
 
 impl ProviderTokenUsage {
-    fn from_provider_usage(raw: &Value) -> Option<Self> {
+    pub(crate) fn from_provider_usage(raw: &Value) -> Option<Self> {
         let raw = raw.as_object()?;
         let details = raw.get("prompt_tokens_details");
         let usage = Self {
@@ -738,6 +739,10 @@ impl ProviderTokenUsage {
             cache_write_tokens: details
                 .and_then(|value| value.get("cache_write_tokens"))
                 .and_then(Value::as_u64),
+            reasoning_tokens: raw
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(Value::as_u64),
         };
         [
             usage.input_tokens,
@@ -745,6 +750,7 @@ impl ProviderTokenUsage {
             usage.total_tokens,
             usage.cache_read_tokens,
             usage.cache_write_tokens,
+            usage.reasoning_tokens,
         ]
         .iter()
         .any(Option::is_some)
@@ -774,6 +780,10 @@ impl ProviderTokenUsage {
     /// Raw `prompt_tokens_details.cache_write_tokens`.
     pub fn cache_write_tokens(&self) -> Option<u64> {
         self.cache_write_tokens
+    }
+    /// Raw `completion_tokens_details.reasoning_tokens`, already included in output.
+    pub fn reasoning_tokens(&self) -> Option<u64> {
+        self.reasoning_tokens
     }
 }
 
