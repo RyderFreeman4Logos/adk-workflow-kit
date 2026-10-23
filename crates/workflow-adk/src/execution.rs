@@ -4747,13 +4747,50 @@ impl ExecutionBackend {
         Self::run(workflow, profile, input, workdir_base)
     }
 
+    /// Persists the allocated run identity before compilation, artifacts or graph effects.
+    ///
+    /// `admit` must durably publish the caller's in-flight record before returning `Ok`.
+    /// An error prevents execution. Admission is not a completed checkpoint: interrupted
+    /// callers must reconcile that same run instead of invoking `run` again.
+    pub fn run_admitted(
+        workflow: impl AsRef<Path>,
+        profile: ExecutionProfileV1,
+        input: Value,
+        workdir_base: impl AsRef<Path>,
+        admit: impl FnOnce(&str) -> std::io::Result<()>,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
+        Self::run_bound(
+            workflow,
+            profile,
+            input,
+            workdir_base,
+            Arc::new(AtomicBool::new(false)),
+            admit,
+        )
+    }
+
     pub fn run_cancellable(
+        workflow: impl AsRef<Path>,
+        profile: ExecutionProfileV1,
+        input: Value,
+        workdir_base: impl AsRef<Path>,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
+        Self::run_bound(workflow, profile, input, workdir_base, cancellation, |_| {
+            Ok(())
+        })
+    }
+
+    fn run_bound(
         workflow: impl AsRef<Path>,
         mut profile: ExecutionProfileV1,
         input: Value,
         workdir_base: impl AsRef<Path>,
         cancellation: Arc<AtomicBool>,
+        admit: impl FnOnce(&str) -> std::io::Result<()>,
     ) -> Result<ExecutionReceipt, ExecutionError> {
+        let run_id = fresh_run_id()?;
+        admit(run_id.as_str()).map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
         let mut phase_backend = oracle_phase::Span::new(10, 11);
         let input_bytes = serde_json::to_vec(&input)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
@@ -4819,7 +4856,6 @@ impl ExecutionBackend {
         let mut phase_workdir = oracle_phase::Span::new(53, 54);
         let manager = WorkdirManager::new(workdir_base.as_ref())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
-        let run_id = fresh_run_id()?;
         let checkpoint_manifest = build_checkpoint_manifest(
             &run_id,
             (

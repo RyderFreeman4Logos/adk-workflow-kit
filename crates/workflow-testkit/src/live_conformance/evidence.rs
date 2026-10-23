@@ -47,7 +47,7 @@ fn snapshot(root: &Path) -> Result<Snapshot, ()> {
         .map(|files| FixtureRepo::from_files(files).snapshot())
 }
 
-pub(super) struct Admission {
+pub(crate) struct Admission {
     root: PathBuf,
     input: String,
     snapshot: Snapshot,
@@ -74,7 +74,7 @@ struct RetainedManifest {
 
 impl Admission {
     /// Host facts are checked before spawning the workflow; they are not an answer.
-    pub(super) fn new(root: &Path) -> Result<Self, ()> {
+    pub(crate) fn new(root: &Path) -> Result<Self, ()> {
         let snapshot = snapshot(root)?;
         let input = String::from_utf8(read(&root.join("input.example.json"), MAX_BYTES)?)
             .map_err(|_| ())?;
@@ -96,13 +96,13 @@ impl Admission {
         })
     }
 
-    pub(super) fn input(&self) -> &str {
+    pub(crate) fn input(&self) -> &str {
         &self.input
     }
 
     /// Inspect the accepted checkpoint's executed branch, never a scripted answer.
     /// Event payloads are evidence of completed reads, not execution authority.
-    pub(super) fn validate(&self, root: &Path) -> Result<(), ()> {
+    pub(crate) fn validate(&self, root: &Path) -> Result<(), ()> {
         if snapshot(&self.root)?.id() != self.snapshot.id() {
             return Err(());
         }

@@ -10,7 +10,7 @@ use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 mod child;
-mod evidence;
+pub(crate) mod evidence;
 mod profile;
 
 use serde::{Deserialize, Serialize};
