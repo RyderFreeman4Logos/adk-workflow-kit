@@ -2,6 +2,7 @@
 
 mod behavioral;
 mod effect_audit;
+mod isolated;
 mod tool_audit;
 pub use behavioral::BehavioralExecutionReceipt;
 use effect_audit::EffectAudits;
@@ -11,7 +12,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt, fs,
     future::Future,
-    io::Read,
+    io::{Read, Write},
     num::{NonZeroU64, NonZeroUsize},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -104,6 +105,8 @@ type BoundCache = (
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LoopState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    invocation: Option<isolated::Invocation>,
     model_iterations: u64,
     total_tool_calls: u64,
     tool_output_bytes: u64,
@@ -187,6 +190,7 @@ struct LoopLedgerV1 {
 
 struct LoopLedgerStore {
     path: PathBuf,
+    artifacts: FilesystemArtifactStore,
     checkpoint_path: PathBuf,
     checkpoint_identity: String,
     checkpoint_manifest: CheckpointManifestV1,
@@ -209,6 +213,7 @@ impl LoopLedgerStore {
         persist_raw_loop_state: bool,
     ) -> Result<Self, ExecutionError> {
         let store = Self {
+            artifacts: Self::artifact_store(&path)?,
             path,
             checkpoint_path,
             checkpoint_identity,
@@ -239,7 +244,7 @@ impl LoopLedgerStore {
         if ledger.schema_version != 5 || ledger.checkpoint_identity != checkpoint_identity {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
-        let nodes = if checkpoint_digest == loop_ledger_digest(&ledger.nodes)? {
+        let mut nodes = if checkpoint_digest == loop_ledger_digest(&ledger.nodes)? {
             ledger.nodes
         } else if let Some(nodes) = ledger.checkpoint_nodes
             && checkpoint_digest == loop_ledger_digest(&nodes)?
@@ -253,8 +258,19 @@ impl LoopLedgerStore {
         {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
+        let durable_nodes = nodes.clone();
+        if !persist_raw_loop_state {
+            for state in nodes.values_mut() {
+                if let Some(owner) = &mut state.invocation {
+                    // Skill transcripts are intentionally absent on disk. Their
+                    // current segment is reconstructed from admitted calls only.
+                    owner.conversation_start = 0;
+                }
+            }
+        }
         let tool_audit_ids = Arc::new(Mutex::new(tool_audit::identities(&nodes)));
         Ok(Self {
+            artifacts: Self::artifact_store(&path)?,
             path,
             checkpoint_path,
             checkpoint_identity,
@@ -262,7 +278,7 @@ impl LoopLedgerStore {
             run_id,
             persist_raw_loop_state,
             effect_audits: EffectAudits::default(),
-            durable_nodes: Mutex::new(nodes.clone()),
+            durable_nodes: Mutex::new(durable_nodes),
             tool_audit_ids,
             nodes: Mutex::new(nodes),
             replaying_skill_resource_reads: Mutex::new(BTreeSet::new()),
@@ -274,6 +290,15 @@ impl LoopLedgerStore {
             .lock()
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
             .map(|nodes| nodes.get(node).cloned().unwrap_or_default())
+    }
+
+    fn artifact_store(path: &Path) -> Result<FilesystemArtifactStore, ExecutionError> {
+        FilesystemArtifactStore::try_new(
+            path.with_file_name("artifacts"),
+            NonZeroU64::new(MAX_STATE_BYTES as u64).expect("positive state limit"),
+            NonZeroU64::new(ARTIFACT_LIMIT).expect("positive page limit"),
+        )
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
     }
 
     fn tool_call_limit(
@@ -382,10 +407,12 @@ impl LoopLedgerStore {
         Ok(nodes
             .iter()
             .flat_map(|(node, state)| {
-                (!state.finish_admitted)
+                (!state.finish_admitted
+                    && (state.invocation.is_none() || !self.persist_raw_loop_state))
                     .then_some(&state.completed_calls)
                     .into_iter()
                     .flatten()
+                    .filter(|completed| isolated::current_call(state, completed.call()))
                     .cloned()
                     .map(|call| (node.clone(), call))
             })
@@ -533,6 +560,14 @@ impl LoopLedgerStore {
     }
 
     fn persist_locked(&self, nodes: &BTreeMap<String, LoopState>) -> Result<(), ExecutionError> {
+        self.persist_generation(nodes, None)
+    }
+
+    fn persist_generation(
+        &self,
+        nodes: &BTreeMap<String, LoopState>,
+        frontier: Option<DurableCheckpointV1>,
+    ) -> Result<(), ExecutionError> {
         if !self.persist_raw_loop_state
             && nodes.values().any(|state| {
                 state
@@ -543,6 +578,11 @@ impl LoopLedgerStore {
         {
             return Err(ExecutionError::new(ExecutionErrorKind::Persistence));
         }
+        // A successful ledger/checkpoint generation may depend on artifact
+        // names published by any adapter sharing this run's concrete store.
+        self.artifacts
+            .sync_published()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
         let mut durable_nodes = nodes.clone();
         {
             let committed = self
@@ -572,7 +612,25 @@ impl LoopLedgerStore {
         }
         self.persist_ledger_with_checkpoint_generation(&durable_nodes)?;
         crash_barrier("after-loop-ledger-before-checkpoint");
-        self.sync_checkpoint(&durable_nodes)?;
+        if let Some(mut checkpoint) = frontier {
+            let mut state: State = serde_json::from_slice(checkpoint.state())
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+            Self::bind_digest(&mut state, &durable_nodes)?;
+            checkpoint = DurableCheckpointV1::new(
+                self.run_id.clone(),
+                checkpoint.node_id(),
+                checkpoint.event_sequence(),
+                serde_json::to_vec(&state)
+                    .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?,
+                checkpoint.artifact_refs().iter().cloned(),
+            )
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+            SqliteCheckpointStore::open(&self.checkpoint_path, self.checkpoint_manifest.clone())
+                .and_then(|mut store| store.save_checkpoint(checkpoint))
+                .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+        } else {
+            self.sync_checkpoint(&durable_nodes)?;
+        }
         // Publish proof only after BOTH durable generations agree. A failed
         // save may leave `nodes` mutated; it must never authorize audit success.
         let mut committed = self
@@ -1020,7 +1078,10 @@ fn valid_terminal_state(state: &LoopState) -> bool {
 }
 
 fn valid_loop_state(state: &LoopState) -> bool {
-    if !tool_audit::valid_bindings(state) || !valid_skill_resource_read_accounting(state) {
+    if !isolated::valid_invocation(state)
+        || !tool_audit::valid_bindings(state)
+        || !valid_skill_resource_read_accounting(state)
+    {
         return false;
     }
     if state.conversation.is_empty() {
@@ -1340,7 +1401,20 @@ impl LoopController {
                 "workflow.loop.limit.model_iterations",
             ));
         }
-        if state.conversation.is_empty() {
+        if state.invocation.is_some() {
+            if isolated::prepare_request(&mut state, &mut request).map_err(|()| {
+                self.fail(
+                    ExecutionErrorKind::InvalidRunState,
+                    "workflow.loop.invalid_state",
+                )
+            })? {
+                self.ledger
+                    .replace(&self.node, state.clone())
+                    .map_err(|_| {
+                        self.fail(ExecutionErrorKind::Persistence, "loop ledger unavailable")
+                    })?;
+            }
+        } else if state.conversation.is_empty() {
             state.conversation = request.contents.clone();
             self.ledger
                 .replace(&self.node, state.clone())
@@ -3502,16 +3576,7 @@ impl Agent for RestoredFinishAgent {
         &self,
         _context: Arc<dyn adk_rust::InvocationContext>,
     ) -> adk_rust::Result<adk_rust::EventStream> {
-        let text = serde_json::to_string(&json!({
-            "status": "finished",
-            "output": self.output,
-        }))
-        .map_err(|_| adk_rust::AdkError::agent("restored finish unavailable"))?;
-        let mut event = adk_rust::Event::new(&self.name);
-        event.set_content(Content::new("assistant").with_text(text));
-        event
-            .provider_metadata
-            .insert("workflow.cache_hit".to_owned(), "1".to_owned());
+        let event = isolated::restored_finish_event(&self.name, self.output.clone())?;
         Ok(Box::pin(adk_rust::futures::stream::iter([Ok(event)])))
     }
 }
@@ -3609,6 +3674,7 @@ fn cached_finish_response(output: Value) -> LlmResponse {
 
 #[derive(Clone)]
 struct RuntimeAgentContract {
+    isolated: bool,
     instruction_path: String,
     instruction: String,
     schema_path: String,
@@ -3669,6 +3735,7 @@ fn resolve_agent_contracts(
             Ok((
                 node.id().as_str().to_owned(),
                 RuntimeAgentContract {
+                    isolated: contract.session() == workflow_spec::SessionMode::Isolated,
                     instruction_path,
                     instruction,
                     schema_path,
@@ -3702,7 +3769,22 @@ fn persist_agent_contracts(
             (&contract.schema_path, contract.schema_bytes.as_slice()),
         ] {
             let destination = root.join(path);
-            fs::create_dir_all(destination.parent().ok_or(())?).map_err(|_| ())?;
+            let parent = destination.parent().ok_or(())?;
+            let mut created = Vec::new();
+            let mut directory = parent;
+            while !directory.exists() {
+                created.push(directory.to_path_buf());
+                directory = directory.parent().ok_or(())?;
+            }
+            fs::create_dir_all(parent).map_err(|_| ())?;
+            for directory in created.iter().rev() {
+                fs::File::open(directory)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|_| ())?;
+                fs::File::open(directory.parent().ok_or(())?)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|_| ())?;
+            }
             write_atomic(&destination, bytes).map_err(|_| ())?;
         }
     }
@@ -4178,6 +4260,8 @@ fn build_profile_agent(
         Arc::clone(&effect_fence.last_progress),
     )?);
     let before_controller = Arc::clone(&controller);
+    let invocation_controller = Arc::clone(&controller);
+    let isolated = contract.is_some_and(|contract| contract.isolated);
     let tool_controller = Arc::clone(&controller);
     let tool_error_controller = Arc::clone(&controller);
     let persist_cache = cache.clone();
@@ -4294,7 +4378,16 @@ fn build_profile_agent(
     }
     builder
         .build()
-        .map(|agent| Arc::new(agent) as Arc<dyn Agent>)
+        .map(|agent| {
+            let agent = Arc::new(agent) as Arc<dyn Agent>;
+            if isolated {
+                crate::agent_admission::replay_current(agent, move || {
+                    invocation_controller.enter_isolated()
+                })
+            } else {
+                agent
+            }
+        })
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::ImplementationBinding))
 }
 
@@ -4997,6 +5090,23 @@ impl ExecutionBackend {
                         start.insert(key.clone(), value.clone());
                     }
                 }
+                let isolated = isolated::nodes(&agent_contracts);
+                // This frontier is admission input, not recovered SDK state.
+                let initial = (!isolated.is_empty()).then(|| {
+                    Checkpoint::new(
+                        run_id.as_str(),
+                        start.clone(),
+                        0,
+                        vec![compiled.ir().entry_node_id().as_str().to_owned()],
+                    )
+                });
+                let mut frontier = isolated::frontier_observer(
+                    &continuation,
+                    initial,
+                    &loop_ledger,
+                    &isolated,
+                    &terminal_kind,
+                );
                 *last_progress
                     .lock()
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))? = Instant::now();
@@ -5007,11 +5117,12 @@ impl ExecutionBackend {
                     &cancellation,
                     &last_progress,
                     Duration::from_millis(profile.run_limits().max_idle_time_ms().get()),
-                    graph.invoke_observed(
+                    graph.invoke_observed_with_frontier(
                         start,
                         ExecutionConfig::new(run_id.as_str()).with_recursion_limit(recursion_limit),
                         &mut mapper,
                         artifacts,
+                        &mut frontier,
                     ),
                 )?;
                 if let Some(kind) = terminal_kind.lock().ok().and_then(|terminal| *terminal) {
@@ -5135,6 +5246,13 @@ impl ExecutionBackend {
         if let Err(error) = write_events(&run_root.join("events.jsonl"), mapper.events()) {
             persistence_error.get_or_insert(error);
         }
+        if artifacts
+            .as_ref()
+            .is_some_and(|artifacts| artifacts.sync_published().is_err())
+        {
+            checkpoint_failed = true;
+            persistence_error.get_or_insert(ExecutionError::new(ExecutionErrorKind::Persistence));
+        }
         if persistence_error.is_none() {
             if let (Ok(state), Some(store), Some(loop_ledger)) =
                 (&execution, checkpoint_store.as_mut(), loop_ledger.as_ref())
@@ -5217,7 +5335,7 @@ impl ExecutionBackend {
                 Vec::new()
             }
         };
-        let artifact_id = match artifacts.as_mut() {
+        let mut artifact_id = match artifacts.as_mut() {
             Some(artifacts) => match artifacts.put(&terminal) {
                 Ok(artifact_id) => artifact_id.as_str().to_owned(),
                 Err(_) => {
@@ -5228,6 +5346,16 @@ impl ExecutionBackend {
             },
             None => "unavailable".to_owned(),
         };
+        if artifacts
+            .as_ref()
+            .is_some_and(|artifacts| artifacts.sync_published().is_err())
+        {
+            persistence_error.get_or_insert(ExecutionError::new(ExecutionErrorKind::Persistence));
+            artifact_id = "unavailable".to_owned();
+        }
+        if persistence_error.is_some() {
+            status = "failed";
+        }
         let (cache_dispositions, event_counts) = cache_provenance(mapper.events());
         let manifest = RunManifestV2 {
             schema_version: 2,
@@ -5484,6 +5612,11 @@ impl ExecutionBackend {
         loop_ledger.effect_audits = profile.effect_audits.clone();
         let loop_ledger = Arc::new(loop_ledger);
         mapper.bind_tool_audit(Arc::clone(&loop_ledger.tool_audit_ids));
+        isolated::validate_checkpoint(
+            &loop_ledger,
+            &checkpoint,
+            &isolated::nodes(&agent_contracts),
+        )?;
         // Reject unprovable historical completion association before replay IO.
         tool_audit::validate_existing(&loop_ledger, &mapper, &artifacts)?;
         let tool_registry = build_tool_registry(
@@ -5577,7 +5710,11 @@ impl ExecutionBackend {
                         &toolsets.get(name).cloned().flatten(),
                     ),
                 )?;
-                let agent = if let Some(output) = loop_ledger.finish_successor(name)? {
+                let agent = if let Some(output) = loop_ledger.finish_successor(name)?
+                    && !agent_contracts
+                        .get(name)
+                        .is_some_and(|contract| contract.isolated)
+                {
                     Arc::new(RestoredFinishAgent {
                         name: name.to_owned(),
                         output,
@@ -5631,6 +5768,14 @@ impl ExecutionBackend {
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
             .with_cache_dispositions(Arc::clone(&cache_dispositions));
         let recursion_limit = crate::graph_recursion_limit(compiled.ir()).max(50);
+        let isolated = isolated::nodes(&agent_contracts);
+        let mut frontier = isolated::frontier_observer(
+            &continuation,
+            None,
+            &loop_ledger,
+            &isolated,
+            &terminal_kind,
+        );
         let runtime = adk_rust::tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -5646,13 +5791,14 @@ impl ExecutionBackend {
             &cancellation,
             &last_progress,
             Duration::from_millis(profile.run_limits().max_idle_time_ms().get()),
-            graph.invoke_observed(
+            graph.invoke_observed_with_frontier(
                 state,
                 ExecutionConfig::new(run_id)
                     .with_recursion_limit(recursion_limit)
                     .with_resume_from(&restored.checkpoint_id),
                 &mut mapper,
                 &mut artifacts,
+                &mut frontier,
             ),
         ) {
             Ok(state) => state,
@@ -5718,6 +5864,9 @@ impl ExecutionBackend {
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
             .as_str()
             .to_owned();
+        artifacts
+            .sync_published()
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
         crash_barrier("before-result");
         write_events(&events_path, mapper.events())?;
         crash_barrier("before-checkpoint");
@@ -6844,9 +6993,18 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), ExecutionError>
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ExecutionError> {
     let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes)
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temporary)
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
-    fs::rename(temporary, path).map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
+    fs::rename(temporary, path)
+        .and_then(|()| fs::File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all())
+        .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))
 }
 
 #[cfg(test)]

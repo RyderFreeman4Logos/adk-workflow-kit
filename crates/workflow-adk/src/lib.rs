@@ -620,8 +620,26 @@ impl AdkGraph {
         if self.sentinel_script.is_some() {
             return Err(AdkGraphError::AuthorizationDenied);
         }
-        self.firewall_run(self.invoke_observed_inner(state, config, mapper, artifacts))
-            .await
+        self.invoke_observed_with_frontier(state, config, mapper, artifacts, &mut |_, _, _, _| {
+            Ok(())
+        })
+        .await
+    }
+
+    // The SDK yields every NodeStart before polling any node in that frontier.
+    // The execution owner can therefore durably admit it before model/tool IO.
+    pub(crate) async fn invoke_observed_with_frontier<S: workflow_runtime::ArtifactStore>(
+        &self,
+        state: State,
+        config: ExecutionConfig,
+        mapper: &mut events::AdkEventMapper,
+        artifacts: &mut S,
+        frontier: &mut impl FnMut(&str, usize, &events::AdkEventMapper, &S) -> Result<(), AdkGraphError>,
+    ) -> Result<State, AdkGraphError> {
+        self.firewall_run(
+            self.invoke_observed_frontier_inner(state, config, mapper, artifacts, frontier),
+        )
+        .await
     }
 
     async fn invoke_observed_inner<S: workflow_runtime::ArtifactStore>(
@@ -630,6 +648,20 @@ impl AdkGraph {
         config: ExecutionConfig,
         mapper: &mut events::AdkEventMapper,
         artifacts: &mut S,
+    ) -> Result<State, AdkGraphError> {
+        self.invoke_observed_frontier_inner(state, config, mapper, artifacts, &mut |_, _, _, _| {
+            Ok(())
+        })
+        .await
+    }
+
+    async fn invoke_observed_frontier_inner<S: workflow_runtime::ArtifactStore>(
+        &self,
+        state: State,
+        config: ExecutionConfig,
+        mapper: &mut events::AdkEventMapper,
+        artifacts: &mut S,
+        frontier: &mut impl FnMut(&str, usize, &events::AdkEventMapper, &S) -> Result<(), AdkGraphError>,
     ) -> Result<State, AdkGraphError> {
         self.prepare_firewall_run(&config)?;
         self.check_behavioral_invocation(&config, mapper)?;
@@ -680,13 +712,14 @@ impl AdkGraph {
                 StreamEvent::NodeStart { node, step } => {
                     mapper
                         .map_stream_observation(
-                            Some(node),
+                            Some(node.clone()),
                             events::AdkRuntimeObservationKindV1::NodeStarted,
                             Some(json!({ "step": step })),
                             None,
                             artifacts,
                         )
                         .map_err(|error| AdkGraphError::Observation(error.kind()))?;
+                    frontier(&node, step, mapper, artifacts)?;
                 }
                 StreamEvent::NodeEnd {
                     node,

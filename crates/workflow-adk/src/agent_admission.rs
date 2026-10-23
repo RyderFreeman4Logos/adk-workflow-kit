@@ -9,7 +9,20 @@ use adk_rust::{
 };
 
 pub(super) fn admit(agent: Arc<dyn Agent>) -> Arc<dyn Agent> {
-    Arc::new(OutputAdmission { agent })
+    Arc::new(OutputAdmission {
+        agent,
+        replay: None,
+    })
+}
+
+pub(super) fn replay_current(
+    agent: Arc<dyn Agent>,
+    replay: impl Fn() -> adk_rust::Result<Option<Event>> + Send + Sync + 'static,
+) -> Arc<dyn Agent> {
+    Arc::new(OutputAdmission {
+        agent,
+        replay: Some(Box::new(replay)),
+    })
 }
 
 fn invalid_output() -> AdkError {
@@ -29,6 +42,7 @@ pub(super) fn is_invalid_output(node: &str, message: &str) -> bool {
 
 struct OutputAdmission {
     agent: Arc<dyn Agent>,
+    replay: Option<Box<dyn Fn() -> adk_rust::Result<Option<Event>> + Send + Sync>>,
 }
 
 #[async_trait]
@@ -81,6 +95,15 @@ impl Agent for OutputAdmission {
     }
 
     async fn run(&self, ctx: Arc<dyn InvocationContext>) -> adk_rust::Result<EventStream> {
+        if let Some(event) = self
+            .replay
+            .as_ref()
+            .map(|replay| replay())
+            .transpose()?
+            .flatten()
+        {
+            return Ok(Box::pin(adk_rust::futures::stream::iter([Ok(event)])));
+        }
         // Match AgentNode's complete-stream boundary: real errors win, and a
         // confirmation remains the SDK's interrupt rather than an empty answer.
         let events: Vec<Event> = self.agent.run(ctx).await?.try_collect().await?;

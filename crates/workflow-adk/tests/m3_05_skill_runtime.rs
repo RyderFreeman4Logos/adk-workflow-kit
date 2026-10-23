@@ -15,6 +15,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use workflow_adk::execution::{ExecutionBackend, ExecutionErrorKind, ExecutionProfileV1};
 
+#[path = "m3_05_skill_runtime/isolated.rs"]
+mod isolated;
+
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 static MODEL_DIGEST_LOCK: Mutex<()> = Mutex::new(());
 

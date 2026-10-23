@@ -138,7 +138,12 @@ impl WorkdirManager {
             let root_metadata = fs::symlink_metadata(&root)
                 .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::CreateRoot, error))?;
             let root_identity = Identity::from_metadata(&root_metadata);
-            if let Err(primary) = initializer(&root, &id) {
+            let initialized = initializer(&root, &id).and_then(|()| {
+                File::open(&self.base)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::CreateRoot, error))
+            });
+            if let Err(primary) = initialized {
                 return match remove_owned_root(&self.base, self.base_identity, &root, root_identity)
                 {
                     Ok(_) => Err(primary),
@@ -323,6 +328,11 @@ fn initialize_layout(
             .map_err(|error| {
                 WorkdirError::with_source(WorkdirErrorKind::InitializeLayout, error)
             })?;
+        File::open(root.join(name))
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                WorkdirError::with_source(WorkdirErrorKind::InitializeLayout, error)
+            })?;
     }
 
     let mut hashes = BTreeMap::new();
@@ -360,9 +370,13 @@ fn initialize_layout(
         .open(&temporary)
         .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::InitializeLayout, error))?;
     file.write_all(&manifest)
+        .and_then(|()| file.sync_all())
         .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::InitializeLayout, error))?;
     drop(file);
     fs::rename(temporary, root.join("manifest.json"))
+        .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::PublishManifest, error))?;
+    File::open(root)
+        .and_then(|directory| directory.sync_all())
         .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::PublishManifest, error))?;
     Ok(())
 }
@@ -384,7 +398,7 @@ fn materialize_immutable_dir(
             let mut hasher = Sha256::new();
             hasher.update(bytes);
             File::create(dir.join("content.bin"))
-                .and_then(|mut file| file.write_all(bytes))
+                .and_then(|mut file| file.write_all(bytes).and_then(|()| file.sync_all()))
                 .map_err(|error| {
                     WorkdirError::with_source(WorkdirErrorKind::InitializeLayout, error)
                 })?;
@@ -393,6 +407,9 @@ fn materialize_immutable_dir(
         None => None,
     };
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o555))
+        .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::InitializeLayout, error))?;
+    File::open(&dir)
+        .and_then(|directory| directory.sync_all())
         .map_err(|error| WorkdirError::with_source(WorkdirErrorKind::InitializeLayout, error))?;
     Ok(hash)
 }

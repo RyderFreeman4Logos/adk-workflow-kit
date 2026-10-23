@@ -464,7 +464,30 @@ impl FilesystemArtifactStore {
         max_content_bytes: NonZeroU64,
         max_page_bytes: NonZeroU64,
     ) -> Result<Self, ArtifactError> {
+        let mut created = Vec::new();
+        let mut directory = root.as_ref();
+        while !directory.exists() {
+            created.push(directory.to_path_buf());
+            directory = directory
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+        }
         fs::create_dir_all(root.as_ref()).map_err(|_| ArtifactError::new(ArtifactErrorKind::Io))?;
+        for directory in created.iter().rev() {
+            fs::File::open(directory)
+                .and_then(|file| file.sync_all())
+                .and_then(|()| {
+                    fs::File::open(
+                        directory
+                            .parent()
+                            .filter(|path| !path.as_os_str().is_empty())
+                            .unwrap_or(Path::new(".")),
+                    )?
+                    .sync_all()
+                })
+                .map_err(Self::storage_error)?;
+        }
         Ok(Self {
             root: root.as_ref().to_path_buf(),
             retention: HashMap::new(),
@@ -477,6 +500,20 @@ impl FilesystemArtifactStore {
     /// Removes the entire store directory; later reads become `NotFound`.
     pub fn remove_all(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+    }
+
+    /// Confirms durability of names already published by this filesystem store.
+    ///
+    /// `commit` remains the atomic visibility boundary. Call this before a
+    /// durable checkpoint or manifest depends on published artifacts. Failure
+    /// does not undo visibility: callers must withhold the dependent generation
+    /// and further execution, while retaining any already published content.
+    pub fn sync_published(&self) -> Result<(), ArtifactError> {
+        let directory = fs::File::open(&self.root).map_err(Self::storage_error)?;
+        if !directory.metadata().map_err(Self::storage_error)?.is_dir() {
+            return Err(ArtifactError::new(ArtifactErrorKind::Io));
+        }
+        directory.sync_all().map_err(Self::storage_error)
     }
 
     fn path_for(&self, id: &ArtifactId) -> PathBuf {
