@@ -10,6 +10,7 @@ use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 mod child;
+mod evidence;
 mod profile;
 
 use serde::{Deserialize, Serialize};
@@ -21,7 +22,7 @@ use serde_json::Value;
 pub enum ConformanceDisposition {
     /// Live execution was not requested.
     Skip,
-    /// Canonical workflow completed and published.
+    /// Canonical workflow published a host-validated, tool-supported answer.
     Pass,
     /// Canonical workflow completed with a valid abstention.
     Abstain,
@@ -76,7 +77,7 @@ impl SafeMetrics {
     pub fn profile_identity(&self) -> &str {
         &self.profile_identity
     }
-    /// Redacted provider error category, if the attempt failed.
+    /// Finite provider, admission or evidence category, if the attempt failed.
     pub fn error_category(&self) -> Option<&str> {
         self.error_category.as_deref()
     }
@@ -186,6 +187,10 @@ impl LiveConformance {
         if command_budget.is_zero() || Instant::now().checked_add(command_budget).is_none() {
             return fail_closed(workdir, Instant::now(), None, None);
         }
+        let evidence = match evidence::Admission::new(example_root) {
+            Ok(evidence) => evidence,
+            Err(()) => return fail_closed(workdir, Instant::now(), None, Some("invalid_snapshot")),
+        };
         let snapshot = match profile::Snapshot::new(profile, command_budget) {
             Ok(snapshot) => snapshot,
             Err(_) => return fail_closed(workdir, Instant::now(), None, None),
@@ -200,10 +205,6 @@ impl LiveConformance {
         let Some(workdir_s) = workdir.to_str().map(str::to_owned) else {
             return fail_closed(workdir, Instant::now(), None, None);
         };
-        let input = match fs::read_to_string(example_root.join("input.example.json")) {
-            Ok(input) => input,
-            Err(_) => return fail_closed(workdir, Instant::now(), None, None),
-        };
         let mut command = Command::new(workflowctl);
         let profile = snapshot.bind(&mut command);
         command.args([
@@ -213,7 +214,7 @@ impl LiveConformance {
             "--profile",
             &profile,
             "--input",
-            input.trim(),
+            evidence.input().trim(),
             "--workdir",
             &workdir_s,
         ]);
@@ -228,6 +229,7 @@ impl LiveConformance {
             child::output(&mut command, command_budget),
             workdir,
             started,
+            &evidence,
         )
     }
 }
@@ -260,6 +262,7 @@ fn classify(
     output: std::io::Result<std::process::Output>,
     workdir: &Path,
     started: Instant,
+    evidence: &evidence::Admission,
 ) -> ConformanceReport {
     let output = match output {
         Ok(output) => output,
@@ -298,6 +301,9 @@ fn classify(
             Some(&run_root),
             category_from_stderr(&output.stderr).as_deref(),
         );
+    }
+    if disposition == ConformanceDisposition::Pass && evidence.validate(&run_root).is_err() {
+        return fail_closed(workdir, started, Some(&run_root), Some("invalid_evidence"));
     }
     let metrics = collect_metrics(disposition, workdir, Some(&run_root), started, None);
     finish(workdir, disposition, metrics)
@@ -468,6 +474,10 @@ mod tests {
             }),
             &workdir,
             Instant::now(),
+            &evidence::Admission::new(
+                &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/01-code-investigation"),
+            )
+            .expect("canonical host facts"),
         );
         (report, Fixture(workdir))
     }

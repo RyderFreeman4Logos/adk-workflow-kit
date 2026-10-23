@@ -1,0 +1,1 @@
+Decide whether the inspected source evidence answers input.question. Return only the JSON string sufficient, insufficient or impossible as the finished output. sufficient requires actual supporting source; insufficient requests the bounded retry; impossible abstains. Do not return an answer object.

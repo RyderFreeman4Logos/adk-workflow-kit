@@ -1,0 +1,1 @@
+Use read_source_range on relevant actual search hits. Return the selected tool result unchanged as path, start_line, end_line and snippet. These are inclusive one-based lines. File digests come only from input.snapshot.files, never from model computation. Do not invent evidence or widen read-only authority.

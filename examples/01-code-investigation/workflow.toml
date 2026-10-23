@@ -8,57 +8,105 @@ entry = "prepare_workspace"
 [[nodes]]
 id = "prepare_workspace"
 kind = "agent"
+instruction = { path = "prompts/prepare.md", sha256 = "sha256:b2fdc49882840465bf902317429882a8ef6284bd7949a34350503e63b60f6347" }
+input = { state_keys = ["input"] }
+output = { state_key = "node:prepare_workspace", schema = "schemas/summary.json" }
+session = "isolated"
 model = { role = "worker", id = "code-investigation-fake", version = "1" }
 [[nodes]]
 id = "planner"
 kind = "agent"
+instruction = { path = "prompts/planner.md", sha256 = "sha256:5a3821000e085d2e4c610ee043439dc6c15bea4e966f08dace08f5991b2a0b41" }
+input = { state_keys = ["input", "node:prepare_workspace"] }
+output = { state_key = "node:planner", schema = "schemas/summary.json" }
+session = "isolated"
 model = { role = "worker", id = "code-investigation-fake", version = "1" }
 skills = [{ id = "code-investigation", version = "1" }]
 [[nodes]]
 id = "search_code"
 kind = "agent"
+instruction = { path = "prompts/search.md", sha256 = "sha256:22dc291065a4e7536a68b506708180779e6d05b6752c2d87c87f39732664d1f2" }
+input = { state_keys = ["input", "node:planner"] }
+output = { state_key = "node:search_code", schema = "schemas/search-hits.json" }
+session = "isolated"
 model = { role = "worker", id = "code-investigation-fake", version = "1" }
 tools = [{ id = "search_code", version = "1" }]
 [[nodes]]
 id = "inspect_evidence"
 kind = "agent"
+instruction = { path = "prompts/inspect.md", sha256 = "sha256:1972fe2b8a094df4890fe0e9fee586482dfd68b18adf88020a4aae1d8c693e0f" }
+input = { state_keys = ["input", "node:search_code"] }
+output = { state_key = "node:inspect_evidence", schema = "schemas/source-range.json" }
+session = "isolated"
 model = { role = "worker", id = "code-investigation-fake", version = "1" }
 tools = [{ id = "read_source_range", version = "1" }]
 [[nodes]]
 id = "coverage_decision"
 kind = "agent"
+instruction = { path = "prompts/coverage.md", sha256 = "sha256:061e43e5469f4eafa017de63bd28171e0ce7d374a7c925a38d97cc7f6eef09d5" }
+input = { state_keys = ["input", "node:inspect_evidence"] }
+output = { state_key = "node:coverage_decision", schema = "schemas/coverage.json" }
+session = "isolated"
 model = { role = "worker", id = "code-investigation-fake", version = "1" }
 [[nodes]]
 id = "retry_search_code"
 kind = "agent"
+instruction = { path = "prompts/search.md", sha256 = "sha256:22dc291065a4e7536a68b506708180779e6d05b6752c2d87c87f39732664d1f2" }
+input = { state_keys = ["input", "node:planner", "node:coverage_decision"] }
+output = { state_key = "node:retry_search_code", schema = "schemas/search-hits.json" }
+session = "isolated"
 model = { role = "worker", id = "code-investigation-fake", version = "1" }
 tools = [{ id = "search_code", version = "1" }]
 [[nodes]]
 id = "retry_inspect_evidence"
 kind = "agent"
+instruction = { path = "prompts/inspect.md", sha256 = "sha256:1972fe2b8a094df4890fe0e9fee586482dfd68b18adf88020a4aae1d8c693e0f" }
+input = { state_keys = ["input", "node:retry_search_code"] }
+output = { state_key = "node:retry_inspect_evidence", schema = "schemas/source-range.json" }
+session = "isolated"
 model = { role = "worker", id = "code-investigation-fake", version = "1" }
 tools = [{ id = "read_source_range", version = "1" }]
 [[nodes]]
 id = "retry_coverage_decision"
 kind = "agent"
+instruction = { path = "prompts/coverage.md", sha256 = "sha256:061e43e5469f4eafa017de63bd28171e0ce7d374a7c925a38d97cc7f6eef09d5" }
+input = { state_keys = ["input", "node:inspect_evidence", "node:retry_inspect_evidence"] }
+output = { state_key = "node:retry_coverage_decision", schema = "schemas/coverage.json" }
+session = "isolated"
 model = { role = "worker", id = "code-investigation-fake", version = "1" }
 [[nodes]]
 id = "draft"
 kind = "agent"
+instruction = { path = "prompts/draft.md", sha256 = "sha256:1444c7501355ae453f19a58b040822a5d1c813ad980c882f6e27c4fa2d8226ae" }
+input = { state_keys = ["input", "node:inspect_evidence", "node:retry_inspect_evidence"] }
+output = { state_key = "node:draft", schema = "schemas/investigation-output.json" }
+session = "isolated"
 model = { role = "worker", id = "code-investigation-fake", version = "1" }
 [[nodes]]
 id = "grounding_validation"
 kind = "agent"
+instruction = { path = "prompts/grounding.md", sha256 = "sha256:00e7d807f87e2137cc51e030fbcc752fdb0f1f254504c0ce50d34787e67ed4ec" }
+input = { state_keys = ["input", "node:draft", "node:revise", "node:inspect_evidence", "node:retry_inspect_evidence"] }
+output = { state_key = "node:grounding_validation", schema = "schemas/grounding.json" }
+session = "isolated"
 model = { role = "worker", id = "code-investigation-fake", version = "1" }
 max_visits = 32
 [[nodes]]
 id = "review"
 kind = "agent"
+instruction = { path = "prompts/reviewer.md", sha256 = "sha256:61d0b5d3e9e9ae6fb95f19abd1fc4c8a640b1497a300cec1f4fd15ab98566a22" }
+input = { state_keys = ["input", "node:draft", "node:revise", "node:grounding_validation", "node:inspect_evidence", "node:retry_inspect_evidence"] }
+output = { state_key = "node:review", schema = "schemas/review.json" }
+session = "isolated"
 model = { role = "reviewer", id = "code-investigation-reviewer", version = "1" }
 max_visits = 32
 [[nodes]]
 id = "revise"
 kind = "agent"
+instruction = { path = "prompts/reviser.md", sha256 = "sha256:1fdee7982caf40114a3d8bfb73a96069621c92a5beb2af05348cea469fdc9d59" }
+input = { state_keys = ["input", "node:draft", "node:revise", "node:grounding_validation", "node:review", "node:inspect_evidence", "node:retry_inspect_evidence"] }
+output = { state_key = "node:revise", schema = "schemas/investigation-output.json" }
+session = "isolated"
 model = { role = "worker", id = "code-investigation-fake", version = "1" }
 max_visits = 32
 [[nodes]]
@@ -73,24 +121,72 @@ path = "skills/code-investigation/SKILL.md"
 sha256 = "sha256:c4adb08d04aa18d9f870310301d4782a5ea2c5344d024fd4136bab5ffb4fc189"
 
 [[resources]]
+path = "prompts/prepare.md"
+sha256 = "sha256:b2fdc49882840465bf902317429882a8ef6284bd7949a34350503e63b60f6347"
+
+[[resources]]
 path = "prompts/planner.md"
-sha256 = "sha256:88514865356dc67787a99259300895827f21cbaab0c7b42f0add7fef3d2ec325"
+sha256 = "sha256:5a3821000e085d2e4c610ee043439dc6c15bea4e966f08dace08f5991b2a0b41"
+
+[[resources]]
+path = "prompts/search.md"
+sha256 = "sha256:22dc291065a4e7536a68b506708180779e6d05b6752c2d87c87f39732664d1f2"
+
+[[resources]]
+path = "prompts/inspect.md"
+sha256 = "sha256:1972fe2b8a094df4890fe0e9fee586482dfd68b18adf88020a4aae1d8c693e0f"
+
+[[resources]]
+path = "prompts/coverage.md"
+sha256 = "sha256:061e43e5469f4eafa017de63bd28171e0ce7d374a7c925a38d97cc7f6eef09d5"
+
+[[resources]]
+path = "prompts/draft.md"
+sha256 = "sha256:1444c7501355ae453f19a58b040822a5d1c813ad980c882f6e27c4fa2d8226ae"
+
+[[resources]]
+path = "prompts/grounding.md"
+sha256 = "sha256:00e7d807f87e2137cc51e030fbcc752fdb0f1f254504c0ce50d34787e67ed4ec"
 
 [[resources]]
 path = "prompts/reviewer.md"
-sha256 = "sha256:632f3f0af5d7c5454696e9bac01f9e2849bbd99b7cf44ca316bcde284c93bce7"
+sha256 = "sha256:61d0b5d3e9e9ae6fb95f19abd1fc4c8a640b1497a300cec1f4fd15ab98566a22"
 
 [[resources]]
 path = "prompts/reviser.md"
-sha256 = "sha256:0493c534da1c066f01d23e87a3426f0ec2184e80ae5f7e25e2b16db6c9a72142"
+sha256 = "sha256:1fdee7982caf40114a3d8bfb73a96069621c92a5beb2af05348cea469fdc9d59"
 
 [[resources]]
 path = "schemas/investigation-input.json"
-sha256 = "sha256:079e99957548044be0471e22c626114585d9edc01991cc178175145ab745b397"
+sha256 = "sha256:1f5cf8cd79810b15d425741e66d770b94a55c53e2fca53ae86e2500a8d9e8da1"
 
 [[resources]]
 path = "schemas/investigation-output.json"
 sha256 = "sha256:373e0b3773fc555083922d63e745efd1c22822680ce0a111ced8c6a80828f764"
+
+[[resources]]
+path = "schemas/summary.json"
+sha256 = "sha256:6489930ff57d4e3624775cca74779eb0c110c90e431edfd942f4549ee1765a3c"
+
+[[resources]]
+path = "schemas/coverage.json"
+sha256 = "sha256:94707ca9bcb1fd80de864c2e9ae274331db14b0e71a13124d2913cfb4898d6f1"
+
+[[resources]]
+path = "schemas/grounding.json"
+sha256 = "sha256:ddef9d7e5c1d0ce924d82e08087a2e8d5f66bb68614d54c0085c7cf87c5ba929"
+
+[[resources]]
+path = "schemas/review.json"
+sha256 = "sha256:7d681b5e996cebd874f66955369354455bc656f7f4cfaa422b8b7f590d335062"
+
+[[resources]]
+path = "schemas/search-hits.json"
+sha256 = "sha256:8c97409fea1720aac2bfd71a226ac7d5ec0bbf179f61a6d9348bf12667c863f7"
+
+[[resources]]
+path = "schemas/source-range.json"
+sha256 = "sha256:cda032ce806a1540ed6a76f9a307fbc2efe5b9d2e667f5dfeb6340b923da5b09"
 
 [[edges]]
 from = "prepare_workspace"
@@ -136,3 +232,60 @@ cases = { invalid = "revise", valid = "review", abstain = "abstain" }
 from = "review"
 predicate = { id = "review.verdict@v1", version = "1.0.0" }
 cases = { pass = "publish", revise = "revise", abstain = "abstain" }
+
+[state]
+schema_id = "code-investigation-state"
+schema_version = "1"
+required_keys = ["input"]
+
+[state.keys."input"]
+schema_id = "json"
+schema_version = "1"
+
+[state.keys."node:prepare_workspace"]
+schema_id = "json"
+schema_version = "1"
+
+[state.keys."node:planner"]
+schema_id = "json"
+schema_version = "1"
+
+[state.keys."node:search_code"]
+schema_id = "json"
+schema_version = "1"
+
+[state.keys."node:inspect_evidence"]
+schema_id = "json"
+schema_version = "1"
+
+[state.keys."node:coverage_decision"]
+schema_id = "json"
+schema_version = "1"
+
+[state.keys."node:retry_search_code"]
+schema_id = "json"
+schema_version = "1"
+
+[state.keys."node:retry_inspect_evidence"]
+schema_id = "json"
+schema_version = "1"
+
+[state.keys."node:retry_coverage_decision"]
+schema_id = "json"
+schema_version = "1"
+
+[state.keys."node:draft"]
+schema_id = "json"
+schema_version = "1"
+
+[state.keys."node:grounding_validation"]
+schema_id = "json"
+schema_version = "1"
+
+[state.keys."node:review"]
+schema_id = "json"
+schema_version = "1"
+
+[state.keys."node:revise"]
+schema_id = "json"
+schema_version = "1"

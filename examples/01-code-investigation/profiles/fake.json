@@ -8,17 +8,63 @@
     "responses": [
       "{\"status\":\"finished\",\"output\":\"prepared\"}",
       "{\"status\":\"finished\",\"output\":\"planned\"}",
-      {"calls": [{"id": "search-retry", "name": "search_code", "args": {"query": "retry", "path": "src"}}]},
-      "{\"status\":\"finished\",\"output\":\"searched\"}",
-      {"calls": [{"id": "read-retry", "name": "read_source_range", "args": {"path": "src/retry.rs", "start_line": 1, "end_line": 8}}]},
-      "{\"status\":\"finished\",\"output\":\"inspected\"}",
+      {
+        "calls": [
+          {
+            "id": "search-retry",
+            "name": "search_code",
+            "args": {
+              "query": "retry",
+              "path": "src"
+            }
+          }
+        ]
+      },
+      "{\"status\":\"finished\",\"output\":{\"matches\":[{\"path\":\"src/retry.rs\",\"line\":1,\"snippet\":\"pub fn default_retry() -> u8 {\"}]}}",
+      {
+        "calls": [
+          {
+            "id": "read-retry",
+            "name": "read_source_range",
+            "args": {
+              "path": "src/retry.rs",
+              "start_line": 1,
+              "end_line": 8
+            }
+          }
+        ]
+      },
+      "{\"status\":\"finished\",\"output\":{\"path\":\"src/retry.rs\",\"start_line\":1,\"end_line\":8,\"snippet\":\"pub fn default_retry() -> u8 {\\n    // Default retry path: three attempts.\\n    retry_with_limit(3)\\n}\\n\\npub fn retry_with_limit(limit: u8) -> u8 {\\n    limit\\n}\"}}",
       "{\"status\":\"finished\",\"output\":\"insufficient\"}",
-      {"calls": [{"id": "retry-search", "name": "search_code", "args": {"query": "pub", "path": "src"}}]},
-      "{\"status\":\"finished\",\"output\":\"retried-search\"}",
-      {"calls": [{"id": "retry-read", "name": "read_source_range", "args": {"path": "src/retry.rs", "start_line": 1, "end_line": 8}}]},
-      "{\"status\":\"finished\",\"output\":\"retried-inspect\"}",
+      {
+        "calls": [
+          {
+            "id": "retry-search",
+            "name": "search_code",
+            "args": {
+              "query": "pub",
+              "path": "src"
+            }
+          }
+        ]
+      },
+      "{\"status\":\"finished\",\"output\":{\"matches\":[{\"path\":\"src/retry.rs\",\"line\":1,\"snippet\":\"pub fn default_retry() -> u8 {\"}]}}",
+      {
+        "calls": [
+          {
+            "id": "retry-read",
+            "name": "read_source_range",
+            "args": {
+              "path": "src/retry.rs",
+              "start_line": 1,
+              "end_line": 8
+            }
+          }
+        ]
+      },
+      "{\"status\":\"finished\",\"output\":{\"path\":\"src/retry.rs\",\"start_line\":1,\"end_line\":8,\"snippet\":\"pub fn default_retry() -> u8 {\\n    // Default retry path: three attempts.\\n    retry_with_limit(3)\\n}\\n\\npub fn retry_with_limit(limit: u8) -> u8 {\\n    limit\\n}\"}}",
       "{\"status\":\"finished\",\"output\":\"sufficient\"}",
-      "{\"status\":\"finished\",\"output\":\"drafted\"}",
+      "{\"status\":\"finished\",\"output\":{\"schema_version\":1,\"snapshot_id\":\"sha256:b670c07a0f85acdbb7d921c5510905d17f498c6f3841f5a3cb5c7cf84e6e775e\",\"claims\":[{\"id\":\"default-retry\",\"text\":\"The default retry path is default_retry in src/retry.rs; it calls retry_with_limit(3).\",\"evidence\":[{\"claim_id\":\"default-retry\",\"path\":\"src/retry.rs\",\"start_line\":1,\"end_line\":8,\"snippet\":\"pub fn default_retry() -> u8 {\\n    // Default retry path: three attempts.\\n    retry_with_limit(3)\\n}\\n\\npub fn retry_with_limit(limit: u8) -> u8 {\\n    limit\\n}\",\"digest\":\"sha256:4eba2d51911d695cd6341f0db4e352d82264f1dcc3a7c9d1971ee0dd769230b3\"}]}]}}",
       "{\"status\":\"finished\",\"output\":\"valid\"}"
     ]
   },
@@ -27,7 +73,9 @@
     "name": "code-investigation-reviewer",
     "version": "1",
     "model": "fake-reviewer",
-    "responses": ["{\"status\":\"finished\",\"output\":\"pass\"}"]
+    "responses": [
+      "{\"status\":\"finished\",\"output\":\"pass\"}"
+    ]
   },
   "skills": [
     {
@@ -40,17 +88,61 @@
     {
       "name": "search_code",
       "root": "repo",
-      "input_schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}}, "required": ["query"], "additionalProperties": false},
-      "required_capabilities": ["filesystem.read"],
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      },
+      "required_capabilities": [
+        "filesystem.read"
+      ],
       "required_scopes": []
     },
     {
       "name": "read_source_range",
       "root": "repo",
-      "input_schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}}, "required": ["path", "start_line", "end_line"], "additionalProperties": false},
-      "required_capabilities": ["filesystem.read"],
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "start_line": {
+            "type": "integer"
+          },
+          "end_line": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path",
+          "start_line",
+          "end_line"
+        ],
+        "additionalProperties": false
+      },
+      "required_capabilities": [
+        "filesystem.read"
+      ],
       "required_scopes": []
     }
   ],
-  "sandbox": {"capabilities": ["filesystem.read", "process.spawn"]}
+  "sandbox": {
+    "capabilities": [
+      "filesystem.read",
+      "process.spawn"
+    ]
+  }
 }

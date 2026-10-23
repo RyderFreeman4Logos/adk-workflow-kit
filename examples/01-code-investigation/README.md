@@ -85,6 +85,37 @@ bytes, so its validation also performs no network access.
 - fresh-process inspection and resume using the selected workdir; and
 - offline validation of the committed redacted replay bundle.
 
+## Model-facing contracts and evidence
+
+All twelve agent nodes bind an instruction, an explicit input-state whitelist,
+an output schema and state key, and isolated model history. Tool turns within
+one node invocation retain their own conversation; a later graph visit receives
+its current whitelisted state rather than the earlier visit's transcript.
+Review receives the selected draft/revision and source evidence, without the
+planner's private transcript. Shared-session policy is separate from this example.
+
+Coverage emits the JSON string `"sufficient"`, `"insufficient"`, or `"impossible"`.
+Grounding and review use their own finite string enums. Search and inspection
+publish structured source evidence; draft and revision publish an
+`InvestigationAnswer`, not a placeholder string. These contracts are supplied to
+the provider and checked locally before downstream routing.
+
+`input.example.json` carries the checked-in repository's Snapshot ID and whole-file
+digests. The opt-in conformance runner recomputes these facts from `repo/` before
+starting the child; a mismatch fails with `invalid_snapshot` and no provider call.
+After publication it reads the actual selected `node:revise` or `node:draft` from
+the retained checkpoint and applies `validate_answer`: Snapshot identity, claim
+binding, contained path, whole-file digest, inclusive range and exact source text.
+Every citation must also fall within a real successful `read_source_range` result
+in the integrity-checked event log, including protected artifact-backed results.
+The canonical question additionally requires a cited `default_retry` finding in
+`src/retry.rs`; this finite expected-finding check does not evaluate arbitrary prose.
+Source changes require updating the Snapshot facts and evidence together. A
+model's `"valid"` verdict or reaching `publish` alone cannot earn conformance `PASS`.
+Invalid retained evidence is `FAIL` with `invalid_evidence`; valid abstention stays
+`ABSTAIN`, and the default, non-opted-in runner stays `SKIP` without I/O. Ordinary
+`workflowctl run` remains a graph execution receipt, not this semantic quality gate.
+
 ## Deterministic node contract
 
 `workflow-deterministic.toml` is the model-free companion fixture for the

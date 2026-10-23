@@ -1,0 +1,27 @@
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "start_line": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "end_line": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "snippet": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "path",
+    "start_line",
+    "end_line",
+    "snippet"
+  ],
+  "additionalProperties": false
+}

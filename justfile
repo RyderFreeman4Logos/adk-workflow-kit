@@ -117,6 +117,10 @@ m3-06-cli test_name:
 m3-07-cli test_name="":
     {{_io}} cargo +1.98.0 test -p workflowctl --test m3_07_live_conformance {{test_name}} --locked -- --nocapture
 
+# Private retained-evidence generation contracts, without a model provider.
+m3-07-evidence:
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --lib live_conformance::evidence::tests --locked -- --nocapture
+
 # Disposable subprocess ownership regressions, without a model provider.
 issue-337-owner test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-testkit --test issue_337_live_owner {{test_name}} --locked -- --nocapture
