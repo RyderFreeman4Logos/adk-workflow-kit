@@ -280,6 +280,56 @@ issue-239-invocation-regression:
 issue-239-isolation:
     {{_io}} cargo +1.98.0 test -p workflow-adk --lib semantic_firewall::tests:: --locked -- --nocapture
 
+# Focused #230 benchmark harness tests.
+issue-230-runtime test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --test issue_230_benchmark_harness {{test_name}} --locked -- --nocapture --test-threads=2
+
+issue-230-modes test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --test issue_230_modes {{test_name}} --locked -- --nocapture --test-threads=2
+
+issue-230-comparison test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --test issue_230_comparison {{test_name}} --locked -- --nocapture --test-threads=2
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --lib execution230::policy::comparison::tests:: --locked -- --nocapture --test-threads=2
+
+issue-230-cache test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --test issue_230_cache {{test_name}} --locked -- --nocapture --test-threads=2
+
+issue-230-telemetry test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --test issue_230_telemetry {{test_name}} --locked -- --nocapture --test-threads=2
+
+issue-230-telemetry-adk:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test model_profiles --locked -- --nocapture --test-threads=1
+    {{_io}} cargo +1.98.0 test -p workflow-adk --lib events:: --locked -- --nocapture --test-threads=1
+    {{_io}} cargo +1.98.0 test -p workflow-adk --lib model_profiles::retry_admission_tests:: --locked -- --nocapture --test-threads=1
+
+issue-230-test:
+    just issue-230-telemetry
+    just issue-230-cache
+    just issue-230-comparison
+    just issue-230-modes
+    just issue-230-runtime
+    just issue-230-execution
+    just issue-230-resume
+    just issue-230-execution-unit
+    just issue-230-telemetry-adk
+
+issue-230-execution test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --test issue_230_execution {{test_name}} --locked -- --nocapture --test-threads=2
+
+issue-230-resume test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --test issue_230_resume {{test_name}} --locked -- --nocapture --test-threads=2
+
+issue-230-execution-unit test_name="execution230::":
+    {{_io}} cargo +1.98.0 test -p workflow-testkit --lib {{test_name}} --locked -- --nocapture --test-threads=2
+
+# One-command scripted smoke for every registered workflow. No live model.
+issue-230-smoke:
+    {{_io}} cargo +1.98.0 run -p workflow-testkit --bin bench-230 --locked -- scripted
+
+# Synthetic values for deterministic golden reports, not measured execution.
+issue-230-fixture:
+    {{_io}} cargo +1.98.0 run -p workflow-testkit --bin bench-230 --locked -- fixture
+
 # Focused #229 pinned dataset registry tests.
 issue-229-http test_name="dataset::dataset_http::":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --lib {{test_name}} --locked -- --nocapture

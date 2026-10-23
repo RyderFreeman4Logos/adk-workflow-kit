@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "wire_fixture",
+  "route": "openai-compatible",
+  "reasoning": "low",
+  "live_opt_in": true,
+  "live_executed": false,
+  "case_id": "wire-1",
+  "workflow_id": "runtime-smoke",
+  "source_revision": "src-wire",
+  "model_revision": "model-wire",
+  "dataset_revision": "ds-wire",
+  "config_digest": "cfg-wire",
+  "prefix_hash": "sha256:wire",
+  "prefix_hit": false,
+  "cache_class": "cold",
+  "result_cache": "recorded",
+  "tokens": {
+    "input": 11,
+    "cached_input": 0,
+    "reasoning": 3,
+    "visible_output": 5
+  },
+  "prefill_ns": 1,
+  "decode_ns": 2,
+  "provider_cost_micros": 0,
+  "retries": 0,
+  "escalation": "none",
+  "hitl": false,
+  "quality_millis": 1000,
+  "security_failures": 0
+}

@@ -6,6 +6,8 @@ pub mod compatibility;
 pub mod conformance;
 mod dataset_product;
 mod eval;
+pub mod execution230;
+mod harness230;
 pub mod live_conformance;
 mod non_progress;
 mod replay;
@@ -13,6 +15,13 @@ mod sandbox;
 
 pub use bench::{BenchmarkDiagnostics, BenchmarkReport, BenchmarkSample, run_suite};
 pub use dataset_product::run_dataset_product;
+pub use harness230::{
+    AggregateReport, BenchmarkCase, BenchmarkSuite, CacheClass, CaseEnvelope, CaseObservation,
+    EvidenceKind, OrderedFloat, PairedReport, PairedRow, RegisteredWorkflow, RunManifest,
+    SuiteMode, TokenClasses, aggregate_report, bench230_main, case_envelope, compare_revisions,
+    confidence_bound, pareto_frontier, registered_workflows, resume_suite, run_mode,
+    run_scripted_smoke, scripted_fixture, split_manifests,
+};
 
 use std::{
     collections::VecDeque,

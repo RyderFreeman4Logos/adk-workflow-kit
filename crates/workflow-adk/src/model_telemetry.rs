@@ -3,7 +3,7 @@ use adk_rust::{LlmRequest, LlmResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::model_invocation::ProviderTokenUsage;
+use crate::model_invocation::{ProviderTokenUsage, canonical_json, digest};
 use crate::model_profiles::{ModelBinding, ModelProfileIdentity};
 
 /// Client-resolved public aliases, not endpoint or server-weight attestations.
@@ -47,7 +47,17 @@ pub struct ModelTelemetryV1 {
     pub decode_ns: Option<u64>,
     pub provider_cost_usd: Option<f64>,
     pub reported_cost_usd: Option<f64>,
+    /// Optional SDK estimate, not response-owned provider billing. Its source is explicit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdk_estimated_cost_usd: Option<f64>,
     pub kv_cache_hit: Option<bool>,
+    /// Digest of the actual request's leading system contents, explicit tools, schema and model.
+    /// Excludes dynamic conversation/continuation and transport; not a wire prefix or KV proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_prefix_hash: Option<String>,
+    /// Digest of the actual request cache salt; never an observation of provider cache state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_cache_salt_hash: Option<String>,
     /// Retries performed by this binding (at most its existing one 429 retry).
     pub retries: u64,
 }
@@ -134,7 +144,17 @@ pub(crate) fn attach(
         provider_cost_usd: None,
         // Normalized SDK cost has no provider-billing provenance here.
         reported_cost_usd: None,
+        sdk_estimated_cost_usd: response
+            .usage_metadata
+            .as_ref()
+            .and_then(|m| m.cost)
+            .filter(|cost| cost.is_finite() && *cost >= 0.0),
         kv_cache_hit: None,
+        host_prefix_hash: Some(host_prefix_hash(request)),
+        request_cache_salt_hash: extension
+            .and_then(|v| v.get("cache_salt"))
+            .and_then(Value::as_str)
+            .map(|salt| digest(salt.as_bytes())),
         retries: u64::from(retried),
     };
     let value = serde_json::to_value(telemetry)
@@ -145,6 +165,20 @@ pub(crate) fn attach(
     }
     metadata[METADATA_KEY] = value;
     Ok(())
+}
+
+// Select the host stable view explicitly: LlmRequest serde intentionally skips its tools.
+fn host_prefix_hash(request: &LlmRequest) -> String {
+    let leading_system = request
+        .contents
+        .iter()
+        .take_while(|c| c.role == "system")
+        .collect::<Vec<_>>();
+    let value = json!({
+        "model":request.model, "leading_system":leading_system, "tools":request.tools,
+        "response_schema":request.config.as_ref().and_then(|c|c.response_schema.as_ref())
+    });
+    digest(canonical_json(&value).as_bytes())
 }
 
 fn public_alias(value: &str) -> Option<String> {
@@ -161,6 +195,60 @@ mod tests {
     use super::*;
     use crate::model_profiles::{CredentialBroker, FakeModelProfile, ModelProfileRegistry};
     use adk_rust::{Content, UsageMetadata};
+
+    #[test]
+    fn actual_prefix_selects_stable_request_fields_and_canonicalizes_tool_keys() {
+        let mut request = LlmRequest::new(
+            "host-model",
+            vec![
+                Content::new("system").with_text("instructions"),
+                Content::new("system").with_text("second"),
+                Content::new("user").with_text("dynamic"),
+            ],
+        );
+        request
+            .tools
+            .insert("tool".into(), json!({"type":"object","required":["query"]}));
+        request
+            .config
+            .get_or_insert_with(Default::default)
+            .response_schema = Some(json!({"type":"string"}));
+        let original = host_prefix_hash(&request);
+        let mut suffix = request.clone();
+        suffix.contents[2] = Content::new("user").with_text("other input");
+        suffix
+            .contents
+            .push(Content::new("tool").with_text("private dynamic result"));
+        suffix.previous_response_id = Some("other-continuation".into());
+        suffix
+            .config
+            .as_mut()
+            .unwrap()
+            .extensions
+            .insert("openai".into(), json!({"cache_salt":"other-domain"}));
+        assert_eq!(original, host_prefix_hash(&suffix));
+        for change in 0..4 {
+            let mut changed = request.clone();
+            match change {
+                0 => changed.contents.swap(0, 1),
+                1 => {
+                    changed
+                        .tools
+                        .insert("other".into(), json!({"type":"string"}));
+                }
+                2 => {
+                    changed.config.as_mut().unwrap().response_schema =
+                        Some(json!({"type":"number"}))
+                }
+                _ => changed.model = "different-model".into(),
+            }
+            assert_ne!(original, host_prefix_hash(&changed));
+        }
+        let mut other = request.clone();
+        request.tools.insert("a".into(), json!({"z":1,"a":2}));
+        other.tools.insert("a".into(), json!({"a":2,"z":1}));
+        assert_eq!(host_prefix_hash(&request), host_prefix_hash(&other));
+    }
 
     #[test]
     fn latest_raw_snapshot_replaces_without_merging_and_spoofs_are_removed() {
@@ -208,6 +296,7 @@ mod tests {
         assert_eq!(telemetry.total_tokens, None);
         assert_eq!(telemetry.retries, 1);
         assert_eq!(telemetry.reported_cost_usd, None);
+        assert_eq!(telemetry.sdk_estimated_cost_usd, Some(0.0));
         assert!(!encoded.to_string().contains("spoof-canary"));
 
         // A new invocation cannot inherit any snapshot from the prior attempt.
