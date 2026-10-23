@@ -25,6 +25,7 @@ pub use model_invocation::{
     ToolSpec,
 };
 pub mod model_profiles;
+pub mod model_telemetry;
 pub use model_profiles::{
     CredentialBroker, FakeModelProfile, ModelBinding, ModelProfileError, ModelProfileErrorKind,
     ModelProfileIdentity, ModelProfileRegistry, ModelRole, ModelRuntimeConfig,

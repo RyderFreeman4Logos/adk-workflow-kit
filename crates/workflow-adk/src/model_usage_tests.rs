@@ -211,3 +211,184 @@ async fn provider_usage_cannot_override_terminal_failures() {
     }
     super::rejected(vec![text(OUTPUT), usage], true).await;
 }
+
+#[tokio::test]
+async fn binding_trait_collects_contentless_usage_without_new_payload_events() {
+    use adk_rust::futures::StreamExt;
+    for (initial, trailers, expected_input, expected_output) in [
+        (
+            Some(json!({"prompt_tokens":11,"completion_tokens":13})),
+            vec![
+                Some(json!({"completion_tokens":0})),
+                None,
+                Some(json!({"prompt_tokens":-1})),
+            ],
+            None,
+            Some(0),
+        ),
+        (
+            None,
+            vec![Some(json!({"prompt_tokens":u64::MAX}))],
+            Some(u64::MAX),
+            None,
+        ),
+        (
+            Some(json!({"prompt_tokens":5})),
+            vec![None, Some(json!({}))],
+            Some(5),
+            None,
+        ),
+    ] {
+        let mut payload = text(OUTPUT);
+        payload.usage_metadata = reported(initial).usage_metadata;
+        let mut responses = vec![payload];
+        responses.extend(trailers.into_iter().map(reported));
+        let (spec, binding) = invocation(Arc::new(Probe {
+            responses,
+            transport_error: false,
+            calls: AtomicUsize::new(0),
+        }));
+        let stream = Llm::generate_content(&binding, spec.to_llm_request(), false)
+            .await
+            .unwrap();
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(
+            items.len(),
+            1,
+            "usage trailers must not manufacture content events"
+        );
+        let item = items[0].as_ref().unwrap();
+        let telemetry =
+            &item.provider_metadata.as_ref().unwrap()[crate::model_telemetry::METADATA_KEY];
+        assert_eq!(telemetry["input_tokens"].as_u64(), expected_input);
+        assert_eq!(telemetry["output_tokens"].as_u64(), expected_output);
+    }
+}
+
+#[tokio::test]
+async fn binding_trait_usage_cannot_accept_failed_or_payloadless_streams() {
+    for failure in [
+        LlmResponse {
+            interrupted: true,
+            ..Default::default()
+        },
+        LlmResponse {
+            error_code: Some("private-code".into()),
+            ..Default::default()
+        },
+        LlmResponse {
+            error_message: Some("private-message".into()),
+            ..Default::default()
+        },
+        LlmResponse {
+            finish_reason: Some(adk_rust::FinishReason::MaxTokens),
+            ..Default::default()
+        },
+    ] {
+        let (spec, binding) = invocation(Arc::new(Probe {
+            responses: vec![
+                text(OUTPUT),
+                reported(Some(json!({"prompt_tokens":5}))),
+                failure,
+            ],
+            transport_error: false,
+            calls: AtomicUsize::new(0),
+        }));
+        assert!(
+            Llm::generate_content(&binding, spec.to_llm_request(), false)
+                .await
+                .is_err()
+        );
+    }
+    for (responses, transport_error) in [
+        (
+            vec![text(OUTPUT), reported(Some(json!({"prompt_tokens":5})))],
+            true,
+        ),
+        (vec![reported(Some(json!({"prompt_tokens":5})))], false),
+    ] {
+        let (spec, binding) = invocation(Arc::new(Probe {
+            responses,
+            transport_error,
+            calls: AtomicUsize::new(0),
+        }));
+        assert!(
+            Llm::generate_content(&binding, spec.to_llm_request(), false)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelled_binding_collection_drops_stream_and_never_reuses_usage() {
+    use adk_rust::futures::{StreamExt, stream};
+    use std::sync::atomic::AtomicBool;
+    struct CancelProbe {
+        calls: AtomicUsize,
+        dropped: Arc<AtomicBool>,
+    }
+    struct OnDrop(Arc<AtomicBool>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    #[adk_rust::async_trait]
+    impl Llm for CancelProbe {
+        fn name(&self) -> &str {
+            "cancel-probe"
+        }
+        async fn generate_content(
+            &self,
+            _: LlmRequest,
+            _: bool,
+        ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let guard = OnDrop(self.dropped.clone());
+                Ok(Box::pin(
+                    stream::iter([
+                        Ok(text(OUTPUT)),
+                        Ok(reported(Some(json!({"prompt_tokens":77})))),
+                    ])
+                    .chain(stream::once(async move {
+                        let _guard = guard;
+                        std::future::pending::<adk_rust::Result<LlmResponse>>().await
+                    })),
+                ))
+            } else {
+                Ok(Box::pin(stream::iter([Ok(text(OUTPUT))])))
+            }
+        }
+    }
+    let (spec, binding) = invocation(Arc::new(Probe {
+        responses: vec![],
+        transport_error: false,
+        calls: AtomicUsize::new(0),
+    }));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let binding = binding.with_test_llm(Arc::new(CancelProbe {
+        calls: AtomicUsize::new(0),
+        dropped: dropped.clone(),
+    }));
+    assert!(
+        adk_rust::tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            Llm::generate_content(&binding, spec.to_llm_request(), false)
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "cancel must drop the actual inner stream"
+    );
+    let mut next = Llm::generate_content(&binding, spec.to_llm_request(), false)
+        .await
+        .unwrap();
+    let response = next.next().await.unwrap().unwrap();
+    let telemetry =
+        &response.provider_metadata.as_ref().unwrap()[crate::model_telemetry::METADATA_KEY];
+    assert!(telemetry["input_tokens"].is_null());
+    assert!(next.next().await.is_none());
+}

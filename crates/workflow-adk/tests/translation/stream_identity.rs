@@ -60,7 +60,7 @@ async fn serve_sse(listener: TcpListener, deadline: Instant) -> io::Result<Vec<u
 async fn official_http_sse_preserves_partial_and_final_audit_events() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
-    let model = OpenAICompatible::new(
+    let model = OpenAICompatible::new_no_auth(
         OpenAICompatibleConfig::new("", "loopback-sse").with_base_url(endpoint),
     )
     .unwrap()

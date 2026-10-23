@@ -38,7 +38,7 @@ dependencies = [
 [[package]]
 name = "adk-core"
 version = "2.3.0"
-source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=1b73faf4f06004e028034e617270fc3003e75cad#1b73faf4f06004e028034e617270fc3003e75cad"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=859b4bb7bf8754b74292743232bb0aca15470816#859b4bb7bf8754b74292743232bb0aca15470816"
 dependencies = [
  "async-trait",
  "chrono",
@@ -54,7 +54,7 @@ dependencies = [
 [[package]]
 name = "adk-graph"
 version = "2.3.0"
-source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=1b73faf4f06004e028034e617270fc3003e75cad#1b73faf4f06004e028034e617270fc3003e75cad"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=859b4bb7bf8754b74292743232bb0aca15470816#859b4bb7bf8754b74292743232bb0aca15470816"
 dependencies = [
  "adk-core",
  "async-stream",
@@ -89,10 +89,10 @@ dependencies = [
 [[package]]
 name = "adk-model"
 version = "2.3.0"
-source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=1b73faf4f06004e028034e617270fc3003e75cad#1b73faf4f06004e028034e617270fc3003e75cad"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=859b4bb7bf8754b74292743232bb0aca15470816#859b4bb7bf8754b74292743232bb0aca15470816"
 dependencies = [
  "adk-core",
- "adk-telemetry 2.3.0 (git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=1b73faf4f06004e028034e617270fc3003e75cad)",
+ "adk-telemetry 2.3.0 (git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=859b4bb7bf8754b74292743232bb0aca15470816)",
  "anyhow",
  "async-openai",
  "async-stream",
@@ -182,7 +182,7 @@ dependencies = [
 [[package]]
 name = "adk-telemetry"
 version = "2.3.0"
-source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=1b73faf4f06004e028034e617270fc3003e75cad#1b73faf4f06004e028034e617270fc3003e75cad"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=859b4bb7bf8754b74292743232bb0aca15470816#859b4bb7bf8754b74292743232bb0aca15470816"
 dependencies = [
  "thiserror",
  "tracing",
@@ -2642,9 +2642,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -3642,4 +3642,4 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[patch.unused]]
 name = "adk-action"
 version = "2.3.0"
-source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=1b73faf4f06004e028034e617270fc3003e75cad#1b73faf4f06004e028034e617270fc3003e75cad"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=859b4bb7bf8754b74292743232bb0aca15470816#859b4bb7bf8754b74292743232bb0aca15470816"
