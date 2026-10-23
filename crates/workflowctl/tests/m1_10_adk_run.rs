@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use workflow_runtime::{
     ArtifactStore, CheckpointManifestV1, FilesystemArtifactStore, PageRequest, RunId,
-    SqliteCheckpointStore, WorkflowRuntimeEventV1,
+    SqliteCheckpointStore, WorkflowRuntimeEventKindV1, WorkflowRuntimeEventV1,
 };
 
 #[path = "support/m1_10_artifact_owner.rs"]
@@ -1742,6 +1742,23 @@ fn post_execution_artifact_failure_still_persists_the_returned_receipt() {
         "artifact persistence failure must report the stable category",
     );
     let failed_receipt = json_stdout(&failed);
+    let events = workflow_events_from_bytes(
+        &fs::read(run_root(&runs).join("events.jsonl"))
+            .expect("post-execution failure events must remain readable"),
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind() == WorkflowRuntimeEventKindV1::WorkflowCompleted),
+        "artifact collision must occur after public workflow completion"
+    );
+    assert!(
+        events
+            .iter()
+            .rfind(|event| event.kind() == WorkflowRuntimeEventKindV1::NodeCompleted)
+            .is_some_and(|event| event.node_id() == Some("done")),
+        "artifact collision must retain the final done-node completion"
+    );
     assert!(
         failed_receipt["status"] == "succeeded",
         "artifact persistence failure must occur after graph execution"

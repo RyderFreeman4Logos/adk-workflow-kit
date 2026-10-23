@@ -5352,8 +5352,6 @@ impl ExecutionBackend {
         {
             persistence_error.get_or_insert(ExecutionError::new(ExecutionErrorKind::Persistence));
             artifact_id = "unavailable".to_owned();
-        }
-        if persistence_error.is_some() {
             status = "failed";
         }
         let (cache_dispositions, event_counts) = cache_provenance(mapper.events());
