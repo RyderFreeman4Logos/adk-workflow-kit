@@ -985,7 +985,7 @@ impl ModelProfile {
             }
             Self::OpenAiCompatible(value) => {
                 let api_key = match (&value.auth, secret.as_ref()) {
-                    // ADK 2.3 uses an empty key as its explicit no-header transport sentinel.
+                    // The explicit NoAuth constructor ignores this required config field.
                     (OpenAiCompatibleAuth::NoAuth, None) => "",
                     (OpenAiCompatibleAuth::Credential(_), Some(secret))
                         if !secret.expose().trim().is_empty() =>
@@ -998,10 +998,13 @@ impl ModelProfile {
                 let config = OpenAICompatibleConfig::new(api_key, &value.model)
                     .with_provider_name(&value.provider)
                     .with_base_url(&value.base_url);
-                let llm = OpenAICompatible::new(config)
-                    .map_err(|_| ModelProfileError::provider())?
-                    .with_response_schema_strict(false)
-                    .with_retry_config(RetryConfig::disabled());
+                let llm = match &value.auth {
+                    OpenAiCompatibleAuth::NoAuth => OpenAICompatible::new_no_auth(config),
+                    OpenAiCompatibleAuth::Credential(_) => OpenAICompatible::new(config),
+                }
+                .map_err(|_| ModelProfileError::provider())?
+                .with_response_schema_strict(false)
+                .with_retry_config(RetryConfig::disabled());
                 (
                     Arc::new(llm) as Arc<dyn Llm>,
                     value.model.clone(),
