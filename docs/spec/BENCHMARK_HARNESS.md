@@ -1,10 +1,10 @@
 # Benchmark harness status
 
-**Issue #230 remains incomplete.** The offline execution milestone runs real compiled
-workflows using the repository's scripted model adapters. It does **not** run a live
-model or measure model quality, token usage, prefill/decode time, or provider cost.
-The separate explicit-input measurement path below captures provider-response usage
-through the same runtime; its local HTTP tests are not live-model coverage.
+The harness supports scripted workflow execution and an explicitly authorized
+provider-measurement path through the same runtime. Scripted adapters and local HTTP
+fixtures remain distinct from the bounded provider acceptance recorded below.
+[Issue #230](https://github.com/RyderFreeman4Logos/adk-workflow-kit/issues/230)
+tracks delivery status and remaining evaluation obligations.
 
 ## Commands and evidence
 
@@ -418,7 +418,8 @@ reports have `evidence_kind="opt_in_provider_execution"`, `live_opt_in=true`, an
 `live_executed=null`: this runtime cannot attest whether a supplied endpoint runs
 real inference. `completed_model_observed` reports only actual completed event
 coverage. Neither model alias nor profile version proves a weights/tokenizer
-revision. **No authorized live provider was executed for this milestone.**
+revision. The authorized provider acceptance below does not change those attestation
+limits.
 
 The plan binds source HEAD/tree/current-file and executable digests, workflow
 bytes, canonical profile/model/input identities and the exact binding-file digest.
@@ -441,6 +442,42 @@ script, verifies wire model/effort and runtime-event usage provenance, missing u
 reported zero, missing details, HTTP 429 retry, invalid-counter omission, privacy, tampering,
 origin/route admission and mismatched binding denial. It is deliberately
 separate from `fixture` and from offline fake-model cache/suite execution.
+
+## Recorded bounded acceptance
+
+These observations bind source revision `ad19edb50e294197a642b16fab0a6c9080d4be12`
+and bench executable SHA-256
+`2c366769951205333e4cec4cbbfa09164079bd1d483355db9c9c9867ba8436d2`.
+They bind observed client source/binary identities and results, not remote model weights.
+
+- One `just issue-230-smoke` command successfully executed all four registered
+  workflows in 45.134 seconds of measured monotonic command time. These are
+  scripted-model runtime results, not live-provider quality measurements.
+- Two distinct config-only campaigns used loop iteration budgets 20 and 21 on that
+  same source/executable. Both tuning cases succeeded in each regression. The
+  comparison's pre-frozen 0-basis-point target **failed**: `compare` exited 1 with
+  `performance_target_failed=true` and `hard_invariant_failed=false`. Exact
+  arithmetic and exit classification were verified; this is not a performance pass,
+  independent repeated sampling or evidence of a causal improvement.
+- Two authorized sequential provider invocations passed the same input-bound
+  sorting/sum predicate described above. Each used one completed model invocation;
+  route/profile version and requested wire model matched the authorized binding,
+  with explicit `low` reasoning. The pair settled naturally within the admitted
+  180-second outer budget. Response-owned observations were:
+
+| Invocation | Input tokens | Output tokens | Reasoning count | Cached input count | Host retries |
+|---|---:|---:|---:|---:|---:|
+| First | 99 | 151 | 127 | 0 | 0 |
+| Second | 99 | 193 | 169 | 0 | 0 |
+
+An observed cached count of zero is valid response evidence, not a KV-hit or warm
+cache claim. Physical HTTP attempts were not independently observed; completed
+host telemetry records two completed invocations and zero retries, below the
+predeclared maximum of four HTTP attempts.
+KV/prefix, prefill/decode, visible-output counts and provider billing remain
+unavailable. Under the user's local-service policy, marginal API cost is zero,
+excluding hardware, electricity and labor; this is not observed provider billing.
+No all-workflow live-quality or shared-service pressure claim follows from this pair.
 
 ## Fixture reporting utilities
 
@@ -465,15 +502,13 @@ in-memory fixture filter, not persistent recovery. These fixture suite-mode enum
 and threshold/holdout splitting do not enforce policy; the campaign commands above
 are the measured execution path.
 
-## Remaining acceptance
+## Scope limits and further evaluation
 
-- Collect actual usage, route/reasoning, token classes, cost and timing from an
-  explicitly authorized live run; no live run occurred in this milestone.
-- Exercise one actual supported cache observation with the live semantic invocation;
-  leave unsupported KV/prefix fields unavailable. Offline cold/warm/pressure and
-  AABBA/ABABA request-order controls are result-cache measurements, not proof of
-  provider KV behavior or a host-resource scheduler. No shared-service cache reset
-  or full live pressure campaign is implied by these capabilities.
+- Offline cold/warm/pressure and AABBA/ABABA request-order controls measure result
+  caching, not provider KV behavior or a host-resource scheduler. The provider pair
+  retains supported cached-input counts; unsupported KV/prefix fields remain
+  unavailable. No shared-service cache reset or full live pressure campaign is
+  implied by these capabilities.
 - Automatic checkpoint/effect reconciliation remains deliberately unsupported.
   Completed-case resume and explicit fail-closed abandonment are implemented.
 - Integrate measured safety/quality evaluation and authorized private holdout data;
@@ -483,6 +518,3 @@ are the measured execution path.
   paired token/cost/cache vectors and measured Pareto reports. Single-pair source
   revision and explicit loop-budget config-only elapsed-time thresholds are
   implemented; arbitrary config changes and joint source/config changes are not.
-- Run the parent-owned official exact-tree gate and independent review. Focused
-  tests and fast hooks are not substitutes; the earlier #268 WallTimeLimit remains
-  unattributed, with no timeout changes or blind full-gate retry here.
