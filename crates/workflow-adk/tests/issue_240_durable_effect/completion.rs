@@ -5,6 +5,9 @@ use workflow_runtime::{
     ToolHandler,
 };
 
+#[path = "history.rs"]
+mod history;
+
 struct TerminalExecutor {
     calls: Arc<AtomicUsize>,
     violated: bool,
@@ -377,12 +380,10 @@ fn failed_effect_provenance_survives_completed_resume() {
             receipt.run_id(),
             &unrelated,
         )
-        .expect("advisory omission");
-        assert!(
-            serde_json::to_value(resumed)
-                .expect("receipt")
-                .get("effect_audits")
-                .is_none()
+        .expect("historical audit independent of current operation");
+        assert_eq!(
+            serde_json::to_value(resumed).expect("receipt")["effect_audits"],
+            audit
         );
         assert_eq!(calls.load(Ordering::SeqCst), count);
         assert_resume(
@@ -408,12 +409,10 @@ fn failed_effect_provenance_survives_completed_resume() {
             receipt.run_id(),
             &rebound,
         )
-        .expect("rebound omission");
-        assert!(
-            serde_json::to_value(resumed)
-                .expect("receipt")
-                .get("effect_audits")
-                .is_none()
+        .expect("historical audit independent of current approval");
+        assert_eq!(
+            serde_json::to_value(resumed).expect("receipt")["effect_audits"],
+            audit
         );
         assert_eq!(calls.load(Ordering::SeqCst), count);
         assert_resume(

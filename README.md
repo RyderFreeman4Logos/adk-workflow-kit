@@ -47,6 +47,8 @@ cargo run -p workflowctl -- resume --run-id RUN_ID --workdir .workflow-runs
 
 `run` prints `RUN_ID`; `inspect` and `resume` read its durable checkpoint and receipt from the same workdir. Keep profiles and workdirs outside source-controlled directories. Do not place API keys or other secrets in a workflow, fixture, replay bundle, or checked-in profile.
 
+Durable effect reports retain the privacy-safe receipt captured from the actual tool invocation in loop-ledger schema 6. Completed resume preserves that history even if a compatible current handler's operation, approval, or audit availability changes; registry and checkpoint admission still apply. These snapshots never grant approval, and a run manifest is never trusted to reconstruct them. Older ledger schemas fail closed rather than fabricating historical evidence; real GitHub mutation remains a separate, unrun integration layer.
+
 ## CLI
 
 ```sh

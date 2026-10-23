@@ -154,7 +154,7 @@ struct PendingCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     response: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    effect: Option<effect_audit::CompletedEffect>,
+    effect: Option<EffectAuditReceipt>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -241,7 +241,7 @@ impl LoopLedgerStore {
     ) -> Result<Self, ExecutionError> {
         let ledger = serde_json::from_slice::<LoopLedgerV1>(&bounded_read(&path)?)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        if ledger.schema_version != 5 || ledger.checkpoint_identity != checkpoint_identity {
+        if ledger.schema_version != 6 || ledger.checkpoint_identity != checkpoint_identity {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
         let mut nodes = if checkpoint_digest == loop_ledger_digest(&ledger.nodes)? {
@@ -677,7 +677,7 @@ impl LoopLedgerStore {
         write_json(
             &self.path,
             &LoopLedgerV1 {
-                schema_version: 5,
+                schema_version: 6,
                 checkpoint_identity: self.checkpoint_identity.clone(),
                 nodes: nodes.clone(),
                 checkpoint_nodes: Some(checkpoint_nodes),
@@ -709,7 +709,7 @@ impl LoopLedgerStore {
         write_json(
             &self.path,
             &LoopLedgerV1 {
-                schema_version: 5,
+                schema_version: 6,
                 checkpoint_identity: self.checkpoint_identity.clone(),
                 nodes,
                 checkpoint_nodes: None,
@@ -5369,9 +5369,7 @@ impl ExecutionBackend {
             plan_hash: resolved_plan.plan_hash().to_owned(),
             resume_identity: resolved_plan.resume_identity().to_owned(),
             checkpoint_manifest: Some(checkpoint_manifest),
-            effect_audits: profile
-                .effect_audits
-                .collect(&profile, loop_ledger.as_deref())?,
+            effect_audits: profile.effect_audits.collect(loop_ledger.as_deref())?,
             cache_dispositions,
             event_counts,
         };
@@ -5660,9 +5658,7 @@ impl ExecutionBackend {
                 )
             })
         {
-            manifest.effect_audits = profile
-                .effect_audits
-                .collect(&profile, Some(&loop_ledger))?;
+            manifest.effect_audits = profile.effect_audits.collect(Some(&loop_ledger))?;
             // Missing fresh authority leaves the checkpoint resumable, not terminal.
             if error.kind() == ExecutionErrorKind::AuthorizationDenied {
                 tool_audit::reconcile(&loop_ledger, &mut mapper, &mut artifacts)?;
@@ -5678,9 +5674,7 @@ impl ExecutionBackend {
                 error,
             ));
         }
-        manifest.effect_audits = profile
-            .effect_audits
-            .collect(&profile, Some(&loop_ledger))?;
+        manifest.effect_audits = profile.effect_audits.collect(Some(&loop_ledger))?;
         tool_audit::reconcile(&loop_ledger, &mut mapper, &mut artifacts)?;
 
         let mut retry_models = Vec::new();
@@ -5802,9 +5796,7 @@ impl ExecutionBackend {
             Ok(state) => state,
             Err(error) => {
                 let _ = record_binding_retries(&mut mapper, retry_models.clone(), run_id, next);
-                manifest.effect_audits = profile
-                    .effect_audits
-                    .collect(&profile, Some(&loop_ledger))?;
+                manifest.effect_audits = profile.effect_audits.collect(Some(&loop_ledger))?;
                 return Err(resume_failure(
                     &root,
                     &mut manifest,
@@ -5874,9 +5866,7 @@ impl ExecutionBackend {
         crash_barrier("after-checkpoint");
         crash_barrier("after-result");
         let (cache_dispositions, event_counts) = cache_provenance(mapper.events());
-        manifest.effect_audits = profile
-            .effect_audits
-            .collect(&profile, Some(&loop_ledger))?;
+        manifest.effect_audits = profile.effect_audits.collect(Some(&loop_ledger))?;
         manifest.status = "succeeded".to_owned();
         manifest.artifact_id = artifact_id;
         manifest.resume_count = next;
