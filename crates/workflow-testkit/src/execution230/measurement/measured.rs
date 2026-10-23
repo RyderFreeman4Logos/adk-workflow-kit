@@ -25,20 +25,33 @@ pub(super) fn append(output: &Path, case: &ExecutedCase, report: Value) -> Resul
     {
         return Err("measured output owner mismatch".to_owned());
     }
-    let quality = if case.status == ScriptedStatus::Succeeded {
+    let (quality, security) = if case.status == ScriptedStatus::Succeeded {
         let root = case
             .receipt
             .as_ref()
             .ok_or("missing measured receipt")?
             .run_root();
-        quality(root, &root.join("checkpoint.sqlite"), &report)?
+        selection(root, &root.join("checkpoint.sqlite"), &report)?
     } else {
-        None
+        (None, None)
     };
-    row(case, report, quality)
+    row(case, report, quality, security)
 }
 
-fn row(case: &ExecutedCase, mut report: Value, quality: Option<Value>) -> Result<Value, String> {
+fn row(
+    case: &ExecutedCase,
+    mut report: Value,
+    quality: Option<Value>,
+    security: Option<Value>,
+) -> Result<Value, String> {
+    // The recorded base projection stays unchanged. Both execution and report-only
+    // callers derive the hard result from this freshly revalidated label.
+    if security
+        .as_ref()
+        .is_some_and(|s| s["catastrophic_count"].as_u64().is_some_and(|n| n > 0))
+    {
+        report["hard_invariant_failed"] = json!(true);
+    }
     let calls = report["model_calls"]
         .as_array()
         .ok_or("missing model observations")?;
@@ -70,11 +83,13 @@ fn row(case: &ExecutedCase, mut report: Value, quality: Option<Value>) -> Result
         "provider_cost_usd":telemetry.as_ref().and_then(|t|t.provider_cost_usd),
         "kv_cache_hit":telemetry.as_ref().and_then(|t|t.kv_cache_hit),
         "retries":telemetry.as_ref().map(|t|t.retries),
-        "security_failures":null,
+        "sampling":report.get("sampling").cloned().unwrap_or(Value::Null),
+        "security_failures":security.as_ref().and_then(|s|s["catastrophic_count"].as_u64()),
+        "security":security,
         "security_failure_confidence_bound":null,
         "unavailable":{
             "quality":"null means no supported host predicate for this exact workflow/input",
-            "security_failures":"no host security observation; absence is not zero or a safety pass",
+            "security_failures":"null means no host security observation; a finite rule count is not an overall safety pass",
             "counts":"null means missing raw count or no single response; individual model_calls remain authoritative",
             "visible_output_count":"provider completion includes reasoning; no subtraction or normalization",
             "confidence":"one run/correlated samples do not establish an independent-trial bound"
@@ -85,16 +100,18 @@ fn row(case: &ExecutedCase, mut report: Value, quality: Option<Value>) -> Result
 
 /// The public store closes before this derived projection is returned or published.
 /// `database` is the run's checkpoint in production; tests may use an explicitly copied DB.
-fn quality(root: &Path, database: &Path, report: &Value) -> Result<Option<Value>, String> {
+fn selection(
+    root: &Path,
+    database: &Path,
+    report: &Value,
+) -> Result<(Option<Value>, Option<Value>), String> {
     let input: Value = journal::read(&root.join("execution-input.json"))?;
     let input_digest = digest(&serde_json::to_vec(&input).map_err(error)?);
     if report["case"]["manifest"]["dataset_digest"] != input_digest {
         return Err("measured input identity mismatch".to_owned());
     }
-    if report["case"]["manifest"]["workflow_source"] != "templates/minimal/workflow.toml"
-        || input != json!({"request":REQUEST})
-    {
-        return Ok(None);
+    if report["case"]["manifest"]["workflow_source"] != "templates/minimal/workflow.toml" {
+        return Ok((None, None));
     }
     let manifest: Manifest = journal::read(&root.join("run-manifest.json"))?;
     if manifest.status != "succeeded" || report["case"]["admitted_run_id"] != manifest.run_id {
@@ -176,14 +193,22 @@ fn quality(root: &Path, database: &Path, report: &Value) -> Result<Option<Value>
     numbers.sort();
     let expected = json!({"sorted":numbers,"sum":numbers.iter().sum::<i32>()});
     let passed = selected == &expected;
-    Ok(Some(json!({
-        "schema_version":1, "predicate":PREDICATE, "passed":passed,
-        "quality_millis":if passed {1000} else {0}, "input_digest":input_digest,
+    let binding = json!({
+        "schema_version":1, "input_digest":input_digest,
         "selected_output_digest":digest(&serde_json::to_vec(selected).map_err(error)?),
         "selected_node":"start", "state_key":"node:start", "run_id":manifest.run_id,
         "checkpoint_sequence":checkpoint.event_sequence(), "checkpoint_node":checkpoint.node_id(),
         "events_digest":digest(&bytes), "execution_manifest":report["case"]["manifest"]
-    })))
+    });
+    let quality = (input == json!({"request":REQUEST})).then(|| {
+        let mut quality = binding.clone();
+        quality["predicate"] = json!(PREDICATE);
+        quality["passed"] = json!(passed);
+        quality["quality_millis"] = json!(if passed { 1000 } else { 0 });
+        quality
+    });
+    let security = super::sampling::security_label(report, &input, selected, &binding)?;
+    Ok((quality, security))
 }
 
 /// Pair only the same task/input. Source/config changes are explicit comparison dimensions.

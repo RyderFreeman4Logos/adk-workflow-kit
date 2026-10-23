@@ -288,6 +288,10 @@ impl PartialOrd<f64> for OrderedFloat {
 }
 
 impl OrderedFloat {
+    pub(crate) fn millionths(self) -> u32 {
+        self.0
+    }
+
     fn as_f64(self) -> f64 {
         f64::from(self.0) / 1_000_000.0
     }
@@ -652,7 +656,8 @@ pub fn bench230_main() {
         args @ (["measure", _, _]
         | ["measure-live", _, _]
         | ["measure-report", _]
-        | ["measure-compare", _, _]) => crate::execution230::measurement::command(args),
+        | ["measure-compare", _, _]
+        | ["measure-aggregate", _, _, ..]) => crate::execution230::measurement::command(args),
         ["fixture"] => run_scripted_smoke().map(|report| (report.canonical_json(), false)),
         ["scripted"] => {
             crate::execution230::output_path().and_then(|output| execution_command(&output, false))
@@ -676,7 +681,7 @@ pub fn bench230_main() {
         }
         _ => {
             eprintln!(
-                "usage: bench-230 scripted [--output DIR]|resume DIR|abandon DIR CASE_ID RUN_ID|fixture|init SPLIT.json CAMPAIGN|init-config SPLIT.json CONFIG.json CAMPAIGN|regression CAMPAIGN|adaptive CAMPAIGN elapsed_ns COUNT|soak CAMPAIGN REPEATS|sealed-final CAMPAIGN|compare-plan BASELINE CANDIDATE MAX_REGRESSION_BPS [config-only]|compare CANDIDATE|cache-experiment DIR|cache-resume DIR|measure BINDING.json DIR|measure-live BINDING.json DIR|measure-report DIR|measure-compare LEFT_DIR RIGHT_DIR"
+                "usage: bench-230 scripted [--output DIR]|resume DIR|abandon DIR CASE_ID RUN_ID|fixture|init SPLIT.json CAMPAIGN|init-config SPLIT.json CONFIG.json CAMPAIGN|regression CAMPAIGN|adaptive CAMPAIGN elapsed_ns COUNT|soak CAMPAIGN REPEATS|sealed-final CAMPAIGN|compare-plan BASELINE CANDIDATE MAX_REGRESSION_BPS [config-only]|compare CANDIDATE|cache-experiment DIR|cache-resume DIR|measure BINDING.json DIR|measure-live BINDING.json DIR|measure-report DIR|measure-compare LEFT_DIR RIGHT_DIR|measure-aggregate SAMPLING.json DIR..."
             );
             process::exit(2);
         }

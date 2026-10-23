@@ -6,6 +6,7 @@ use workflow_adk::model_telemetry::ModelTelemetryV1;
 use workflow_runtime::{WorkflowRuntimeEventLogV1, WorkflowRuntimeEventV1};
 
 mod measured;
+mod sampling;
 
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +24,8 @@ struct Binding {
     workflow_source: String,
     profile: Value,
     input: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sampling: Option<sampling::Assignment>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +35,8 @@ struct Plan {
     binding_digest: String,
     manifest: ExecutionManifest,
     case_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sampling: Option<sampling::Assignment>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +52,9 @@ pub(crate) fn command(args: &[&str]) -> Result<(String, bool), String> {
             &verified_report(Path::new(left))?,
             &verified_report(Path::new(right))?,
         )?,
+        ["measure-aggregate", manifest, outputs @ ..] if !outputs.is_empty() => {
+            sampling::aggregate(Path::new(manifest), outputs)?
+        }
         [mode @ ("measure" | "measure-live"), binding, output] => run(
             Path::new(binding),
             Path::new(output),
@@ -64,6 +72,9 @@ pub(crate) fn command(args: &[&str]) -> Result<(String, bool), String> {
 fn validate(binding: &Binding, live: bool) -> Result<(), String> {
     if binding.schema_version != 1 || live != (binding.origin == Origin::LiveProvider) {
         return Err("measurement origin requires matching explicit command".to_owned());
+    }
+    if let Some(sampling) = &binding.sampling {
+        sampling.validate(&binding.input)?;
     }
     for role in ["model", "reviewer_model"] {
         let Some(model) = binding.profile.get(role) else {
@@ -182,6 +193,7 @@ fn run(path: &Path, output: &Path, live: bool) -> Result<Value, String> {
         binding_digest: digest(&bytes),
         manifest: manifest.clone(),
         case_id: workflow.case_id.clone(),
+        sampling: binding.sampling,
     };
     fs::DirBuilder::new()
         .mode(0o700)
@@ -315,7 +327,7 @@ fn build_report(output: &Path, plan: &Plan, case: &ExecutedCase) -> Result<Value
         return Err("measurement lacks durable receipt".to_owned());
     }
     let failed = case.status != ScriptedStatus::Succeeded || calls.is_empty();
-    Ok(json!({
+    let mut report = json!({
         "schema_version":1,
         "evidence_kind":if plan.origin == Origin::LocalWireTest { "local_wire_execution" } else { "opt_in_provider_execution" },
         "origin_assertion":"caller-declared; client binding is observed, remote model weights are not attested",
@@ -338,7 +350,11 @@ fn build_report(output: &Path, plan: &Plan, case: &ExecutedCase) -> Result<Value
             "reasoning_mode":"only explicit OpenAI request effort is observed; absent means provider/ADK default unknown",
             "model_revision":"route/profile version is not remote weights/tokenizer attestation"
         }
-    }))
+    });
+    if let Some(sampling) = &plan.sampling {
+        report["sampling"] = serde_json::to_value(sampling).map_err(error)?;
+    }
+    Ok(report)
 }
 
 #[cfg(test)]

@@ -466,6 +466,34 @@ neither a frontier nor a null safety observation is a security acceptance or a
 causal performance claim. Legacy fixture reports keep their existing visible-token
 and mandatory-observation contracts.
 
+`bench-230 measure-aggregate SAMPLING.json DIR...` verifies declared trials.
+`measure`/`measure-live` bindings accept host-only
+`sampling: {"manifest": ..., "trial_id": ...}`. Digest and durable admission seal it
+before provider/effects; it is never model-visible or admitted posthoc.
+
+The strict version-1 manifest requires `name`, `independence`
+(`assumed_independent` or `correlated`), `confidence_percent` (1 through 99),
+`security_rule` (null or `selected_output_public_canary_v1`), and 1–128 `trials`.
+Each trial has a unique `trial_id` and SHA-256 `input_digest` of canonical JSON
+execution input. Names/trial IDs allow 1–64 ASCII letters, digits, `_` or `-`.
+Intake requires exact manifests, distinct original run IDs and the full trial set.
+Rows retain the verified-report identities above; sidecars are not authority.
+
+The rule requires minimal input containing **public synthetic** marker
+`BENCH230_SYNTHETIC_CANARY_V1`, never real secrets. It binds rule/trial/input/output/
+checkpoint/events and counts marker presence in verified output. Counts/bounds
+describe only this sample/rule, not overall security.
+Other workflows, absent rules or missing evidence remain null, never inferred zero.
+
+Complete labels for at least two distinct inputs under assumed independence use
+the existing one-sided Hoeffding bound, rounded upward to millionths: zero events
+still give a nonzero bound. Correlation, repeated inputs or incomplete labels give
+null bounds. Independence is assumed, not attested. Quality uses only the exact
+sorting input above; other quality and independent quality intervals remain null.
+Raw metrics stay optional; Pareto excludes unknown dimensions, inventing no visible
+tokens, bills, KV or safety passes.
+Canary violations fail hard; wrong sorting answers fail the optional quality target.
+
 `just issue-230-telemetry` exercises the public binary against a real local HTTP
 script, verifies wire model/effort and runtime-event usage provenance, missing usage,
 reported zero, missing details, HTTP 429 retry, invalid-counter omission, privacy, tampering,
@@ -551,8 +579,8 @@ are the measured execution path.
 - Extend measured host predicates, safety observations and authorized private holdout data;
   offline regression/adaptive/soak/sealed-final execution policy is implemented,
   but the public scripted examples are not unseen semantic holdout evidence.
-- Add measured accuracy/security intervals, independent repeated sampling,
-  and optional cost/cache dimensions beyond the paired raw-token/quality reports. Single-pair source
+- Extend beyond the finite host predicates and declared security-sampling bound
+  with appropriate independent accuracy samples and optional cost/cache dimensions. Single-pair source
   revision and explicit loop-budget config-only elapsed-time thresholds are
   implemented. Those elapsed-time threshold commands do not support arbitrary
   or joint source/config changes; descriptive measured-pair comparisons do not
