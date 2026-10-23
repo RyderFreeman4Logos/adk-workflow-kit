@@ -11,6 +11,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "issue_230_telemetry/semantic.rs"]
+mod semantic;
+
 fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -126,7 +129,30 @@ fn read_request(socket: &mut TcpStream, deadline: Instant) -> io::Result<Value> 
         let count = read_bytes(socket, &mut buffer[..limit], deadline)?;
         bytes.extend_from_slice(&buffer[..count]);
     }
-    let request = serde_json::from_slice(&bytes[offset..end]).map_err(|_| invalid())?;
+    let mut request: Value = serde_json::from_slice(&bytes[offset..end]).map_err(|_| invalid())?;
+    let headers = std::str::from_utf8(&bytes[..offset]).map_err(|_| invalid())?;
+    // Finite synthetic observations only; never retain arbitrary authorization bytes.
+    let carries = |expected| {
+        headers.lines().any(|line| {
+            let Some((name, value)) = line.split_once(':') else {
+                return false;
+            };
+            let mut fields = value.split_ascii_whitespace();
+            name.eq_ignore_ascii_case("authorization")
+                && fields
+                    .next()
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer"))
+                && fields.next() == Some(expected)
+                && fields.next().is_none()
+        })
+    };
+    request["wire_caller_credential"] = json!(carries("CALLER_AUTH_NEVER_REPORT"));
+    request["wire_fixture_credential"] = json!(carries("WIRE_SECRET_NEVER_REPORT"));
+    request["wire_proxy_form"] = json!(headers.lines().next().is_some_and(|line| {
+        line.split_whitespace()
+            .nth(1)
+            .is_some_and(|target| target.starts_with("http://"))
+    }));
     remaining(deadline)?;
     Ok(request)
 }
@@ -162,6 +188,55 @@ impl Drop for WireServer {
 }
 
 fn wire_attempt(usage: Option<Value>, retry: bool) -> (PathBuf, Output, Value) {
+    let (root, output, request) = wire_options(usage, retry, json!({"reasoning_effort":"low"}));
+    (root, output, request.unwrap())
+}
+
+fn wire_options(
+    usage: Option<Value>,
+    retry: bool,
+    options: Value,
+) -> (PathBuf, Output, Result<Value, String>) {
+    wire_case(
+        usage,
+        retry,
+        options,
+        "examples/00-runtime-smoke/workflow.toml",
+        "m3-00-fake",
+        json!({"request":"PRIVATE_INPUT_NEVER_REPORT"}),
+        json!("PRIVATE_OUTPUT_NEVER_REPORT"),
+    )
+}
+
+fn wire_case(
+    usage: Option<Value>,
+    retry: bool,
+    options: Value,
+    workflow: &str,
+    model_name: &str,
+    input: Value,
+    response_output: Value,
+) -> (PathBuf, Output, Result<Value, String>) {
+    wire_scenario(
+        usage,
+        retry,
+        options,
+        (workflow, model_name, input, response_output),
+        1,
+        |path, output| cli(&["measure", path.to_str().unwrap(), output.to_str().unwrap()]),
+    )
+}
+
+fn wire_scenario(
+    usage: Option<Value>,
+    retry: bool,
+    options: Value,
+    case: (&str, &str, Value, Value),
+    replies: usize,
+    run: impl FnOnce(&std::path::Path, &std::path::Path) -> Output,
+) -> (PathBuf, Output, Result<Value, String>) {
+    assert!((1..=2).contains(&replies));
+    let (workflow, model_name, input, response_output) = case;
     let scratch = std::env::var_os("TMPDIR").expect("explicit SSD TMPDIR");
     let root = PathBuf::from(scratch).join(format!(
         "wire230-{}-{}",
@@ -177,7 +252,8 @@ fn wire_attempt(usage: Option<Value>, retry: bool) -> (PathBuf, Output, Value) {
     let address = listener.local_addr().unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     let server = WireServer(Some(thread::spawn(move || {
-        for attempt in 0..=usize::from(retry) {
+        let mut last = None;
+        for attempt in 0..replies + usize::from(retry) {
             let mut socket = accept_request(&listener, deadline).map_err(|e| e.to_string())?;
             let mut request = read_request(&mut socket, deadline).map_err(|e| e.to_string())?;
             request["wire_request_count"] = json!(attempt + 1);
@@ -185,7 +261,10 @@ fn wire_attempt(usage: Option<Value>, retry: bool) -> (PathBuf, Output, Value) {
                 write_reply(&mut socket, b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", deadline).map_err(|e| e.to_string())?;
                 continue;
             }
-            let mut response = json!({"id":"wire-fixture", "object":"chat.completion", "created":0,"model":"wire-fixture-model", "choices":[{"index":0,"message":{"role":"assistant","content":"{\"status\":\"finished\",\"output\":\"PRIVATE_OUTPUT_NEVER_REPORT\"}"},"finish_reason":"stop"}]});
+            let content =
+                serde_json::to_string(&json!({"status":"finished","output":response_output}))
+                    .unwrap();
+            let mut response = json!({"id":"wire-fixture", "object":"chat.completion", "created":0,"model":"wire-fixture-model", "choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}]});
             if let Some(usage) = &usage {
                 response["usage"] = usage.clone();
             }
@@ -196,26 +275,22 @@ fn wire_attempt(usage: Option<Value>, retry: bool) -> (PathBuf, Output, Value) {
             );
             write_reply(&mut socket, header.as_bytes(), deadline).map_err(|e| e.to_string())?;
             write_reply(&mut socket, &body, deadline).map_err(|e| e.to_string())?;
-            return Ok(request);
+            last = Some(request);
         }
-        Err("no request served".to_owned())
+        last.ok_or_else(|| "no request served".to_owned())
     })));
     let mut profile: Value = serde_json::from_slice(
         &fs::read(repo().join("examples/00-runtime-smoke/profiles/fake.json")).unwrap(),
     )
     .unwrap();
-    profile["model"] = json!({"provider":"openai-compatible","name":"m3-00-fake","version":"1","model":"wire-fixture-model","base_url":format!("http://{address}/v1"),"credential_env":"BENCH230_WIRE_TEST_KEY","runtime":{"timeout_ms":10000,"provider_extensions":{"openai":{"reasoning_effort":"low"}}}});
-    let manifest = json!({"schema_version":1,"origin":"local_wire_test","workflow_source":"examples/00-runtime-smoke/workflow.toml","profile":profile,"input":{"request":"PRIVATE_INPUT_NEVER_REPORT"}});
+    profile["model"] = json!({"provider":"openai-compatible","name":model_name,"version":"1","model":"wire-fixture-model","base_url":format!("http://{address}/v1"),"credential_env":"BENCH230_WIRE_TEST_KEY","runtime":{"timeout_ms":10000,"provider_extensions":{"openai":options}}});
+    let manifest = json!({"schema_version":1,"origin":"local_wire_test","workflow_source":workflow,"profile":profile,"input":input});
     let path = root.join("binding.json");
     fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-    let output = cli(&[
-        "measure",
-        path.to_str().unwrap(),
-        root.join("run").to_str().unwrap(),
-    ]);
+    let output = run(&path, &root.join("run"));
     // Join even on a missing CLI command; never leak the listener thread.
     let request = server.finish().unwrap();
-    (root, output, request.unwrap())
+    (root, output, request)
 }
 
 #[test]
@@ -409,7 +484,9 @@ fn admission_rejects_origin_route_and_profile_overrides_without_provider_work() 
         &fs::read(repo().join("examples/00-runtime-smoke/profiles/fake.json")).unwrap(),
     )
     .unwrap();
-    profile["model"] = json!({"provider":"openai-compatible","name":"m3-00-fake","version":"1","model":"wire-fixture-model","base_url":"http://127.0.0.1:9/v1","credential_env":"BENCH230_WIRE_TEST_KEY"});
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    profile["model"] = json!({"provider":"openai-compatible","name":"m3-00-fake","version":"1","model":"wire-fixture-model","base_url":format!("http://{}/v1",listener.local_addr().unwrap()),"credential_env":"BENCH230_WIRE_TEST_KEY"});
     let base = json!({"schema_version":1,"origin":"local_wire_test","workflow_source":"templates/minimal/workflow.toml","profile":profile,"input":{}});
     let path = root.join("binding.json");
     let output = root.join("run");
@@ -434,16 +511,32 @@ fn admission_rejects_origin_route_and_profile_overrides_without_provider_work() 
         assert_eq!(result.status.code(), Some(1), "negative {index}");
         assert!(!output.exists());
     }
-    let mut overridden = base.clone();
-    overridden["profile"]["model"]["runtime"] =
-        json!({"provider_extensions":{"openai":{"model":"silent-route-override"}}});
-    fs::write(&path, serde_json::to_vec(&overridden).unwrap()).unwrap();
-    assert!(
-        !cli(&["measure", path.to_str().unwrap(), output.to_str().unwrap()])
-            .status
-            .success()
-    );
-    assert!(!output.exists());
+    for options in [
+        json!({"model":"silent-route-override"}),
+        json!({"messages":[]}),
+        json!({"stream":true}),
+        json!({"cache_salt":1}),
+        json!({"cache_salt":""}),
+        json!({"cache_salt":"private value with spaces"}),
+        json!({"cache_salt":"x".repeat(129)}),
+        json!({"return_token_ids":"true"}),
+        json!({"reasoning_effort":"invented"}),
+    ] {
+        let mut overridden = base.clone();
+        overridden["profile"]["model"]["runtime"] =
+            json!({"provider_extensions":{"openai":options}});
+        fs::write(&path, serde_json::to_vec(&overridden).unwrap()).unwrap();
+        assert!(
+            !cli(&["measure", path.to_str().unwrap(), output.to_str().unwrap()])
+                .status
+                .success()
+        );
+        assert!(!output.exists());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
     // A legal profile with an unmatched model identity cannot fabricate measurements.
     fs::write(&path, serde_json::to_vec(&base).unwrap()).unwrap();
     let result = cli(&["measure", path.to_str().unwrap(), output.to_str().unwrap()]);

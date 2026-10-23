@@ -88,17 +88,63 @@ fn validate(binding: &Binding, live: bool) -> Result<(), String> {
             }
             if let Some(openai) = extensions.get("openai") {
                 let openai = openai.as_object().ok_or("invalid OpenAI extensions")?;
-                if openai.keys().any(|k| k != "reasoning_effort")
-                    || openai.get("reasoning_effort").is_some_and(|v| {
-                        !matches!(
-                            v.as_str(),
-                            Some("none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
-                        )
+                if openai.keys().any(|k| {
+                    !matches!(
+                        k.as_str(),
+                        "reasoning_effort" | "cache_salt" | "return_token_ids"
+                    )
+                }) || openai.get("reasoning_effort").is_some_and(|v| {
+                    !matches!(
+                        v.as_str(),
+                        Some("none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
+                    )
+                }) || openai
+                    .get("return_token_ids")
+                    .is_some_and(|v| !v.is_boolean())
+                    || openai.get("cache_salt").is_some_and(|v| {
+                        !v.as_str().is_some_and(|s| {
+                            !s.is_empty()
+                                && s.len() <= 128
+                                && s.bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b"_./-".contains(&b))
+                        })
                     })
                 {
                     return Err("unsupported measurement request override".to_owned());
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+// A caller designates a public trust domain; the actual wire salt also isolates
+// stable configuration, workflow and role. It is not a cache-hit observation.
+fn bind_cache_salts(profile: &mut Value, manifest: &ExecutionManifest) -> Result<(), String> {
+    let mut configuration = profile.clone();
+    for role in ["model", "reviewer_model"] {
+        if let Some(options) = configuration
+            .get_mut(role)
+            .and_then(|model| model.pointer_mut("/runtime/provider_extensions/openai"))
+            .and_then(Value::as_object_mut)
+        {
+            options.remove("cache_salt");
+        }
+    }
+    for role in ["model", "reviewer_model"] {
+        if let Some(salt) = profile
+            .get_mut(role)
+            .and_then(|model| model.pointer_mut("/runtime/provider_extensions/openai/cache_salt"))
+        {
+            let namespace = salt.as_str().ok_or("invalid public cache domain")?;
+            *salt = json!(digest(
+                &serde_json::to_vec(&json!({
+                    "domain":namespace, "role":role, "configuration":configuration,
+                    "workflow_source":manifest.workflow_source,
+                    "workflow_digest":manifest.workflow_digest
+                }))
+                .map_err(error)?
+            ));
         }
     }
     Ok(())
@@ -111,7 +157,7 @@ fn run(path: &Path, output: &Path, live: bool) -> Result<Value, String> {
         1024 * 1024,
     )
     .map_err(|_| "cannot read bounded regular measurement binding")?;
-    let binding: Binding =
+    let mut binding: Binding =
         serde_json::from_slice(&bytes).map_err(|_| "invalid measurement binding")?;
     validate(&binding, live)?;
     let profile_bytes = serde_json::to_vec(&binding.profile).map_err(error)?;
@@ -122,6 +168,7 @@ fn run(path: &Path, output: &Path, live: bool) -> Result<Value, String> {
         .find(|(w, _)| w.source == binding.workflow_source)
         .ok_or("workflow is not registered")?;
     canonical_admission(&repo, &workflow.source, &binding.input)?;
+    bind_cache_salts(&mut binding.profile, &manifest)?;
     bind_inputs(&mut manifest, &binding.profile, &binding.input)?;
     let plan = Plan {
         schema_version: 1,
@@ -286,4 +333,50 @@ fn build_report(output: &Path, plan: &Plan, case: &ExecutedCase) -> Result<Value
             "model_revision":"route/profile version is not remote weights/tokenizer attestation"
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_domains_are_stable_and_bound_to_configuration_workflow_and_role() {
+        let profile = json!({"model":{"model":"one","runtime":{"provider_extensions":{"openai":{"cache_salt":"public-domain","return_token_ids":true}}}},"reviewer_model":{"model":"one","runtime":{"provider_extensions":{"openai":{"cache_salt":"public-domain","return_token_ids":true}}}}});
+        let manifest: ExecutionManifest = serde_json::from_value(json!({
+            "source_revision":"one", "source_tree":"one", "source_files_digest":"one",
+            "executable_digest":"one", "workflow_source":"one/workflow.toml", "workflow_digest":"one",
+            "config_digest":null, "dataset_digest":null, "model_digest":null
+        })).unwrap();
+        let prepare = |mut profile: Value, manifest: &ExecutionManifest| {
+            bind_cache_salts(&mut profile, manifest).unwrap();
+            profile
+        };
+        let prepared = prepare(profile.clone(), &manifest);
+        assert_eq!(prepared, prepare(profile.clone(), &manifest));
+        let salt = |profile: &Value, role| {
+            profile[role]["runtime"]["provider_extensions"]["openai"]["cache_salt"].clone()
+        };
+        assert_ne!(salt(&prepared, "model"), salt(&prepared, "reviewer_model"));
+        let mut other = profile.clone();
+        other["model"]["runtime"]["provider_extensions"]["openai"]["cache_salt"] =
+            json!("other-domain");
+        assert_ne!(
+            salt(&prepared, "model"),
+            salt(&prepare(other, &manifest), "model")
+        );
+        let mut other = profile.clone();
+        other["model"]["model"] = json!("two");
+        assert_ne!(
+            salt(&prepared, "model"),
+            salt(&prepare(other, &manifest), "model")
+        );
+        let mut other = manifest.clone();
+        other.workflow_digest = "two".to_owned();
+        assert_ne!(
+            salt(&prepared, "model"),
+            salt(&prepare(profile, &other), "model")
+        );
+        let omitted = json!({"model":{"model":"one"}});
+        assert_eq!(omitted, prepare(omitted.clone(), &manifest));
+    }
 }

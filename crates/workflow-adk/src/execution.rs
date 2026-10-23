@@ -2510,7 +2510,18 @@ impl ModelRuntimeWire {
         if self.provider_extensions.len() > 8 || encoded.len() > 4096 {
             return Err(invalid());
         }
-        if contains_sensitive_key(&json!(self.provider_extensions)) {
+        let mut public_extensions = json!(self.provider_extensions);
+        if let Some(openai) = public_extensions
+            .get_mut("openai")
+            .and_then(Value::as_object_mut)
+            && openai
+                .get("return_token_ids")
+                .is_some_and(Value::is_boolean)
+        {
+            // This exact boolean requests response metadata, not a token credential.
+            openai.remove("return_token_ids");
+        }
+        if contains_sensitive_key(&public_extensions) {
             return Err(invalid());
         }
         let mut runtime = ModelRuntimeConfig::default();

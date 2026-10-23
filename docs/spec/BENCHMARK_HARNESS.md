@@ -359,10 +359,32 @@ The profile's existing credential **handle** is resolved only by the runtime
 broker during execution. Do not put credential values in the binding. Unknown
 binding fields/versions, fake profiles, remote endpoints in test mode, and model/
 message/stream overrides in provider extensions are rejected before admission.
-Only `runtime.provider_extensions.openai.reasoning_effort` is admitted here, using
-ADK's documented OpenAI request extension. Omission is unknown/default, never the
-cache policy's hardcoded medium effort. The minimal template uses its declared
-versioned binding. Bindings are regular files bounded to 1 MiB.
+The existing ADK OpenAI extension channel admits only typed `reasoning_effort`,
+`return_token_ids` (boolean), and `cache_salt` here. The salt is a caller-designated
+public trust-domain name: 1–128 ASCII letters, digits, `_`, `.`, `/`, or `-`; never
+put a credential in it. The harness derives the actual wire salt from that domain,
+the role, stable effective profile (excluding salt operands), and workflow identity.
+It adds no random entropy. Equal configurations retain the same salt, while distinct
+domains/configurations/roles are isolated. The effective profile/model digests bind
+the derived value. These request capabilities do not establish cache hits or token
+ID availability; only actual response observations can do so. Omitted reasoning
+effort remains unknown/default, never the cache policy's hardcoded medium effort.
+The minimal template uses its declared versioned binding. Bindings are regular
+files bounded to 1 MiB.
+
+The telemetry target also checks one fixed minimal semantic case through real SDK
+loopback requests: sorting `[7,2,7,1]` and summing to `17`. The admitted input digest,
+actual user message, completed nodes, full terminal event prefix and public SQLite
+checkpoint bind the predicate. A fully finished response with sum `18` is rejected
+semantically. `semantic-check.json` retains that separate verdict with source,
+executable/config/input and run identities; runtime success alone is insufficient.
+The ignored `minimal_semantic_live_pair_from_explicit_binding` test uses this same
+predicate only with explicitly supplied private binding/output paths. It performs
+at most two sequential fresh invocations, proceeding to the second only after the
+first satisfies semantic, token and supported-cache checks. Default tests never
+execute it; an ignored test is not live acceptance. The invocation requires an
+independently admitted 180-second outer process fence. It does not restart services
+or establish KV-hit, coldness, provider billing or model-weight attestation.
 
 Host `ModelBinding` stamps one terminal response per successful invocation with
 version-1 typed telemetry, overwriting any provider lookalike. The ADK event mapper
