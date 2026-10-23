@@ -268,6 +268,7 @@ fn exit_diagnostic(diagnostic: Diagnostic, json: bool) -> ! {
     } else {
         eprintln!("{diagnostic}");
     }
+    workflow_adk::OraclePhaseGuard::before_error_exit();
     exit(2)
 }
 
@@ -654,6 +655,7 @@ fn exit_execution_error(kind: ExecutionErrorKind, json: bool) -> ! {
 }
 
 pub(crate) fn run() {
+    let oracle_phase = workflow_adk::OraclePhaseGuard::enter_cli();
     let arguments = std::env::args_os().skip(1).collect::<Vec<OsString>>();
     let json = arguments
         .iter()
@@ -877,6 +879,7 @@ pub(crate) fn run() {
                 if subcommand.get_flag("fail-checkpoint-saves") {
                     ExecutionBackend::fail_checkpoint_saves_for_tests();
                 }
+                oracle_phase.dispatch();
                 match ExecutionBackend::run_cancellable(path, profile, input, workdir, cancellation)
                 {
                     Ok(receipt) => write_execution_receipt(&receipt, json),

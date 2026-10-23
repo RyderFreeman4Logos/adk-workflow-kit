@@ -3,6 +3,7 @@
 mod behavioral;
 mod effect_audit;
 mod isolated;
+pub(crate) mod oracle_phase;
 mod tool_audit;
 pub use behavioral::BehavioralExecutionReceipt;
 use effect_audit::EffectAudits;
@@ -1388,6 +1389,7 @@ impl LoopController {
         &self,
         mut request: adk_rust::LlmRequest,
     ) -> adk_rust::Result<adk_rust::LlmRequest> {
+        let mut phase = oracle_phase::Span::new(20, 21);
         if self.cancellation.load(Ordering::Acquire) {
             return Err(self.fail(ExecutionErrorKind::Cancelled, "workflow.loop.cancelled"));
         }
@@ -1433,6 +1435,7 @@ impl LoopController {
         }
         model_contents_test_digest(&request, &self.ledger.path);
         model_contents_test_pairs(&request, &self.ledger.path);
+        phase.returned(true);
         Ok(request)
     }
 
@@ -3625,6 +3628,7 @@ impl Llm for FencedModel {
                 _ => {}
             }
         }
+        let mut phase = oracle_phase::Span::new(68, 69);
         let result = Llm::generate_content(&*self.binding, request, stream).await;
         if result
             .as_ref()
@@ -3634,9 +3638,11 @@ impl Llm for FencedModel {
             self.fence.cancellation.store(true, Ordering::Release);
         }
         let Ok(response_stream) = result else {
+            phase.returned(false);
             return result;
         };
         let items = response_stream.collect::<Vec<_>>().await;
+        phase.returned(true);
         if let Ok(mut pending) = self.pending.lock() {
             *pending = key.and_then(|(_, key)| {
                 items.iter().rev().find_map(|item| {
@@ -4748,6 +4754,7 @@ impl ExecutionBackend {
         workdir_base: impl AsRef<Path>,
         cancellation: Arc<AtomicBool>,
     ) -> Result<ExecutionReceipt, ExecutionError> {
+        let mut phase_backend = oracle_phase::Span::new(10, 11);
         let input_bytes = serde_json::to_vec(&input)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
         if input_bytes.len() > PureTransformRequest::MAX_JSON_BYTES {
@@ -4809,6 +4816,7 @@ impl ExecutionBackend {
         let effective_capabilities = sandbox_capabilities;
         let transform_module = profile.transform_module()?;
         let recursion_limit = crate::graph_recursion_limit(compiled.ir()).max(50);
+        let mut phase_workdir = oracle_phase::Span::new(53, 54);
         let manager = WorkdirManager::new(workdir_base.as_ref())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let run_id = fresh_run_id()?;
@@ -4839,6 +4847,8 @@ impl ExecutionBackend {
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Workdir))?;
         let run_root = run_workdir.root().to_path_buf();
         let workdir_id = run_workdir.id().as_str().to_owned();
+        phase_workdir.returned(true);
+        let mut phase_publication = oracle_phase::Span::new(36, 37);
         let contracts_persisted = persist_agent_contracts(&run_root, &agent_contracts).is_ok();
         let workflow_source = fs::read(workflow.as_ref())
             .ok()
@@ -4977,6 +4987,7 @@ impl ExecutionBackend {
                 }
             }
         }
+        phase_publication.returned(persistence_error.is_none());
         let execution = if persistence_error.is_some() {
             Err(ExecutionError::new(ExecutionErrorKind::Persistence))
         } else {
@@ -4987,6 +4998,8 @@ impl ExecutionBackend {
                 let sandbox = RunSandbox::new(context, run_workdir, effective_capabilities.clone())
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::SandboxDenied))?;
                 let deadline = execution_deadline(&profile.run_limits())?;
+                oracle_phase::mark(16, 0);
+                let mut phase_graph_setup = oracle_phase::Span::new(50, 51);
                 let terminal_kind = Arc::new(Mutex::new(None));
                 let last_progress = Arc::new(Mutex::new(Instant::now()));
                 let effect_fence = Arc::new(EffectFence {
@@ -5110,6 +5123,8 @@ impl ExecutionBackend {
                 *last_progress
                     .lock()
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))? = Instant::now();
+                phase_graph_setup.returned(true);
+                let mut phase_graph = oracle_phase::Span::new(18, 19);
                 let state = invoke_graph_with_deadline(
                     &runtime,
                     deadline,
@@ -5124,7 +5139,9 @@ impl ExecutionBackend {
                         artifacts,
                         &mut frontier,
                     ),
-                )?;
+                );
+                phase_graph.returned(state.is_ok());
+                let state = state?;
                 if let Some(kind) = terminal_kind.lock().ok().and_then(|terminal| *terminal) {
                     return Err(ExecutionError::new(kind));
                 }
@@ -5377,10 +5394,12 @@ impl ExecutionBackend {
             persistence_error.get_or_insert(error);
         }
         let receipt = manifest.receipt(run_root);
-        match (execution.err(), persistence_error) {
+        let result = match (execution.err(), persistence_error) {
             (Some(error), _) | (None, Some(error)) => Err(error.with_receipt(receipt)),
             (None, None) => Ok(receipt),
-        }
+        };
+        phase_backend.returned(result.is_ok());
+        result
     }
 
     pub fn inspect(

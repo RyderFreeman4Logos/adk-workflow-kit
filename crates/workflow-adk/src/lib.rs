@@ -7,6 +7,8 @@ mod agent_admission;
 pub mod behavioral;
 pub mod events;
 pub mod execution;
+#[doc(hidden)]
+pub use execution::oracle_phase::OraclePhaseGuard;
 pub mod firewall;
 pub mod model_invocation;
 pub mod semantic_firewall;
