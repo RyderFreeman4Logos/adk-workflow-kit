@@ -1258,7 +1258,8 @@ fn frame(label: &str, value: &str) -> String {
     format!("{label}_BYTES:{}\n{value}", value.len())
 }
 
-fn canonical_json(value: &Value) -> String {
+/// Stable JSON representation: sort object keys, preserve array order and exact values.
+pub(crate) fn canonical_json(value: &Value) -> String {
     match value {
         Value::Null => "null".to_owned(),
         Value::Bool(value) => value.to_string(),
@@ -1288,7 +1289,8 @@ fn canonical_json(value: &Value) -> String {
     }
 }
 
-fn digest(bytes: &[u8]) -> String {
+/// Content identity only; hashing is not redaction or a proof of authorization.
+pub(crate) fn digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 

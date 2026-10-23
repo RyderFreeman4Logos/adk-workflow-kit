@@ -13,6 +13,8 @@ use std::{
 
 #[path = "issue_230_telemetry/aggregate.rs"]
 mod aggregate;
+#[path = "issue_230_telemetry/kv.rs"]
+mod kv;
 #[path = "issue_230_telemetry/measured.rs"]
 mod measured;
 #[path = "issue_230_telemetry/semantic.rs"]
@@ -257,10 +259,12 @@ fn wire_scenario(
     let deadline = Instant::now() + Duration::from_secs(20);
     let server = WireServer(Some(thread::spawn(move || {
         let mut last = None;
+        let mut salts = Vec::new();
         for attempt in 0..replies + usize::from(retry) {
             let mut socket = accept_request(&listener, deadline).map_err(|e| e.to_string())?;
             let mut request = read_request(&mut socket, deadline).map_err(|e| e.to_string())?;
             request["wire_request_count"] = json!(attempt + 1);
+            salts.push(request.get("cache_salt").cloned().unwrap_or(Value::Null));
             if retry && attempt == 0 {
                 write_reply(&mut socket, b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", deadline).map_err(|e| e.to_string())?;
                 continue;
@@ -281,7 +285,11 @@ fn wire_scenario(
             write_reply(&mut socket, &body, deadline).map_err(|e| e.to_string())?;
             last = Some(request);
         }
-        last.ok_or_else(|| "no request served".to_owned())
+        last.map(|mut request| {
+            request["wire_cache_salts"] = json!(salts);
+            request
+        })
+        .ok_or_else(|| "no request served".to_owned())
     })));
     let mut profile: Value = serde_json::from_slice(
         &fs::read(repo().join("examples/00-runtime-smoke/profiles/fake.json")).unwrap(),

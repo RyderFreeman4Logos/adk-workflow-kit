@@ -401,10 +401,8 @@ carry the exact event ID, sequence and node. The schema exposes:
 
 `output_tokens` is the provider completion count, not inferred visible output.
 `visible_output_count`, prefill/decode clocks, billing cost, KV hit, wire-prefix
-hash, escalation and human-intervention status remain null with reasons. No
-pricing, timing split, warm label, confidence or quality/security score is invented.
-`reported_cost_usd` also remains null: normalized SDK estimates do not establish
-raw-response billing provenance, so the current telemetry does not export them.
+hash, escalation and human-intervention status remain null with reasons.
+`reported_cost_usd` remains null; see [source labels and KV intent](BENCHMARK_TELEMETRY.md).
 Failed invocations can lack telemetry; missing rows do not prove no provider work.
 Usage counters are independently optional. An absent or invalid raw counter stays
 null without discarding other valid counters or failing a semantic completion.
@@ -571,9 +569,10 @@ are the measured execution path.
 
 - Offline cold/warm/pressure and AABBA/ABABA request-order controls measure result
   caching, not provider KV behavior or a host-resource scheduler. The provider pair
-  retains supported cached-input counts; unsupported KV/prefix fields remain
-  unavailable. No shared-service cache reset or full live pressure campaign is
-  implied by these capabilities.
+  retains supported cached-input counts. Host request-prefix observations and
+  pre-admitted KV intent are distinct from unavailable server KV state; see
+  [the telemetry contract](BENCHMARK_TELEMETRY.md). No shared-service reset or
+  full live pressure campaign is implied.
 - Automatic checkpoint/effect reconciliation remains deliberately unsupported.
   Completed-case resume and explicit fail-closed abandonment are implemented.
 - Extend measured host predicates, safety observations and authorized private holdout data;

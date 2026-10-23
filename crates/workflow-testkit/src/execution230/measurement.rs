@@ -5,6 +5,7 @@ use std::os::unix::fs::DirBuilderExt;
 use workflow_adk::model_telemetry::ModelTelemetryV1;
 use workflow_runtime::{WorkflowRuntimeEventLogV1, WorkflowRuntimeEventV1};
 
+mod kv;
 mod measured;
 mod sampling;
 
@@ -26,6 +27,8 @@ struct Binding {
     input: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sampling: Option<sampling::Assignment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kv_intent: Option<kv::Assignment>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +40,8 @@ struct Plan {
     case_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sampling: Option<sampling::Assignment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kv_intent: Option<kv::Intent>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -185,8 +190,15 @@ fn run(path: &Path, output: &Path, live: bool) -> Result<Value, String> {
         .find(|(w, _)| w.source == binding.workflow_source)
         .ok_or("workflow is not registered")?;
     canonical_admission(&repo, &workflow.source, &binding.input)?;
+    if let Some(kv) = &binding.kv_intent {
+        kv.apply(&mut binding.profile)?;
+    }
     bind_cache_salts(&mut binding.profile, &manifest)?;
     bind_inputs(&mut manifest, &binding.profile, &binding.input)?;
+    let kv_intent = binding
+        .kv_intent
+        .map(|intent| kv::prepare(intent, &binding.profile, &manifest, binding.origin))
+        .transpose()?;
     let plan = Plan {
         schema_version: 1,
         origin: binding.origin,
@@ -194,6 +206,7 @@ fn run(path: &Path, output: &Path, live: bool) -> Result<Value, String> {
         manifest: manifest.clone(),
         case_id: workflow.case_id.clone(),
         sampling: binding.sampling,
+        kv_intent,
     };
     fs::DirBuilder::new()
         .mode(0o700)
@@ -326,6 +339,15 @@ fn build_report(output: &Path, plan: &Plan, case: &ExecutedCase) -> Result<Value
     } else if case.admitted_run_id.is_some() || case.status == ScriptedStatus::Succeeded {
         return Err("measurement lacks durable receipt".to_owned());
     }
+    if let Some(intent) = &plan.kv_intent {
+        kv::validate(
+            intent,
+            &plan.manifest,
+            plan.origin,
+            &calls,
+            case.status == ScriptedStatus::Succeeded,
+        )?;
+    }
     let failed = case.status != ScriptedStatus::Succeeded || calls.is_empty();
     let mut report = json!({
         "schema_version":1,
@@ -351,6 +373,9 @@ fn build_report(output: &Path, plan: &Plan, case: &ExecutedCase) -> Result<Value
             "model_revision":"route/profile version is not remote weights/tokenizer attestation"
         }
     });
+    if let Some(intent) = &plan.kv_intent {
+        report["kv_intent"] = serde_json::to_value(intent).map_err(error)?;
+    }
     if let Some(sampling) = &plan.sampling {
         report["sampling"] = serde_json::to_value(sampling).map_err(error)?;
     }

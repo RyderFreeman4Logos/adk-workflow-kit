@@ -73,6 +73,8 @@ fn row(
         "model_calls":report["model_calls"], "result_cache":report["result_cache"],
         "elapsed_ns":case.elapsed_ns, "hitl":report["hitl"], "escalation":report["escalation"],
         "prefix_hash":report["prefix_hash"],
+        "host_prefix_hash":telemetry.as_ref().and_then(|t|t.host_prefix_hash.as_ref()),
+        "cache_write_count":telemetry.as_ref().and_then(|t|t.cache_write_tokens),
         "input_count":telemetry.as_ref().and_then(|t|t.input_tokens),
         "cached_input_count":telemetry.as_ref().and_then(|t|t.cached_input_tokens),
         "reasoning_count":telemetry.as_ref().and_then(|t|t.reasoning_tokens),
@@ -81,6 +83,8 @@ fn row(
         "prefill_ns":telemetry.as_ref().and_then(|t|t.prefill_ns),
         "decode_ns":telemetry.as_ref().and_then(|t|t.decode_ns),
         "provider_cost_usd":telemetry.as_ref().and_then(|t|t.provider_cost_usd),
+        "sdk_estimated_cost_usd":telemetry.as_ref().and_then(|t|t.sdk_estimated_cost_usd),
+        "total_count":telemetry.as_ref().and_then(|t|t.total_tokens),
         "kv_cache_hit":telemetry.as_ref().and_then(|t|t.kv_cache_hit),
         "retries":telemetry.as_ref().map(|t|t.retries),
         "sampling":report.get("sampling").cloned().unwrap_or(Value::Null),
@@ -95,7 +99,67 @@ fn row(
             "confidence":"one run/correlated samples do not establish an independent-trial bound"
         }
     });
+    let kv = report.get("kv_intent").cloned().unwrap_or(Value::Null);
+    let row = &mut report["measured"];
+    row["field_sources"] = field_sources(row);
+    row["kv_intent"] = kv;
     Ok(report)
+}
+
+// Sources describe observations, never requested capabilities or inferred provider metrics.
+fn field_sources(row: &Value) -> Value {
+    let mut sources = serde_json::Map::new();
+    for (field, source, unit) in [
+        ("input_count", "provider_usage.prompt_tokens", "tokens"),
+        (
+            "cached_input_count",
+            "provider_usage.prompt_tokens_details.cached_tokens",
+            "tokens",
+        ),
+        (
+            "cache_write_count",
+            "provider_usage.prompt_tokens_details.cache_write_tokens",
+            "tokens",
+        ),
+        (
+            "reasoning_count",
+            "provider_usage.completion_tokens_details.reasoning_tokens",
+            "tokens",
+        ),
+        (
+            "provider_completion_count",
+            "provider_usage.completion_tokens",
+            "tokens_including_reasoning",
+        ),
+        (
+            "host_prefix_hash",
+            "host_actual_llm_request.leading_system_tools_schema_model.v1",
+            "sha256",
+        ),
+        ("elapsed_ns", "host_workflow_elapsed", "nanoseconds"),
+        ("retries", "host_binding_retry_count", "retries"),
+        ("total_count", "provider_usage.total_tokens", "tokens"),
+        (
+            "sdk_estimated_cost_usd",
+            "sdk.UsageMetadata.cost.estimate",
+            "USD_estimate_not_billing",
+        ),
+        ("visible_output_count", "unavailable", "tokens"),
+        ("prefill_ns", "unavailable", "nanoseconds"),
+        ("decode_ns", "unavailable", "nanoseconds"),
+        ("provider_cost_usd", "unavailable_provider_billing", "USD"),
+        (
+            "kv_cache_hit",
+            "unavailable_provider_cache_state",
+            "boolean",
+        ),
+    ] {
+        sources.insert(
+            field.to_owned(),
+            json!({"source":source,"unit":unit,"observed":!row[field].is_null()}),
+        );
+    }
+    Value::Object(sources)
 }
 
 /// The public store closes before this derived projection is returned or published.
