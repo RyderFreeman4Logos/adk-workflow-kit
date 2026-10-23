@@ -22,7 +22,7 @@ clippy:
 
 test:
     {{_io}} cargo +1.98.0 build -p workflowctl --locked
-    {{_io}} cargo +1.98.0 test --workspace --exclude workflow-adk --locked
+    {{_io}} cargo +1.98.0 test --workspace --exclude workflow-adk --locked -- --test-threads=2
     {{_io}} cargo +1.98.0 test -p workflow-adk --locked -- --test-threads=1
     ./target/debug/workflowctl test crates/workflowctl/tests/fixtures/cli004-test.json
     ./target/debug/workflowctl eval crates/workflowctl/tests/fixtures/cli004-eval.json
@@ -329,7 +329,7 @@ m3-04-cli test_name:
     {{_io}} cargo +1.98.0 test -p workflowctl --test m1_12_destructive_resume {{test_name}} --locked -- --exact --nocapture
 
 m1-10-adk test_name:
-    {{_io}} cargo +1.98.0 test -p workflowctl --test m1_10_adk_run {{test_name}} --locked -- --exact --nocapture
+    {{_io}} cargo +1.98.0 test -p workflowctl --test m1_10_adk_run {{test_name}} --locked -- --exact --nocapture --test-threads=2
 
 # Focused M1-15 conformance contract tests.
 m1-15-test:

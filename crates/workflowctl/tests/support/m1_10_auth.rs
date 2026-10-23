@@ -1,5 +1,150 @@
 use super::*;
 
+fn supervised_no_auth_child(
+    role: &str,
+    child: Result<Output, String>,
+    server: &thread::Result<Result<RequestObservation, &'static str>>,
+) -> Output {
+    match child {
+        Ok(child) => child,
+        Err(error) => {
+            let role = match role {
+                "worker" => "worker",
+                "reviewer" => "reviewer",
+                _ => "unknown",
+            };
+            // Keep only finite outcomes from the already joined server. Never
+            // format a child error, request observation, or thread panic payload.
+            let outcome = match server {
+                Ok(Ok(_)) => "completed",
+                Ok(Err("oracle listener accept timed out")) => "accept-timeout",
+                Ok(Err(_)) => "request-failed",
+                Err(_) => "thread-panicked",
+            };
+            let (stage, outcomes) = match error.as_str() {
+                "oracle child stdout create failed" => ("stdout-setup", "not-started".to_owned()),
+                "oracle child stderr create failed" => ("stderr-setup", "not-started".to_owned()),
+                "oracle child spawn failed" => ("spawn", "not-started".to_owned()),
+                "oracle child output open failed" => {
+                    ("output-open", "reaped-before-readback".to_owned())
+                }
+                "oracle child output read failed" => {
+                    ("output-read", "reaped-before-readback".to_owned())
+                }
+                "oracle child output exceeded size limit" => {
+                    ("output-size-limit", "reaped-before-readback".to_owned())
+                }
+                _ => error
+                    .split_once("; ")
+                    .and_then(|(stage, details)| {
+                        let stage = match stage {
+                            "oracle child timed out" => "timeout",
+                            "oracle child wait failed" => "wait",
+                            _ => return None,
+                        };
+                        // The unchanged producer emits at most three cleanup labels
+                        // and one readback error per output. Reject other text in full.
+                        let outcomes = details
+                            .split("; ")
+                            .take(6)
+                            .map(|detail| match detail {
+                                "oracle child kill failed" => Some("kill-failed"),
+                                "oracle child reap check failed" => Some("reap-check-failed"),
+                                "oracle child reaped after kill" => Some("reaped-after-kill"),
+                                "oracle child output open failed" => Some("output-open-failed"),
+                                "oracle child output read failed" => Some("output-read-failed"),
+                                "oracle child output exceeded size limit" => {
+                                    Some("output-size-limit")
+                                }
+                                _ => None,
+                            })
+                            .collect::<Option<Vec<_>>>()?;
+                        (outcomes.len() <= 5 && outcomes.contains(&"reaped-after-kill"))
+                            .then(|| (stage, outcomes.join(",")))
+                    })
+                    .unwrap_or_else(|| ("unknown", "unknown".to_owned())),
+            };
+            panic!(
+                "bounded production child supervision failed; role={role}; server={outcome}; child_stage={stage}; child_outcomes={outcomes}"
+            );
+        }
+    }
+}
+
+#[test]
+fn no_auth_supervision_failure_preserves_finite_context_without_payloads() {
+    const MARKER: &str = "synthetic-private-failure-payload";
+    let child_errors = [
+        (
+            "oracle child timed out; oracle child reaped after kill".to_owned(),
+            "timeout",
+            "reaped-after-kill",
+        ),
+        (
+            "oracle child stdout create failed".to_owned(),
+            "stdout-setup",
+            "not-started",
+        ),
+        (
+            "oracle child output read failed".to_owned(),
+            "output-read",
+            "reaped-before-readback",
+        ),
+        (
+            "oracle child wait failed; oracle child kill failed; oracle child reap check failed; oracle child reaped after kill; oracle child output open failed; oracle child output exceeded size limit".to_owned(),
+            "wait",
+            "kill-failed,reap-check-failed,reaped-after-kill,output-open-failed,output-size-limit",
+        ),
+        (MARKER.to_owned(), "unknown", "unknown"),
+        (
+            format!("oracle child timed out; oracle child reaped after kill; {MARKER}"),
+            "unknown",
+            "unknown",
+        ),
+    ];
+    for role in ["worker", "reviewer"] {
+        let observations = [
+            (
+                Ok(Ok(RequestObservation {
+                    method: MARKER.to_owned(),
+                    path: MARKER.to_owned(),
+                    authorization_headers: 0,
+                    authorization_canary_occurrences: 0,
+                    request_canary_occurrences: 0,
+                })),
+                "completed",
+            ),
+            (
+                Ok(Err("oracle listener accept timed out")),
+                "accept-timeout",
+            ),
+            (Ok(Err(MARKER)), "request-failed"),
+            (
+                Err(Box::new(MARKER.to_owned()) as Box<dyn std::any::Any + Send>),
+                "thread-panicked",
+            ),
+        ];
+        for (observation, expected) in observations {
+            for (error, stage, outcomes) in &child_errors {
+                let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    supervised_no_auth_child(role, Err(error.clone()), &observation)
+                }))
+                .expect_err("child supervision failure must remain a failure");
+                let message = failure
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| failure.downcast_ref::<&str>().copied())
+                    .expect("finite child supervision diagnostic");
+                assert!(message.contains(&format!("role={role}")));
+                assert!(message.contains(&format!("server={expected}")));
+                assert!(message.contains(&format!("child_stage={stage}")));
+                assert!(message.contains(&format!("child_outcomes={outcomes}")));
+                assert!(!message.contains(MARKER));
+            }
+        }
+    }
+}
+
 #[test]
 fn production_no_auth_worker_and_reviewer_omit_authorization() {
     const ABSENT_HANDLE: &str = "WORKFLOWCTL_NO_AUTH_UNUSED_HANDLE";
@@ -59,7 +204,7 @@ fn production_no_auth_worker_and_reviewer_omit_authorization() {
         );
         signal_oracle_child_done(&done_tx);
         let observation = server.join();
-        let child = child.expect("bounded production child");
+        let child = supervised_no_auth_child(role, child, &observation);
         assert_child_success(&child, "production NoAuth invocation");
         assert_eq!(json_stdout(&child)["status"], "succeeded");
         let observation = observation
