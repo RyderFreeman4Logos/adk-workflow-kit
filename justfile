@@ -48,6 +48,10 @@ m1-03-green:
 issue-332-compiler test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-compiler --test skill_contracts {{test_name}} --locked -- --nocapture
 
+# Preserve specification, canonical IR, and compiler contracts across the private facade split.
+issue-376-contracts:
+    {{_io}} cargo +1.98.0 test -p workflow-spec -p workflow-ir -p workflow-compiler --locked -- --test-threads=2
+
 # Focused M3-02 per-node binding tests.
 m3-02-spec test_name:
     {{_io}} cargo +1.98.0 test -p workflow-spec --test m3_02_node_bindings {{test_name}} --locked -- --exact --nocapture
