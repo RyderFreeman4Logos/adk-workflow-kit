@@ -1,13 +1,13 @@
-//! Private graph-frontier ownership for explicitly isolated agent invocations.
+//! Graph-frontier ownership for authored Isolated and Shared node visits.
 
 use super::*;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Invocation {
-    step: usize,
+    pub(super) step: usize,
     pub(super) conversation_start: usize,
-    model_iteration_start: u64,
+    pub(super) model_iteration_start: u64,
 }
 
 pub(super) fn valid_invocation(state: &LoopState) -> bool {
@@ -54,6 +54,9 @@ pub(super) fn validate_checkpoint(
     .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
     for node in isolated {
         let state = ledger.snapshot(node)?;
+        if state.shared_pending.is_some() && !continuation.pending_nodes.contains(node) {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
         if let Some(owner) = &state.invocation {
             if owner.step > continuation.step
                 || (continuation.pending_nodes.contains(node) && owner.step != continuation.step)
@@ -70,11 +73,7 @@ pub(super) fn validate_checkpoint(
 }
 
 pub(super) fn nodes(contracts: &BTreeMap<String, RuntimeAgentContract>) -> BTreeSet<String> {
-    contracts
-        .iter()
-        .filter(|(_, contract)| contract.isolated)
-        .map(|(node, _)| node.clone())
-        .collect()
+    contracts.keys().cloned().collect()
 }
 
 impl LoopLedgerStore {
@@ -103,7 +102,8 @@ impl LoopLedgerStore {
             {
                 continue;
             }
-            if !state.pending_calls.is_empty()
+            if state.shared_pending.is_some()
+                || !state.pending_calls.is_empty()
                 || (state.invocation.is_some() && !state.finish_admitted)
             {
                 return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
