@@ -382,6 +382,11 @@ issue-361:
     {{_io}} cargo +1.98.0 test -p workflow-adk --lib execution::isolated --locked -- --nocapture
     {{_io}} cargo +1.98.0 test -p workflow-adk --test m3_04_model_tool_loop --locked -- --nocapture
 
+# Real-owner deadline/cancellation classification and the unchanged replay contracts.
+issue-306:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --lib execution::effect_fence_tests --locked -- --nocapture --test-threads=1
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test m3_04_model_tool_loop --locked -- --nocapture --test-threads=1
+
 m3-04-cli test_name:
     {{_io}} cargo +1.98.0 test -p workflowctl --test m1_12_destructive_resume {{test_name}} --locked -- --exact --nocapture
 

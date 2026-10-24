@@ -2,6 +2,8 @@
 
 mod behavioral;
 mod effect_audit;
+#[cfg(test)]
+mod effect_fence_tests;
 mod isolated;
 pub(crate) mod oracle_phase;
 mod shared;
@@ -6091,21 +6093,40 @@ impl EffectFence {
         {
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
         }
+        // Already stopped work must not wait for progress ownership. For live
+        // work, classify only after the lock wait: a wall-clamped tool deadline
+        // must retain wall precedence even when it expires during that wait.
+        let progress =
+            if self.cancellation.load(Ordering::Acquire) || Instant::now() >= self.wall_deadline {
+                None
+            } else {
+                #[cfg(test)]
+                effect_fence_tests::before_progress_lock();
+                self.last_progress.lock().ok()
+            };
+        if self
+            .terminal
+            .lock()
+            .map_or(true, |terminal| terminal.is_some())
+        {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
+        }
+        let now = Instant::now();
         let kind = if self.cancellation.load(Ordering::Acquire) {
             Some(ExecutionErrorKind::Cancelled)
-        } else if Instant::now() >= self.wall_deadline {
+        } else if now >= self.wall_deadline {
             Some(ExecutionErrorKind::WallTimeLimit)
-        } else if self
-            .last_progress
-            .lock()
-            .map_or(true, |progress| progress.elapsed() >= self.idle_timeout)
+        } else if progress
+            .as_deref()
+            .is_none_or(|progress| now.saturating_duration_since(*progress) >= self.idle_timeout)
         {
             Some(ExecutionErrorKind::IdleTimeLimit)
-        } else if Instant::now() >= tool_deadline {
+        } else if now >= tool_deadline {
             Some(ExecutionErrorKind::ToolTimeLimit)
         } else {
             None
         };
+        drop(progress);
         if let Some(kind) = kind {
             record_terminal(&self.terminal, kind);
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
