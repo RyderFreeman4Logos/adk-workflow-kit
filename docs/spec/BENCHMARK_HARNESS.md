@@ -470,9 +470,11 @@ or a final security decision. Existing optional sorting-quality behavior is unch
 Sentinel's private calls are reported separately in `sentinel_probe_calls`, sourced
 from the protected version-four semantic artifact, with branch, view, invocation
 identity, schema hash and six optional raw usage counters. They remain available
-when clean or conflicting findings are discarded. Null accounting is unavailable;
-an empty list means verified language denial; a null per-call usage value means
-missing usage, while reported zero remains zero. These calls never become agent
+when clean or conflicting findings are discarded. Null accounting is unknown or
+incomplete; an empty list means verified preparation denial before model entry,
+including invalid input or language-policy denial, and does not identify the denial
+reason. A null per-call usage value means missing usage, while reported zero remains
+zero. These calls never become agent
 `model_calls` or a synthetic single-response total. A positive run without any
 completed model call fails the measurement wiring check even when preparation
 passes. KV intent is refused before admission for this package. No wire count,
@@ -512,8 +514,9 @@ Other workflows, absent rules or missing evidence remain null, never inferred ze
 Complete labels for at least two distinct inputs under assumed independence use
 the existing one-sided Hoeffding bound, rounded upward to millionths: zero events
 still give a nonzero bound. Correlation, repeated inputs or incomplete labels give
-null bounds. Independence is assumed, not attested. Quality uses only the exact
-sorting input above; other quality and independent quality intervals remain null.
+null bounds. Independence is assumed, not attested. Quality uses the finite sorting
+and Sentinel host predicates above; unknown inputs have no quality label, and
+independent quality intervals remain null.
 Raw metrics stay optional; Pareto excludes unknown dimensions, inventing no visible
 tokens, bills, KV or safety passes.
 Canary violations fail hard; wrong sorting answers fail the optional quality target.

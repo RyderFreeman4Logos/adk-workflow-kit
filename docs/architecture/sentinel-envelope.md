@@ -1,6 +1,6 @@
 # Sentinel canonical untrusted-data preparation
 
-Status: **partial implementation of #231**, not a completed Sentinel or general
+This document defines the **bounded #231 preparation contract**, not a completed Sentinel or general
 language detector. `workflow_runtime::prepare_untrusted_text` is the explicit artifact IO
 boundary; emitted text/maps are deterministic and normalization performs no IO. Callers
 inject the existing `ArtifactStore`. No model, provider, executor, or ADK agent is
@@ -266,26 +266,58 @@ hashes/handles, resource counts and policy identity. It contains no input text,
 timestamps, or random values. Treat hashes as correlation-sensitive metadata;
 this is not permission to expose artifact contents. The bounded
 [single-terminal preparation workflow](sentinel-workflow.md) now emits it through
-the existing event producer; shared #230 benchmark integration remains pending.
+the existing event producer. The [shared benchmark harness](../spec/BENCHMARK_HARNESS.md)
+validates a finite preparation oracle against retained input, artifacts, checkpoints
+and events, including report reconstruction. Controlled HTTP fixtures exercise this
+integration; the harness independently requires an observed completed model call.
 
 ## Acceptance ledger and runnable checks
 
-Run `just issue-231-runtime` (offline, no credentials).
+The normalization, carrier and language foundation was delivered in
+[PR #372](https://github.com/RyderFreeman4Logos/adk-workflow-kit/pull/372).
+Run `just issue-231-runtime` and `just issue-231-compiler` offline, without credentials.
+`just issue-231-adk` and `just issue-232-semantics` exercise observed preparation with
+scripted semantic bindings; `just issue-230-telemetry sentinel` covers controlled
+HTTP and retained-artifact reconstruction. These checks establish the finite
+contracts below, not a current full-gate or live semantic-quality result.
 
 | #231 requirement | Evidence/status |
 | --- | --- |
 | Immutable original bytes and fixed envelope | `retained_bytes_and_length_framed_envelope_are_exact` |
 | Typed invalid states, no lossy UTF-8 | `invalid_paths_are_typed_without_lossy_conversion` |
 | Mapped zero-width/bidi/control carriers | `unicode_controls_have_golden_original_byte_mappings` (explicit list only) |
-| Deterministic resource bounds | `output_and_work_exhaustion_never_return_partial_prepared_text` |
+| Deterministic resource bounds | `output_and_work_exhaustion_never_return_partial_prepared_text`, `resource_and_depth_limits_fail_atomically`; `elapsed_preparation_budget_is_not_reset_before_carrier_analysis` checks the shared 1,000-ms cooperative budget, not OS preemption |
 | Cache identity and structured telemetry | `cache_consumes_canonical_policy_raw_bytes_and_trust_provenance`, `telemetry_is_versioned_deterministic_and_does_not_echo_text` |
-| en/zh/ja versus material unsupported spans | Pinned statistical en/zh-Hans/zh-Hant/ja attribution plus conservative short-text paths; raw/decoded policy and eight allowlists use actual provider-entry counters; engineering fixtures do not replace held-out calibration |
+| en/zh/ja versus material unsupported spans | Actual pinned statistical en/zh-Hans/zh-Hant/ja attribution plus conservative short-text paths; `frozen_language_ingress_table_covers_every_allowlist_and_transport` executed 1,280 unique raw/decoded and eight-allowlist combinations with zero mismatches: 908 denials with no semantic requests, 364 positive semantic-dispatch combinations and eight empty-normalized pending combinations with no semantic requests. Semantic bindings are controlled; these correlated engineering fixtures do not establish held-out accuracy |
 | Code/URL/identifier/emoji/math/data segmentation | Bounded recognized-syntax subset, mapped spans; `segmentation::*` focused fixtures; exclusions are lexical, not safety approval |
 | Hidden HTML/Markdown, escaping, Base64, hex, nested decoding | Finite subset above, optional decoded views and composed maps; `carriers::*`, `carrier_syntax::*`; arbitrary rendered markup is unsupported |
 | Unicode mapping/resource property corpus | `deterministic_unicode_property_corpus_has_total_source_coverage` (512 deterministic cases), joiner/variation-selector fixture |
-| Multilingual/hard-negative/nested-encoding fuzz fixtures | Carrier subset: 256 seeded nested UTF-8 mapping cases, 512 seeded malformed-input cases, quantum golden maps and code/URL/data negatives; complete language/markup coverage remains pending |
+| Multilingual/hard-negative/nested-encoding fuzz fixtures | Carrier subset: 256 seeded nested UTF-8 mapping cases, 512 seeded malformed-input cases, quantum golden maps and code/URL/data negatives; language cases use the finite table above. Generalization beyond these model fixtures and recognized markup grammars is unmeasured |
 | Spec/IR/compiler runtime routing | Explicit v1 single-terminal preparation contract, canonical IR v11 and observed ADK execution; `just issue-231-compiler` / `just issue-231-adk`; general routing, positive continuation and cache reuse are unsupported capabilities outside this one-shot contract |
-| Live semantic coverage | Bounded #232 model branches are implemented and exercised offline with scripted bindings ([sentinel-probes.md](sentinel-probes.md)); live semantic quality and authorized live binding remain unverified |
+| Shared benchmark compatibility | `sentinel_language_http_contract`, `sentinel_private_measurement_rebuilds_without_inventing_agent_calls_or_totals` and `sentinel_private_reconstruction_rejects_artifact_input_and_missing_checkpoint` exercise the production executor and protected-artifact oracle; preparation quality and completed-model wiring remain separate assertions |
+| Conditional semantic coverage | [#232 semantic branches](sentinel-probes.md) are exercised with scripted bindings; the real-provider failure below does not establish live semantic quality |
 
-Do not close #231 from this ledger. #232 remains responsible for model branches;
-preparation alone cannot supply their final security judgment.
+Earlier qualification runs failed at 19/20 and 1,272/1,280; the later finite table
+does not erase those results or prove held-out calibration. The bounded real-provider
+table stopped at its first, 81-byte English case: preparation passed, but semantic
+reason was `invalid_or_failed`, observations were null and
+`completed_model_observed` was false. The table failed; the other three language
+rows were unexecuted. The provider/schema cause and physical send count remain
+unknown. The completed-model invariant still fails this run independently of the
+preparation predicate; no failed wiring result is reclassified as PASS.
+
+This ledger establishes a bounded preparation milestone for
+[#231](https://github.com/RyderFreeman4Logos/adk-workflow-kit/issues/231), with
+[#232](https://github.com/RyderFreeman4Logos/adk-workflow-kit/issues/232) providing
+the dependent semantic-judgment work. It does not replace the
+[OWNER's full issue acceptance requirements](https://github.com/RyderFreeman4Logos/adk-workflow-kit/issues/231#issuecomment-5832579820):
+live-model semantic efficacy/calibration, benchmark acceptance, independently
+enforced process/OS sandboxing, persistent replay/checkpoint/crash-resume, and full
+issue acceptance. This milestone does not establish or waive those requirements.
+Public Sentinel resume refuses before modifying completed history; that protection
+does not establish positive continuation.
+
+The historical failed canonical run is retained under
+[#374](https://github.com/RyderFreeman4Logos/adk-workflow-kit/issues/374).
+A clean exact-tree full gate, fresh whole-range review and verified merge are
+necessary delivery gates; they are not sufficient for full issue acceptance.

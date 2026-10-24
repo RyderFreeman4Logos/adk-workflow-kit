@@ -15,7 +15,8 @@ mod tests;
 
 pub(super) struct ValidatedPreparation {
     pub(super) quality: Option<Value>,
-    /// None is unavailable accounting; an empty vector is a verified language denial.
+    /// None is unknown or incomplete accounting. Empty means verified preparation denial
+    /// before model entry (invalid input or language policy), without identifying its reason.
     pub(super) probe_calls: Option<Vec<Value>>,
 }
 
