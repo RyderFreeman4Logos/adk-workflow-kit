@@ -1,7 +1,8 @@
 use std::{
     fs,
+    io::Write,
     path::PathBuf,
-    process::{Command, Output},
+    process::{Child, Command, ExitStatus, Output, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -59,6 +60,114 @@ fn artifact_files(workdir: &std::path::Path) -> Vec<PathBuf> {
         .collect::<Vec<_>>();
     files.sort();
     files
+}
+
+fn wait_for_fifo_module_exit(child: &mut Child, deadline: std::time::Instant) -> ExitStatus {
+    loop {
+        if let Some(status) = child.try_wait().expect("wait must not fail") {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let killed = child.kill();
+            let reaped = child.wait();
+            panic!(
+                "workflowctl must not block on a non-regular module path; kill={killed:?}; reap={reaped:?}"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn fifo_module_timeout_reaps_child_before_panicking() {
+    struct RescueChild(Child);
+
+    impl Drop for RescueChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            if let Err(error) = self.0.wait() {
+                let _ = writeln!(std::io::stderr(), "timeout fixture rescue failed: {error}");
+            }
+        }
+    }
+
+    // SAFETY: zero initializes the output action; the null second argument
+    // queries SIGCHLD without changing process-wide signal disposition.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: the action pointer is valid, and the null input requests only a query.
+    assert_eq!(
+        unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) },
+        0,
+        "SIGCHLD disposition must be readable"
+    );
+    assert!(
+        action.sa_sigaction == libc::SIG_DFL && action.sa_flags & libc::SA_NOCLDWAIT == 0,
+        "timeout fixture requires retained direct-child status"
+    );
+    let mut fixture = RescueChild(
+        Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("timeout fixture must start"),
+    );
+    assert!(
+        fixture
+            .0
+            .try_wait()
+            .expect("fixture status must be readable")
+            .is_none()
+    );
+    let pid = fixture.0.id();
+    // SAFETY: zero is valid initialization for the waitid output structure.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let started = std::time::Instant::now();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_fifo_module_exit(&mut fixture.0, started - std::time::Duration::from_secs(1))
+    }));
+    // SAFETY: this exact positive PID belongs to our direct fixture child;
+    // WNOWAIT observes its status without performing the missing reap.
+    let observed = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    // SAFETY: info was initialized before waitid, including its error path.
+    let observed_pid = unsafe { info.si_pid() };
+    let elapsed = started.elapsed();
+
+    // Save the non-consuming observation before independent rescue can reap.
+    let _ = fixture.0.kill();
+    let rescued = fixture
+        .0
+        .wait()
+        .expect("independent rescue must reap the fixture");
+    eprintln!(
+        "timeout custody: pre_rescue_waitid={observed}; errno={errno:?}; si_pid={observed_pid}; elapsed={elapsed:?}; rescue={rescued:?}"
+    );
+    let panic = panic.expect_err("expired FIFO deadline must panic");
+    let message = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+    assert!(message.is_some_and(|message| {
+        message.starts_with("workflowctl must not block on a non-regular module path")
+    }));
+    assert_eq!(
+        (observed, errno),
+        (-1, Some(libc::ECHILD)),
+        "timeout helper must reap before independent rescue; observed pid={observed_pid}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "controlled direct-sleeper timeout must complete within two seconds"
+    );
 }
 
 #[test]
@@ -225,16 +334,7 @@ fn run_rejects_non_regular_module_without_blocking() {
         .expect("workflowctl must start");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("wait must not fail") {
-            break status;
-        }
-        if std::time::Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("workflowctl must not block on a non-regular module path");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    };
+    let status = wait_for_fifo_module_exit(&mut child, deadline);
     assert_eq!(
         status.code(),
         Some(2),
