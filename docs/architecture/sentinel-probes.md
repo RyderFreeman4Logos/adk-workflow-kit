@@ -104,13 +104,13 @@ timeout and provider extensions), following the semantic Firewall identity contr
 raw runtime policy is never published. No semantic cache is
 read or written. The preparation key alone is **not** a semantic cache key.
 
-## Executed semantic report v2
+## Executed semantic report v3
 
 Read `preparation.semantics.artifact_id` from the same completion event. This
 content-addressed report has `schema_version`, `version`
-(`sentinel-semantic-probes-v2`), a closed `reason`, `task_alignment`
+(`sentinel-semantic-probes-v3`), a closed `reason`, `task_alignment`
 (`trusted_goal_unavailable`, `not_completed`, or a validated relation below),
-`causal_attribution` (`not_measured`), `findings`, and
+`causal_attribution` (`not_measured`), `findings`, `observations`, and
 `decision` (shared Sentinel `TypedOutput` or null).
 
 After the unchanged language gate, a fresh ADK graph superstep executes one
@@ -127,7 +127,7 @@ or interruption, missing final complete Stop, over-budget output and malformed r
 strict Sentinel parsing rejects duplicate/unknown fields before Value decoding.
 
 The fixed ceiling is **8 requests total**, **128 requested output tokens / 512
-response bytes per request**, **30 seconds for the model superstep**, no retries or
+accepted model-text bytes per request**, **30 seconds for the model superstep**, no retries or
 escalation, and **32,768 report bytes**. Any missing ordered/shuffled view, exhausted
 descriptor branch or total above eight denies all model entry (`view_budget`), not
 partial coverage. A bound goal consumes one slot in this same ceiling, not an extra
@@ -135,6 +135,7 @@ budget: eight source views plus a task view denies all nine. No decoded candidat
 needs no extra request. Invalid/unsupported/
 unattributed preparation is not upgraded by semantic inference (`language_gate`).
 The deadline excludes synchronous normalization, schema construction and artifact IO.
+The text limit does not bound the raw HTTP response body or provider metadata.
 
 An invocation-local failure signal cancels pending sibling requests/streams without
 waiting for ADK's deferred error collection. Cancellation of the owning observed
@@ -155,9 +156,35 @@ pending/null. Absent goals abstain; present-but-uncompleted task branches report
 `not_completed`. On unanimous Clean the validated relation may be reported, but
 findings and decision remain absent.
 
-Fixed policy/tool ordering is stable. Branch-specific schemas precede data in the
-existing prompt protocol, limiting cross-branch exact-prefix sharing. Provider cache
-reuse, shared-prefix latency, usage/cost telemetry and semantic quality are not measured.
+| Reason | Meaning for consumers |
+| --- | --- |
+| `invalid_or_failed`, `deadline`, `conflict` | Typed uncertainty/abstention: classification unavailable; never a semantic-quality success, authority, or automatic retry/escalation. |
+| `language_gate`, `view_budget`, `model_unavailable` | No complete semantic coverage; preparation and capability boundaries remain unchanged. |
+| `clean_not_authoritative` | Complete unanimous model Clean evidence, deliberately discarded as insufficient for authorization. |
+| `agreement` | Complete unanimous non-Clean findings; fallible evidence, never permission. |
+
+`observations` is independent of `findings`. After the private superstep completes,
+it contains at most eight host-created records in the same canonical branch/view
+order, binding each call to its descriptor and invocation/schema hashes. Each `usage`
+is null when provider counters are unavailable, otherwise it contains six optional
+raw counters: `input_tokens`, `output_tokens`, `total_tokens`, `cache_read_tokens`,
+`cache_write_tokens`, and `reasoning_tokens`. Missing counters stay null; genuine zero
+stays zero. The latest valid provider snapshot replaces earlier snapshots; counters
+are not merged, summed, inferred, or normalized from SDK defaults. Clean and Conflict
+discard findings while preserving these completed-call observations. If the superstep
+fails or is cancelled before complete aggregation, observations are null: accounting
+is unavailable, not zero cost or proof that no request ran. Validation attempts are
+not HTTP-send counts, and these records do not establish billing or physical KV hits.
+
+Fixed policy/tool ordering is stable. Non-task probes share the source-schema family
+ID; for an identical view, ordered/shuffled messages share the complete system and
+common-data prefix up to the branch task suffix. Different source covers retain
+different strict enum schemas; different text/view descriptors retain different
+common-data identities. The task branch alone receives the authenticated goal and
+keeps its dedicated policy/schema. Branch suffixes and invocation hashes remain
+distinct. This message-prefix property does not guarantee equal HTTP bodies or
+provider cache keys. Provider cache reuse, shared-prefix latency, actual cost and
+semantic quality require separate measurement.
 Existing `model_request_started` agent-loop events do not cover these private probes;
 accepted invocation provenance is in this protected aggregate, not an agent-loop log.
 
@@ -169,8 +196,9 @@ They prove wiring, concurrent requests, source isolation, validation and publica
 behavior—not semantic accuracy. The descriptor fixtures continue to test replay,
 overlap, normalized offsets, ambiguity and atomic exhaustion.
 
-Remaining #232 acceptance: authenticated end-to-end CLI/service goal integration,
-live calibrated task alignment, calibrated final Clean/security routing, more than eight-view
-scheduling, multilingual/decoded-language quality, precise offending spans,
-shared-prefix/cache measurements, live security hard negatives and chunk-boundary
-accuracy, causal experiments and shared benchmark integration. **Leave #232 OPEN.**
+Remaining #232 acceptance is the shared benchmark integration and a separately
+frozen finite live table covering benign quotation/security discussion, goal
+redirection, decoded material and adjacent overlapping chunks through the existing
+authenticated host-goal API. Scripted fixtures and prefix equality do not establish
+those model-quality results or physical cache benefits. Final Clean authorization,
+new goal ingress, expanded scheduling and causal experiments are separate contracts.

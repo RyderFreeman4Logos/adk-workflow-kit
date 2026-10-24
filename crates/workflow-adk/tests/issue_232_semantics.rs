@@ -91,7 +91,9 @@ fn two_executed_views_join_typed_findings_with_provenance() {
         report["findings"][0]["invocation_identity"],
         report["findings"][1]["invocation_identity"]
     );
-    assert_ne!(
+    // One schema family and the same exact source cover share schema identity;
+    // the branch task suffix still distinguishes the invocation above.
+    assert_eq!(
         report["findings"][0]["schema_hash"],
         report["findings"][1]["schema_hash"]
     );

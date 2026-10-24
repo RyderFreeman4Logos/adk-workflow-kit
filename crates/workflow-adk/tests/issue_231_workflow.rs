@@ -342,7 +342,7 @@ fn actual_path_cache_key_has_an_independent_versioned_policy_oracle() {
         "version":"sentinel-workflow-preparation-v7",
         "probe_version":"sentinel-source-probes-v2",
         "probe_budget":{"max_views_per_branch":32,"max_bytes_per_branch":65536,"max_report_bytes":32768,"chunk_bytes":256,"overlap_bytes":64},
-        "semantic_version":"sentinel-semantic-probes-v2",
+        "semantic_version":"sentinel-semantic-probes-v3",
         "task_alignment_version":"sentinel-task-alignment-v1",
         "max_goal_bytes":4096,
         "trusted_goal":null,
