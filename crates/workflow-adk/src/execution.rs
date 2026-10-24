@@ -2,8 +2,11 @@
 
 mod behavioral;
 mod effect_audit;
+#[cfg(test)]
+mod effect_fence_tests;
 mod isolated;
 pub(crate) mod oracle_phase;
+mod shared;
 mod tool_audit;
 pub use behavioral::BehavioralExecutionReceipt;
 use effect_audit::EffectAudits;
@@ -79,7 +82,7 @@ use crate::{
 mod resume_approvals;
 pub use resume_approvals::PendingToolApproval;
 
-const MAX_STATE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_STATE_BYTES: usize = 1024 * 1024;
 const ARTIFACT_LIMIT: u64 = 64 * 1024;
 const SKILL_RESOURCE_READ_LIMIT: u64 = 64 * 1024;
 const SKILL_PACKAGE_LIMIT: usize = 64;
@@ -108,6 +111,10 @@ type BoundCache = (
 struct LoopState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     invocation: Option<isolated::Invocation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    shared_turns: Vec<crate::shared_session::Turn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shared_pending: Option<shared::Prepared>,
     model_iterations: u64,
     total_tool_calls: u64,
     tool_output_bytes: u64,
@@ -189,7 +196,7 @@ struct LoopLedgerV1 {
     checkpoint_nodes: Option<BTreeMap<String, LoopState>>,
 }
 
-struct LoopLedgerStore {
+pub(crate) struct LoopLedgerStore {
     path: PathBuf,
     artifacts: FilesystemArtifactStore,
     checkpoint_path: PathBuf,
@@ -242,7 +249,7 @@ impl LoopLedgerStore {
     ) -> Result<Self, ExecutionError> {
         let ledger = serde_json::from_slice::<LoopLedgerV1>(&bounded_read(&path)?)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        if ledger.schema_version != 6 || ledger.checkpoint_identity != checkpoint_identity {
+        if ledger.schema_version != 7 || ledger.checkpoint_identity != checkpoint_identity {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
         let mut nodes = if checkpoint_digest == loop_ledger_digest(&ledger.nodes)? {
@@ -678,7 +685,7 @@ impl LoopLedgerStore {
         write_json(
             &self.path,
             &LoopLedgerV1 {
-                schema_version: 6,
+                schema_version: 7,
                 checkpoint_identity: self.checkpoint_identity.clone(),
                 nodes: nodes.clone(),
                 checkpoint_nodes: Some(checkpoint_nodes),
@@ -710,7 +717,7 @@ impl LoopLedgerStore {
         write_json(
             &self.path,
             &LoopLedgerV1 {
-                schema_version: 6,
+                schema_version: 7,
                 checkpoint_identity: self.checkpoint_identity.clone(),
                 nodes,
                 checkpoint_nodes: None,
@@ -980,7 +987,7 @@ fn valid_skill_resource_read_accounting(state: &LoopState) -> bool {
 }
 
 fn loop_ledger_digest(nodes: &BTreeMap<String, LoopState>) -> Result<String, ExecutionError> {
-    let canonical = serde_json::to_vec(&(3_u8, nodes))
+    let canonical = serde_json::to_vec(&(4_u8, nodes))
         .map_err(|_| ExecutionError::new(ExecutionErrorKind::Persistence))?;
     Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
 }
@@ -1039,6 +1046,9 @@ enum FinishStatus {
 }
 
 fn admitted_finish(content: &adk_rust::Content) -> Result<Option<Value>, ()> {
+    if !matches!(content.role.as_str(), "assistant" | "model") {
+        return Err(());
+    }
     let text = crate::model_text(content).filter(|text| !text.trim().is_empty());
     let has_call = content
         .parts
@@ -4278,7 +4288,7 @@ fn build_profile_agent(
     )?);
     let before_controller = Arc::clone(&controller);
     let invocation_controller = Arc::clone(&controller);
-    let isolated = contract.is_some_and(|contract| contract.isolated);
+    let authored = contract.is_some();
     let tool_controller = Arc::clone(&controller);
     let tool_error_controller = Arc::clone(&controller);
     let persist_cache = cache.clone();
@@ -4308,9 +4318,9 @@ fn build_profile_agent(
         .before_model_callback(Box::new(move |_context, request| {
             let controller = Arc::clone(&before_controller);
             Box::pin(async move {
-                Ok(adk_rust::BeforeModelResult::Continue(
-                    controller.before_model(request)?,
-                ))
+                controller
+                    .before_model(request)
+                    .map(adk_rust::BeforeModelResult::Continue)
             })
         }))
         .after_model_callback(Box::new(move |_context, response| {
@@ -4397,7 +4407,7 @@ fn build_profile_agent(
         .build()
         .map(|agent| {
             let agent = Arc::new(agent) as Arc<dyn Agent>;
-            if isolated {
+            if authored {
                 crate::agent_admission::replay_current(agent, move || {
                     invocation_controller.enter_isolated()
                 })
@@ -4816,6 +4826,7 @@ impl ExecutionBackend {
         let agent_contracts = resolve_agent_contracts(workflow.as_ref(), compiled.ir())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidProfile))?;
         profile.bind_declared_skill_roots(workflow.as_ref(), compiled.ir())?;
+        shared::recoverable(&agent_contracts, profile.skill_packages()?.is_empty())?;
         let skill_snapshot = SealedSkillSnapshotV1::from_packages(
             profile.planned_skill_packages(compiled.ir())?,
             &profile.model,
@@ -5130,6 +5141,8 @@ impl ExecutionBackend {
                     )
                     .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?
                     .with_cache_dispositions(Arc::clone(&cache_dispositions));
+                let mut graph = graph;
+                graph.shared_ledger = Some(Arc::clone(&loop_ledger));
                 let graph = if graph.untrusted_text.is_some() {
                     graph.with_sentinel_model(profile.bind_model(IrModelRole::Worker, 0)?)
                 } else {
@@ -5592,6 +5605,8 @@ impl ExecutionBackend {
         }
         let agent_contracts = resolve_agent_contracts(&workflow, compiled.ir())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        shared::recoverable(&agent_contracts, profile.skill_packages()?.is_empty())
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         if compiled.ir().workflow_id().as_str() != manifest.workflow_id
             || compiled.ir().workflow_version() != manifest.workflow_version
         {
@@ -5690,6 +5705,7 @@ impl ExecutionBackend {
             &checkpoint,
             &isolated::nodes(&agent_contracts),
         )?;
+        shared::validate(&loop_ledger, &agent_contracts)?;
         // Reject unprovable historical completion association before replay IO.
         tool_audit::validate_existing(&loop_ledger, &mapper, &artifacts)?;
         let tool_registry = build_tool_registry(
@@ -5780,9 +5796,7 @@ impl ExecutionBackend {
                     ),
                 )?;
                 let agent = if let Some(output) = loop_ledger.finish_successor(name)?
-                    && !agent_contracts
-                        .get(name)
-                        .is_some_and(|contract| contract.isolated)
+                    && !agent_contracts.contains_key(name)
                 {
                     Arc::new(RestoredFinishAgent {
                         name: name.to_owned(),
@@ -5836,6 +5850,8 @@ impl ExecutionBackend {
             )
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?
             .with_cache_dispositions(Arc::clone(&cache_dispositions));
+        let mut graph = graph;
+        graph.shared_ledger = Some(Arc::clone(&loop_ledger));
         let recursion_limit = crate::graph_recursion_limit(compiled.ir()).max(50);
         let isolated = isolated::nodes(&agent_contracts);
         let mut frontier = isolated::frontier_observer(
@@ -5986,7 +6002,7 @@ fn build_checkpoint_manifest(
         .with_resource_hash("workflow.ir", workflow_hash)
         .with_implementation("model", profile.profile_identity())
         .with_implementation("adk-rust", crate::ADK_RUST_VERSION)
-        .with_implementation("loop-ledger", "v3")
+        .with_implementation("loop-ledger", "v4")
         .with_implementation(
             "execution-profile",
             format!("sha256:{:x}", Sha256::digest(profile_identity)),
@@ -6088,21 +6104,40 @@ impl EffectFence {
         {
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
         }
+        // Already stopped work must not wait for progress ownership. For live
+        // work, classify only after the lock wait: a wall-clamped tool deadline
+        // must retain wall precedence even when it expires during that wait.
+        let progress =
+            if self.cancellation.load(Ordering::Acquire) || Instant::now() >= self.wall_deadline {
+                None
+            } else {
+                #[cfg(test)]
+                effect_fence_tests::before_progress_lock();
+                self.last_progress.lock().ok()
+            };
+        if self
+            .terminal
+            .lock()
+            .map_or(true, |terminal| terminal.is_some())
+        {
+            return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));
+        }
+        let now = Instant::now();
         let kind = if self.cancellation.load(Ordering::Acquire) {
             Some(ExecutionErrorKind::Cancelled)
-        } else if Instant::now() >= self.wall_deadline {
+        } else if now >= self.wall_deadline {
             Some(ExecutionErrorKind::WallTimeLimit)
-        } else if self
-            .last_progress
-            .lock()
-            .map_or(true, |progress| progress.elapsed() >= self.idle_timeout)
+        } else if progress
+            .as_deref()
+            .is_none_or(|progress| now.saturating_duration_since(*progress) >= self.idle_timeout)
         {
             Some(ExecutionErrorKind::IdleTimeLimit)
-        } else if Instant::now() >= tool_deadline {
+        } else if now >= tool_deadline {
             Some(ExecutionErrorKind::ToolTimeLimit)
         } else {
             None
         };
+        drop(progress);
         if let Some(kind) = kind {
             record_terminal(&self.terminal, kind);
             return Err(ToolBridgeError::new(ToolBridgeErrorKind::HandlerFailed));

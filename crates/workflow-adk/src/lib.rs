@@ -7,6 +7,10 @@ mod agent_admission;
 pub mod behavioral;
 pub mod events;
 pub mod execution;
+mod session_context;
+#[cfg(test)]
+mod session_policy_tests;
+mod shared_session;
 #[doc(hidden)]
 pub use execution::oracle_phase::OraclePhaseGuard;
 pub mod firewall;
@@ -505,6 +509,8 @@ struct PlanBinding {
 
 pub struct AdkGraph {
     graph: GraphAgent,
+    shared_sessions: Arc<shared_session::Sessions>,
+    shared_ledger: Option<Arc<execution::LoopLedgerStore>>,
     summary: GraphSummary,
     input: StateInputMapper,
     output: StateOutputMapper,
@@ -546,6 +552,9 @@ impl AdkGraph {
         state: State,
         config: ExecutionConfig,
     ) -> Result<State, AdkGraphError> {
+        let _shared_run = self
+            .shared_sessions
+            .begin(&config.thread_id, self.shared_ledger.clone())?;
         self.prepare_firewall_run(&config)?;
         let mut state = self.input.map(state);
         state.retain(|key, _| !key.starts_with("visits:"));
@@ -666,6 +675,9 @@ impl AdkGraph {
         artifacts: &mut S,
         frontier: &mut impl FnMut(&str, usize, &events::AdkEventMapper, &S) -> Result<(), AdkGraphError>,
     ) -> Result<State, AdkGraphError> {
+        let _shared_run = self
+            .shared_sessions
+            .begin(&config.thread_id, self.shared_ledger.clone())?;
         self.prepare_firewall_run(&config)?;
         self.check_behavioral_invocation(&config, mapper)?;
         let mut state = self.input.map(state);
@@ -1070,6 +1082,10 @@ impl AdkGraphTranslator {
     }
 
     /// Translates a profile graph with a caller-owned checkpoint store.
+    /// Shared sessions require the execution backend's checkpoint-bound loop
+    /// ledger; a standalone SDK checkpointer cannot restore their history.
+    /// SDK tool-confirmation resume is not exposed by this API. It is distinct
+    /// from the execution backend's call-scoped ToolBridge/Firewall approvals.
     pub fn translate_profile_with_checkpointer(
         &self,
         plan: &CompiledPlan,
@@ -1210,6 +1226,14 @@ impl AdkGraphTranslator {
         // Reject reserved control IDs and dangling origins before ADK adds entries.
         workflow_compiler::validate_graph(ir).map_err(TranslationError::InvalidGraph)?;
         firewall::validate_binding(ir, firewall.as_ref())?;
+        let shared_sessions = Arc::new(shared_session::Sessions::new(
+            ir.nodes().iter().any(|node| {
+                node.agent_contract().is_some_and(|contract| {
+                    contract.session() == workflow_spec::SessionMode::Shared
+                })
+            }),
+            checkpointer.is_some(),
+        ));
         let firewall_decisions = firewall::Decisions::default();
         let ids: std::collections::BTreeSet<&str> =
             ir.nodes().iter().map(|node| node.id().as_str()).collect();
@@ -1439,38 +1463,43 @@ impl AdkGraphTranslator {
                     .unwrap_or_default();
                 let preds = predecessors.get(&id).cloned().unwrap_or_default();
                 builder = builder.node(
-                    AgentNode::new(agent_admission::admit(agent))
-                        .with_input_mapper(move |state| {
-                            agent_node_input(state, &preds, &input_keys)
-                        })
-                        .with_output_mapper(move |events| {
-                            let mut output = std::collections::HashMap::new();
-                            // OutputAdmission has accepted the complete stream before
-                            // AgentNode calls this infallible state projection.
-                            let Some(text) = final_agent_text(events) else {
-                                return output;
-                            };
-                            let value = serde_json::from_str(&text).unwrap_or_else(|_| json!(text));
-                            let node_value = value
-                                .get("output")
-                                .cloned()
-                                .unwrap_or_else(|| value.clone());
-                            if let Some(state) =
-                                value.get("state").and_then(serde_json::Value::as_object)
-                            {
-                                if fan_in_targets.is_empty() {
-                                    output.extend(
-                                        state
-                                            .iter()
-                                            .map(|(key, value)| (key.clone(), value.clone())),
-                                    );
-                                } else {
-                                    for (target, source) in &fan_in_targets {
-                                        let generation = fan_in_generations
-                                            .get(&(target.clone(), source.clone()))
-                                            .expect("fan-in generation exists for each target")
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        output.extend(state.iter().map(|(key, value)| {
+                    AgentNode::new(agent_admission::admit(
+                        agent,
+                        node.agent_contract()
+                            .filter(|contract| {
+                                contract.session() == workflow_spec::SessionMode::Shared
+                            })
+                            .map(|_| (id.clone(), Arc::clone(&shared_sessions))),
+                    ))
+                    .with_input_mapper(move |state| agent_node_input(state, &preds, &input_keys))
+                    .with_output_mapper(move |events| {
+                        let mut output = std::collections::HashMap::new();
+                        // OutputAdmission has accepted the complete stream before
+                        // AgentNode calls this infallible state projection.
+                        let Some(text) = final_agent_text(events) else {
+                            return output;
+                        };
+                        let value = serde_json::from_str(&text).unwrap_or_else(|_| json!(text));
+                        let node_value = value
+                            .get("output")
+                            .cloned()
+                            .unwrap_or_else(|| value.clone());
+                        if let Some(state) =
+                            value.get("state").and_then(serde_json::Value::as_object)
+                        {
+                            if fan_in_targets.is_empty() {
+                                output.extend(
+                                    state
+                                        .iter()
+                                        .map(|(key, value)| (key.clone(), value.clone())),
+                                );
+                            } else {
+                                for (target, source) in &fan_in_targets {
+                                    let generation = fan_in_generations
+                                        .get(&(target.clone(), source.clone()))
+                                        .expect("fan-in generation exists for each target")
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    output.extend(state.iter().map(|(key, value)| {
                                     (
                                         format!(
                                             "__workflow_fanin:{target}:{source}:{generation}:{key}"
@@ -1478,12 +1507,12 @@ impl AdkGraphTranslator {
                                         value.clone(),
                                     )
                                 }));
-                                    }
                                 }
                             }
-                            output.insert(output_key.clone(), node_value);
-                            output
-                        }),
+                        }
+                        output.insert(output_key.clone(), node_value);
+                        output
+                    }),
                 );
             } else {
                 let terminal = node.kind() == IrNodeKind::Terminal;
@@ -1698,6 +1727,8 @@ impl AdkGraphTranslator {
                 target: error.to_string(),
             })?;
         Ok(AdkGraph {
+            shared_sessions,
+            shared_ledger: None,
             sentinel_model: None,
             sentinel_script: self.sentinel_script.clone(),
             graph,

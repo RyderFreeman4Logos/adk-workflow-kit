@@ -8,10 +8,14 @@ use adk_rust::{
     futures::TryStreamExt as _,
 };
 
-pub(super) fn admit(agent: Arc<dyn Agent>) -> Arc<dyn Agent> {
+pub(super) fn admit(
+    agent: Arc<dyn Agent>,
+    shared: Option<(String, Arc<super::shared_session::Sessions>)>,
+) -> Arc<dyn Agent> {
     Arc::new(OutputAdmission {
         agent,
         replay: None,
+        shared,
     })
 }
 
@@ -22,10 +26,11 @@ pub(super) fn replay_current(
     Arc::new(OutputAdmission {
         agent,
         replay: Some(Box::new(replay)),
+        shared: None,
     })
 }
 
-fn invalid_output() -> AdkError {
+pub(super) fn invalid_output() -> AdkError {
     AdkError::agent("workflow.node.invalid_output")
 }
 
@@ -41,6 +46,7 @@ pub(super) fn is_invalid_output(node: &str, message: &str) -> bool {
 }
 
 struct OutputAdmission {
+    shared: Option<(String, Arc<super::shared_session::Sessions>)>,
     agent: Arc<dyn Agent>,
     replay: Option<Box<dyn Fn() -> adk_rust::Result<Option<Event>> + Send + Sync>>,
 }
@@ -106,7 +112,11 @@ impl Agent for OutputAdmission {
         }
         // Match AgentNode's complete-stream boundary: real errors win, and a
         // confirmation remains the SDK's interrupt rather than an empty answer.
-        let events: Vec<Event> = self.agent.run(ctx).await?.try_collect().await?;
+        let events: Vec<Event> = if let Some((node, sessions)) = &self.shared {
+            sessions.invoke(node, self.agent.as_ref(), ctx).await?
+        } else {
+            self.agent.run(ctx).await?.try_collect().await?
+        };
         if !events
             .iter()
             .any(|event| event.actions.tool_confirmation.is_some())

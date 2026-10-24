@@ -18,6 +18,8 @@ use workflow_adk::execution::{
 
 #[path = "m3_04_model_tool_loop/isolated.rs"]
 mod isolated;
+#[path = "m3_04_model_tool_loop/shared.rs"]
+mod shared;
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
