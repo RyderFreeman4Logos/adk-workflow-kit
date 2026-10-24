@@ -80,18 +80,22 @@ fn worker() -> SealedProbeWorker {
 }
 fn boundary_worker() -> SealedProbeWorker {
     // This separate package has no CARGO_BIN_EXE in this integration test.
-    // Just builds and hashes precisely this canonical artifact before execution.
+    // Just snapshots and hashes the fixed fixture before later Cargo builds can replace its source.
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
         .parent()
         .unwrap();
-    let path = root.join("target/debug/issue-233-boundary-child");
-    let stamp = fs::read_to_string(root.join("target/debug/issue-233-boundary-child.sha256"))
-        .expect("run Just's fixed binary build prerequisite");
+    let path = root.join("target/debug/issue-233-boundary-child.fixture");
+    let stamp =
+        fs::read_to_string(root.join("target/debug/issue-233-boundary-child.fixture.sha256"))
+            .expect("run Just's fixed binary build prerequisite");
     let mut fields = stamp.split_whitespace();
     let expected = format!("sha256:{}", fields.next().unwrap());
-    assert_eq!(fields.next(), Some("target/debug/issue-233-boundary-child"));
+    assert_eq!(
+        fields.next(),
+        Some("target/debug/issue-233-boundary-child.fixture")
+    );
     assert_eq!(fields.next(), None);
     assert!(fs::symlink_metadata(&path).unwrap().is_file());
     SealedProbeWorker::authorize(&fs::read(path).unwrap(), &expected).unwrap()

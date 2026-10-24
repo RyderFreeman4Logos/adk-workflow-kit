@@ -258,10 +258,12 @@ issue-233-adk:
 issue-233-doc:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --doc behavioral --locked
 
-# Exact fixed binaries for the #233 worker and its separate OS-negative fixture.
+# Snapshot the fixed OS-negative fixture before later Cargo graphs can rebuild its canonical binary.
 issue-233-worker-binaries:
     {{_io}} cargo +1.98.0 build -p workflow-runtime --bin sentinel-probe-worker -p workflow-testkit --bin issue-233-boundary-child --locked
-    sha256sum target/debug/issue-233-boundary-child > target/debug/issue-233-boundary-child.sha256
+    test ! -L target/debug/issue-233-boundary-child.fixture && { test ! -e target/debug/issue-233-boundary-child.fixture || test -f target/debug/issue-233-boundary-child.fixture; } && test ! -L target/debug/issue-233-boundary-child.fixture.sha256 && { test ! -e target/debug/issue-233-boundary-child.fixture.sha256 || test -f target/debug/issue-233-boundary-child.fixture.sha256; }
+    cp --no-dereference --no-target-directory --remove-destination -- target/debug/issue-233-boundary-child target/debug/issue-233-boundary-child.fixture
+    sha256sum target/debug/issue-233-boundary-child.fixture > target/debug/issue-233-boundary-child.fixture.sha256
 
 issue-233-worker test_name="": issue-233-worker-binaries
     ADK_WORKER_INHERITED_CANARY=issue-233-fixed-test-only {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_233_worker {{test_name}} --locked -- --nocapture --test-threads=1
