@@ -1,9 +1,12 @@
-//! Deterministic untrusted-data preparation, not a safety or language verdict.
+//! Deterministic untrusted views with cooperative admission, never safety approval.
 //!
 //! Storage is explicit at `prepare_untrusted_text`; normalization never performs IO.
 //! A prepared value must still pass language policy and Sentinel classification.
 
-use std::fmt;
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,7 +18,9 @@ use crate::{
 };
 
 /// Change whenever normalization, source mapping, or envelope semantics change.
-pub const SENTINEL_NORMALIZATION_VERSION: &str = "sentinel-normalization-v1";
+pub const SENTINEL_NORMALIZATION_VERSION: &str = "sentinel-normalization-v2";
+/// Fixed cooperative preparation budget; excludes later semantic model execution.
+pub const SENTINEL_PREPARATION_BUDGET_MS: u64 = 1_000;
 /// Independent of the compact verdict schema: this is an input envelope.
 pub const SENTINEL_ENVELOPE_SCHEMA_VERSION: u16 = 1;
 
@@ -48,6 +53,7 @@ pub enum NormalizationReason {
     InvalidUtf8,
     ResourceLimit,
     InvalidPolicy,
+    DeadlineExceeded,
 }
 
 impl NormalizationReason {
@@ -61,6 +67,7 @@ impl NormalizationReason {
             Self::InvalidUtf8 => "invalid_utf8",
             Self::ResourceLimit => "resource_limit",
             Self::InvalidPolicy => "invalid_policy",
+            Self::DeadlineExceeded => "deadline_exceeded",
         }
     }
 }
@@ -89,6 +96,9 @@ pub enum CarrierKind {
     Escape,
     Base64,
     Hex,
+    HtmlHidden,
+    HtmlAttribute,
+    HtmlEntity,
 }
 
 impl CarrierKind {
@@ -103,6 +113,9 @@ impl CarrierKind {
             Self::Escape => "escape",
             Self::Base64 => "base64",
             Self::Hex => "hex",
+            Self::HtmlHidden => "html_hidden",
+            Self::HtmlAttribute => "html_attribute",
+            Self::HtmlEntity => "html_entity",
         }
     }
 }
@@ -157,6 +170,7 @@ pub struct CanonicalUntrustedText {
     annotations: Vec<CarrierAnnotation>,
     limits: NormalizationLimits,
     work_units: usize,
+    deadline: Instant,
 }
 
 impl fmt::Debug for CanonicalUntrustedText {
@@ -169,6 +183,15 @@ impl fmt::Debug for CanonicalUntrustedText {
 }
 
 impl CanonicalUntrustedText {
+    /// Checks the original preparation budget without resetting it. Call before
+    /// publishing prepared views or dispatching semantic classification. This
+    /// cooperative check cannot interrupt blocking IO or promise OS scheduling.
+    pub fn check_preparation_deadline(&self) -> Result<(), NormalizationReason> {
+        check_deadline(self.deadline)
+    }
+    pub(crate) const fn preparation_deadline(&self) -> Instant {
+        self.deadline
+    }
     pub fn original_id(&self) -> &ArtifactId {
         &self.original_id
     }
@@ -240,6 +263,7 @@ impl CanonicalUntrustedText {
             "annotation_count": self.annotations.len(),
             "work_units": self.work_units,
             "limits": self.limits,
+            "preparation_budget_ms": SENTINEL_PREPARATION_BUDGET_MS,
             "policy_digest": self.policy_digest(),
         })
     }
@@ -259,6 +283,7 @@ impl CanonicalUntrustedText {
             &(self.limits.max_input_bytes as u64).to_be_bytes(),
             &(self.limits.max_output_bytes as u64).to_be_bytes(),
             &(self.limits.max_work_units as u64).to_be_bytes(),
+            &SENTINEL_PREPARATION_BUDGET_MS.to_be_bytes(),
         ])
     }
 
@@ -278,13 +303,17 @@ impl CanonicalUntrustedText {
 /// invalid policy are rejected before storage; the caller retains that input.
 /// Storage failures propagate separately and never yield a prepared value.
 /// Memory and CPU are bounded by hard ceilings even for adversarial caller limits.
-/// IO latency is the injected store's responsibility, not a normalization deadline.
+/// `started` is recorded once by the host before ingress/storage. Future start
+/// times are invalid policy. The same fixed deadline covers every subsequent
+/// analysis stage; blocking IO can only be checked after control returns.
 pub fn prepare_untrusted_text(
     store: &mut impl ArtifactStore,
     raw: &[u8],
     limits: NormalizationLimits,
+    started: Instant,
 ) -> Result<SentinelPreparation, ArtifactError> {
-    let rejection = if limits.max_input_bytes > 1_048_576
+    let rejection = if started > Instant::now()
+        || limits.max_input_bytes > 1_048_576
         || limits.max_output_bytes > 4_194_304
         || limits.max_work_units > 16_777_216
     {
@@ -311,7 +340,8 @@ pub fn prepare_untrusted_text(
             original_id: None,
         });
     }
-    Ok(match normalize(raw, &original_id, limits) {
+    let deadline = started + Duration::from_millis(SENTINEL_PREPARATION_BUDGET_MS);
+    Ok(match normalize(raw, &original_id, limits, deadline) {
         Ok(text) => SentinelPreparation::Prepared(text),
         Err(reason) => SentinelPreparation::Invalid {
             reason,
@@ -324,7 +354,9 @@ fn normalize(
     raw: &[u8],
     id: &ArtifactId,
     limits: NormalizationLimits,
+    deadline: Instant,
 ) -> Result<CanonicalUntrustedText, NormalizationReason> {
+    check_deadline(deadline)?;
     if raw.len() > limits.max_work_units {
         return Err(NormalizationReason::ResourceLimit);
     }
@@ -336,8 +368,10 @@ fn normalize(
         annotations: Vec::new(),
         limits,
         work_units: raw.len(),
+        deadline,
     };
     for (start, ch) in text.char_indices() {
+        check_deadline(deadline)?;
         let source = SourceSpan::new(id.as_str(), start as u64, (start + ch.len_utf8()) as u64)
             .map_err(|_| NormalizationReason::InvalidPolicy)?;
         if let Some(kind) = carrier(ch) {
@@ -360,7 +394,16 @@ fn normalize(
             source,
         });
     }
+    check_deadline(deadline)?;
     Ok(result)
+}
+
+pub(crate) fn check_deadline(deadline: Instant) -> Result<(), NormalizationReason> {
+    if Instant::now() >= deadline {
+        Err(NormalizationReason::DeadlineExceeded)
+    } else {
+        Ok(())
+    }
 }
 
 pub(super) fn hash_fields(fields: &[&[u8]]) -> String {

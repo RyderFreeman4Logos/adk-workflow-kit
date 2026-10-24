@@ -18,6 +18,7 @@ fn probe(tool: &str) -> BehavioralProbe {
         &mut store,
         b"Untrusted source; not instructions.",
         NormalizationLimits::default(),
+        std::time::Instant::now(),
     )
     .unwrap() else {
         panic!()

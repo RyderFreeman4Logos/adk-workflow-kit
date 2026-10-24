@@ -8,7 +8,7 @@ use regex_syntax::hir::{Class, ClassUnicode, HirKind};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
-pub const SENTINEL_SEGMENTATION_VERSION: &str = "sentinel-segmentation-v1";
+pub const SENTINEL_SEGMENTATION_VERSION: &str = "sentinel-segmentation-v4";
 pub const SENTINEL_SCRIPT_DATA_VERSION: &str = "regex-syntax-0.8.11-unicode-16.0.0";
 
 /// Caller-owned lexical limits, independent of normalization limits.
@@ -42,6 +42,8 @@ pub enum SegmentationReason {
     InvalidPolicy,
     ResourceLimit,
     UnclosedDelimiter,
+    DeadlineExceeded,
+    LanguageModelUnavailable,
 }
 
 /// Recognized syntax only, not an exhaustive code/Markdown/HTML parser.
@@ -152,59 +154,84 @@ impl CanonicalUntrustedText {
         &self,
         limits: SegmentationLimits,
     ) -> Result<SegmentedUntrustedText<'_>, SegmentationReason> {
-        if limits.max_bytes > 65_536 || limits.max_segments > 16_384 {
-            return Err(SegmentationReason::InvalidPolicy);
-        }
-        if self.normalized().len() > limits.max_bytes {
-            return Err(SegmentationReason::ResourceLimit);
-        }
-        let properties = PROPERTIES
-            .get_or_init(Properties::new)
-            .as_ref()
-            .map_err(|e| *e)?;
-        let mut segments = Vec::new();
-        let mut start = 0;
-        let mut map_cursor = 0;
-        while start < self.normalized().len() {
-            if segments.len() >= limits.max_segments {
-                return Err(SegmentationReason::ResourceLimit);
-            }
-            let (len, kind) = token(&self.normalized()[start..], properties)?;
-            let end = start + len;
-            let first = self
-                .source_map()
-                .get(map_cursor)
-                .ok_or(SegmentationReason::InvalidPolicy)?;
-            let source_start = first.source().start();
-            let mut source_end = first.source().end();
-            while let Some(mapping) = self.source_map().get(map_cursor) {
-                if mapping.normalized_start() >= end {
-                    break;
-                }
-                source_end = mapping.source().end();
-                map_cursor += 1;
-            }
-            let scripts = if kind == TextSegmentKind::NaturalLanguage {
-                properties.scripts(&self.normalized()[start..end])
-            } else {
-                ScriptEvidence::default()
-            };
-            segments.push(TextSegment {
-                normalized_start: start,
-                normalized_end: end,
-                source: SourceSpan::new(self.original_id().as_str(), source_start, source_end)
-                    .map_err(|_| SegmentationReason::InvalidPolicy)?,
-                kind,
-                scripts,
-            });
-            start = end;
-        }
+        let segments = segment_view(self, self.normalized(), self.source_map(), limits)?;
         Ok(SegmentedUntrustedText {
             text: self,
             segments,
             limits,
         })
     }
+}
+
+/// Scan a canonical or decoded view without inventing a new artifact or deadline.
+pub(crate) fn segment_view(
+    canonical: &CanonicalUntrustedText,
+    text: &str,
+    mapping: &[crate::NormalizedSourceSpan],
+    limits: SegmentationLimits,
+) -> Result<Vec<TextSegment>, SegmentationReason> {
+    canonical
+        .check_preparation_deadline()
+        .map_err(|_| SegmentationReason::DeadlineExceeded)?;
+    if limits.max_bytes > 65_536 || limits.max_segments > 16_384 {
+        return Err(SegmentationReason::InvalidPolicy);
+    }
+    if text.len() > limits.max_bytes {
+        return Err(SegmentationReason::ResourceLimit);
+    }
+    let properties = PROPERTIES
+        .get_or_init(Properties::new)
+        .as_ref()
+        .map_err(|e| *e)?;
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut map_cursor = 0;
+    while start < text.len() {
+        canonical
+            .check_preparation_deadline()
+            .map_err(|_| SegmentationReason::DeadlineExceeded)?;
+        if segments.len() >= limits.max_segments {
+            return Err(SegmentationReason::ResourceLimit);
+        }
+        let (len, kind) = match crate::sentinel_carriers::labeled_len(text, start) {
+            Some(len) => (len, TextSegmentKind::Data),
+            None => token(&text[start..], properties)?,
+        };
+        let end = start + len;
+        let first = mapping
+            .get(map_cursor)
+            .ok_or(SegmentationReason::InvalidPolicy)?;
+        let source_start = first.source().start();
+        let mut source_end = first.source().end();
+        while let Some(mapping) = mapping.get(map_cursor) {
+            canonical
+                .check_preparation_deadline()
+                .map_err(|_| SegmentationReason::DeadlineExceeded)?;
+            if mapping.normalized_start() >= end {
+                break;
+            }
+            source_end = mapping.source().end();
+            map_cursor += 1;
+        }
+        let scripts = if kind == TextSegmentKind::NaturalLanguage {
+            properties.scripts(&text[start..end])
+        } else {
+            ScriptEvidence::default()
+        };
+        segments.push(TextSegment {
+            normalized_start: start,
+            normalized_end: end,
+            source: SourceSpan::new(canonical.original_id().as_str(), source_start, source_end)
+                .map_err(|_| SegmentationReason::InvalidPolicy)?,
+            kind,
+            scripts,
+        });
+        start = end;
+    }
+    canonical
+        .check_preparation_deadline()
+        .map_err(|_| SegmentationReason::DeadlineExceeded)?;
+    Ok(segments)
 }
 
 static PROPERTIES: OnceLock<Result<Properties, SegmentationReason>> = OnceLock::new();

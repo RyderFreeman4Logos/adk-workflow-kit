@@ -7,6 +7,9 @@ use std::{
 };
 use workflow_adk::execution::{ExecutionBackend, ExecutionProfileV1};
 
+#[path = "issue_231/resume.rs"]
+mod resume;
+
 const WORKFLOW: &str = include_str!("fixtures/sentinel.workflow.toml");
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Root(PathBuf);
@@ -215,6 +218,18 @@ fn closed_terminal_report_preserves_abstention_and_rejects_forgery() {
     let decode = |value: &Value| UntrustedTextReport::parse(&serde_json::to_vec(value).unwrap());
     let (_, path) = run(&root, WORKFLOW, input(&[255]));
     let invalid = terminal_value(&path);
+    let mut unavailable = invalid.clone();
+    unavailable["reason"] = json!("language_model_unavailable");
+    assert_eq!(
+        decode(&unavailable).unwrap().reason(),
+        workflow_adk::PreparationReason::LanguageModelUnavailable
+    );
+    unavailable["state"] = json!("pending_classification");
+    unavailable["decision"] = Value::Null;
+    assert!(
+        decode(&unavailable).is_err(),
+        "model failure cannot grant semantic admission"
+    );
     assert_eq!(
         serde_json::from_str::<Value>(&decode(&invalid).unwrap().to_json().unwrap()).unwrap(),
         invalid
@@ -324,7 +339,7 @@ fn actual_path_cache_key_has_an_independent_versioned_policy_oracle() {
     let raw = b"1";
     let (result, _) = run(&root, WORKFLOW, input(raw));
     let policy = json!({
-        "version":"sentinel-workflow-preparation-v5",
+        "version":"sentinel-workflow-preparation-v7",
         "probe_version":"sentinel-source-probes-v2",
         "probe_budget":{"max_views_per_branch":32,"max_bytes_per_branch":65536,"max_report_bytes":32768,"chunk_bytes":256,"overlap_bytes":64},
         "semantic_version":"sentinel-semantic-probes-v2",
@@ -338,10 +353,12 @@ fn actual_path_cache_key_has_an_independent_versioned_policy_oracle() {
         "carrier":SENTINEL_CARRIER_VERSION,
         "segmentation":SENTINEL_SEGMENTATION_VERSION,
         "language":SENTINEL_LANGUAGE_POLICY_VERSION,
+        "language_model":workflow_runtime::SENTINEL_LANGUAGE_MODEL_ID,
         "script_data":SENTINEL_SCRIPT_DATA_VERSION,
         "unicode":std::char::UNICODE_VERSION,
         "security":SECURITY_MODEL_VERSION,
         "normalization_limits":{"max_input_bytes":65536,"max_output_bytes":262144,"max_work_units":1048576},
+        "preparation_budget_ms":1000,
         "carrier_limits":{"max_input_bytes":65536,"max_candidates":256,"max_depth":3,"max_expanded_bytes":65536,"max_work_units":1048576},
         "carrier_mode":"decode",
         "segmentation_limits":{"max_bytes":16384,"max_segments":4096},
@@ -365,7 +382,7 @@ fn actual_path_cache_key_has_an_independent_versioned_policy_oracle() {
             ("WORKFLOW_ID", "sentinel-preparation"),
             ("WORKFLOW_VERSION", "1"),
             ("NODE_ID", "prepare"),
-            ("NODE_VERSION", "sentinel-workflow-preparation-v5"),
+            ("NODE_VERSION", "sentinel-workflow-preparation-v7"),
             ("INVOCATION_IDENTITY", ir_hash.as_str()),
             ("INPUT_ARTIFACT_HASHES", raw_digest.as_str()),
             ("REQUEST_INPUT_DIGEST", raw_digest.as_str()),
@@ -381,6 +398,12 @@ fn actual_path_cache_key_has_an_independent_versioned_policy_oracle() {
         )
     };
     assert_eq!(result["cache_key"], expected_key(&expected_policy));
+    let mut deadline_policy = policy.clone();
+    deadline_policy["preparation_budget_ms"] = json!(1001);
+    assert_ne!(
+        result["cache_key"],
+        expected_key(&digest(&serde_json::to_vec(&deadline_policy).unwrap()))
+    );
     let mut changed = policy.clone();
     changed["typed_output_schema"] = json!(TYPED_OUTPUT_SCHEMA_VERSION_V1 + 1);
     assert_ne!(

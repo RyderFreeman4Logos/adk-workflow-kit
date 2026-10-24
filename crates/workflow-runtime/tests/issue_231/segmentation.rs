@@ -4,6 +4,80 @@ use workflow_runtime::{
 };
 
 #[test]
+fn labeled_data_uses_exact_carrier_grammar_and_keeps_mapped_bytes() {
+    use TextSegmentKind::{Data, NaturalLanguage};
+    for (raw, expected) in [
+        ("base64:VGhpcyBpcyBhIG1lc3NhZ2U=", Data),
+        ("hex:4142", Data),
+        ("base64:", Data),
+        ("base64word", NaturalLanguage),
+        ("hexagon", NaturalLanguage),
+        ("abase64:VGhp", NaturalLanguage),
+    ] {
+        let text = prepared(raw.as_bytes(), NormalizationLimits::default());
+        let segmented = text
+            .segment_language(SegmentationLimits::default())
+            .unwrap();
+        assert_eq!(segmented.segments()[0].kind(), expected, "{raw}");
+        let mut cursor = 0;
+        for segment in segmented.segments() {
+            assert_eq!(segment.normalized_start(), cursor);
+            cursor = segment.normalized_end();
+            assert_eq!(
+                &raw[segment.source().start() as usize..segment.source().end() as usize],
+                &text.normalized()[segment.normalized_start()..cursor]
+            );
+        }
+        assert_eq!(cursor, raw.len());
+        assert_eq!(text.normalized(), raw);
+    }
+}
+
+#[test]
+fn numeric_prefixes_do_not_create_new_labeled_carrier_boundaries() {
+    use workflow_runtime::{CarrierLimits, CarrierMode};
+    for (raw, word_start) in [
+        ("1hex:616263", 1),
+        ("9hex:616263", 1),
+        ("١hex:616263", 2),
+        ("1hex:313233", 1),
+    ] {
+        let text = prepared(raw.as_bytes(), NormalizationLimits::default());
+        let carriers = text
+            .analyze_carriers(CarrierMode::Decode, CarrierLimits::default())
+            .unwrap();
+        assert!(carriers.candidates().is_empty(), "{raw}");
+        let segmented = text
+            .segment_language(SegmentationLimits::default())
+            .unwrap();
+        assert_eq!(segmented.screening(), LanguageScreening::Unattributed);
+        let word = segmented
+            .segments()
+            .iter()
+            .find(|span| {
+                span.kind() == TextSegmentKind::NaturalLanguage
+                    && &text.normalized()[span.normalized_start()..span.normalized_end()] == "hex"
+            })
+            .unwrap();
+        assert_eq!(
+            (word.source().start(), word.source().end()),
+            (word_start, word_start + 3)
+        );
+        let mut cursor = 0;
+        for span in segmented.segments() {
+            assert_eq!(span.normalized_start(), cursor);
+            cursor = span.normalized_end();
+            assert_eq!(span.source().artifact_id(), text.original_id().as_str());
+            assert_eq!(
+                &raw[span.source().start() as usize..span.source().end() as usize],
+                &text.normalized()[span.normalized_start()..cursor]
+            );
+        }
+        assert_eq!(cursor, raw.len());
+    }
+}
+
+#[test]
 fn mapped_segments_exclude_only_recognized_non_prose_syntax() {
     let raw = "中\u{200b}文 日本語かな Français русский `код` https://例え.jp/道 foo_bar 👩‍💻 $x + y$ 123 true";
     let text = prepared(raw.as_bytes(), NormalizationLimits::default());
@@ -181,6 +255,19 @@ fn language_segmentation_consumes_limits_in_the_real_cache_path() {
             .unwrap()
     };
     let key = bind(SegmentationLimits::default());
+    let repeated = bind(SegmentationLimits::default());
+    // Finish bounded preparation before unrelated persistent cache I/O.
+    let misses = [
+        bind(SegmentationLimits {
+            max_segments: 100,
+            ..SegmentationLimits::default()
+        }),
+        bind(SegmentationLimits {
+            max_bytes: 100,
+            ..SegmentationLimits::default()
+        }),
+        cache_key(&text, "unknown", "outer-policy"),
+    ];
     let root =
         std::env::temp_dir().join(format!("issue-231-segments-cache-{}", std::process::id()));
     let cache = NodeResultCache::open(&root).unwrap();
@@ -195,20 +282,10 @@ fn language_segmentation_consumes_limits_in_the_real_cache_path() {
         )
         .unwrap();
     assert!(matches!(
-        cache.lookup(&bind(SegmentationLimits::default())).unwrap(),
+        cache.lookup(&repeated).unwrap(),
         NodeCacheLookup::Hit(_)
     ));
-    for changed in [
-        bind(SegmentationLimits {
-            max_segments: 100,
-            ..SegmentationLimits::default()
-        }),
-        bind(SegmentationLimits {
-            max_bytes: 100,
-            ..SegmentationLimits::default()
-        }),
-        cache_key(&text, "unknown", "outer-policy"),
-    ] {
+    for changed in misses {
         assert!(matches!(
             cache.lookup(&changed).unwrap(),
             NodeCacheLookup::Miss

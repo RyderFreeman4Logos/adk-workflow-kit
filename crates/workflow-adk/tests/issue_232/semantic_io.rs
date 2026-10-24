@@ -28,6 +28,7 @@ use workflow_runtime::{ArtifactId, ArtifactStore, InMemoryArtifactStore, PageReq
 #[derive(Clone, Copy)]
 enum Mode {
     Agree,
+    DelayedAgree,
     Fail,
     Pending,
     ToolCall,
@@ -53,6 +54,10 @@ enum Mode {
     TaskUncertain,
 }
 
+#[path = "language_admission.rs"]
+mod language_admission;
+#[path = "preparation_deadline.rs"]
+mod preparation_deadline;
 #[path = "task_alignment.rs"]
 mod task_alignment;
 struct Probe {
@@ -187,6 +192,9 @@ impl Llm for Probe {
                 if leader {
                     ready.notify_one();
                 }
+                if matches!(mode, Mode::DelayedAgree) {
+                    tokio::time::sleep(Duration::from_millis(1_100)).await;
+                }
                 match mode {
                     Mode::Pending => std::future::pending().await,
                     Mode::Fail if ordinal != 0 => std::future::pending().await,
@@ -239,6 +247,19 @@ fn setup_runtime_checked(
     InMemoryArtifactStore,
     AdkEventMapper,
 ) {
+    setup_workflow_checked(mode, count, runtime, WORKFLOW)
+}
+fn setup_workflow_checked(
+    mode: Mode,
+    count: usize,
+    runtime: ModelRuntimeConfig,
+    workflow: &str,
+) -> (
+    Result<AdkGraph, ModelProfileError>,
+    Arc<Probe>,
+    InMemoryArtifactStore,
+    AdkEventMapper,
+) {
     let probe = Arc::new(Probe {
         mode,
         barrier: Arc::new(Barrier::new(count)),
@@ -250,10 +271,9 @@ fn setup_runtime_checked(
         .with_worker(
             FakeModelProfile::new("fake-model", "1", "fake", ["unused"]).with_runtime(runtime),
         )
-        .unwrap()
-        .bind_worker(&CredentialBroker::new());
+        .and_then(|registry| registry.bind_worker(&CredentialBroker::new()));
     let graph = binding.map(|binding| {
-        let plan = workflow_compiler::compile_str("sentinel.toml", WORKFLOW).unwrap();
+        let plan = workflow_compiler::compile_str("sentinel.toml", workflow).unwrap();
         AdkGraphTranslator::new()
             .translate(&plan)
             .unwrap()
@@ -446,8 +466,9 @@ async fn semantic_identity_binds_runtime_without_publishing_policy() {
 
 #[tokio::test]
 async fn concurrent_response_barrier_and_source_only_requests() {
-    // Ordered + two overlapping shuffled windows + decoded candidate.
-    let raw = format!("`{}` %61%62%63", "0123456789 ".repeat(30));
+    // Ordered + two overlapping shuffled windows + decoded numeric data.
+    // Absent prose still needs safety analysis; unknown decoded prose does not enter.
+    let raw = format!("`{}` %31%32%33", "0123456789 ".repeat(30));
     let (graph, probe, mut store, mut mapper) = setup(Mode::Agree, 4);
     let output = tokio::time::timeout(
         Duration::from_secs(2),
@@ -498,7 +519,7 @@ async fn concurrent_response_barrier_and_source_only_requests() {
         let branch = schema["$id"].as_str().unwrap().rsplit(':').next().unwrap();
         branches.push(branch.to_owned());
         if branch == "decoded" {
-            assert_eq!(data["text"], "abc");
+            assert_eq!(data["text"], "123");
             assert_eq!(data["view"]["candidate"], 0);
         }
         let source = &data["view"]["source"];

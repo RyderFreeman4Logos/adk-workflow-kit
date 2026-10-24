@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use workflow_runtime::{
     CacheProvenance, ContentObject, ContentProvenance, LanguagePolicy, NodeCacheEntry,
     NodeCacheKeyMaterial, NodeCacheLookup, NodeResultCache, NormalizationLimits,
-    SENTINEL_LANGUAGE_POLICY_VERSION, SegmentationLimits, TrustPolicy,
+    SENTINEL_LANGUAGE_MODEL_ID, SENTINEL_LANGUAGE_POLICY_VERSION, SegmentationLimits, TrustPolicy,
 };
 
 fn material(policy_digest: &str) -> NodeCacheKeyMaterial<'_> {
@@ -28,10 +28,14 @@ fn provenance(author: &str) -> ContentProvenance {
         .unwrap()
 }
 fn policy_hash(version: &str) -> String {
+    policy_hash_with_model(version, SENTINEL_LANGUAGE_MODEL_ID)
+}
+fn policy_hash_with_model(version: &str, model: &str) -> String {
     let mut hash = Sha256::new();
     for field in [
         b"outer-policy".as_slice(),
         version.as_bytes(),
+        model.as_bytes(),
         b"language-attribution-untrusted",
         &[1, 1, 1],
     ] {
@@ -45,7 +49,7 @@ fn policy_hash(version: &str) -> String {
 fn language_cache_binds_real_stage_version_every_allowlist_bit_and_prior_stages() {
     assert_eq!(
         SENTINEL_LANGUAGE_POLICY_VERSION,
-        "sentinel-language-policy-v1"
+        "sentinel-language-policy-v5"
     );
     let text = prepared(b"This is a message", NormalizationLimits::default());
     let limits = SegmentationLimits::default();
@@ -61,24 +65,16 @@ fn language_cache_binds_real_stage_version_every_allowlist_bit_and_prior_stages(
         )
         .unwrap();
     assert_eq!(key, expected, "independent stage framing must match");
-    let root =
-        std::env::temp_dir().join(format!("issue-231-language-cache-{}", std::process::id()));
-    let cache = NodeResultCache::open(&root).unwrap();
-    cache
-        .put(
-            NodeCacheEntry::success(
-                key.clone(),
-                serde_json::to_value(analysis.attribution()).unwrap(),
-                CacheProvenance::from_key(&key),
+    let mut misses = vec![
+        segments
+            .bind_cache_key(
+                material(&policy_hash_with_model(
+                    SENTINEL_LANGUAGE_POLICY_VERSION,
+                    "different-model-digest",
+                )),
+                &provenance("unknown"),
             )
             .unwrap(),
-        )
-        .unwrap();
-    assert!(matches!(
-        cache.lookup(&expected).unwrap(),
-        NodeCacheLookup::Hit(_)
-    ));
-    let mut misses = vec![
         segments
             .bind_cache_key(material("outer-policy"), &provenance("unknown"))
             .unwrap(),
@@ -131,10 +127,6 @@ fn language_cache_binds_real_stage_version_every_allowlist_bit_and_prior_stages(
         .unwrap()
         .bind_cache_key(material("outer-policy"), &provenance("unknown"))
         .unwrap();
-    assert!(matches!(
-        cache.lookup(&repeated).unwrap(),
-        NodeCacheLookup::Hit(_)
-    ));
     for changed in [
         SegmentationLimits {
             max_bytes: 100,
@@ -165,6 +157,28 @@ fn language_cache_binds_real_stage_version_every_allowlist_bit_and_prior_stages(
             .bind_cache_key(material("outer-policy"), &provenance("unknown"))
             .unwrap(),
     );
+    // Finish bounded preparation before unrelated persistent cache I/O.
+    let root =
+        std::env::temp_dir().join(format!("issue-231-language-cache-{}", std::process::id()));
+    let cache = NodeResultCache::open(&root).unwrap();
+    cache
+        .put(
+            NodeCacheEntry::success(
+                key.clone(),
+                serde_json::to_value(analysis.attribution()).unwrap(),
+                CacheProvenance::from_key(&key),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        cache.lookup(&expected).unwrap(),
+        NodeCacheLookup::Hit(_)
+    ));
+    assert!(matches!(
+        cache.lookup(&repeated).unwrap(),
+        NodeCacheLookup::Hit(_)
+    ));
     for miss in misses {
         assert!(matches!(
             cache.lookup(&miss).unwrap(),

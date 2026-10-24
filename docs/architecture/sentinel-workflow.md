@@ -64,8 +64,10 @@ cannot borrow the observer's artifact store; a private ADK graph owns isolated
 probe scheduling. ADK still owns terminal execution and checkpoint delivery. Input state
 is replaced by the host-created report before the stream starts, preventing
 caller-injected state from minting a preparation result. Unobserved `invoke` and
-checkpoint-resume invocations fail closed for this contract. Existing model/tool
-and WASM workflows without `untrusted_text` are unchanged.
+checkpoint-resume invocations fail closed for this contract. Public backend resume
+returns `InvalidRunState` before opening a checkpoint or changing the original
+manifest, events or artifacts; the original run remains inspectable. Existing
+model/tool and WASM workflows without `untrusted_text` are unchanged.
 
 ## Typed terminal output and limits
 
@@ -87,8 +89,10 @@ host execution and retained artifacts. Reasons are closed preparation subcodes;
 invalid payload and empty input have no original, all other results retain one.
 A successful run means preparation completed, never semantic approval or graph
 continuation. The separate #232 report records executed model evidence or explicit
-abstention; the terminal is unchanged. Han-only Chinese remains unattributed.
-Adapter identity `sentinel-workflow-preparation-v5` binds the output contract and
+abstention; the terminal is unchanged. Language admission covers every raw and decoded material region; Chinese
+attribution uses the pinned statistical model, while short or ambiguous evidence
+can remain unattributed.
+Adapter identity `sentinel-workflow-preparation-v7` binds the output contract and
 [source descriptors plus semantic evidence](sentinel-probes.md). No trusted
 task-alignment goal is inferred from input. Embedding hosts can separately bind an
 authenticated goal through `AdkGraph::with_sentinel_trusted_goal`; the CLI/JSON
@@ -98,8 +102,20 @@ Normalization uses the authored input ceiling and the runtime's default output/w
 limits. Carriers use bounded Decode defaults; segmentation uses its default 16,384
 bytes / 4,096 segments. Stage resource/delimiter failures produce `invalid_input`
 with a typed reason and `failed_stage`. Language en/zh/ja flags are explicit and
-independent; zh is reserved pending genuine attribution, as described in
+independent; disabling a positively attributed language rejects it, while unknown
+evidence remains unresolved, as described in
 [sentinel-envelope.md](sentinel-envelope.md).
+
+A single fixed 1,000 ms preparation deadline starts before ingress storage and is
+checked throughout analysis and before envelope/probe publication and the handoff
+to the semantic phase. Model-specific specification and graph construction follow
+that handoff; the preparation budget does not extend to physical provider entry.
+Blocking staging completes before the deadline check; an expired staged view is
+dropped without committing it. Original evidence stays retained. Expiry observed
+by preparation checks returns `invalid_input` / `deadline_exceeded`, with zero
+semantic provider dispatch. This cooperative budget is not an OS scheduling bound.
+The semantic phase retains its existing independent 30-second model-superstep
+deadline after preparation finishes.
 
 The existing `NodeCacheKey` binds raw-byte digest, artifact identity, canonical IR,
 workflow/node identity, every preparation stage and compact-output schema version,
@@ -112,6 +128,8 @@ semantic cache key; #232 invocation identities additionally bind the model route
 prompt/task/schema and budgets. Generic bytes have no claimed issue-body author.
 
 Verify with `just issue-231-compiler`, `just issue-231-adk` and
-`just issue-231-runtime`. Full #231 acceptance remains incomplete: general graph
-routing, resumable preparation, durable cache reuse, complete language/carrier
-coverage and #230 benchmark integration remain; #232 owns semantic classification.
+`just issue-231-runtime`. Full #231 acceptance still needs complete language/carrier
+coverage and #230 benchmark integration. General graph routing, positive checkpoint
+continuation and durable cache reuse are unsupported capabilities outside this
+one-shot contract; refusal is not successful continuation. #232 owns semantic
+classification.

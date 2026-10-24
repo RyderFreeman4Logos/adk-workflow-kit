@@ -303,6 +303,7 @@ fn prepared() -> workflow_runtime::CanonicalUntrustedText {
         &mut store(),
         RAW,
         workflow_runtime::NormalizationLimits::default(),
+        std::time::Instant::now(),
     )
     .unwrap() else {
         panic!("prepared source")
@@ -387,19 +388,21 @@ async fn default_v12_ir_authority_report_and_cache_snapshot() {
         plan.sentinel_script_identity(),
         Some("sha256:a9f4eb9f4fc128531fd5011017e1bb49adcaf9ccd9b83674e6e3f59d20058564")
     );
+    // Prepared-source policy versions bind the report identity; preparation and
+    // cache additionally bind the language model. IR and host authority stay fixed.
     assert_eq!(
         format!("{:x}", Sha256::digest(report.to_json().unwrap())),
-        "a905406a344f85ce94ed22a6e1377fc96d6143a2f9cbb6b0293852e3a2c3d41d"
+        "65cd5868eac79f419a9129dcc053afe010a23b43606ea01b0790a6a68eafa214"
     );
     assert_eq!(
         format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(preparation(&mapper)).unwrap())
         ),
-        "d029dbf584376a163b748d551ebe005946163926a0739a4fc7613b859d31c973"
+        "ab4f33b6ede84c3a3807ca87bacfcc81af4c7e8e12f20a71860c213c6e2f1b46"
     );
     assert_eq!(
         preparation(&mapper)["cache_key"],
-        "sha256:af97d48c6d93cee82bf80f00d01ac17f520392ff6200e6138f1f392ac955020e"
+        "sha256:fedd9d3caf462d091045ba5a2eb34e4959ab1f47ca757f1f34a073447255e6bd"
     );
 }

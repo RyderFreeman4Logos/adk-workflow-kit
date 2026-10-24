@@ -223,12 +223,16 @@ issue-243-runtime test_name="":
 issue-231-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_231_sentinel_envelope {{test_name}} --locked -- --nocapture
 
+# Pinned language asset rejection and bounded production preparation resources.
+issue-231-language-unit:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --lib sentinel_language --locked -- --nocapture --test-threads=1
+
 # Focused #231 versioned compiler and production execution integration.
 issue-231-compiler:
     {{_io}} cargo +1.98.0 test -p workflow-compiler --test issue_231_workflow --locked -- --nocapture
 
-issue-231-adk:
-    {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_231_workflow --locked -- --nocapture --test-threads=1
+issue-231-adk test_name="":
+    {{_io}} cargo +1.98.0 test -p workflow-adk --test issue_231_workflow {{test_name}} --locked -- --nocapture --test-threads=1
 
 # Focused #232 executed semantic probes (offline fake model only).
 issue-232-semantics test_name="":
