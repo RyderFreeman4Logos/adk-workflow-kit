@@ -1,0 +1,114 @@
+[
+  {
+    "family": "cyrillic",
+    "raw": "абв где",
+    "eligible_prediction": true,
+    "direct_unsupported": false,
+    "accuracy_credit": false
+  },
+  {
+    "family": "cyrillic",
+    "raw": "аб вгд",
+    "eligible_prediction": false,
+    "direct_unsupported": false,
+    "accuracy_credit": false
+  },
+  {
+    "family": "cyrillic",
+    "raw": "абвгде",
+    "eligible_prediction": false,
+    "direct_unsupported": false,
+    "accuracy_credit": false
+  },
+  {
+    "family": "cyrillic",
+    "raw": "абвгде жзийкл",
+    "eligible_prediction": false,
+    "direct_unsupported": true,
+    "accuracy_credit": false
+  },
+  {
+    "family": "arabic",
+    "raw": "ابت ثجح",
+    "eligible_prediction": true,
+    "direct_unsupported": false,
+    "accuracy_credit": false
+  },
+  {
+    "family": "arabic",
+    "raw": "اب تثج",
+    "eligible_prediction": false,
+    "direct_unsupported": false,
+    "accuracy_credit": false
+  },
+  {
+    "family": "arabic",
+    "raw": "ابتثجح",
+    "eligible_prediction": false,
+    "direct_unsupported": false,
+    "accuracy_credit": false
+  },
+  {
+    "family": "arabic",
+    "raw": "ابتثجح خدذرزس",
+    "eligible_prediction": false,
+    "direct_unsupported": true,
+    "accuracy_credit": false
+  },
+  {
+    "family": "hangul",
+    "raw": "가나다 라마바",
+    "eligible_prediction": true,
+    "direct_unsupported": false,
+    "accuracy_credit": false
+  },
+  {
+    "family": "hangul",
+    "raw": "가나 다라마",
+    "eligible_prediction": false,
+    "direct_unsupported": false,
+    "accuracy_credit": false
+  },
+  {
+    "family": "hangul",
+    "raw": "가나다라마바",
+    "eligible_prediction": false,
+    "direct_unsupported": false,
+    "accuracy_credit": false
+  },
+  {
+    "family": "hangul",
+    "raw": "가나다라마바 사아자차카타",
+    "eligible_prediction": false,
+    "direct_unsupported": true,
+    "accuracy_credit": false
+  },
+  {
+    "family": "controls",
+    "raw": "abc def",
+    "eligible_prediction": false,
+    "direct_unsupported": false,
+    "accuracy_credit": false
+  },
+  {
+    "family": "controls",
+    "raw": "абв ابت",
+    "eligible_prediction": false,
+    "direct_unsupported": false,
+    "accuracy_credit": false
+  },
+  {
+    "family": "controls",
+    "raw": "َََ َََ",
+    "eligible_prediction": false,
+    "direct_unsupported": false,
+    "accuracy_credit": false
+  },
+  {
+    "family": "controls",
+    "raw": "аб‍в где",
+    "eligible_prediction": false,
+    "direct_unsupported": false,
+    "accuracy_credit": false
+  }
+]

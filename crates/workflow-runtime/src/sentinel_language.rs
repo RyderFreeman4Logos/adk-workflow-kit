@@ -1,22 +1,24 @@
 //! Conservative language attribution, never a safety approval.
-use crate::sentinel_segments::{contains, property};
+
+#[path = "sentinel_language/detector.rs"]
+mod detector;
+#[path = "sentinel_language/regions.rs"]
+mod regions;
 use crate::{
     ContentProvenance, NodeCacheKey, NodeCacheKeyError, NodeCacheKeyMaterial, SegmentationReason,
     SegmentedUntrustedText, SentinelVerdict, TextSegment, TextSegmentKind,
 };
-use regex_syntax::hir::ClassUnicode;
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
 
 /// Bump for changes to grammar, materiality, aggregation or policy semantics.
-pub const SENTINEL_LANGUAGE_POLICY_VERSION: &str = "sentinel-language-policy-v2";
+pub const SENTINEL_LANGUAGE_POLICY_VERSION: &str = "sentinel-language-policy-v5";
 
 /// Caller-owned allowlist. Unknown/missing fields fail; an empty allowlist is valid.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LanguagePolicy {
     pub en: bool,
-    /// Reserved for genuine Chinese attribution; Han alone never supplies it.
+    /// Simplified and Traditional Chinese share the statistical zh label.
     pub zh: bool,
     pub ja: bool,
 }
@@ -47,6 +49,8 @@ pub enum LanguageAttribution {
     Unattributed,
     Attributed(SentinelLanguage),
     UnsupportedLanguage,
+    /// More than one independently attributed language, all allowed by policy.
+    MixedSupported,
 }
 
 /// Immutable, bounded evidence borrowed from the canonical segmentation.
@@ -69,6 +73,7 @@ impl LanguageAssessment<'_> {
         let policy = crate::sentinel_envelope::hash_fields(&[
             material.policy_digest.as_bytes(),
             SENTINEL_LANGUAGE_POLICY_VERSION.as_bytes(),
+            SENTINEL_LANGUAGE_MODEL_ID.as_bytes(),
             b"language-attribution-untrusted",
             &[
                 u8::from(self.policy.en),
@@ -112,22 +117,15 @@ impl SegmentedUntrustedText<'_> {
         self.text()
             .check_preparation_deadline()
             .map_err(|_| SegmentationReason::DeadlineExceeded)?;
-        let detected = attribute(self)?;
+        let attribution = regions::attribute(
+            self.text(),
+            self.text().normalized(),
+            self.segments(),
+            policy,
+        )?;
         self.text()
             .check_preparation_deadline()
             .map_err(|_| SegmentationReason::DeadlineExceeded)?;
-        let attribution = match detected {
-            LanguageAttribution::Attributed(language)
-                if !match language {
-                    SentinelLanguage::En => policy.en,
-                    SentinelLanguage::Zh => policy.zh,
-                    SentinelLanguage::Ja => policy.ja,
-                } =>
-            {
-                LanguageAttribution::UnsupportedLanguage
-            }
-            other => other,
-        };
         Ok(LanguageAssessment {
             segmented: self,
             attribution,
@@ -136,139 +134,71 @@ impl SegmentedUntrustedText<'_> {
     }
 }
 
-struct LanguageProperties {
-    japanese: ClassUnicode,
-    kana_letters: ClassUnicode,
-    letters: ClassUnicode,
-    unsupported: [ClassUnicode; 3],
-}
-impl LanguageProperties {
-    fn new() -> Result<Self, SegmentationReason> {
-        Ok(Self {
-            japanese: property(
-                r"[[\p{scx=Han}\p{scx=Hiragana}\p{scx=Katakana}]&&[\p{Alphabetic}\p{M}]]",
-            )?,
-            kana_letters: property(r"[[\p{sc=Hiragana}\p{sc=Katakana}]&&\p{Lo}]")?,
-            // Alphabetic also includes some combining marks (e.g. Arabic vowels).
-            // Materiality needs base letters, not marks or modifier/extender runs.
-            letters: property(r"[\p{L}&&[^\p{Lm}]]")?,
-            unsupported: [
-                property(r"[\p{scx=Cyrillic}&&[\p{Alphabetic}\p{M}]]")?,
-                property(r"[\p{scx=Arabic}&&[\p{Alphabetic}\p{M}]]")?,
-                property(r"[\p{scx=Hangul}&&[\p{Alphabetic}\p{M}]]")?,
-            ],
-        })
-    }
-}
-static PROPERTIES: OnceLock<Result<LanguageProperties, SegmentationReason>> = OnceLock::new();
+/// Exact statistical model/engine identity, included in language cache material.
+pub const SENTINEL_LANGUAGE_MODEL_ID: &str = "fasttext-0.7.8/lid.176/sha256:8f3472cfe8738a7b6099e8e999c3cbfae0dcd15696aac7d7738a8039db603e83";
 
-fn attribute(
-    segmented: &SegmentedUntrustedText<'_>,
-) -> Result<LanguageAttribution, SegmentationReason> {
-    use LanguageAttribution::{Attributed, NoNaturalLanguage, Unattributed, UnsupportedLanguage};
-    let spans: Vec<_> = segmented
-        .segments()
-        .iter()
-        .filter(|s| s.kind() == TextSegmentKind::NaturalLanguage)
-        .collect();
-    if spans.is_empty() {
-        return Ok(NoNaturalLanguage);
-    }
-    let text = segmented.text().normalized();
-    // Do not fabricate a sentence by joining prose across excluded syntax,
-    // punctuation (e.g. dotted identifiers), or mathematical operators.
-    if spans.windows(2).any(|pair| {
-        let gap = &text[pair[0].normalized_end()..pair[1].normalized_start()];
-        gap.is_empty() || !gap.chars().all(char::is_whitespace)
-    }) {
-        return Ok(Unattributed);
-    }
-    let words: Vec<_> = spans
-        .iter()
-        .map(|s| &text[s.normalized_start()..s.normalized_end()])
-        .collect();
-    let p = PROPERTIES
-        .get_or_init(LanguageProperties::new)
-        .as_ref()
-        .map_err(|e| *e)?;
-    let letters = words
-        .iter()
-        .flat_map(|w| w.chars())
-        .filter(|ch| contains(&p.letters, *ch))
-        .count();
-    if spans
-        .iter()
-        .all(|s| !s.scripts().latin && !s.scripts().other)
-        && letters >= 4
-        && words
+impl crate::CarrierAnalysis<'_> {
+    /// Assess every raw and decoded material region with the same limits, original
+    /// source map and preparation deadline. No partial result survives an error.
+    /// Unsupported dominates unresolved material; absence of prose is not Clean.
+    /// Callers caching this aggregate must bind carrier, segmentation and language
+    /// versions (including MODEL_ID), limits and all allowlist bits, as the ADK
+    /// preparation key does. A carrier-only cache key does not cover this stage.
+    pub fn assess_language(
+        &self,
+        policy: LanguagePolicy,
+        limits: crate::SegmentationLimits,
+    ) -> Result<LanguageAttribution, SegmentationReason> {
+        let raw = self.text().segment_language(limits)?;
+        let mut result = raw.assess_language(policy)?.attribution();
+        for decoded in self
+            .candidates()
             .iter()
-            .flat_map(|w| w.chars())
-            .all(|ch| contains(&p.japanese, ch))
-        && words
-            .iter()
-            .flat_map(|w| w.chars())
-            .filter(|ch| contains(&p.kana_letters, *ch))
-            .count()
-            >= 2
-    {
-        return Ok(Attributed(SentinelLanguage::Ja));
+            .filter_map(|candidate| candidate.decoded())
+        {
+            let segments = crate::sentinel_segments::segment_view(
+                self.text(),
+                decoded.text(),
+                decoded.source_map(),
+                limits,
+            )?;
+            result = merge(
+                result,
+                regions::attribute(self.text(), decoded.text(), &segments, policy)?,
+            );
+        }
+        self.text()
+            .check_preparation_deadline()
+            .map_err(|_| SegmentationReason::DeadlineExceeded)?;
+        Ok(result)
     }
-    if english(&words) {
-        return Ok(Attributed(SentinelLanguage::En));
-    }
-    // ponytail: only three nonshared script families with material word evidence;
-    // extend only with hard-negative validation, never classify `other` wholesale.
-    if letters >= 12
-        && words
-            .iter()
-            .filter(|w| w.chars().filter(|ch| contains(&p.letters, *ch)).count() >= 3)
-            .count()
-            >= 2
-        && spans
-            .iter()
-            .all(|s| !s.scripts().latin && !s.scripts().han && !s.scripts().kana)
-        && p.unsupported.iter().any(|script| {
-            words
-                .iter()
-                .flat_map(|w| w.chars())
-                .all(|ch| contains(script, ch))
-        })
-    {
-        return Ok(UnsupportedLanguage);
-    }
-    Ok(Unattributed)
 }
 
-fn english(words: &[&str]) -> bool {
-    // ponytail: a closed, whole-span grammar, not a general English detector.
-    // Unknown vocabulary/extra tokens abstain; no bag-of-stopwords or Latin guess.
-    let noun = |w: &str| {
-        matches!(
-            w,
-            "message" | "request" | "document" | "instruction" | "instructions" | "test"
-        )
-    };
-    let verb = |w: &str| matches!(w, "read" | "check" | "review" | "follow" | "ignore");
-    let determiner = |w: &str| matches!(w, "the" | "this" | "that");
-    if !(4..=5).contains(&words.len())
-        || !words
-            .iter()
-            .all(|w| w.chars().all(|ch| ch.is_ascii_alphabetic()))
-    {
-        return false;
+fn permitted(value: LanguageAttribution, policy: LanguagePolicy) -> LanguageAttribution {
+    if let LanguageAttribution::Attributed(language) = value {
+        let allowed = match language {
+            SentinelLanguage::En => policy.en,
+            SentinelLanguage::Zh => policy.zh,
+            SentinelLanguage::Ja => policy.ja,
+        };
+        if !allowed {
+            return LanguageAttribution::UnsupportedLanguage;
+        }
     }
-    let lowered: Vec<_> = words.iter().map(|w| w.to_ascii_lowercase()).collect();
-    let words: Vec<_> = lowered.iter().map(String::as_str).collect();
-    match words.as_slice() {
-        ["this" | "that", "is" | "was", "a" | "the", n] => noun(n),
-        ["please", v, d, n] => verb(v) && determiner(d) && noun(n),
-        [
-            "we" | "they" | "you",
-            "will" | "must" | "should" | "can",
-            v,
-            d,
-            n,
-        ] => verb(v) && determiner(d) && noun(n),
-        _ => false,
+    value
+}
+
+fn merge(left: LanguageAttribution, right: LanguageAttribution) -> LanguageAttribution {
+    use LanguageAttribution::*;
+    match (left, right) {
+        (UnsupportedLanguage, _) | (_, UnsupportedLanguage) => UnsupportedLanguage,
+        (Unattributed, _) | (_, Unattributed) => Unattributed,
+        (NoNaturalLanguage, value) | (value, NoNaturalLanguage) => value,
+        (Attributed(a), Attributed(b)) if a == b => Attributed(a),
+        _ => MixedSupported,
     }
 }
+
+#[cfg(test)]
+#[path = "sentinel_language/contract_tests.rs"]
+mod contract_tests;

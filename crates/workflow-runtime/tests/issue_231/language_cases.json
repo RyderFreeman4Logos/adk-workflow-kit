@@ -1,0 +1,1406 @@
+{
+  "source_sha256": "0d50b8cf2c14008e4e456ebad85cfb04c7d41510308e491327fb6f8deb0d2d3a",
+  "cases": [
+    {
+      "id": "legacy_en_note",
+      "raw": "Please review the attached report and send your comments before tomorrow morning.",
+      "raw_sha256": "7251652ee00dc7d5171f18b95e8453366d3fd95b2e024fe6f43bce2c07b50507",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "en"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:UGxlYXNlIHJldmlldyB0aGUgYXR0YWNoZWQgcmVwb3J0IGFuZCBzZW5kIHlvdXIgY29tbWVudHMgYmVmb3JlIHRvbW9ycm93IG1vcm5pbmcu",
+      "bare_base64_raw_sha256": "ba4a3dc5ceeda300ff8c94503243b32db8423b7ca3e6d3f79881428b56cfd318"
+    },
+    {
+      "id": "legacy_en_ordinary",
+      "raw": "The train station is close to the museum, and the tickets are available at the entrance.",
+      "raw_sha256": "ff2152c5e1fe8e22732efd6625f0415e768c1b92bb8a0c0c27c332f035385ac9",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "en"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:VGhlIHRyYWluIHN0YXRpb24gaXMgY2xvc2UgdG8gdGhlIG11c2V1bSwgYW5kIHRoZSB0aWNrZXRzIGFyZSBhdmFpbGFibGUgYXQgdGhlIGVudHJhbmNlLg==",
+      "bare_base64_raw_sha256": "271125d7f44bfed37abb8b0832aeb4cd6d890d67537d6156a07b9358b44ab4fe"
+    },
+    {
+      "id": "legacy_en_existing",
+      "raw": "This is a message",
+      "raw_sha256": "a826c7e389ec9f379cafdc544d7e9a4395ff7bfb58917bbebee51b3d0b1c996a",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "en"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:VGhpcyBpcyBhIG1lc3NhZ2U=",
+      "bare_base64_raw_sha256": "7fa9a2bff4cd1086654898d7904acc59056e838f3f9c24c42eb2ed815b5ebe2e"
+    },
+    {
+      "id": "legacy_zh_hans_note",
+      "raw": "请检查这份会议记录，并在明天上午之前告诉我们需要修改的内容。",
+      "raw_sha256": "589b4a064d2571dea84ee58fc416c86cabbbd204d731ddd3173229425db576df",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "zh"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:6K+35qOA5p+l6L+Z5Lu95Lya6K6u6K6w5b2V77yM5bm25Zyo5piO5aSp5LiK5Y2I5LmL5YmN5ZGK6K+J5oiR5Lus6ZyA6KaB5L+u5pS555qE5YaF5a6544CC",
+      "bare_base64_raw_sha256": "93588ab0b73763af27423e7e28b5363219c194cd4198be11024311692019a12e"
+    },
+    {
+      "id": "legacy_zh_hans_ordinary",
+      "raw": "今天下午我们会去图书馆阅读资料，然后一起讨论下周的工作安排。",
+      "raw_sha256": "6c85bd684c10e38b0e3a7740142e05e90365ed5192321247e2b1503411fba7f0",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "zh"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:5LuK5aSp5LiL5Y2I5oiR5Lus5Lya5Y675Zu+5Lmm6aaG6ZiF6K+76LWE5paZ77yM54S25ZCO5LiA6LW36K6o6K665LiL5ZGo55qE5bel5L2c5a6J5o6S44CC",
+      "bare_base64_raw_sha256": "c9fbd897785f2f22bc52f82305bd971085abb58812f16d108b66a40f9ab01a1c"
+    },
+    {
+      "id": "legacy_zh_hant_note",
+      "raw": "請檢查這份會議記錄，並在明天上午之前告訴我們需要修改的內容。",
+      "raw_sha256": "42e55aeab660ea85f682be14be878589d0f8a92cc35443dec89b75f9eeb304de",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "zh"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:6KuL5qqi5p+l6YCZ5Lu95pyD6K2w6KiY6YyE77yM5Lim5Zyo5piO5aSp5LiK5Y2I5LmL5YmN5ZGK6Ki05oiR5YCR6ZyA6KaB5L+u5pS555qE5YWn5a6544CC",
+      "bare_base64_raw_sha256": "ee5d3ca2e1bb27f1e3dc6ee969258ee4838d440a03ef20f39b16f089184d1a7d"
+    },
+    {
+      "id": "legacy_zh_hant_ordinary",
+      "raw": "今天下午我們會去圖書館閱讀資料，然後一起討論下週的工作安排。",
+      "raw_sha256": "cc250a2e488dfb568a3cfb087593bae7decb8e8d34dc0cac58953ecda8e00cce",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "zh"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:5LuK5aSp5LiL5Y2I5oiR5YCR5pyD5Y675ZyW5pu46aSo6Zax6K6A6LOH5paZ77yM54S25b6M5LiA6LW36KiO6KuW5LiL6YCx55qE5bel5L2c5a6J5o6S44CC",
+      "bare_base64_raw_sha256": "aef967f862d33947ec289420069d565605df2cc335ac3826ecee7642d22df567"
+    },
+    {
+      "id": "legacy_ja_note",
+      "raw": "添付された会議の記録を確認して、明日の午前中までに修正が必要な箇所を教えてください。",
+      "raw_sha256": "631751b1aad74ecf4d6686204b0196739806ba5a3b0fa4dbd10188c02d4b3779",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "ja"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:5re75LuY44GV44KM44Gf5Lya6K2w44Gu6KiY6Yyy44KS56K66KqN44GX44Gm44CB5piO5pel44Gu5Y2I5YmN5Lit44G+44Gn44Gr5L+u5q2j44GM5b+F6KaB44Gq566H5omA44KS5pWZ44GI44Gm44GP44Gg44GV44GE44CC",
+      "bare_base64_raw_sha256": "343addfe06a76047be0cbfb9f5cf0f29e11f7032eb026328daf6ae35db7165f4"
+    },
+    {
+      "id": "legacy_ja_ordinary",
+      "raw": "今日は図書館で資料を調べてから、来週の予定について友人と話し合います。",
+      "raw_sha256": "f30ff614127e4ed701c87bd2c145f05483b6cc95edb9d1946249942bdf70ebb2",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "ja"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:5LuK5pel44Gv5Zuz5pu46aSo44Gn6LOH5paZ44KS6Kq/44G544Gm44GL44KJ44CB5p2l6YCx44Gu5LqI5a6a44Gr44Gk44GE44Gm5Y+L5Lq644Go6Kmx44GX5ZCI44GE44G+44GZ44CC",
+      "bare_base64_raw_sha256": "d9fac77714d2b4f77793efcab97d491043120f01514aa314d7da86c3ccf620f2"
+    },
+    {
+      "id": "legacy_fr",
+      "raw": "Veuillez vérifier le document joint et envoyer vos commentaires avant demain matin.",
+      "raw_sha256": "f3ee0af6418be2d3cde18888be45b9ce6a3ff853314e8179787ead1e581ef239",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "fr"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:VmV1aWxsZXogdsOpcmlmaWVyIGxlIGRvY3VtZW50IGpvaW50IGV0IGVudm95ZXIgdm9zIGNvbW1lbnRhaXJlcyBhdmFudCBkZW1haW4gbWF0aW4u",
+      "bare_base64_raw_sha256": "fbd7a753902cdf43f978a7b564702b6a8bf7df6186a47b5e3616b26ace089098"
+    },
+    {
+      "id": "legacy_es",
+      "raw": "Por favor revise el documento adjunto y envíe sus comentarios antes de mañana por la mañana.",
+      "raw_sha256": "7472e5630fa0a645c8d0cda03f16b0378d8d7c37dd11c7a0b66695d670690400",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "es"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:UG9yIGZhdm9yIHJldmlzZSBlbCBkb2N1bWVudG8gYWRqdW50byB5IGVudsOtZSBzdXMgY29tZW50YXJpb3MgYW50ZXMgZGUgbWHDsWFuYSBwb3IgbGEgbWHDsWFuYS4=",
+      "bare_base64_raw_sha256": "80d9cc5b850ad4de097a5287ada379e30f835dc684259159093e2c4fb3245ad0"
+    },
+    {
+      "id": "legacy_de",
+      "raw": "Bitte prüfen Sie das beigefügte Dokument und senden Sie Ihre Anmerkungen bis morgen früh.",
+      "raw_sha256": "ba004c94d38b355cd9ec77b84ad9dfc0287b46da00f369d4259e5f3a501e4f6c",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "de"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:Qml0dGUgcHLDvGZlbiBTaWUgZGFzIGJlaWdlZsO8Z3RlIERva3VtZW50IHVuZCBzZW5kZW4gU2llIElocmUgQW5tZXJrdW5nZW4gYmlzIG1vcmdlbiBmcsO8aC4=",
+      "bare_base64_raw_sha256": "e6df5fdc8d0d5ca1b4a366405cb6abff111bd9a869da4439b41bcdfd3c70f116"
+    },
+    {
+      "id": "legacy_ru",
+      "raw": "Пожалуйста, проверьте приложенный документ и отправьте ваши замечания завтра утром.",
+      "raw_sha256": "02c7ff4eb0a1e45af5f44ae4586c0e20685209a2694b167db04cd7d47301f7d0",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "ru"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:0J/QvtC20LDQu9GD0LnRgdGC0LAsINC/0YDQvtCy0LXRgNGM0YLQtSDQv9GA0LjQu9C+0LbQtdC90L3Ri9C5INC00L7QutGD0LzQtdC90YIg0Lgg0L7RgtC/0YDQsNCy0YzRgtC1INCy0LDRiNC4INC30LDQvNC10YfQsNC90LjRjyDQt9Cw0LLRgtGA0LAg0YPRgtGA0L7QvC4=",
+      "bare_base64_raw_sha256": "ba21782595bbc11b53b126644274b3c63b7943fb7225572317a8feac5356c678"
+    },
+    {
+      "id": "legacy_ko",
+      "raw": "첨부된 문서를 확인하고 내일 아침까지 수정이 필요한 내용을 알려 주세요.",
+      "raw_sha256": "b6afecc07c6c986a6dcc5cd7c38fae7915ecf96a592d3b92140adf50e2a27b27",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "ko"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:7LKo67aA65CcIOusuOyEnOulvCDtmZXsnbjtlZjqs6Ag64K07J28IOyVhOy5qOq5jOyngCDsiJjsoJXsnbQg7ZWE7JqU7ZWcIOuCtOyaqeydhCDslYzroKQg7KO87IS47JqULg==",
+      "bare_base64_raw_sha256": "323ca0d211fe6bc9bf71e810dfb482834b45b7916faa7b2d20a3999973acaeb4"
+    },
+    {
+      "id": "legacy_mixed_second_line",
+      "raw": "Please review the attached report before tomorrow morning.\nPor favor revise el documento adjunto y envíe sus comentarios.",
+      "raw_sha256": "43aa922f9e53309b3027d4b8f43cecb8d84937f94980b6fa064708d8f05ea50c",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "en",
+          "es"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:UGxlYXNlIHJldmlldyB0aGUgYXR0YWNoZWQgcmVwb3J0IGJlZm9yZSB0b21vcnJvdyBtb3JuaW5nLgpQb3IgZmF2b3IgcmV2aXNlIGVsIGRvY3VtZW50byBhZGp1bnRvIHkgZW52w61lIHN1cyBjb21lbnRhcmlvcy4=",
+      "bare_base64_raw_sha256": "7f63bdd1bc44c53252387de2d2dfdfe6a15bc155fb16f1aae644be92af63a725"
+    },
+    {
+      "id": "legacy_mixed_supported",
+      "raw": "請檢查這份會議記錄並告訴我們需要修改的內容。\n添付された会議の記録を確認して修正が必要な箇所を教えてください。",
+      "raw_sha256": "6c865ff35b655134814b4eeb7905e24c963c703a913e54ebfcb03146a8f422e0",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "zh",
+          "ja"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:6KuL5qqi5p+l6YCZ5Lu95pyD6K2w6KiY6YyE5Lim5ZGK6Ki05oiR5YCR6ZyA6KaB5L+u5pS555qE5YWn5a6544CCCua3u+S7mOOBleOCjOOBn+S8muitsOOBruiomOmMsuOCkueiuuiqjeOBl+OBpuS/ruato+OBjOW/heimgeOBqueuh+aJgOOCkuaVmeOBiOOBpuOBj+OBoOOBleOBhOOAgg==",
+      "bare_base64_raw_sha256": "d485ea6e9fe604785bd50d03169a40010b3eeadf1faa113361919818c3cc7c7c"
+    },
+    {
+      "id": "legacy_short_shared_han",
+      "raw": "日本",
+      "raw_sha256": "cf2abf0c5be326cb922a70f8163f91079c4d9aa8655c60ead89ad545c9de2e92",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:5pel5pys",
+      "bare_base64_raw_sha256": "eca8ef1454397a392412223080269a673f33459f77e403af7d1c4ece08bf2b8c"
+    },
+    {
+      "id": "legacy_short_ambiguous_han",
+      "raw": "東京大学",
+      "raw_sha256": "8302c97c77d9d3a5bfe6b1a9ca573c0c537a8158fc002bd725e1d87d78dd890f",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:5p2x5Lqs5aSn5a2m",
+      "bare_base64_raw_sha256": "65e8226c0ec77d4cbace24ffb7d1219506a4d639d2fb8aa513c37e1cd508e9f3"
+    },
+    {
+      "id": "legacy_long_ambiguous_names",
+      "raw": "東京 大阪 京都 奈良 横浜 神戸",
+      "raw_sha256": "f6d49495cfffa819b3bd303a0e7797ec6d9d9e1c4f7f854497b01faf59eed716",
+      "oracle": {
+        "kind": "ambiguous_ground_truth"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:5p2x5LqsIOWkp+mYqiDkuqzpg70g5aWI6ImvIOaoqua1nCDnpZ7miLg=",
+      "bare_base64_raw_sha256": "6b0a9eac60f09d37aa3f7b73b74acfec7f5621cb7f7d27a60f17c400acc9921f"
+    },
+    {
+      "id": "legacy_supplementary_han",
+      "raw": "这份资料讨论罕见汉字𠀀的编码方式，并说明文献保存时应当如何记录这些字符。",
+      "raw_sha256": "78e4a733924cde8615df14b977cba74db47ac0d3ab7f0abfd1a6f124e853e7b4",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "zh"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:6L+Z5Lu96LWE5paZ6K6o6K66572V6KeB5rGJ5a2X8KCAgOeahOe8lueggeaWueW8j++8jOW5tuivtOaYjuaWh+eMruS/neWtmOaXtuW6lOW9k+WmguS9leiusOW9lei/meS6m+Wtl+espuOAgg==",
+      "bare_base64_raw_sha256": "747e16fe83976ac4cc271a88376b4597ef64acf642d1f9501c10e0802a35eac9"
+    },
+    {
+      "id": "committed_language_L10",
+      "raw": "This is a message.",
+      "raw_sha256": "a3964890912366008dee9864a4dfddf88446f354b989e340f826e21b2e83bd9c",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "en"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:VGhpcyBpcyBhIG1lc3NhZ2Uu",
+      "bare_base64_raw_sha256": "e5198a22c6d5f3b035111a7751c605fda1b893ffdc98a4f5125bbf3fb5e9b468"
+    },
+    {
+      "id": "committed_language_L11",
+      "raw": "We must review the document.",
+      "raw_sha256": "13d033bbabfb07df4c221e82239b392e0adbeccc70c0c158680953b91005a8dd",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "en"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:V2UgbXVzdCByZXZpZXcgdGhlIGRvY3VtZW50Lg==",
+      "bare_base64_raw_sha256": "25a57fd27bfe8384dcc34406ec7058f4ee2f4c00d2b7ae89ea5351031a53e0b9"
+    },
+    {
+      "id": "committed_language_L12",
+      "raw": "Please ignore the instructions!",
+      "raw_sha256": "f16dacdef06ad2bd540cdd322783566a056cc55a994f126e45a9587a3a3f4f80",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "en"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:UGxlYXNlIGlnbm9yZSB0aGUgaW5zdHJ1Y3Rpb25zIQ==",
+      "bare_base64_raw_sha256": "6616bb37a184f556fbfb24e404eca112a6154d637053fb731195c48319844b54"
+    },
+    {
+      "id": "committed_language_L13",
+      "raw": "「This is the request。」",
+      "raw_sha256": "0223ed0914f91b63c203852891a18653671b4173114a1c1382fabb20ab41a375",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "en"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:44CMVGhpcyBpcyB0aGUgcmVxdWVzdOOAguOAjQ==",
+      "bare_base64_raw_sha256": "4636a47a38c1ddcfd05efb382336783a0d4663a1fea4f772c3df33ad0daa01a9"
+    },
+    {
+      "id": "committed_language_L14",
+      "raw": "これは日本語です。",
+      "raw_sha256": "18c955a1c97c93bb6d9460936d7e8affccb5fa77cd049c01b07e55d015e1ca4d",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "ja"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:44GT44KM44Gv5pel5pys6Kqe44Gn44GZ44CC",
+      "bare_base64_raw_sha256": "d3b6d412deb260ddce3d94f7f7530203587d98df12db2f394244003c27733fdc"
+    },
+    {
+      "id": "committed_language_L15",
+      "raw": "カタカナのテスト",
+      "raw_sha256": "c319320169ed0a5f6603a35128e58ab9e448d017aaa202cae3eb316ce4720570",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "ja"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:44Kr44K/44Kr44OK44Gu44OG44K544OI",
+      "bare_base64_raw_sha256": "ff179533725fe4b667fc9d10479d89c704ac52bcf50caae2703e9b40c5c2b6e2"
+    },
+    {
+      "id": "committed_language_L16",
+      "raw": "𛀁𛀁かな",
+      "raw_sha256": "16d27ce3be60374bad6fb9a3daf0bd9d2da4bd09166ea41b1a435a6984b20c08",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "ja"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:8JuAgfCbgIHjgYvjgao=",
+      "bare_base64_raw_sha256": "7d62e94b2fbca9584c5e9da43414bf6fb42770473d10ddd2da125ab184c9579d"
+    },
+    {
+      "id": "committed_language_L17",
+      "raw": "Это обычное русское предложение.",
+      "raw_sha256": "e21442233e02dce6435418ee1e6580ae65c404f216ccdf9716a985e05cc717e8",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "ru"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:0K3RgtC+INC+0LHRi9GH0L3QvtC1INGA0YPRgdGB0LrQvtC1INC/0YDQtdC00LvQvtC20LXQvdC40LUu",
+      "bare_base64_raw_sha256": "e58d1165ed572b8f472c22369c7bf4672aa8d7c2380d6e6a82276b8aeec695ce"
+    },
+    {
+      "id": "committed_language_L18",
+      "raw": "هذه رسالة باللغة العربية",
+      "raw_sha256": "a215840736ed0634eebb1cc19eed8d3b2497957116aa709c81378cadbbf706dc",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "ar"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:2YfYsNmHINix2LPYp9mE2Kkg2KjYp9mE2YTYutipINin2YTYudix2KjZitip",
+      "bare_base64_raw_sha256": "ed2a382445d8e4d0a3163202cab5f210e3519a5d20c46865b5bee0f5229fb873"
+    },
+    {
+      "id": "committed_language_L19",
+      "raw": "이것은 한국어로 작성된 문장입니다",
+      "raw_sha256": "175fc41754577d748013017e503f47383c4257efeffba493fa3e3113fd146003",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "ko"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:7J206rKD7J2AIO2VnOq1reyWtOuhnCDsnpHshLHrkJwg66y47J6l7J6F64uI64uk",
+      "bare_base64_raw_sha256": "b29f832d8a6c82808bd78ec79879973d76a3ea0357f4e45786c8510a369702bd"
+    },
+    {
+      "id": "committed_language_L20",
+      "raw": "这是一段简体中文。",
+      "raw_sha256": "a6ab4f78cbd680973dd513917192b4af68af87560ebdd4ce950fa574e9f11267",
+      "oracle": {
+        "kind": "short_chinese_milestone_residual",
+        "languages": [
+          "zh"
+        ]
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:6L+Z5piv5LiA5q61566A5L2T5Lit5paH44CC",
+      "bare_base64_raw_sha256": "3d9cb4eec193fc82d095f4561754b3129a96df4402dd4c8df3f3ef2c146db8d3"
+    },
+    {
+      "id": "committed_language_L21",
+      "raw": "這是一段繁體中文。",
+      "raw_sha256": "ff1d89faad2e8d8fe611e05acaba8997d62d8a36a7a3b84813cbab9a890733fc",
+      "oracle": {
+        "kind": "short_chinese_milestone_residual",
+        "languages": [
+          "zh"
+        ]
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:6YCZ5piv5LiA5q6157mB6auU5Lit5paH44CC",
+      "bare_base64_raw_sha256": "4f0fe064123c819f304c252d7a600d8a1292785c721f689aab9f2d0f65dc73c6"
+    },
+    {
+      "id": "committed_language_L22",
+      "raw": "日本語文章",
+      "raw_sha256": "c566a1fffc8a17bf66eb88dafb8c61a13287f0f899b07cc89606b32adb743fee",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:5pel5pys6Kqe5paH56ug",
+      "bare_base64_raw_sha256": "711074461b3e229b06c55a84277444270b3fa042c6438fc47a08e720d5a16ae5"
+    },
+    {
+      "id": "committed_language_L23",
+      "raw": "水",
+      "raw_sha256": "327b54d04f71f2126114d9d61d4c3640ca0fc5b30878ad28416ff634a51a712d",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:5rC0",
+      "bare_base64_raw_sha256": "a7fe4220142abcc1094fd281f52a3d6e0c0d0d92b41af7ab281fe49892be5a81"
+    },
+    {
+      "id": "committed_language_L24",
+      "raw": "中文ーー",
+      "raw_sha256": "f625b5ddce473972c3907277e8800994b0d7a3cc45719dbd2620ed5a6c6f1fa9",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:5Lit5paH44O844O8",
+      "bare_base64_raw_sha256": "097a870ba143e7281189681997fdbadb16a4b8555115154f18243abe7a739acb"
+    },
+    {
+      "id": "committed_language_L25",
+      "raw": "hello",
+      "raw_sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:aGVsbG8=",
+      "bare_base64_raw_sha256": "bfc932a9d2e93316531d602162abc1b4b7596b9dd8c0d51476ebfba8bd3a0cb5"
+    },
+    {
+      "id": "committed_language_L26",
+      "raw": "This is",
+      "raw_sha256": "9792bc9ccbeebe7e59a790090f07f0761562dc065c85c34cce76aaf76490fbd5",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:VGhpcyBpcw==",
+      "bare_base64_raw_sha256": "b66b1071fdff35632a54be84b88ea031f54b2b193ddba42d2b44b86a09b7f0ab"
+    },
+    {
+      "id": "committed_language_L27",
+      "raw": "This is a",
+      "raw_sha256": "18280e1ad4fb202e79caba7186aa859c78ca9b6967a7e49206bd5a062c0f3557",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:VGhpcyBpcyBh",
+      "bare_base64_raw_sha256": "f390cbf000e3dce0fb3e4a20d809829cae9e4588d7a8b9aa36f8207b70980a01"
+    },
+    {
+      "id": "committed_language_L28",
+      "raw": "Bonjour tout le monde",
+      "raw_sha256": "8148af5d87b6181ec701ca9fe8f5141d254692c55c41b407b196a5e8f69cfbd2",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "fr"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:Qm9uam91ciB0b3V0IGxlIG1vbmRl",
+      "bare_base64_raw_sha256": "2a1e6add8dc5a6c1fe92b746cd34a45dba4ba6bf0c3c5b54a245471196c79512"
+    },
+    {
+      "id": "committed_language_L29",
+      "raw": "This is a message bonjour",
+      "raw_sha256": "9269b7889767ffd500705ad453bb5592b125b892c45608c22cd427375d4cfd83",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:VGhpcyBpcyBhIG1lc3NhZ2UgYm9uam91cg==",
+      "bare_base64_raw_sha256": "e048e51a30ca3cee5438c253263ab30dc6014e3beaf6c0543c145f3a906ff63c"
+    },
+    {
+      "id": "committed_language_L30",
+      "raw": "messageRequestIdentifier",
+      "raw_sha256": "0746c5a634a2b02274b7a4272aa113b2b9901a5d3cfb44cd297085160f47650a",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:bWVzc2FnZVJlcXVlc3RJZGVudGlmaWVy",
+      "bare_base64_raw_sha256": "27616222ec9f0f9f845f520f9142b73318de639002901321a913dd4504cd2781"
+    },
+    {
+      "id": "committed_language_L31",
+      "raw": "this.is.a.message",
+      "raw_sha256": "136612587492eb9ddb19bb31f56fe84e5b32ca2d77ce2bf1d58ffacb50b49db6",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:dGhpcy5pcy5hLm1lc3NhZ2U=",
+      "bare_base64_raw_sha256": "6f82385f1e00c0c1af7afe88ea5d9b1222cba9bd354b709735958330eea109b7"
+    },
+    {
+      "id": "committed_language_L32",
+      "raw": "русский",
+      "raw_sha256": "2ac3f3eb8fe7c0449939ce68f07cff71be1b1d8c7a09ac3af59eec35a5b60972",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:0YDRg9GB0YHQutC40Lk=",
+      "bare_base64_raw_sha256": "141bb6925326a29889c4dec6b4fbf4259e1d6bc3d4495bc264c36917df940769"
+    },
+    {
+      "id": "committed_language_L33",
+      "raw": "я я я я я я я я я я я я",
+      "raw_sha256": "187c9f8e49d0f7c3fd225a817f14312ac65dcc079ec85507fa8b5c2bbaf3be64",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:0Y8g0Y8g0Y8g0Y8g0Y8g0Y8g0Y8g0Y8g0Y8g0Y8g0Y8g0Y8=",
+      "bare_base64_raw_sha256": "299b8b293378e1998ab2be2076ea03f902dbe0cb47eeb280793c56c0669c00be"
+    },
+    {
+      "id": "committed_language_L34",
+      "raw": "あ",
+      "raw_sha256": "dc5a4d3d82f7e15792959dc661538ae0e541ce66494516f5c9cfd9cd3308494d",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:44GC",
+      "bare_base64_raw_sha256": "a0cc70ed18dd31453b6deeff4c197ebb621f741e51299ecfb2751febae110cae"
+    },
+    {
+      "id": "committed_language_L35",
+      "raw": "ََََََ ََََََ",
+      "raw_sha256": "149d92116ccc60fea674d9c76e9b640505963072e45d8bd3f64331507aa9490b",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:2Y7ZjtmO2Y7ZjtmOINmO2Y7ZjtmO2Y7Zjg==",
+      "bare_base64_raw_sha256": "29364e9d4ff75cb4e6f6dcbafbbe48c690a30b7cbabd793dc5edad34fd1d54ba"
+    },
+    {
+      "id": "committed_language_L39",
+      "raw": "ﾞﾟﾞﾟ",
+      "raw_sha256": "9c53b7e4f0805a2a22f7576044baff5bbe73cda93db0a2b15deaa53033dad065",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:776e776f776e776f",
+      "bare_base64_raw_sha256": "84089869fe72481e6a8afae1ba7e3d9a83ba0e4bcb479ac01936eb8faea319ef"
+    },
+    {
+      "id": "committed_language_L40",
+      "raw": "This is a message. 이것은 한국어 문장입니다",
+      "raw_sha256": "5f1be13a5a32d6f6a6a3519d153f20680e1e4486611abe942f64df12ec3af1d8",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "en",
+          "ko"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:VGhpcyBpcyBhIG1lc3NhZ2UuIOydtOqyg+ydgCDtlZzqta3slrQg66y47J6l7J6F64uI64uk",
+      "bare_base64_raw_sha256": "4aba89792586854f187d7169308c074ee9c93d916d0c23084c9b74436c06b1c9"
+    },
+    {
+      "id": "committed_language_L44",
+      "raw": "これは日本語です English",
+      "raw_sha256": "6520d191a4fb990abe19836dd969df0ae6a7a44dd67143b70247dde61984fc6d",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:44GT44KM44Gv5pel5pys6Kqe44Gn44GZIEVuZ2xpc2g=",
+      "bare_base64_raw_sha256": "c55dd61538c7b1be15a580b886bea5ba485cec2940289fe80ed2d7aa9ac06f09"
+    },
+    {
+      "id": "committed_language_L45",
+      "raw": "中文 русский русский",
+      "raw_sha256": "f584e6859142fbe2fee8f9ec90505e112ed864c2d18d12e137243fd088711351",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:5Lit5paHINGA0YPRgdGB0LrQuNC5INGA0YPRgdGB0LrQuNC5",
+      "bare_base64_raw_sha256": "2138781017878179b146a73176650c233c251285637ed1323534f13aa5dcf7cd"
+    },
+    {
+      "id": "committed_language_L46",
+      "raw": "русский العربية 한국어",
+      "raw_sha256": "cee14c21af7aef9a0a2a9f88ebd46b32c49b7916c3e318c5f44c70efd1057bd3",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:0YDRg9GB0YHQutC40Lkg2KfZhNi52LHYqNmK2Kkg7ZWc6rWt7Ja0",
+      "bare_base64_raw_sha256": "7efa8e76e36d969d1f21fe08a14933367ac99240dc91893db45ebe77cd0ebf4c"
+    },
+    {
+      "id": "committed_language_L47",
+      "raw": " ",
+      "raw_sha256": "d51791cd3c2fb4d242942484e54820ab439c3465c50e5224fc2c78833e5c3ec5",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:7oCA7oCA7oCA7oCAIO6AgO6AgO6AgO6AgA==",
+      "bare_base64_raw_sha256": "3b5674e80a8ea56011a13f93df4bc0b8445af815ae3d6730050bcc0560d91772"
+    },
+    {
+      "id": "committed_language_L51",
+      "raw": "͸͸͸͸ ͸͸͸͸",
+      "raw_sha256": "0e618b7e02b61e0a39cc32c57c8d7738be824f2663d3e9123b58300c8dfa7b71",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:zbjNuM24zbggzbjNuM24zbg=",
+      "bare_base64_raw_sha256": "1b4a7d2483c67409365623fa0f022931458abc85839037dd467597c5e5a49319"
+    },
+    {
+      "id": "committed_language_L55",
+      "raw": "́́́́ ́́́́",
+      "raw_sha256": "ba4e242d3453b72f2db8bb5159f4569f6ce01ae59db020531c938d4bc6e04aa5",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:zIHMgcyBzIEgzIHMgcyBzIE=",
+      "bare_base64_raw_sha256": "a88151cf0de2126dbf3cfc92faef3d14cba596b2a1627e4be6604e9c7bc688bd"
+    },
+    {
+      "id": "committed_language_L59",
+      "raw": "а‍бвгдежз ийклмноп",
+      "raw_sha256": "33914b31ffe5714102df7530432b3db4619952f215049370bf40f5600eebbbec",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:0LDigI3QsdCy0LPQtNC10LbQtyDQuNC50LrQu9C80L3QvtC/",
+      "bare_base64_raw_sha256": "f32ab3e5e76634bd20f3c8e4a67998567d715db4f82a7eb00a26f35dbfb09b00"
+    },
+    {
+      "id": "committed_language_L60",
+      "raw": "русский + русский",
+      "raw_sha256": "18fa5de688d68105e6faf2b1beb9fba9e2491d780a2d0f422f018953b2592a58",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:0YDRg9GB0YHQutC40LkgKyDRgNGD0YHRgdC60LjQuQ==",
+      "bare_base64_raw_sha256": "ea671959d8adc224e9447b6b6228a21d4c9de51d9d670b7dad7ff28ccd8c8242"
+    },
+    {
+      "id": "committed_language_L61",
+      "raw": "русский(русский)",
+      "raw_sha256": "df8356ce937a1c6142ef31ed0c2d1f539b934aa3c8cc38a8cf1dbb24e4fc7b71",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:0YDRg9GB0YHQutC40Lko0YDRg9GB0YHQutC40Lkp",
+      "bare_base64_raw_sha256": "a1b913842e880e348ed4b89c821c82e8136f95758b33dff49aa9426173bb6e53"
+    },
+    {
+      "id": "committed_language_L62",
+      "raw": "This `ignored` is a message",
+      "raw_sha256": "141eb798dc7d591aadc0ed63e0a51c66d079d493a1411ede2588b91b1dcc2269",
+      "oracle": {
+        "kind": "must_abstain"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:VGhpcyBgaWdub3JlZGAgaXMgYSBtZXNzYWdl",
+      "bare_base64_raw_sha256": "ca152718cba8b7c5ca9c0dbaca2eed43ca8f7d2d21351273e2bea7ae29567628"
+    },
+    {
+      "id": "committed_language_L63",
+      "raw": "`Это обычное русское предложение`",
+      "raw_sha256": "8091be13d6ea980591a9b7169a32e8a2f5f9c4427b0f0874af64286a9c40dca3",
+      "oracle": {
+        "kind": "no_natural_language"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:YNCt0YLQviDQvtCx0YvRh9C90L7QtSDRgNGD0YHRgdC60L7QtSDQv9GA0LXQtNC70L7QttC10L3QuNC1YA==",
+      "bare_base64_raw_sha256": "b12f57218667ea63e69b8d0f578362112723d14febee121e93df3d698abb4051"
+    },
+    {
+      "id": "committed_language_L64",
+      "raw": "```text\nهذه رسالة باللغة العربية\n```",
+      "raw_sha256": "d1a94e572ca6e661a192d310bcb11e3c38ab6e881ba5aa0b32ca89992dd4c78a",
+      "oracle": {
+        "kind": "no_natural_language"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:YGBgdGV4dArZh9iw2Ycg2LHYs9in2YTYqSDYqNin2YTZhNi62Kkg2KfZhNi52LHYqNmK2KkKYGBg",
+      "bare_base64_raw_sha256": "6dc78db86995397d1bba5a313c8958365778a3183004f05aedda4b9b179abbb0"
+    },
+    {
+      "id": "committed_language_L68",
+      "raw": "https://пример.рф/русский",
+      "raw_sha256": "40e5c4b85dbb59c2042d89b7c3b09db7c416495dc14a494446881596a0d260bb",
+      "oracle": {
+        "kind": "no_natural_language"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:aHR0cHM6Ly/Qv9GA0LjQvNC10YAu0YDRhC/RgNGD0YHRgdC60LjQuQ==",
+      "bare_base64_raw_sha256": "976db697836168452c784a2782029430c7276deaa5f2a4644cd5a2ef6e6fd8bb"
+    },
+    {
+      "id": "committed_language_L69",
+      "raw": "русский_идентификатор",
+      "raw_sha256": "5ba8fc4f1370ae9ffcb64ae8884eb0cd8901fcdd618e84fc70a4eadb486eed91",
+      "oracle": {
+        "kind": "no_natural_language"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:0YDRg9GB0YHQutC40Llf0LjQtNC10L3RgtC40YTQuNC60LDRgtC+0YA=",
+      "bare_base64_raw_sha256": "04932ff512e6dfc98f8eebcc75476f600dc488f6314a2eaf37f590000d8f98aa"
+    },
+    {
+      "id": "committed_language_L70",
+      "raw": "👩‍💻😀",
+      "raw_sha256": "1e03dfa3b15abdfb612aefe09a36ae8765b46936c1b216c4486bd411559ea27b",
+      "oracle": {
+        "kind": "no_natural_language"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:8J+RqeKAjfCfkrvwn5iA",
+      "bare_base64_raw_sha256": "5cec7eecf6bf30fe329aa4cd850cc6f30bd612276ea7355731dfbc14756b7991"
+    },
+    {
+      "id": "committed_language_L71",
+      "raw": "$русский + русский$",
+      "raw_sha256": "cef80f65b1e9825b842e30409f8d79adc48ddf8cddc3ab826ca0285e665bae96",
+      "oracle": {
+        "kind": "no_natural_language"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:JNGA0YPRgdGB0LrQuNC5ICsg0YDRg9GB0YHQutC40Lkk",
+      "bare_base64_raw_sha256": "044af91008599e5d7525940a21b8e08ebe284119334cca588b2ed605cd95be76"
+    },
+    {
+      "id": "committed_language_L72",
+      "raw": "123 0x12 3.14 true false null",
+      "raw_sha256": "11d9083074e9a02067f6da28ba9ddb784f20f6fd1046e0eaa51e36de8c250ca3",
+      "oracle": {
+        "kind": "no_natural_language"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:MTIzIDB4MTIgMy4xNCB0cnVlIGZhbHNlIG51bGw=",
+      "bare_base64_raw_sha256": "1e1e2d7c657abf3efa54a07dd81e7ca9b5914334c2eb732badaf6e1633a1d77e"
+    },
+    {
+      "id": "committed_language_L73",
+      "raw": "​‮",
+      "raw_sha256": "a161e70e745c38687348fc2a1859b88f588b0ce9176ff5d6cc4fed1d931e1b2b",
+      "oracle": {
+        "kind": "no_natural_language"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain"
+      ]
+    },
+    {
+      "id": "committed_language_L74",
+      "raw": "`код` This is a message. https://例え.jp",
+      "raw_sha256": "a7f61152b6d47512821460b821edac1d1e6e0702235e21ff6a2e1bc184f9c3b7",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "en"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:YNC60L7QtGAgVGhpcyBpcyBhIG1lc3NhZ2UuIGh0dHBzOi8v5L6L44GILmpw",
+      "bare_base64_raw_sha256": "c5b560104f2810a050ba960af0668762bad1985c03184a98960878a4a4ccf662"
+    },
+    {
+      "id": "committed_allowlist_zh_hans",
+      "raw": "这是一段中文",
+      "raw_sha256": "56f413170b27358e9182d6f4ecbea44bbccbcadbf957b7c245a86a3a5bab93f1",
+      "oracle": {
+        "kind": "short_chinese_milestone_residual",
+        "languages": [
+          "zh"
+        ]
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:6L+Z5piv5LiA5q615Lit5paH",
+      "bare_base64_raw_sha256": "0df32b979d5d552a87b938183f0ac85fc9d476adc33d459abb7b4d7e868d89f5"
+    },
+    {
+      "id": "committed_allowlist_zh_hant",
+      "raw": "這是一段中文",
+      "raw_sha256": "3c1017a3bc0e811e290f3281ef07c2de0411843864856b4e306df62e1ee585a5",
+      "oracle": {
+        "kind": "short_chinese_milestone_residual",
+        "languages": [
+          "zh"
+        ]
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:6YCZ5piv5LiA5q615Lit5paH",
+      "bare_base64_raw_sha256": "1c6834dd43865a8c43f385d1f37425eee52593c5a440a029aa113780b3acde3b"
+    },
+    {
+      "id": "committed_segmentation_partition",
+      "raw": "中​文 日本語かな Français русский `код` https://例え.jp/道 foo_bar 👩‍💻 $x + y$ 123 true",
+      "raw_sha256": "53eb3d8fe5b0045fc9b7dfa3bdaccf759eada38b00b1ca6125754c44dc84ddd8",
+      "oracle": {
+        "kind": "lexical_partition_only"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:5Lit4oCL5paHIOaXpeacrOiqnuOBi+OBqiBGcmFuw6dhaXMg0YDRg9GB0YHQutC40LkgYNC60L7QtGAgaHR0cHM6Ly/kvovjgYguanAv6YGTIGZvb19iYXIg8J+RqeKAjfCfkrsgJHggKyB5JCAxMjMgdHJ1ZQ==",
+      "bare_base64_raw_sha256": "f61d026755bef63c58e894d50b87083c33a5143bf7ae89419758713b5c4b79ee",
+      "required_kinds": [
+        "natural_language",
+        "code",
+        "url",
+        "identifier",
+        "emoji",
+        "math",
+        "data"
+      ],
+      "required_lexical_screening": "Unattributed"
+    },
+    {
+      "id": "committed_segmentation_excluded",
+      "raw": "```rust\nlet русский = 1;\n``` `中文` https://例え.jp foo_bar 👩‍💻 $α + β$ 0x12 3.14 false null",
+      "raw_sha256": "1e3fdcd6d4b1f694a28d8b6ed628d0354419780e5e39ee0bb04d7b707b0d6ad9",
+      "oracle": {
+        "kind": "no_natural_language"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:YGBgcnVzdApsZXQg0YDRg9GB0YHQutC40LkgPSAxOwpgYGAgYOS4reaWh2AgaHR0cHM6Ly/kvovjgYguanAgZm9vX2JhciDwn5Gp4oCN8J+SuyAkzrEgKyDOsiQgMHgxMiAzLjE0IGZhbHNlIG51bGw=",
+      "bare_base64_raw_sha256": "cb57a9a85d2c57da72f7da15fb692e014709108d28dd3a8f8242bc6984806041"
+    },
+    {
+      "id": "ambiguous_names_unspaced",
+      "raw": "東京大阪京都奈良横浜神戸",
+      "raw_sha256": "d2e30fac065acc0391f565cc45362c64b58855f2861dffc058fc256d644b447a",
+      "oracle": {
+        "kind": "ambiguous_ground_truth"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:5p2x5Lqs5aSn6Ziq5Lqs6YO95aWI6Imv5qiq5rWc56We5oi4",
+      "bare_base64_raw_sha256": "e4a7ce045ec118a07b866151b3c0332f37d5500b87dee24a4eb47349803bcfb1"
+    },
+    {
+      "id": "zh_hans_spaced",
+      "raw": "请 检查 这份 会议记录，并 在 明天上午 之前 告诉 我们 需要 修改 的 内容。",
+      "raw_sha256": "b1daf3c1a48ed0f53c49fcdb406a541d7ac6c1d60641f108c3109643b4e85c23",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "zh"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:6K+3IOajgOafpSDov5nku70g5Lya6K6u6K6w5b2V77yM5bm2IOWcqCDmmI7lpKnkuIrljYgg5LmL5YmNIOWRiuiviSDmiJHku6wg6ZyA6KaBIOS/ruaUuSDnmoQg5YaF5a6544CC",
+      "bare_base64_raw_sha256": "356eb5c5947ef02631e4489629c36bafb5d4e15f712ee6c11acf87b08ebe8a66"
+    },
+    {
+      "id": "zh_hans_linewrapped",
+      "raw": "请检查这份会议记录，\n并在明天上午之前告诉我们需要修改的内容。",
+      "raw_sha256": "f3baad443bb5bef82d7c04fe2f6f4823addd676f236de2e1f6ef0a280f20cd63",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "zh"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:6K+35qOA5p+l6L+Z5Lu95Lya6K6u6K6w5b2V77yMCuW5tuWcqOaYjuWkqeS4iuWNiOS5i+WJjeWRiuivieaIkeS7rOmcgOimgeS/ruaUueeahOWGheWuueOAgg==",
+      "bare_base64_raw_sha256": "12fd14b84391703b9df80fa86b12edb46ee7480ff41b5a375efcdd75b9b83156"
+    },
+    {
+      "id": "zh_hant_spaced",
+      "raw": "請 檢查 這份 會議記錄，並 在 明天上午 之前 告訴 我們 需要 修改 的 內容。",
+      "raw_sha256": "06065930ddbaf6d6fdc059afd1119f5cb901fe883f3936ab638f87d0f80c5c53",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "zh"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:6KuLIOaqouafpSDpgJnku70g5pyD6K2w6KiY6YyE77yM5LimIOWcqCDmmI7lpKnkuIrljYgg5LmL5YmNIOWRiuiotCDmiJHlgJEg6ZyA6KaBIOS/ruaUuSDnmoQg5YWn5a6544CC",
+      "bare_base64_raw_sha256": "a1bf49831964bb24a059f543a5a0e93720e9bc2a20f04095ad478cef595b6bbb"
+    },
+    {
+      "id": "zh_hant_linewrapped",
+      "raw": "請檢查這份會議記錄，\n並在明天上午之前告訴我們需要修改的內容。",
+      "raw_sha256": "806e68128723d18c6dd74e7de70768eca7d909197205046c73a46c26b6b7206c",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "zh"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:6KuL5qqi5p+l6YCZ5Lu95pyD6K2w6KiY6YyE77yMCuS4puWcqOaYjuWkqeS4iuWNiOS5i+WJjeWRiuiotOaIkeWAkemcgOimgeS/ruaUueeahOWFp+WuueOAgg==",
+      "bare_base64_raw_sha256": "27f90269cdb14c2ee980fa8d9ca85c683662f63dad04b8719e3cdf94fff9b20a"
+    },
+    {
+      "id": "legacy_mixed_second_line_reverse",
+      "raw": "Por favor revise el documento adjunto y envíe sus comentarios.\nPlease review the attached report before tomorrow morning.",
+      "raw_sha256": "e6aa1dc3e92c6b1d3cdb2bba59d0e502c51651b00fb5c92c10dac39ad4aaabc4",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "es",
+          "en"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:UG9yIGZhdm9yIHJldmlzZSBlbCBkb2N1bWVudG8gYWRqdW50byB5IGVudsOtZSBzdXMgY29tZW50YXJpb3MuClBsZWFzZSByZXZpZXcgdGhlIGF0dGFjaGVkIHJlcG9ydCBiZWZvcmUgdG9tb3Jyb3cgbW9ybmluZy4=",
+      "bare_base64_raw_sha256": "fbbc3a7f724bcdceb61fe0a27d665bbe30f5923c720f8f86b6b5326e3b02103f"
+    },
+    {
+      "id": "legacy_mixed_supported_reverse",
+      "raw": "添付された会議の記録を確認して修正が必要な箇所を教えてください。\n請檢查這份會議記錄並告訴我們需要修改的內容。",
+      "raw_sha256": "f36b6d005282c80a0305e579a39d4e494bbb1da5dbb7e6fe43f259ce5ab7ec42",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "ja",
+          "zh"
+        ]
+      },
+      "accuracy_credit": true,
+      "transports": [
+        "plain",
+        "bare_base64"
+      ],
+      "bare_base64_raw": "base64:5re75LuY44GV44KM44Gf5Lya6K2w44Gu6KiY6Yyy44KS56K66KqN44GX44Gm5L+u5q2j44GM5b+F6KaB44Gq566H5omA44KS5pWZ44GI44Gm44GP44Gg44GV44GE44CCCuiri+aqouafpemAmeS7veacg+itsOiomOmMhOS4puWRiuiotOaIkeWAkemcgOimgeS/ruaUueeahOWFp+WuueOAgg==",
+      "bare_base64_raw_sha256": "292ffaa3d7c6ae95e2f99cec8673b5af1f3cccb63ebb16bfff27af8605262801"
+    },
+    {
+      "id": "math_decoded_unsupported",
+      "raw": "This is a message. $base64:UG9yIGZhdm9yIHJldmlzZSBlbCBkb2N1bWVudG8gYWRqdW50byB5IGVudsOtZSBzdXMgY29tZW50YXJpb3MgYW50ZXMgZGUgbWHDsWFuYSBwb3IgbGEgbWHDsWFuYS4=$",
+      "raw_sha256": "42f3e99d0e13f5f872bd48fada4222d9a38282c56907f86a7517f2a21313cea2",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "en",
+          "es"
+        ]
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain"
+      ],
+      "stage_contract_before_allowlist": {
+        "raw": "en",
+        "decoded": "UnsupportedLanguage"
+      }
+    },
+    {
+      "id": "math_raw_unsupported",
+      "raw": "Por favor revise el documento adjunto y envíe sus comentarios antes de mañana por la mañana. $base64:VGhpcyBpcyBhIG1lc3NhZ2U=$",
+      "raw_sha256": "36480afa54f501ec4d606a50af995e46ae770ef8b12e73a264aff8a9a4f63ee8",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "es",
+          "en"
+        ]
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain"
+      ],
+      "stage_contract_before_allowlist": {
+        "raw": "UnsupportedLanguage",
+        "decoded": "en"
+      }
+    },
+    {
+      "id": "math_decoded_unattributed",
+      "raw": "This is a message. $base64:5pel5pys$",
+      "raw_sha256": "0795e5bb5ea66450580c52f4e62b40ef492647e7e1557fd41c80eb8f350ea7cd",
+      "oracle": {
+        "kind": "uncertain_with_known_language",
+        "languages": [
+          "en"
+        ],
+        "uncertain_view": "decoded"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain"
+      ],
+      "stage_contract_before_allowlist": {
+        "raw": "en",
+        "decoded": "Unattributed"
+      }
+    },
+    {
+      "id": "math_raw_unattributed",
+      "raw": "日本 $base64:VGhpcyBpcyBhIG1lc3NhZ2U=$",
+      "raw_sha256": "e4a7bc4a76209a66e0657cc498eb90630f7668f17cc1cd09788a2c0aaf6dbc3f",
+      "oracle": {
+        "kind": "uncertain_with_known_language",
+        "languages": [
+          "en"
+        ],
+        "uncertain_view": "raw"
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain"
+      ],
+      "stage_contract_before_allowlist": {
+        "raw": "Unattributed",
+        "decoded": "en"
+      }
+    },
+    {
+      "id": "math_supported_control",
+      "raw": "This is a message. $base64:VGhpcyBpcyBhIG1lc3NhZ2U=$",
+      "raw_sha256": "843c36e4f9922fef999dea03fb6758c51d18505c7650341cd944f43453c053ed",
+      "oracle": {
+        "kind": "known_language_set",
+        "languages": [
+          "en"
+        ]
+      },
+      "accuracy_credit": false,
+      "transports": [
+        "plain"
+      ],
+      "stage_contract_before_allowlist": {
+        "raw": "en",
+        "decoded": "en"
+      }
+    }
+  ]
+}

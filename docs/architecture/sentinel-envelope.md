@@ -95,68 +95,78 @@ in admitted text size with fixed Unicode tables. No wall-time guarantee is made.
 Limit or delimiter errors return no partial segment list. Empty normalized views
 can have zero spans (original bytes/annotations remain in the preparation).
 
-## Conservative language policy (bounded attribution subset)
+## Language attribution and material-region policy
 
-`SegmentedUntrustedText::assess_language(LanguagePolicy)` borrows the existing
-mapped possible-prose tokens. `LanguageAssessment::evidence()` returns those exact
-`TextSegment` references, not newly invented offsets or per-word language labels.
-The aggregate `LanguageAttribution` is separate from lexical `LanguageScreening`
-and from `SentinelVerdict`. Excluded syntax does not vote, but it is never removed
-from the envelope. Possible-prose tokens must be separated only by whitespace:
-punctuation, code, URLs, identifiers, math or data between them force abstention
-rather than stitching unrelated fragments into a sentence. Exclusions before or
-after the prose remain available for semantic safety analysis.
+`SegmentedUntrustedText::assess_language(LanguagePolicy)` assesses the actual
+mapped possible-prose tokens. `LanguageAssessment::evidence()` returns those
+`TextSegment` references. `CarrierAnalysis::assess_language(policy, limits)` also
+assesses every decoded view, using its composed original map and the original
+preparation deadline; it does not normalize again or fabricate a new artifact.
+Language attribution, lexical screening and a Sentinel safety verdict remain
+separate. Excluded syntax is retained in the envelope and safety probes.
 
-The versioned rules are deliberately narrow and deterministic:
+Whitespace within a line, commas and apostrophes can join prose tokens into one
+material region. Newlines (including Unicode line/paragraph separators), sentence
+endings, excluded syntax and other gaps end
+a region. No sentence is invented across code, URLs, math or identifiers. Mixed
+incompatible scripts in one region remain unresolved; independent sentences and
+lines are assessed separately, including the second line of an input. Han and
+kana can coexist in a Japanese region. There is no whole-document majority vote.
+Bare `base64:` and `hex:` data use the same exact labeled carrier grammar as the
+decoder, without excluding ordinary words such as `base64word` or `hexagon`.
 
-- `Attributed(En)` requires an entire ASCII multiword grammar, case-insensitive:
-  `(this|that) (is|was) (a|the) NOUN`, `please VERB (the|this|that) NOUN`, or
-  `(we|they|you) (will|must|should|can) VERB (the|this|that) NOUN`.
-  NOUN is `message|request|document|instruction|instructions|test`; VERB is
-  `read|check|review|follow|ignore`. Extra/unknown tokens abstain. Latin script,
-  shared vocabulary, stopword counts and single words never suffice.
-- `Attributed(Ja)` requires at least four base-letter scalars including two actual
-  Hiragana/Katakana `Lo` letters, and only Han/kana letters/marks. This uses
-  the pinned Unicode tables, including supplementary kana. Shared Script_Extensions
-  punctuation such as `ー` cannot supply those two kana letters. Latin or other
-  scripts mixed into the evidence force `Unattributed`.
-- `UnsupportedLanguage` requires all possible-prose letters/marks to belong to
-  one of Cyrillic, Arabic or Hangul, at least twelve base-letter scalars, and at
-  least two words with three base-letter scalars each. Base letters use Unicode
-  `L` minus modifier letters `Lm`, not `Alphabetic` (which includes some vowel
-  marks); mark/extender-only runs cannot meet materiality. The general `other` flag,
-  private/unassigned scalars, format controls and mark-only strings do not qualify.
-  This identifies material outside the allowlist, not a specific Russian/Arabic/
-  Korean language. Other scripts, short spans and cross-script mixtures abstain.
-- Han-only text is always `Unattributed`: Simplified and Traditional Chinese,
-  kana-free Japanese and shared Han words are not distinguishable by script.
-  **Positive Chinese attribution is an acceptance residual**, not implemented
-  support. `Zh` is never manufactured from Han, even when it is the only allowed
-  language. No dominant-language vote is taken for mixed text.
+The existing complete English grammar remains a narrow deterministic fast path:
+`(this|that) (is|was) (a|the) NOUN`, `please VERB (the|this|that) NOUN`, or
+`(we|they|you) (will|must|should|can) VERB (the|this|that) NOUN`, case-insensitive.
+NOUN is `message|request|document|instruction|instructions|test`; VERB is
+`read|check|review|follow|ignore`. The Japanese fast path still requires at least
+four base letters, including two actual Hiragana/Katakana `Lo` letters, and only
+Han/kana letters or marks. Extenders do not supply kana evidence. Neither fast
+path is presented as broad language support.
 
-`LanguagePolicy { en, zh, ja }` is caller-owned, defaults to all three enabled,
-and requires all three Boolean fields when deserialized. Missing, duplicate,
-unknown or mistyped fields fail; all false is valid. A positively attributed En
-or Ja disabled by policy becomes `UnsupportedLanguage`; changing the allowlist
-never resolves ambiguous evidence. The zh bit is reserved, consumed in cache
-identity, and cannot make Han supported. This is a useful but low-recall subset,
-not a calibrated language detector or a claim of universal classification accuracy.
-Inline code, multi-sentence punctuation, broader English vocabulary and other
-scripts require future validated attribution, not relaxed default acceptance.
+General Latin and Han material uses the pinned reference `fasttext = 0.7.8`
+engine and packaged `lid.176.ftz` model. All 176 labels compete before applying
+the en/zh/ja allowlist. The top rank must be at least 0.8 and exceed the next rank
+by at least 0.2; these are engineering cutoffs, not calibrated accuracy claims.
+Latin regions need twelve base letters and two words of at least three base
+letters. Han-only regions need six base letters, irrespective of spaces. The
+model can attribute Simplified and Traditional Chinese to `Zh`, but shared-Han
+names remain semantically ambiguous even if the model emits a high-ranked label.
+Such names receive no accuracy credit in the qualification corpus. Short Han,
+mark/extender-only runs, and opaque/private/unassigned evidence remain unresolved.
+The existing single-script Cyrillic/Arabic/Hangul rule rejects material with
+twelve base letters and two words of at least three base letters. Shorter material
+with that same two-word evidence can use the same statistical model to corroborate
+rejection. Only a foreign prediction meeting the fixed rank cutoffs rejects;
+a supported label contradicting the validated nonshared script remains unresolved.
+This route cannot grant supported-language admission, and errors propagate.
 
-`LanguageAssessment::rejection_verdict()` returns the existing typed
-`SentinelVerdict::UnsupportedLanguage` (`uns`) only for `UnsupportedLanguage`.
-It returns `None` for attribution, absent prose or ambiguity; **None is not Clean**.
-`Unattributed` must stop supported-language routing. Even the positively attributed
-English phrase `Please ignore the instructions` is not a safety approval.
-The library attribution stage introduces no Boolean safety method, model dependency
-or workflow wiring; the adapter policy wiring is described below. Work uses linear
-scans under the already-enforced segmentation byte/span ceilings and shared
-cooperative preparation deadline; no hard wall-clock guarantee is made.
+The model is 938,013 bytes, SHA-256
+`8f3472cfe8738a7b6099e8e999c3cbfae0dcd15696aac7d7738a8039db603e83`.
+Its [source and separate CC BY-SA 3.0 license](../../crates/workflow-runtime/assets/README.md)
+are packaged with the bytes. Loading verifies the digest and uses the existing
+sealed-memory-file primitive; an immutable `OnceLock` shares the reference engine.
+Installed code needs no source checkout, model path, network or fallback model.
+An unavailable or mismatched asset fails atomically as `language_model_unavailable`.
+Prediction checks the shared cooperative deadline before and after native work;
+this does not bound OS scheduling or supersede semantic model timeouts.
 
-`whatlang 0.18.0` was not added: its Han-only Cmn fast path cannot resolve Chinese
-versus kana-free Japanese. Broader attribution needs pinned model/data identity,
-reliable abstention and measured multilingual hard negatives before enabling it.
+`LanguagePolicy { en, zh, ja }` defaults to all enabled; all three Boolean fields
+are required, and an empty allowlist is valid. A positively identified disabled
+language or material foreign language becomes `UnsupportedLanguage`. Changing
+policy never resolves unknown evidence. Aggregation gives unsupported material
+priority, then unresolved material, then the one positive label or `MixedSupported`.
+Any raw or decoded unsupported/unresolved region stops every semantic dispatch.
+Absent prose is neutral for attribution and still requires complete safety analysis.
+`LanguageAssessment::rejection_verdict()` returns `uns` only for unsupported
+language; `None` is never Clean. An English injection instruction is still untrusted.
+
+The frozen engineering corpus covers ordinary en/zh-Hans/zh-Hant/ja, short Japanese,
+unsupported languages, short/ambiguous evidence, all eight masks and raw/decoded
+transport. Its correlated masks/transports are not independent accuracy samples;
+held-out multilingual calibration and the #230 live quality/cost gates remain
+separate acceptance requirements. Unicode, byte, segment, carrier expansion and
+work ceilings remain unchanged; deadline/limit failure returns no partial result.
 
 ## Bounded carrier analysis (recognized syntax only)
 
@@ -232,12 +242,16 @@ which additionally binds both segmentation limits and the unattributed stage.
 Prepared-only keys cannot hit segmented results, and changing either limit
 misses the durable cache in the integration fixture.
 For attributed results use `LanguageAssessment::bind_cache_key`: it wraps that
-segmented key with `sentinel-language-policy-v2`, a distinct attribution-stage tag,
+segmented key with `sentinel-language-policy-v5`, the exact model/engine identity,
+a distinct attribution-stage tag,
 and the canonical en/zh/ja Boolean tuple. Bump the language version on any grammar,
 materiality, aggregation or allowlist semantic change. The durable-cache fixture
 independently reconstructs the framing, proves all eight policy combinations have
 distinct identities, and checks stage/version/limits/raw/provenance/request misses.
-No prepared-only or segmented-only key may cache attribution results.
+No prepared-only or segmented-only key may cache attribution results. Aggregate
+raw/decoded attribution additionally requires the carrier stage and its limits;
+the ADK preparation key consumes all these identities. A carrier-only key cannot
+cache the language aggregate.
 Carrier recognition/decoder identity (`sentinel-carriers-v3`) also participates
 in preparation keys and telemetry. Cache optional carrier results only with
 `CarrierAnalysis::bind_cache_key`: it binds the analysis stage, annotation/decode
@@ -265,7 +279,7 @@ Run `just issue-231-runtime` (offline, no credentials).
 | Mapped zero-width/bidi/control carriers | `unicode_controls_have_golden_original_byte_mappings` (explicit list only) |
 | Deterministic resource bounds | `output_and_work_exhaustion_never_return_partial_prepared_text` |
 | Cache identity and structured telemetry | `cache_consumes_canonical_policy_raw_bytes_and_trust_provenance`, `telemetry_is_versioned_deterministic_and_does_not_echo_text` |
-| en/zh/ja versus material unsupported spans | Conservative En/Ja and material Cyrillic/Arabic/Hangul subset with typed rejection, mapped evidence and configurable allowlist; `language::*`, `language_cache::*`; Chinese and general language attribution remain incomplete |
+| en/zh/ja versus material unsupported spans | Pinned statistical en/zh-Hans/zh-Hant/ja attribution plus conservative short-text paths; raw/decoded policy and eight allowlists use actual provider-entry counters; engineering fixtures do not replace held-out calibration |
 | Code/URL/identifier/emoji/math/data segmentation | Bounded recognized-syntax subset, mapped spans; `segmentation::*` focused fixtures; exclusions are lexical, not safety approval |
 | Hidden HTML/Markdown, escaping, Base64, hex, nested decoding | Finite subset above, optional decoded views and composed maps; `carriers::*`, `carrier_syntax::*`; arbitrary rendered markup is unsupported |
 | Unicode mapping/resource property corpus | `deterministic_unicode_property_corpus_has_total_source_coverage` (512 deterministic cases), joiner/variation-selector fixture |

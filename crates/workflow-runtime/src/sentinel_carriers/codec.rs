@@ -89,21 +89,13 @@ pub(super) fn recognize(
     if !boundary {
         return Ok(None);
     }
-    for (prefix, kind) in LABELS {
-        if let Some(body) = text.strip_prefix(prefix) {
-            let len = body
-                .bytes()
-                .take_while(|b| {
-                    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_')
-                })
-                .count();
-            return Ok(Some(Recognition::single(
-                kind,
-                prefix.len() + len,
-                prefix.len()..prefix.len() + len,
-                len > 0,
-            )));
-        }
+    if let Some((prefix, kind, len)) = labeled(text) {
+        return Ok(Some(Recognition::single(
+            kind,
+            len,
+            prefix..len,
+            len > prefix,
+        )));
     }
     let Some(first) = text.chars().next() else {
         return Ok(None);
@@ -157,6 +149,19 @@ pub(super) fn recognize(
         },
         |kind| Recognition::single(kind, len, 0..len, true),
     )))
+}
+
+pub(super) fn labeled(text: &str) -> Option<(usize, CarrierKind, usize)> {
+    LABELS.into_iter().find_map(|(prefix, kind)| {
+        let body = text.strip_prefix(prefix)?;
+        let len = body
+            .bytes()
+            .take_while(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_')
+            })
+            .count();
+        Some((prefix.len(), kind, prefix.len() + len))
+    })
 }
 
 pub(super) struct Decoded {

@@ -296,7 +296,7 @@ fn segmentation_identity_is_bound_before_language_screening() {
     let text = prepared(b"unattributed prose", NormalizationLimits::default());
     assert_eq!(
         text.telemetry()["segmentation_version"],
-        "sentinel-segmentation-v2"
+        "sentinel-segmentation-v4"
     );
     assert_eq!(
         text.telemetry()["script_data_version"],

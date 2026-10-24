@@ -20,6 +20,7 @@ pub enum PreparationReason {
     InvalidPolicy,
     DeadlineExceeded,
     UnclosedDelimiter,
+    LanguageModelUnavailable,
     UnsupportedLanguage,
     Unattributed,
     PendingClassification,
@@ -63,6 +64,7 @@ impl UntrustedTextReport {
                     | PreparationReason::InvalidPolicy
                     | PreparationReason::DeadlineExceeded
                     | PreparationReason::UnclosedDelimiter
+                    | PreparationReason::LanguageModelUnavailable
             ),
             UntrustedTextState::UnsupportedLanguage => {
                 reason == PreparationReason::UnsupportedLanguage

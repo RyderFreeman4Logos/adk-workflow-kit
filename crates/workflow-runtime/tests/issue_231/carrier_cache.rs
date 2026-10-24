@@ -66,22 +66,6 @@ fn carrier_cache_consumes_version_mode_all_limits_and_original_provenance() {
         )
         .unwrap();
     assert_eq!(key, expected);
-    let root = std::env::temp_dir().join(format!("issue-231-carrier-cache-{}", std::process::id()));
-    let cache = NodeResultCache::open(&root).unwrap();
-    cache
-        .put(
-            NodeCacheEntry::success(
-                key.clone(),
-                serde_json::json!({"carrier_stage": true}),
-                CacheProvenance::from_key(&key),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    assert!(matches!(
-        cache.lookup(&expected).unwrap(),
-        NodeCacheLookup::Hit(_)
-    ));
     let mut misses: Vec<NodeCacheKey> = vec![
         text.bind_cache_key(material("outer-policy"), &provenance("unknown"))
             .unwrap(),
@@ -139,6 +123,23 @@ fn carrier_cache_consumes_version_mode_all_limits_and_original_provenance() {
             .bind_cache_key(material("outer-policy"), &provenance("unknown"))
             .unwrap(),
     );
+    // Finish bounded preparation before unrelated persistent cache I/O.
+    let root = std::env::temp_dir().join(format!("issue-231-carrier-cache-{}", std::process::id()));
+    let cache = NodeResultCache::open(&root).unwrap();
+    cache
+        .put(
+            NodeCacheEntry::success(
+                key.clone(),
+                serde_json::json!({"carrier_stage": true}),
+                CacheProvenance::from_key(&key),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        cache.lookup(&expected).unwrap(),
+        NodeCacheLookup::Hit(_)
+    ));
     for miss in misses {
         assert!(matches!(
             cache.lookup(&miss).unwrap(),

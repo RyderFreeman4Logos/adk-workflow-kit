@@ -28,6 +28,7 @@ mod policy;
 mod production_profile;
 mod pure_transform;
 mod sandbox_execution;
+mod sealed_file;
 mod security;
 pub mod semantic_firewall;
 mod sentinel_carriers;
@@ -160,8 +161,8 @@ pub use sentinel_envelope::{
     prepare_untrusted_text,
 };
 pub use sentinel_language::{
-    LanguageAssessment, LanguageAttribution, LanguagePolicy, SENTINEL_LANGUAGE_POLICY_VERSION,
-    SentinelLanguage,
+    LanguageAssessment, LanguageAttribution, LanguagePolicy, SENTINEL_LANGUAGE_MODEL_ID,
+    SENTINEL_LANGUAGE_POLICY_VERSION, SentinelLanguage,
 };
 pub use sentinel_segments::{
     LanguageScreening, SENTINEL_SCRIPT_DATA_VERSION, SENTINEL_SEGMENTATION_VERSION, ScriptEvidence,

@@ -21,7 +21,7 @@ mod semantics;
 mod task_alignment;
 
 pub(crate) const STATE_KEY: &str = "__workflow_untrusted_preparation";
-const VERSION: &str = "sentinel-workflow-preparation-v6";
+const VERSION: &str = "sentinel-workflow-preparation-v7";
 
 /// Preparation-only terminal states. None means semantic Clean.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -103,6 +103,7 @@ impl PreparationWorkflow {
             "carrier": SENTINEL_CARRIER_VERSION,
             "segmentation": SENTINEL_SEGMENTATION_VERSION,
             "language": SENTINEL_LANGUAGE_POLICY_VERSION,
+            "language_model": workflow_runtime::SENTINEL_LANGUAGE_MODEL_ID,
             "script_data": SENTINEL_SCRIPT_DATA_VERSION,
             "unicode": std::char::UNICODE_VERSION,
             "security": SECURITY_MODEL_VERSION,
@@ -204,28 +205,20 @@ impl PreparationWorkflow {
             }
         };
         report["carriers"] = carriers.telemetry();
-        let assessment = text.segment_language(SegmentationLimits::default());
-        let segmented = match assessment {
-            Ok(segmented) => segmented,
-            Err(reason) => {
-                report["failed_stage"] = json!("segmentation");
-                return set_outcome(report, UntrustedTextState::InvalidInput, json!(reason));
-            }
-        };
-        let assessment = match segmented.assess_language(language) {
-            Ok(assessment) => assessment,
+        let attribution = match carriers.assess_language(language, SegmentationLimits::default()) {
+            Ok(attribution) => attribution,
             Err(reason) => {
                 report["failed_stage"] = json!("language");
                 return set_outcome(report, UntrustedTextState::InvalidInput, json!(reason));
             }
         };
-        report["language"] = json!(assessment.attribution());
-        let state = match assessment.attribution() {
+        report["language"] = json!(attribution);
+        let state = match attribution {
             LanguageAttribution::UnsupportedLanguage => UntrustedTextState::UnsupportedLanguage,
             LanguageAttribution::Unattributed => UntrustedTextState::Unattributed,
-            LanguageAttribution::NoNaturalLanguage | LanguageAttribution::Attributed(_) => {
-                UntrustedTextState::PendingClassification
-            }
+            LanguageAttribution::NoNaturalLanguage
+            | LanguageAttribution::Attributed(_)
+            | LanguageAttribution::MixedSupported => UntrustedTextState::PendingClassification,
         };
         if self.policy.behavioral.is_some() {
             if state != UntrustedTextState::PendingClassification {

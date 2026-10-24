@@ -90,7 +90,7 @@ excess discards all populated lists with that reason. Existing carrier/segmentat
 ceilings apply first. These are offline construction bounds, not model-token or
 wall-time guarantees. No unbounded task text or semantic prose is serialized.
 
-Adapter identity is `sentinel-workflow-preparation-v6`; the preparation key binds
+Adapter identity is `sentinel-workflow-preparation-v7`; the preparation key binds
 both probe versions and fixed budgets, retaining raw-byte, workflow/IR, language
 policy and preparation identities. A host goal additionally binds its domain-separated
 SHA-256 identity (goal bytes, host revision, fixed `authenticated_host_api_v1` origin,

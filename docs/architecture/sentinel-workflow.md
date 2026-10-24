@@ -89,8 +89,10 @@ host execution and retained artifacts. Reasons are closed preparation subcodes;
 invalid payload and empty input have no original, all other results retain one.
 A successful run means preparation completed, never semantic approval or graph
 continuation. The separate #232 report records executed model evidence or explicit
-abstention; the terminal is unchanged. Han-only Chinese remains unattributed.
-Adapter identity `sentinel-workflow-preparation-v6` binds the output contract and
+abstention; the terminal is unchanged. Language admission covers every raw and decoded material region; Chinese
+attribution uses the pinned statistical model, while short or ambiguous evidence
+can remain unattributed.
+Adapter identity `sentinel-workflow-preparation-v7` binds the output contract and
 [source descriptors plus semantic evidence](sentinel-probes.md). No trusted
 task-alignment goal is inferred from input. Embedding hosts can separately bind an
 authenticated goal through `AdkGraph::with_sentinel_trusted_goal`; the CLI/JSON
@@ -100,7 +102,8 @@ Normalization uses the authored input ceiling and the runtime's default output/w
 limits. Carriers use bounded Decode defaults; segmentation uses its default 16,384
 bytes / 4,096 segments. Stage resource/delimiter failures produce `invalid_input`
 with a typed reason and `failed_stage`. Language en/zh/ja flags are explicit and
-independent; zh is reserved pending genuine attribution, as described in
+independent; disabling a positively attributed language rejects it, while unknown
+evidence remains unresolved, as described in
 [sentinel-envelope.md](sentinel-envelope.md).
 
 A single fixed 1,000 ms preparation deadline starts before ingress storage and is

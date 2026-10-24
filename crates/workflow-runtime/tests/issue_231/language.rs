@@ -5,6 +5,32 @@ use workflow_runtime::{
 };
 
 #[test]
+fn ordinary_supported_and_foreign_material_is_attributed() {
+    for (raw, expected) in [
+        (
+            "请检查这份会议记录，并在明天上午之前告诉我们需要修改的内容。",
+            A::Attributed(L::Zh),
+        ),
+        (
+            "Por favor revise el documento adjunto y envíe sus comentarios antes de mañana por la mañana.",
+            A::UnsupportedLanguage,
+        ),
+    ] {
+        let text = prepared(raw.as_bytes(), NormalizationLimits::default());
+        let segmented = text
+            .segment_language(SegmentationLimits::default())
+            .unwrap();
+        assert_eq!(
+            segmented
+                .assess_language(LanguagePolicy::default())
+                .unwrap()
+                .attribution(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn conservative_language_fixtures_never_confuse_attribution_with_safety() {
     let fixtures = [
         ("This is a message.", A::Attributed(L::En)),
@@ -17,15 +43,15 @@ fn conservative_language_fixtures_never_confuse_attribution_with_safety() {
         ("Это обычное русское предложение.", A::UnsupportedLanguage),
         ("هذه رسالة باللغة العربية", A::UnsupportedLanguage),
         ("이것은 한국어로 작성된 문장입니다", A::UnsupportedLanguage),
-        ("这是一段简体中文。", A::Unattributed),
-        ("這是一段繁體中文。", A::Unattributed),
+        ("这是一段简体中文。", A::Attributed(L::Zh)),
+        ("這是一段繁體中文。", A::Attributed(L::Zh)),
         ("日本語文章", A::Unattributed),
         ("水", A::Unattributed),
         ("中文ーー", A::Unattributed),
         ("hello", A::Unattributed),
         ("This is", A::Unattributed),
         ("This is a", A::Unattributed),
-        ("Bonjour tout le monde", A::Unattributed),
+        ("Bonjour tout le monde", A::UnsupportedLanguage),
         ("This is a message bonjour", A::Unattributed),
         ("messageRequestIdentifier", A::Unattributed),
         ("this.is.a.message", A::Unattributed),
@@ -39,7 +65,7 @@ fn conservative_language_fixtures_never_confuse_attribution_with_safety() {
         ("ﾞﾟﾞﾟ", A::Unattributed),
         (
             "This is a message. 이것은 한국어 문장입니다",
-            A::Unattributed,
+            A::UnsupportedLanguage,
         ),
         ("これは日本語です English", A::Unattributed),
         ("中文 русский русский", A::Unattributed),
@@ -105,8 +131,13 @@ fn conservative_language_fixtures_never_confuse_attribution_with_safety() {
 }
 
 #[test]
-fn allowlist_denies_only_positive_attribution_and_han_never_becomes_chinese() {
-    for (raw, language) in [("This is a message", L::En), ("これは日本語です", L::Ja)] {
+fn allowlist_denies_positive_attribution_and_short_han_stays_unresolved() {
+    for (raw, language) in [
+        ("This is a message", L::En),
+        ("これは日本語です", L::Ja),
+        ("这是一段中文", L::Zh),
+        ("這是一段中文", L::Zh),
+    ] {
         let text = prepared(raw.as_bytes(), NormalizationLimits::default());
         let segments = text
             .segment_language(SegmentationLimits::default())
@@ -120,7 +151,10 @@ fn allowlist_denies_only_positive_attribution_and_han_never_becomes_chinese() {
             let result = segments.assess_language(policy).unwrap();
             assert_eq!(
                 result.attribution(),
-                if (language == L::En && policy.en) || (language == L::Ja && policy.ja) {
+                if (language == L::En && policy.en)
+                    || (language == L::Ja && policy.ja)
+                    || (language == L::Zh && policy.zh)
+                {
                     A::Attributed(language)
                 } else {
                     A::UnsupportedLanguage
@@ -128,7 +162,7 @@ fn allowlist_denies_only_positive_attribution_and_han_never_becomes_chinese() {
             );
         }
     }
-    for raw in ["这是一段中文", "這是一段中文", "日本語文章", "水"] {
+    for raw in ["日本", "東京大学", "日本語文章", "水"] {
         let text = prepared(raw.as_bytes(), NormalizationLimits::default());
         let segments = text
             .segment_language(SegmentationLimits::default())

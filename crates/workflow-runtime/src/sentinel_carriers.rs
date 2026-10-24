@@ -213,11 +213,7 @@ impl CarrierAnalysis<'_> {
                 start += len;
                 continue;
             }
-            let boundary = start == 0
-                || text[..start]
-                    .chars()
-                    .next_back()
-                    .is_some_and(|c| !c.is_alphanumeric() && c != '_');
+            let boundary = token_boundary(text, start);
             let Some(found) = codec::recognize(
                 tail,
                 boundary,
@@ -352,4 +348,19 @@ fn cover(map: &[NormalizedSourceSpan], range: Range<usize>) -> Result<SourceSpan
 
 fn check_deadline(deadline: Instant) -> Result<(), CarrierReason> {
     crate::sentinel_envelope::check_deadline(deadline).map_err(|_| CarrierReason::DeadlineExceeded)
+}
+
+pub(crate) fn token_boundary(text: &str, start: usize) -> bool {
+    start == 0
+        || text
+            .get(..start)
+            .and_then(|prefix| prefix.chars().next_back())
+            .is_some_and(|ch| !ch.is_alphanumeric() && ch != '_')
+}
+
+pub(crate) fn labeled_len(text: &str, start: usize) -> Option<usize> {
+    if !token_boundary(text, start) {
+        return None;
+    }
+    codec::labeled(text.get(start..)?).map(|(_, _, len)| len)
 }

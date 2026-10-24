@@ -9,6 +9,7 @@ license.workspace = true
 workflow-ir = { path = "../workflow-ir" }
 libc = "0.2"
 base64 = "=0.22.1"
+fasttext = "=0.7.8"
 bytes = "1"
 jsonschema.workspace = true
 parquet = { version = "60", default-features = false, features = ["snap"] }
