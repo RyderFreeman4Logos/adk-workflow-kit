@@ -196,8 +196,9 @@ They prove wiring, concurrent requests, source isolation, validation and publica
 behavior—not semantic accuracy. The descriptor fixtures continue to test replay,
 overlap, normalized offsets, ambiguity and atomic exhaustion.
 
-Remaining #232 acceptance is the shared benchmark integration and a separately
-frozen finite live table covering benign quotation/security discussion, goal
+The shared benchmark now verifies protected private-call observations and the finite
+preparation contract through the shipped no-goal package. Remaining #232 acceptance
+is a separately frozen finite live table covering benign quotation/security discussion, goal
 redirection, decoded material and adjacent overlapping chunks through the existing
 authenticated host-goal API. Scripted fixtures and prefix equality do not establish
 those model-quality results or physical cache benefits. Final Clean authorization,

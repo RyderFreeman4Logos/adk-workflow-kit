@@ -15,6 +15,7 @@ fn fixture(revision: &str) -> Campaign {
             holdout: vec![
                 "code-investigation".to_owned(),
                 "minimal-template".to_owned(),
+                "sentinel-preparation".to_owned(),
             ],
         },
         registry,
@@ -58,6 +59,7 @@ fn fixture_pairs_reject_same_revision_and_every_control_mismatch() {
             "downstream-consumer".to_owned(),
             "code-investigation".to_owned(),
             "minimal-template".to_owned(),
+            "sentinel-preparation".to_owned(),
         ],
     };
     assert!(compatible(&a, &b, false).is_err());
@@ -88,6 +90,23 @@ fn committed_source_checks_object_tree_contents_and_inputs_without_checkout() {
     // A source-proven identity fixture, not a report or measured execution.
     // Build the identity fixture from committed blobs, including workflows edited in this worktree.
     let mut campaign = fixture(&revision);
+    // A newly authored package belongs to the next commit, not this historical fixture.
+    campaign
+        .registry
+        .retain(|case| files.contains_key(&case.workflow.source));
+    let committed_ids = campaign
+        .registry
+        .iter()
+        .map(|case| case.workflow.case_id.clone())
+        .collect::<BTreeSet<_>>();
+    campaign
+        .split
+        .tuning
+        .retain(|id| committed_ids.contains(id));
+    campaign
+        .split
+        .holdout
+        .retain(|id| committed_ids.contains(id));
     for case in &mut campaign.registry {
         case.manifest.source_files_digest = expected.clone();
         case.manifest.workflow_digest = digest(files.get(&case.workflow.source).unwrap());

@@ -37,7 +37,7 @@ fn read(path: impl AsRef<Path>) -> Value {
 fn initialize() -> PathBuf {
     let root = scratch();
     let policy = root.with_extension("json");
-    fs::write(&policy, serde_json::to_vec(&json!({"schema_version":1,"tuning":["runtime-smoke","downstream-consumer"],"holdout":["minimal-template","code-investigation"]})).unwrap()).unwrap();
+    fs::write(&policy, serde_json::to_vec(&json!({"schema_version":1,"tuning":["runtime-smoke","downstream-consumer"],"holdout":["minimal-template","code-investigation","sentinel-preparation"]})).unwrap()).unwrap();
     value(
         cli(&["init", policy.to_str().unwrap(), root.to_str().unwrap()]),
         0,
@@ -63,7 +63,7 @@ fn relative_campaign(mode: &str) {
     let path = scratch();
     fs::create_dir(&path).unwrap();
     let root = Scratch(path);
-    fs::write(root.0.join("split.json"), serde_json::to_vec(&json!({"schema_version":1,"tuning":["runtime-smoke","downstream-consumer"],"holdout":["minimal-template","code-investigation"]})).unwrap()).unwrap();
+    fs::write(root.0.join("split.json"), serde_json::to_vec(&json!({"schema_version":1,"tuning":["runtime-smoke","downstream-consumer"],"holdout":["minimal-template","code-investigation","sentinel-preparation"]})).unwrap()).unwrap();
     fs::write(root.0.join("config.json"), serde_json::to_vec(&json!({"schema_version":1,"loop_policy":{"schema_version":1,"max_model_iterations":20,"max_total_tool_calls":20,"max_tool_calls_per_tool":20,"wall_time_ms":60000,"idle_time_ms":30000,"tool_time_ms":10000,"max_tool_output_bytes":65536}})).unwrap()).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_bench-230"));
     command.current_dir(&root.0).args([mode, "split.json"]);
@@ -185,12 +185,16 @@ fn soak_reexecutes_each_tuning_case_without_claiming_warm_cache() {
 }
 
 #[test]
-fn sealed_final_is_one_shot_blocks_tuning_and_exposes_fourth_binding() {
+fn sealed_final_is_one_shot_blocks_tuning_and_exposes_all_holdout_bindings() {
     let root = initialize();
     let report = run("sealed-final", &root, &[], 0);
     assert_eq!(
         report["selected_case_ids"],
-        json!(["code-investigation", "minimal-template"])
+        json!([
+            "code-investigation",
+            "minimal-template",
+            "sentinel-preparation"
+        ])
     );
     assert_eq!(cases(&report)[0]["status"], "succeeded");
     assert_eq!(cases(&report)[1]["status"], "succeeded");
@@ -266,7 +270,8 @@ fn partitions_fail_closed_on_overlap_missing_unknown_and_identity_drift() {
                 "runtime-smoke",
                 "minimal-template",
                 "code-investigation",
-                "downstream-consumer"
+                "downstream-consumer",
+                "sentinel-preparation"
             ]),
         ),
         (json!(["runtime-smoke"]), json!(["minimal-template"])),
@@ -275,7 +280,8 @@ fn partitions_fail_closed_on_overlap_missing_unknown_and_identity_drift() {
             json!([
                 "minimal-template",
                 "code-investigation",
-                "downstream-consumer"
+                "downstream-consumer",
+                "sentinel-preparation"
             ]),
         ),
     ] {

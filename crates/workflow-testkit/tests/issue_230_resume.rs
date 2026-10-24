@@ -154,7 +154,7 @@ fn killed_case_requires_explicit_abandon_without_replaying_effects() {
     let resumed = command().arg("resume").arg(&root).output().unwrap();
     assert_eq!(resumed.status.code(), Some(1));
     let report: Value = serde_json::from_slice(&resumed.stdout).unwrap();
-    assert_eq!(report["cases"].as_array().unwrap().len(), 4);
+    assert_eq!(report["cases"].as_array().unwrap().len(), 5);
     assert_eq!(report["cases"][0], first);
     assert_eq!(report["cases"][1], failed);
     assert_eq!(report["cases"][3]["status"], "succeeded");

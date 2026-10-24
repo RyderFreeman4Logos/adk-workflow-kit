@@ -16,6 +16,7 @@ pub(crate) mod cache;
 mod journal;
 pub(crate) mod measurement;
 pub(crate) mod policy;
+mod sentinel;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use workflow_adk::execution::{ExecutionBackend, ExecutionProfileV1, ExecutionReceipt};
@@ -35,6 +36,7 @@ pub fn scripted_workflows(repo: &Path) -> Result<Vec<ScriptedWorkflow>, String> 
         "examples/00-runtime-smoke/workflow.toml",
         "examples/01-code-investigation/workflow.toml",
         "examples/02-downstream-consumer-269/workflow.toml",
+        sentinel::SOURCE,
         "templates/minimal/workflow.toml",
     ] {
         if !repo.join(source).is_file() {
@@ -63,6 +65,7 @@ pub fn scripted_workflows(repo: &Path) -> Result<Vec<ScriptedWorkflow>, String> 
                 "examples/00-runtime-smoke/workflow.toml" => "runtime-smoke",
                 "examples/01-code-investigation/workflow.toml" => "code-investigation",
                 "examples/02-downstream-consumer-269/workflow.toml" => "downstream-consumer",
+                sentinel::SOURCE => "sentinel-preparation",
                 "templates/minimal/workflow.toml" => "minimal-template",
                 _ => &source,
             }
@@ -328,6 +331,18 @@ fn execute_bound_case(
     } else {
         ScriptedStatus::Failed
     };
+    if case.status == ScriptedStatus::Succeeded && case.manifest.workflow_source == sentinel::SOURCE
+    {
+        let receipt = case.receipt.as_ref().ok_or("missing Sentinel receipt")?;
+        if let Err(error) = sentinel::validate(
+            &case,
+            receipt,
+            &receipt.run_root().join("checkpoint.sqlite"),
+        ) {
+            case.hard_invariant_failures.push(error);
+            case.status = ScriptedStatus::Failed;
+        }
+    }
     Ok(case)
 }
 
@@ -372,6 +387,10 @@ fn scripted_inputs_with(
         "examples/02-downstream-consumer-269/workflow.toml" => (
             "examples/02-downstream-consumer-269/fixtures/profile.json",
             "examples/02-downstream-consumer-269/assets/data/input.json",
+        ),
+        sentinel::SOURCE => (
+            "examples/03-sentinel-preparation/profiles/fake.json",
+            "examples/03-sentinel-preparation/input.example.json",
         ),
         _ => return Ok(None),
     };

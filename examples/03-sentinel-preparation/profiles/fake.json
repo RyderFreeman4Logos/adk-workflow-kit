@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "model": {
+    "provider": "fake",
+    "name": "sentinel-worker",
+    "version": "1",
+    "model": "fake-sentinel",
+    "responses": [
+      "{\"schema_version\":1,\"node\":\"sentinel\",\"completeness\":\"complete\",\"payload\":{\"kind\":\"sentinel\",\"verdict\":\"cln\",\"spans\":[{\"artifact_id\":\"7251652ee00dc7d5171f18b95e8453366d3fd95b2e024fe6f43bce2c07b50507\",\"start\":0,\"end\":81}],\"artifacts\":[]}}",
+      "{\"schema_version\":1,\"node\":\"sentinel\",\"completeness\":\"complete\",\"payload\":{\"kind\":\"sentinel\",\"verdict\":\"cln\",\"spans\":[{\"artifact_id\":\"7251652ee00dc7d5171f18b95e8453366d3fd95b2e024fe6f43bce2c07b50507\",\"start\":0,\"end\":81}],\"artifacts\":[]}}"
+    ]
+  },
+  "sandbox": {
+    "capabilities": []
+  }
+}

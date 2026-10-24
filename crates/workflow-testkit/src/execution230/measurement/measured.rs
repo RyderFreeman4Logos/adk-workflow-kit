@@ -31,7 +31,7 @@ pub(super) fn append(output: &Path, case: &ExecutedCase, report: Value) -> Resul
             .as_ref()
             .ok_or("missing measured receipt")?
             .run_root();
-        selection(root, &root.join("checkpoint.sqlite"), &report)?
+        selection(case, root, &root.join("checkpoint.sqlite"), &report)?
     } else {
         (None, None)
     };
@@ -99,6 +99,12 @@ fn row(
             "confidence":"one run/correlated samples do not establish an independent-trial bound"
         }
     });
+    if let Some(calls) = report.get("sentinel_probe_calls").cloned() {
+        report["measured"]["sentinel_probe_calls"] = calls;
+        report["measured"]["unavailable"]["counts"] = json!(
+            "individual sentinel_probe_calls retain raw optional usage; multiple private responses never become a scalar total"
+        );
+    }
     let kv = report.get("kv_intent").cloned().unwrap_or(Value::Null);
     let row = &mut report["measured"];
     row["field_sources"] = field_sources(row);
@@ -165,10 +171,18 @@ fn field_sources(row: &Value) -> Value {
 /// The public store closes before this derived projection is returned or published.
 /// `database` is the run's checkpoint in production; tests may use an explicitly copied DB.
 fn selection(
+    case: &ExecutedCase,
     root: &Path,
     database: &Path,
     report: &Value,
 ) -> Result<(Option<Value>, Option<Value>), String> {
+    if case.manifest.workflow_source == super::super::sentinel::SOURCE {
+        let receipt = case.receipt.as_ref().ok_or("missing Sentinel receipt")?;
+        return Ok((
+            super::super::sentinel::validate(case, receipt, database)?.quality,
+            None,
+        ));
+    }
     let input: Value = journal::read(&root.join("execution-input.json"))?;
     let input_digest = digest(&serde_json::to_vec(&input).map_err(error)?);
     if report["case"]["manifest"]["dataset_digest"] != input_digest {

@@ -29,7 +29,7 @@ fn explicit_config_campaigns_bind_real_execution_and_reject_unsafe_controls() {
     let split = root.join("split.json");
     write(
         &split,
-        &json!({"schema_version":1,"tuning":["runtime-smoke","downstream-consumer"],"holdout":["code-investigation","minimal-template"]}),
+        &json!({"schema_version":1,"tuning":["runtime-smoke","downstream-consumer"],"holdout":["code-investigation","minimal-template","sentinel-preparation"]}),
     );
     let config = root.join("config.json");
     let valid = json!({"schema_version":1,"loop_policy":{"schema_version":1,"max_model_iterations":20,"max_total_tool_calls":20,"max_tool_calls_per_tool":20,"wall_time_ms":60000,"idle_time_ms":30000,"tool_time_ms":10000,"max_tool_output_bytes":65536}});
@@ -148,7 +148,7 @@ fn comparison_admission_fails_closed_on_ineligible_real_reports() {
     let split = root.join("split.json");
     write(
         &split,
-        &json!({"schema_version":1,"tuning":["runtime-smoke","downstream-consumer"],"holdout":["code-investigation","minimal-template"]}),
+        &json!({"schema_version":1,"tuning":["runtime-smoke","downstream-consumer"],"holdout":["code-investigation","minimal-template","sentinel-preparation"]}),
     );
     let baseline = root.join("baseline");
     let candidate = root.join("candidate");

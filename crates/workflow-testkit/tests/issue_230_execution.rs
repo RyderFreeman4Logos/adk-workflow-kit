@@ -43,7 +43,8 @@ fn scripted_cli_executes_registered_sources_and_measures_receipts() {
             "code-investigation",
             "downstream-consumer",
             "minimal-template",
-            "runtime-smoke"
+            "runtime-smoke",
+            "sentinel-preparation"
         ])
     );
     assert_eq!(ids.len(), cases.len());
