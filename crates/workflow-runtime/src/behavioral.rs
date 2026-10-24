@@ -2,8 +2,10 @@
 //!
 //! No handler, callback, filesystem, network, secret broker, or process capability
 //! crosses this boundary. The only executor is a sealed, data-only catalog.
+mod model_authority;
 #[path = "trajectory.rs"]
 pub mod trajectory;
+pub use model_authority::TrustedModelProbe;
 
 use crate::{
     ArtifactId, ArtifactRef, CanonicalUntrustedText, Completeness, ContentProvenance,

@@ -549,8 +549,9 @@ impl AgentNodeContract {
     }
 }
 
-/// Explicit opt-in to host-authorized scripted simulation, never execution authority.
-/// V1 requires 1..=32 steps and 1..=1000 milliseconds at compiler admission.
+/// Explicit behavioral opt-in, never execution authority: v1 is an authored script,
+/// v2 is host-approved model observation. Both require 1..=32 steps and 1..=1000 ms.
+/// Model observation cannot execute until its sealed worker is available.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BehavioralPolicy {
