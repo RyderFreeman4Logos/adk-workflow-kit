@@ -5457,6 +5457,8 @@ impl ExecutionBackend {
         Ok(manifest.receipt(root))
     }
 
+    /// Resumes a supported workflow. One-shot preparation rejects without changing
+    /// the original run's durable history or returning a new execution receipt.
     pub fn resume(
         workdir_base: impl AsRef<Path>,
         run_id: &str,
@@ -5496,6 +5498,18 @@ impl ExecutionBackend {
     ) -> Result<ExecutionReceipt, ExecutionError> {
         let (root, mut manifest) = find_run(workdir_base.as_ref(), run_id)?;
         if !matches!(manifest.status.as_str(), "running" | "succeeded") {
+            return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
+        }
+        let workflow = root.join("workflow.toml");
+        let compiled = compile_file(workflow.to_string_lossy().as_ref())
+            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
+        // Reject the one-shot contract before checkpoint opens or event truncation.
+        if compiled
+            .ir()
+            .nodes()
+            .iter()
+            .any(|node| node.untrusted_text().is_some())
+        {
             return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
         }
         let checkpoint_manifest = manifest
@@ -5564,7 +5578,6 @@ impl ExecutionBackend {
         let input =
             serde_json::from_slice::<Value>(&bounded_read(&root.join("execution-input.json"))?)
                 .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
-        let workflow = root.join("workflow.toml");
         profile
             .bind_declared_implementations(&workflow)
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
@@ -5577,8 +5590,6 @@ impl ExecutionBackend {
                 return Err(ExecutionError::new(ExecutionErrorKind::InvalidRunState));
             }
         }
-        let compiled = compile_file(workflow.to_string_lossy().as_ref())
-            .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         let agent_contracts = resolve_agent_contracts(&workflow, compiled.ir())
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::InvalidRunState))?;
         if compiled.ir().workflow_id().as_str() != manifest.workflow_id

@@ -7,6 +7,9 @@ use std::{
 };
 use workflow_adk::execution::{ExecutionBackend, ExecutionProfileV1};
 
+#[path = "issue_231/resume.rs"]
+mod resume;
+
 const WORKFLOW: &str = include_str!("fixtures/sentinel.workflow.toml");
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Root(PathBuf);

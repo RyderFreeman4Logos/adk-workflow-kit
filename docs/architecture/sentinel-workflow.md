@@ -64,8 +64,10 @@ cannot borrow the observer's artifact store; a private ADK graph owns isolated
 probe scheduling. ADK still owns terminal execution and checkpoint delivery. Input state
 is replaced by the host-created report before the stream starts, preventing
 caller-injected state from minting a preparation result. Unobserved `invoke` and
-checkpoint-resume invocations fail closed for this contract. Existing model/tool
-and WASM workflows without `untrusted_text` are unchanged.
+checkpoint-resume invocations fail closed for this contract. Public backend resume
+returns `InvalidRunState` before opening a checkpoint or changing the original
+manifest, events or artifacts; the original run remains inspectable. Existing
+model/tool and WASM workflows without `untrusted_text` are unchanged.
 
 ## Typed terminal output and limits
 
@@ -112,6 +114,8 @@ semantic cache key; #232 invocation identities additionally bind the model route
 prompt/task/schema and budgets. Generic bytes have no claimed issue-body author.
 
 Verify with `just issue-231-compiler`, `just issue-231-adk` and
-`just issue-231-runtime`. Full #231 acceptance remains incomplete: general graph
-routing, resumable preparation, durable cache reuse, complete language/carrier
-coverage and #230 benchmark integration remain; #232 owns semantic classification.
+`just issue-231-runtime`. Full #231 acceptance still needs complete language/carrier
+coverage and #230 benchmark integration. General graph routing, positive checkpoint
+continuation and durable cache reuse are unsupported capabilities outside this
+one-shot contract; refusal is not successful continuation. #232 owns semantic
+classification.
