@@ -19,6 +19,10 @@ mod kv;
 mod measured;
 #[path = "issue_230_telemetry/semantic.rs"]
 mod semantic;
+#[path = "issue_230_telemetry/sentinel.rs"]
+mod sentinel;
+#[path = "issue_230_telemetry/sentinel_finite.rs"]
+mod sentinel_finite;
 
 fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -136,6 +140,7 @@ fn read_request(socket: &mut TcpStream, deadline: Instant) -> io::Result<Value> 
         bytes.extend_from_slice(&buffer[..count]);
     }
     let mut request: Value = serde_json::from_slice(&bytes[offset..end]).map_err(|_| invalid())?;
+    request["wire_body_bytes"] = json!(length);
     let headers = std::str::from_utf8(&bytes[..offset]).map_err(|_| invalid())?;
     // Finite synthetic observations only; never retain arbitrary authorization bytes.
     let carries = |expected| {
@@ -243,6 +248,7 @@ fn wire_scenario(
 ) -> (PathBuf, Output, Result<Value, String>) {
     assert!((1..=2).contains(&replies));
     let (workflow, model_name, input, response_output) = case;
+    let sentinel = workflow == "examples/03-sentinel-preparation/workflow.toml";
     let scratch = std::env::var_os("TMPDIR").expect("explicit SSD TMPDIR");
     let root = PathBuf::from(scratch).join(format!(
         "wire230-{}-{}",
@@ -260,33 +266,62 @@ fn wire_scenario(
     let server = WireServer(Some(thread::spawn(move || {
         let mut last = None;
         let mut salts = Vec::new();
-        for attempt in 0..replies + usize::from(retry) {
-            let mut socket = accept_request(&listener, deadline).map_err(|e| e.to_string())?;
+        let mut requests = Vec::new();
+        for attempt in 0..replies + usize::from(retry && !sentinel) {
+            let mut socket = match accept_request(&listener, deadline) {
+                Ok(socket) => socket,
+                Err(_) if sentinel && retry && last.is_some() => break,
+                Err(error) => return Err(error.to_string()),
+            };
             let mut request = read_request(&mut socket, deadline).map_err(|e| e.to_string())?;
             request["wire_request_count"] = json!(attempt + 1);
             salts.push(request.get("cache_salt").cloned().unwrap_or(Value::Null));
+            requests.push(request.clone());
+            last = Some(request.clone());
             if retry && attempt == 0 {
                 write_reply(&mut socket, b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", deadline).map_err(|e| e.to_string())?;
                 continue;
             }
-            let content =
+            let content = if sentinel {
+                let schema = &request["response_format"]["json_schema"]["schema"];
+                schema["enum"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|value| value["payload"]["verdict"] == "cln")
+                    .unwrap()
+                    .to_string()
+            } else {
                 serde_json::to_string(&json!({"status":"finished","output":response_output}))
-                    .unwrap();
+                    .unwrap()
+            };
             let mut response = json!({"id":"wire-fixture", "object":"chat.completion", "created":0,"model":"wire-fixture-model", "choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}]});
             if let Some(usage) = &usage {
-                response["usage"] = usage.clone();
+                response["usage"] = if sentinel && usage.is_array() {
+                    let shuffled = request["messages"].to_string().contains("/shuffled;");
+                    usage[usize::from(shuffled)].clone()
+                } else {
+                    usage.clone()
+                };
             }
             let body = serde_json::to_vec(&response).unwrap();
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
-            write_reply(&mut socket, header.as_bytes(), deadline).map_err(|e| e.to_string())?;
-            write_reply(&mut socket, &body, deadline).map_err(|e| e.to_string())?;
+            if let Err(error) = write_reply(&mut socket, header.as_bytes(), deadline)
+                .and_then(|()| write_reply(&mut socket, &body, deadline))
+            {
+                if sentinel && retry {
+                    break;
+                }
+                return Err(error.to_string());
+            }
             last = Some(request);
         }
         last.map(|mut request| {
             request["wire_cache_salts"] = json!(salts);
+            request["wire_requests"] = json!(requests);
             request
         })
         .ok_or_else(|| "no request served".to_owned())

@@ -205,7 +205,7 @@ pub(super) fn aggregate(path: &Path, outputs: &[&str]) -> Result<Value, String> 
     let bound = |events, confidence| {
         crate::harness230::confidence_bound(events, trials.len(), confidence).millionths()
     };
-    // The sole quality predicate has one exact input. Repeats are correlated here,
+    // Host quality predicates cover finite inputs. Repeats are correlated here,
     // so no independent quality interval is justified by this finite implementation.
     let dimensions = |p: &Value| {
         Some((

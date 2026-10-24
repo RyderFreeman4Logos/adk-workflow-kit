@@ -30,6 +30,7 @@ enum Mode {
     Agree,
     DelayedAgree,
     Fail,
+    FailStatus,
     Pending,
     ToolCall,
     Oversize,
@@ -52,10 +53,18 @@ enum Mode {
     TaskLegacy,
     TaskConflict,
     TaskUncertain,
+    UsageMissing,
+    UsageZero,
+    UsageInvalid,
+    UsageSnapshots,
 }
 
+#[path = "failures.rs"]
+mod failures;
 #[path = "language_admission.rs"]
 mod language_admission;
+#[path = "observations.rs"]
+mod observations;
 #[path = "preparation_deadline.rs"]
 mod preparation_deadline;
 #[path = "task_alignment.rs"]
@@ -104,6 +113,14 @@ impl Llm for Probe {
         let schema: Value =
             serde_json::from_str(frame(&text(&request.contents[0]), "OUTPUT_SCHEMA_JSON")).unwrap();
         let task = schema["$id"].as_str().unwrap().ends_with(":task_alignment");
+        let user = text(&request.contents[1]);
+        let suffix = frame(&user, "TASK_SUFFIX");
+        let branch = suffix.split_once('/').unwrap().1.split(';').next().unwrap();
+        let usage_rank = ["ordered", "shuffled", "decoded", "task_alignment"]
+            .iter()
+            .position(|value| *value == branch)
+            .unwrap() as u64
+            + 1;
         let choice = match self.mode {
             Mode::TaskBenign | Mode::TaskConflict if task => 1,
             Mode::TaskUncertain if task => 3,
@@ -171,6 +188,14 @@ impl Llm for Probe {
             self.mode,
         );
         let trailer = match mode {
+            Mode::UsageSnapshots => {
+                let mut response = LlmResponse::default();
+                response
+                    .usage_metadata
+                    .get_or_insert_default()
+                    .provider_usage = Some(json!({"prompt_tokens":7}));
+                Some(response)
+            }
             Mode::UsageTrailer => Some(LlmResponse {
                 usage_metadata: Some(Default::default()),
                 ..Default::default()
@@ -197,10 +222,37 @@ impl Llm for Probe {
                 }
                 match mode {
                     Mode::Pending => std::future::pending().await,
-                    Mode::Fail if ordinal != 0 => std::future::pending().await,
+                    Mode::Fail | Mode::FailStatus if ordinal != 0 => std::future::pending().await,
                     Mode::Fail => Err(adk_rust::AdkError::agent("raw-secret-do-not-echo")),
+                    Mode::FailStatus => {
+                        let mut error = adk_rust::AdkError::agent("raw-secret-do-not-echo");
+                        error.details.upstream_status_code = Some(429);
+                        Err(error)
+                    }
                     _ => {
                         let mut response = LlmResponse::new(content);
+                        let usage = match mode {
+                            Mode::UsageMissing => None,
+                            Mode::UsageZero => Some(json!({"prompt_tokens":0})),
+                            Mode::UsageInvalid => Some(json!({
+                                "prompt_tokens":-1,"completion_tokens":"invalid"
+                            })),
+                            _ => Some(json!({
+                                "prompt_tokens":100 * usage_rank,
+                                "completion_tokens":10 * usage_rank,
+                                "total_tokens":999 + usage_rank,
+                                "prompt_tokens_details":{
+                                    "cached_tokens":0,"cache_write_tokens":2 * usage_rank
+                                },
+                                "completion_tokens_details":{"reasoning_tokens":3 * usage_rank}
+                            })),
+                        };
+                        if let Some(usage) = usage {
+                            response
+                                .usage_metadata
+                                .get_or_insert_default()
+                                .provider_usage = Some(usage);
+                        }
                         if matches!(mode, Mode::Truncated) {
                             response.finish_reason = Some(adk_rust::FinishReason::MaxTokens);
                         }
@@ -516,7 +568,8 @@ async fn concurrent_response_barrier_and_source_only_requests() {
                 .is_some_and(|s| s.starts_with("sha256:"))
         );
         let schema: Value = serde_json::from_str(frame(&system, "OUTPUT_SCHEMA_JSON")).unwrap();
-        let branch = schema["$id"].as_str().unwrap().rsplit(':').next().unwrap();
+        let suffix = frame(&user, "TASK_SUFFIX");
+        let branch = suffix.split_once('/').unwrap().1.split(';').next().unwrap();
         branches.push(branch.to_owned());
         if branch == "decoded" {
             assert_eq!(data["text"], "123");
@@ -532,6 +585,7 @@ async fn concurrent_response_barrier_and_source_only_requests() {
         .iter()
         .filter(|f| f["branch"] == "shuffled")
         .collect();
+    assert_ne!(shuffled[0]["schema_hash"], shuffled[1]["schema_hash"]);
     assert_ne!(shuffled[0]["view"]["start"], 0);
     assert!(
         shuffled[0]["view"]["start"].as_u64().unwrap()
@@ -560,6 +614,7 @@ async fn failure_drops_pending_sibling_without_partial_findings_or_echo() {
     assert_eq!(report["reason"], "invalid_or_failed");
     assert!(report["decision"].is_null());
     assert_eq!(report["findings"], json!([]));
+    assert_eq!(report.get("observations"), Some(&Value::Null));
     assert!(
         !serde_json::to_string(mapper.events())
             .unwrap()

@@ -399,10 +399,10 @@ async fn default_v12_ir_authority_report_and_cache_snapshot() {
             "{:x}",
             Sha256::digest(serde_json::to_vec(preparation(&mapper)).unwrap())
         ),
-        "ab4f33b6ede84c3a3807ca87bacfcc81af4c7e8e12f20a71860c213c6e2f1b46"
+        "50a313953145c30c47a05da0aff3afa4b4854865a08e58227644f3296f7435b6"
     );
     assert_eq!(
         preparation(&mapper)["cache_key"],
-        "sha256:fedd9d3caf462d091045ba5a2eb34e4959ab1f47ca757f1f34a073447255e6bd"
+        "sha256:ec0e927c2d92c072cbdd6310cefc646402c901d0c416563dc8bf124bfc0ab9a1"
     );
 }

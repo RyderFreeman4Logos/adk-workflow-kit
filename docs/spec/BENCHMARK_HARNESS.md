@@ -22,7 +22,7 @@ With `TMPDIR` set to an admitted SSD scratch directory:
   completion-integrity and writer-lock checks. `just issue-230-execution-unit`
   exercises unsupported and source-mismatch paths.
 
-The scripted command executes all **four** known packages and requires a successful
+The scripted command executes all **five** known packages and requires a successful
 runtime receipt for each. Every input/profile remains part of the recorded identity:
 
 | Package | Adapter |
@@ -31,6 +31,7 @@ runtime receipt for each. Every input/profile remains part of the recorded ident
 | runtime-smoke | Shipped fake profile and input; real ADK execution |
 | downstream-consumer | Shipped fake profile, data input and scripted echo connector; real ADK/Skill/tool execution, not a downstream dependency-pin rebuild |
 | minimal-template | Declared versioned `minimal-worker` binding; the runtime-smoke fake model is explicitly bound to this identity and receives a distinct case input |
+| sentinel-preparation | Shipped 81-byte English note, two source-bound fake probe replies, and the same durable preparation validator used by measurement reconstruction |
 
 The minimal template declares its binding in the source. A mismatched profile is
 still rejected as `MissingBinding`, with no fabricated receipt or provider measurements.
@@ -108,7 +109,7 @@ discovered workflow exactly once; empty groups, duplicate/unknown/omitted IDs an
 shared input digests across groups are rejected. For example:
 
 ```json
-{"schema_version":1,"tuning":["downstream-consumer","runtime-smoke"],"holdout":["code-investigation","minimal-template"]}
+{"schema_version":1,"tuning":["downstream-consumer","runtime-smoke"],"holdout":["code-investigation","minimal-template","sentinel-preparation"]}
 ```
 
 Run the built `./target/debug/bench-230` locally:
@@ -442,7 +443,7 @@ terminal event generation, and recomputes predicate
 `sort-7-2-7-1-and-sum-exact-v1`. It binds the output digest, run, input, selected
 node, checkpoint sequence, events and producer source. External `passed` or
 quality sidecars are not authority. A wrong but complete answer has quality 0;
-the exact answer has quality 1000. Other tasks have null quality rather than an
+the exact answer has quality 1000. Tasks without a finite host predicate have null quality rather than an
 invented judge. Raw counts from one response remain optional; multiple-response
 runs retain their individual `model_calls` without inventing one combined count.
 Security failures and their confidence bound remain null without a security
@@ -451,6 +452,33 @@ The checkpoint reader requires existing compatible data and never initializes or
 repairs its database, schema, metadata or manifest. It reads committed WAL frames;
 SQLite may still coordinate through derived SHM files. Close readers before sealing
 evidence; read-only checkpoint data does not imply zero directory I/O.
+
+For `examples/03-sentinel-preparation/workflow.toml`, the same finite validator
+runs after execution, while building the measurement, and during report-only
+reconstruction. It binds the input, latest checkpoint/event generation, identical
+`node:prepare` and `terminal`, closed terminal report, and bounded protected
+original/envelope/probe/semantic artifacts with exact commit references. Predicate
+`sentinel-preparation-contract-v1` covers four fixed benign English, Simplified
+Chinese, Traditional Chinese and Japanese inputs and existing invalid, unsupported
+and unattributed controls. Unknown inputs have no quality label. Positive cases
+require their exact language label, unchanged envelope bytes and complete source
+covers; `PendingClassification`, null decisions or supported language alone cannot
+pass. Explicit preparation-contract violations fail execution and reconstruction.
+The model's `semantic_reason` is separate fallible evidence, never quality authority
+or a final security decision. Existing optional sorting-quality behavior is unchanged.
+
+Sentinel's private calls are reported separately in `sentinel_probe_calls`, sourced
+from the protected version-four semantic artifact, with branch, view, invocation
+identity, schema hash and six optional raw usage counters. They remain available
+when clean or conflicting findings are discarded. Null accounting is unknown or
+incomplete; an empty list means verified preparation denial before model entry,
+including invalid input or language-policy denial, and does not identify the denial
+reason. A null per-call usage value means missing usage, while reported zero remains
+zero. These calls never become agent
+`model_calls` or a synthetic single-response total. A positive run without any
+completed model call fails the measurement wiring check even when preparation
+passes. KV intent is refused before admission for this package. No wire count,
+physical KV benefit, billing or final Clean decision is inferred from the report.
 
 `bench-230 measure-compare LEFT_DIR RIGHT_DIR` revalidates both measurements and
 pairs distinct runs of the same case, workflow and canonical input. Its row
@@ -486,8 +514,9 @@ Other workflows, absent rules or missing evidence remain null, never inferred ze
 Complete labels for at least two distinct inputs under assumed independence use
 the existing one-sided Hoeffding bound, rounded upward to millionths: zero events
 still give a nonzero bound. Correlation, repeated inputs or incomplete labels give
-null bounds. Independence is assumed, not attested. Quality uses only the exact
-sorting input above; other quality and independent quality intervals remain null.
+null bounds. Independence is assumed, not attested. Quality uses the finite sorting
+and Sentinel host predicates above; unknown inputs have no quality label, and
+independent quality intervals remain null.
 Raw metrics stay optional; Pareto excludes unknown dimensions, inventing no visible
 tokens, bills, KV or safety passes.
 Canary violations fail hard; wrong sorting answers fail the optional quality target.

@@ -27,10 +27,11 @@ ja = true
 
 ## Execution and byte identity
 
-Run the fixture `crates/workflow-adk/tests/fixtures/sentinel.workflow.toml` through
-`ExecutionBackend::run` (or the normal `workflowctl run` boundary). Its input is
-exactly `{"schema_version":1,"bytes":[80,108,101,97,115,101]}`: an explicit array
-of integer bytes in 0..255. Unknown fields, wrong types and unsupported payload
+Run `examples/03-sentinel-preparation/workflow.toml` through
+`ExecutionBackend::run` (or the normal `workflowctl run` boundary). The shipped
+`input.example.json` contains the exact 81-byte English note to which both replies
+in `profiles/fake.json` are bound. The input shape is a version-one object with an
+explicit `bytes` array of integer bytes in 0..255. Unknown fields, wrong types and unsupported payload
 versions produce `invalid_input / invalid_byte_payload`. Arbitrary JSON values
 and JSON strings are never converted into text implicitly.
 
@@ -128,8 +129,11 @@ semantic cache key; #232 invocation identities additionally bind the model route
 prompt/task/schema and budgets. Generic bytes have no claimed issue-body author.
 
 Verify with `just issue-231-compiler`, `just issue-231-adk` and
-`just issue-231-runtime`. Full #231 acceptance still needs complete language/carrier
-coverage and #230 benchmark integration. General graph routing, positive checkpoint
+`just issue-231-runtime`. The shipped package is also registered in the
+[benchmark harness](../spec/BENCHMARK_HARNESS.md#explicit-input-runtime-measurement),
+which checks a finite preparation predicate and protected private-call observations
+on both execution and report reconstruction. Candidate-bound live wiring remains
+separate from those scripted checks. General graph routing, positive checkpoint
 continuation and durable cache reuse are unsupported capabilities outside this
 one-shot contract; refusal is not successful continuation. #232 owns semantic
 classification.

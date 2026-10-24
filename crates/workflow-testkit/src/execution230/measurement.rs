@@ -190,6 +190,9 @@ fn run(path: &Path, output: &Path, live: bool) -> Result<Value, String> {
         .find(|(w, _)| w.source == binding.workflow_source)
         .ok_or("workflow is not registered")?;
     canonical_admission(&repo, &workflow.source, &binding.input)?;
+    if workflow.source == super::sentinel::SOURCE && binding.kv_intent.is_some() {
+        return Err("Sentinel private probes do not support KV intent measurements".to_owned());
+    }
     if let Some(kv) = &binding.kv_intent {
         kv.apply(&mut binding.profile)?;
     }
@@ -274,6 +277,7 @@ fn build_report(output: &Path, plan: &Plan, case: &ExecutedCase) -> Result<Value
     let mut calls = Vec::new();
     let mut cache = json!(null);
     let mut approval_events = Vec::new();
+    let mut sentinel_calls = None;
     if let Some(receipt) = &case.receipt {
         let admission: Admission = journal::read(&output.join("measurement-admission.json"))?;
         if admission.plan_digest != digest(&serde_json::to_vec(plan).map_err(error)?)
@@ -318,6 +322,16 @@ fn build_report(output: &Path, plan: &Plan, case: &ExecutedCase) -> Result<Value
                     .map_err(|_| "canonical answer evidence rejected")?;
             }
         }
+        if plan.manifest.workflow_source == super::sentinel::SOURCE
+            && receipt.status() == "succeeded"
+        {
+            sentinel_calls = super::sentinel::validate(
+                case,
+                receipt,
+                &receipt.run_root().join("checkpoint.sqlite"),
+            )?
+            .probe_calls;
+        }
         cache = raw_receipt["cache_dispositions"].clone();
         for event in events {
             if let Some(telemetry) = event.payload().get("model_telemetry") {
@@ -348,14 +362,18 @@ fn build_report(output: &Path, plan: &Plan, case: &ExecutedCase) -> Result<Value
             case.status == ScriptedStatus::Succeeded,
         )?;
     }
-    let failed = case.status != ScriptedStatus::Succeeded || calls.is_empty();
+    let completed_model = !calls.is_empty()
+        || sentinel_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty());
+    let failed = case.status != ScriptedStatus::Succeeded || !completed_model;
     let mut report = json!({
         "schema_version":1,
         "evidence_kind":if plan.origin == Origin::LocalWireTest { "local_wire_execution" } else { "opt_in_provider_execution" },
         "origin_assertion":"caller-declared; client binding is observed, remote model weights are not attested",
         "live_executed":if plan.origin == Origin::LocalWireTest { Some(false) } else { None::<bool> },
         "live_opt_in":plan.origin == Origin::LiveProvider,
-        "completed_model_observed":!calls.is_empty(),
+        "completed_model_observed":completed_model,
         "binding_digest":plan.binding_digest,
         "case":{"case_id":case.case_id,"manifest":case.manifest,"status":case.status,"admitted_run_id":case.admitted_run_id,"elapsed_ns":case.elapsed_ns,"events_digest":case.events_digest,"unsupported_reason":case.unsupported_reason},
         "model_calls":calls,"result_cache":cache,"approval_events":approval_events,
@@ -373,6 +391,9 @@ fn build_report(output: &Path, plan: &Plan, case: &ExecutedCase) -> Result<Value
             "model_revision":"route/profile version is not remote weights/tokenizer attestation"
         }
     });
+    if plan.manifest.workflow_source == super::sentinel::SOURCE {
+        report["sentinel_probe_calls"] = json!(sentinel_calls);
+    }
     if let Some(intent) = &plan.kv_intent {
         report["kv_intent"] = serde_json::to_value(intent).map_err(error)?;
     }

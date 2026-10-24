@@ -1,8 +1,10 @@
 //! Isolated ADK superstep: only complete, source-bound typed drafts reach publication.
 use super::{UntrustedTextState, probes, task_alignment};
 use crate::{
-    AdkGraphError, InferenceBudget, ModelInvocationSpec, PromptProtocol, ProviderRouteIdentity,
-    ReasoningEffort, StructuredOutputContract, model_invocation::ResponsePolicy,
+    AdkGraphError, InferenceBudget, ModelInvocationError, ModelInvocationErrorKind,
+    ModelInvocationSpec, ModelProfileErrorKind, PromptProtocol, ProviderRouteIdentity,
+    ReasoningEffort, StructuredOutputContract,
+    model_invocation::{ProviderTokenUsage, ResponsePolicy},
     model_profiles::ModelBinding,
 };
 use adk_rust::graph::prelude::{END, ExecutionConfig, GraphAgent, NodeOutput, START, State};
@@ -18,7 +20,7 @@ use workflow_runtime::{
     TypedOutput, TypedPayload, admit_for_reducer, argument_fingerprint, parse_typed_output,
 };
 
-pub(super) const VERSION: &str = "sentinel-semantic-probes-v2";
+pub(super) const VERSION: &str = "sentinel-semantic-probes-v4";
 pub(super) const MAX_REQUESTS: usize = 8;
 pub(super) const DEADLINE_MS: u64 = 30_000;
 pub(super) const OUTPUT_BYTES: usize = 512;
@@ -32,10 +34,78 @@ enum Reason {
     LanguageGate,
     ViewBudget,
     ModelUnavailable,
+    /// Typed uncertainty: no usable classification, authority, or automatic retry.
     InvalidOrFailed,
     Deadline,
     Conflict,
     CleanNotAuthoritative,
+}
+/// One host-observed failure, not all branch outcomes or a global root cause.
+/// Probe ordinals refer to the canonical request order, never completion order.
+#[derive(Serialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+enum Failure {
+    Invocation {
+        probe: usize,
+        kind: &'static str,
+        model_error: Option<&'static str>,
+        output_error: Option<&'static str>,
+        upstream_status_code: Option<u16>,
+        attempts: u8,
+    },
+    GraphExecution,
+    MissingCompleted {
+        probe: usize,
+    },
+    InvalidCompleted {
+        probe: usize,
+    },
+    TaskAlignment {
+        probe: usize,
+    },
+    TypedOutput {
+        probe: usize,
+    },
+    ReducerAdmission {
+        probe: usize,
+    },
+    Consensus,
+}
+impl Failure {
+    fn invocation(probe: usize, error: ModelInvocationError) -> Self {
+        // Exhaustive projections admit only existing closed classes. Never format
+        // arbitrary errors, profile identities, schema paths or provider messages.
+        Self::Invocation {
+            probe,
+            kind: match error.kind() {
+                ModelInvocationErrorKind::RouteMismatch => "route_mismatch",
+                ModelInvocationErrorKind::ModelProfile => "model_profile",
+                ModelInvocationErrorKind::StructuredOutput => "structured_output",
+                ModelInvocationErrorKind::Session => "session",
+                ModelInvocationErrorKind::DeadlineExceeded => "deadline_exceeded",
+                ModelInvocationErrorKind::Cancelled => "cancelled",
+            },
+            model_error: error.model_error().map(|kind| match kind {
+                ModelProfileErrorKind::InvalidProfile => "invalid_profile",
+                ModelProfileErrorKind::DuplicateProfile => "duplicate_profile",
+                ModelProfileErrorKind::MissingProfile => "missing_profile",
+                ModelProfileErrorKind::Credential => "credential",
+                ModelProfileErrorKind::InvalidRequest => "invalid_request",
+                ModelProfileErrorKind::Provider => "provider",
+                ModelProfileErrorKind::RetryableProvider => "retryable_provider",
+                ModelProfileErrorKind::Timeout => "timeout",
+            }),
+            output_error: error.output_error().map(|error| match error {
+                StructuredOutputError::OutputTooLarge => "output_too_large",
+                StructuredOutputError::InvalidUtf8 => "invalid_utf8",
+                StructuredOutputError::InvalidJson => "invalid_json",
+                StructuredOutputError::TrailingBytes => "trailing_bytes",
+                StructuredOutputError::SchemaViolation { .. } => "schema_violation",
+            }),
+            upstream_status_code: error.upstream_status_code(),
+            attempts: error.attempts(),
+        }
+    }
 }
 #[derive(Serialize)]
 struct Finding {
@@ -44,6 +114,42 @@ struct Finding {
     invocation_identity: String,
     schema_hash: String,
     output: Value,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Usage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+}
+impl From<&ProviderTokenUsage> for Usage {
+    fn from(usage: &ProviderTokenUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens(),
+            output_tokens: usage.output_tokens(),
+            total_tokens: usage.total_tokens(),
+            cache_read_tokens: usage.cache_read_tokens(),
+            cache_write_tokens: usage.cache_write_tokens(),
+            reasoning_tokens: usage.reasoning_tokens(),
+        }
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Completed {
+    output: Value,
+    usage: Option<Usage>,
+}
+#[derive(Serialize)]
+struct Observation {
+    branch: &'static str,
+    view: probes::View,
+    invocation_identity: String,
+    schema_hash: String,
+    usage: Option<Usage>,
 }
 #[derive(Serialize)]
 struct Report {
@@ -54,11 +160,14 @@ struct Report {
     causal_attribution: &'static str,
     findings: Vec<Finding>,
     decision: Option<Value>,
+    /// None means aggregate accounting is unavailable, never zero cost.
+    observations: Option<Vec<Observation>>,
+    failure: Option<Failure>,
 }
 impl Report {
     fn new(reason: Reason, has_goal: bool) -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 4,
             version: VERSION,
             reason,
             task_alignment: if has_goal {
@@ -69,7 +178,14 @@ impl Report {
             causal_attribution: "not_measured",
             findings: vec![],
             decision: None,
+            observations: None,
+            failure: None,
         }
+    }
+    fn failed(mut self, failure: Failure) -> Result<Vec<u8>, AdkGraphError> {
+        self.reason = Reason::InvalidOrFailed;
+        self.failure = Some(failure);
+        self.encode()
     }
     fn encode(self) -> Result<Vec<u8>, AdkGraphError> {
         let bytes = serde_json::to_vec(&self).map_err(|_| AdkGraphError::Failed)?;
@@ -104,7 +220,7 @@ pub(super) async fn run(
     let mut graph = GraphAgent::builder(VERSION).channels(&channels);
     let (failed, mut failures) = mpsc::channel(1);
     let mut expected = Vec::new();
-    for (input, key) in inputs.into_iter().zip(&keys) {
+    for (probe, (input, key)) in inputs.into_iter().zip(&keys).enumerate() {
         let spec = specification(&input, binding, preparation_identity, goal)?;
         let provenance = spec.provenance();
         expected.push(Finding {
@@ -135,9 +251,12 @@ pub(super) async fn run(
                         .invoke_with_policy(&binding, validate_wire, ResponsePolicy::CompleteText)
                         .await;
                     let output = match result {
-                        Ok(output) => output.into_output(),
-                        Err(_) => {
-                            let _ = failed.try_send(());
+                        Ok(output) => {
+                            let usage = output.usage().map(Usage::from);
+                            json!({"output":output.into_output(), "usage":usage})
+                        }
+                        Err(error) => {
+                            let _ = failed.try_send(Failure::invocation(probe, error));
                             Value::Null
                         }
                     };
@@ -151,50 +270,76 @@ pub(super) async fn run(
     let outcome = timeout(Duration::from_millis(DEADLINE_MS), async {
         tokio::select! {
             biased;
-            _ = failures.recv() => None,
-            result = graph.invoke(State::new(), ExecutionConfig::new(VERSION).with_recursion_limit(2)) => result.ok(),
+            Some(failure) = failures.recv() => Err(failure),
+            result = graph.invoke(State::new(), ExecutionConfig::new(VERSION).with_recursion_limit(2)) => result.map_err(|_| Failure::GraphExecution),
         }
     }).await;
     // Keep a sender alive through select: channel closure is not branch failure.
     drop(failed);
     let state = match outcome {
         Err(_) => return report(Reason::Deadline).encode(),
-        Ok(None) => return report(Reason::InvalidOrFailed).encode(),
-        Ok(Some(state)) => state,
+        Ok(Err(failure)) => return report(Reason::InvalidOrFailed).failed(failure),
+        Ok(Ok(state)) => {
+            // A graph can publish its final state in the same poll that queued a
+            // branch failure. Preserve that owned error before decoding Null.
+            if let Ok(failure) = failures.try_recv() {
+                return report(Reason::InvalidOrFailed).failed(failure);
+            }
+            state
+        }
     };
+    let mut observations = Vec::with_capacity(expected.len());
+    for (probe, (finding, key)) in expected.iter_mut().zip(keys).enumerate() {
+        let Some(value) = state.get(&key) else {
+            return report(Reason::InvalidOrFailed).failed(Failure::MissingCompleted { probe });
+        };
+        let Ok(completed) = serde_json::from_value::<Completed>(value.clone()) else {
+            return report(Reason::InvalidOrFailed).failed(Failure::InvalidCompleted { probe });
+        };
+        observations.push(Observation {
+            branch: finding.branch,
+            view: finding.view.clone(),
+            invocation_identity: finding.invocation_identity.clone(),
+            schema_hash: finding.schema_hash.clone(),
+            usage: completed.usage,
+        });
+        finding.output = completed.output;
+    }
+    // All calls completed before reduction. Keep their counters even when the
+    // consensus deliberately discards every finding (Clean or disagreement).
+    let mut report = report(Reason::Agreement);
+    report.observations = Some(observations);
     let mut consensus = None;
     let mut relation = None;
-    for (finding, key) in expected.iter_mut().zip(keys) {
-        let Some(value) = state.get(&key) else {
-            return report(Reason::InvalidOrFailed).encode();
-        };
+    for (probe, finding) in expected.iter().enumerate() {
+        let value = &finding.output;
         let verdict = if finding.branch == "task_alignment" {
             let Some(admitted) = goal.and_then(|goal| goal.admit(value, &finding.view.source))
             else {
-                return report(Reason::InvalidOrFailed).encode();
+                return report.failed(Failure::TaskAlignment { probe });
             };
             relation = Some(admitted);
             admitted.verdict()
         } else {
             let bytes = serde_json::to_vec(value).map_err(|_| AdkGraphError::Failed)?;
             let Ok(output) = parse_typed_output(&bytes) else {
-                return report(Reason::InvalidOrFailed).encode();
+                return report.failed(Failure::TypedOutput { probe });
             };
             let Ok(TypedPayload::Sentinel(evidence)) = admit_for_reducer(&output) else {
-                return report(Reason::InvalidOrFailed).encode();
+                return report.failed(Failure::ReducerAdmission { probe });
             };
             evidence.verdict()
         };
         if consensus.is_some_and(|previous| previous != verdict) {
-            return report(Reason::Conflict).encode();
+            report.reason = Reason::Conflict;
+            return report.encode();
         }
         consensus = Some(verdict);
-        finding.output = value.clone();
     }
     // ponytail: unanimous non-Clean evidence only. Calibrated Clean admission needs
     // all deterministic/behavioral gates and is deliberately not implemented here.
     if consensus == Some(SentinelVerdict::Clean) {
-        let mut report = report(Reason::CleanNotAuthoritative);
+        report.reason = Reason::CleanNotAuthoritative;
         if let Some(relation) = relation {
             report.task_alignment = relation.code();
         }
@@ -204,9 +349,8 @@ pub(super) async fn run(
         consensus,
         Some(SentinelVerdict::Injection | SentinelVerdict::Suspicious)
     ) {
-        return report(Reason::InvalidOrFailed).encode();
+        return report.failed(Failure::Consensus);
     }
-    let mut report = report(Reason::Agreement);
     if let Some(relation) = relation {
         report.task_alignment = relation.code();
     }
@@ -247,7 +391,7 @@ fn specification(
         (goal.schema(input), goal.policy())
     } else {
         (
-            json!({"$id":format!("urn:{VERSION}:{}", input.branch), "enum": choices}),
+            json!({"$id":format!("urn:{VERSION}:source"), "enum": choices}),
             POLICY.to_owned(),
         )
     };
