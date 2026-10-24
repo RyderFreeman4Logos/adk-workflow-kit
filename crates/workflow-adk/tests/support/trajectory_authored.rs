@@ -303,6 +303,7 @@ fn prepared() -> workflow_runtime::CanonicalUntrustedText {
         &mut store(),
         RAW,
         workflow_runtime::NormalizationLimits::default(),
+        std::time::Instant::now(),
     )
     .unwrap() else {
         panic!("prepared source")

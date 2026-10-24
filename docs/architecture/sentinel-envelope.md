@@ -2,9 +2,16 @@
 
 Status: **partial implementation of #231**, not a completed Sentinel or general
 language detector. `workflow_runtime::prepare_untrusted_text` is the explicit artifact IO
-boundary; the internal normalizer is deterministic and performs no IO. Callers
+boundary; emitted text/maps are deterministic and normalization performs no IO. Callers
 inject the existing `ArtifactStore`. No model, provider, executor, or ADK agent is
 constructed by this data transformation.
+
+Callers record one `Instant` before ingress and pass it to `prepare_untrusted_text`.
+Its fixed 1,000 ms cooperative budget follows the canonical value through scanning,
+decoding, source mapping, segmentation and attribution. It is never reset between
+stages. Expiry yields typed `DeadlineExceeded`, never a partial successful view.
+Future start times are invalid policy. Checks cannot interrupt blocking IO or
+provide an OS scheduling bound; semantic model execution has its separate budget.
 
 ## Contract
 
@@ -48,8 +55,8 @@ bytes, 1,048,576 work units. Hard ceilings: 1,048,576 input bytes, 4,194,304
 output bytes, 16,777,216 work units. Zero denies the corresponding resource.
 A work unit is one byte admitted to a normalization pass. The current single
 pass charges the input size before walking scalars. Validation, hashing and
-artifact IO add a bounded number of linear passes; store latency is external.
-There is no claim of a wall-clock deadline. Limit exhaustion returns no partial
+artifact IO add a bounded number of linear passes; blocking store latency can only
+be checked after return. There is no hard wall-clock guarantee. Exhaustion returns no partial
 prepared view. Maps/annotations have at most one entry per input scalar.
 
 ## Conservative segmentation (partial language prerequisite)
@@ -144,8 +151,8 @@ It returns `None` for attribution, absent prose or ambiguity; **None is not Clea
 English phrase `Please ignore the instructions` is not a safety approval.
 The library attribution stage introduces no Boolean safety method, model dependency
 or workflow wiring; the adapter policy wiring is described below. Work uses linear
-scans under the already-enforced segmentation byte/span ceilings; no wall-clock
-claim is made.
+scans under the already-enforced segmentation byte/span ceilings and shared
+cooperative preparation deadline; no hard wall-clock guarantee is made.
 
 `whatlang 0.18.0` was not added: its Han-only Cmn fast path cannot resolve Chinese
 versus kana-free Japanese. Broader attribution needs pinned model/data identity,
@@ -161,17 +168,25 @@ the retained artifact, canonical text, envelope, author provenance or untrusted
 analysis domain. A candidate is not proof of Injection; no candidates is not Clean.
 Decoded text must stay in an untrusted data role, just like the original envelope.
 
-The v2 subset recognizes literal `<!--...-->`, `[//]: # (...)`, standalone runs
-of `%HH`, `\xHH` and `\uHHHH`, and explicitly labeled `base64:` / `hex:` tokens.
+The v3 subset recognizes literal `<!--...-->`, `[//]: # (...)`, `%HH`, `\xHH`,
+`\uHHHH` (including paired surrogates), and labeled `base64:` / `hex:` tokens.
+Literal text can surround and mix byte escapes and entities in a token. Entities
+are strict Unicode decimal/hex references and `amp`, `lt`, `gt`, `quot`, `apos`,
+`nbsp`; other named references are invalid encoding, never silently expanded.
+HTML attribute values have separate mapped views. Element bodies marked `hidden`,
+`aria-hidden=true`, or literal inline `display:none` / `visibility:hidden` have
+additional views; quoted delimiters and nested same-name elements are tracked.
+Unsupported opener syntax or carrier labels in tag/attribute names decline the
+HTML projection and leave those bytes to the ordinary carrier scanner; lookahead
+remains charged and stops at the next unquoted `<`.
 The comment patterns are candidates, not claims about actual rendered visibility.
 Backtick/tilde-delimited literals and HTTP(S)/FTP/www URL runs are not decoded.
 Unclosed literal delimiters consume the remaining literal region. Bare Base64,
 hex digests, numeric literals, ordinary percent signs and normal backslash escapes
 are not guessed to be encoded instructions. This is **not an HTML, Markdown,
-JSON, CSS, or programming-language parser**. Hidden elements/attributes/styles,
-entities, arbitrary reference-comment forms, unlabeled encodings, mixed literal
-and escaped strings, URL encodings inside URLs, and surrogate-pair escapes remain
-unsupported. All original text still reaches the complete canonical envelope.
+JSON, CSS, or programming-language parser**. CSS cascade/computed visibility,
+arbitrary reference comments, unlabeled encodings and URL encodings inside URLs
+remain unsupported. All original text still reaches the complete canonical envelope.
 
 Base64 uses the already-locked `base64 = 0.22.1` strict standard alphabet and
 canonical padding; URL-safe and unpadded variants are not silently accepted.
@@ -187,14 +202,15 @@ one. Decoded `Debug` output is content-free.
 Default limits are 65,536 input bytes, 256 candidates, depth 3, 65,536 aggregate
 expanded bytes and 1,048,576 work units. Hard ceilings are respectively 65,536,
 4,096, 8, 262,144 and 16,777,216. Caller policy rejects unknown fields and excessive
-values. Work units charge bytes admitted to each scan, decoder and output-mapping
+values. Work units charge bytes admitted to each scan, HTML lookahead, decoder and output-mapping
 pass; fixed recognition checks, bounded binary searches for source spans and
 UTF-8 validation add constant-factor work under these hard ceilings. This is not
 a wall-clock guarantee. Expanded bytes include intermediate and attempted invalid
 output, not just final leaves. Allocation checks precede each decoded chunk.
 Limits are aggregate across siblings and nested transformations. Exceeding any
 limit, including discovery of a candidate beyond the depth ceiling, returns an
-atomic `ResourceLimit` error with no partial analysis. Annotation-only never
+atomic `ResourceLimit` error with no partial analysis. Deadline expiry similarly
+returns atomic `DeadlineExceeded`. Annotation-only never
 claims nested coverage. Decoded controls are retained verbatim, not recursively
 normalized or assigned language/safety labels.
 
@@ -204,7 +220,8 @@ normalized or assigned language/safety labels.
 and trusted `ContentProvenance`, returning an actual `NodeCacheKey` for
 `NodeResultCache`. It binds original artifact bytes by digest even when two
 inputs normalize identically; normalized bytes; all limits; normalizer, envelope,
-compact-output, security-model and Rust Unicode-data versions; and provenance
+compact-output, security-model and Rust Unicode-data versions, the fixed preparation
+budget (never the process-local Instant); and provenance
 including scope, author and trust-policy classification. The analysis domain
 remains untrusted even for allowlisted authors. Existing outer request/policy
 identities are combined, never discarded. Model/provider/prompt/tool/dataset
@@ -215,13 +232,13 @@ which additionally binds both segmentation limits and the unattributed stage.
 Prepared-only keys cannot hit segmented results, and changing either limit
 misses the durable cache in the integration fixture.
 For attributed results use `LanguageAssessment::bind_cache_key`: it wraps that
-segmented key with `sentinel-language-policy-v1`, a distinct attribution-stage tag,
+segmented key with `sentinel-language-policy-v2`, a distinct attribution-stage tag,
 and the canonical en/zh/ja Boolean tuple. Bump the language version on any grammar,
 materiality, aggregation or allowlist semantic change. The durable-cache fixture
 independently reconstructs the framing, proves all eight policy combinations have
 distinct identities, and checks stage/version/limits/raw/provenance/request misses.
 No prepared-only or segmented-only key may cache attribution results.
-Carrier recognition/decoder identity (`sentinel-carriers-v2`) also participates
+Carrier recognition/decoder identity (`sentinel-carriers-v3`) also participates
 in preparation keys and telemetry. Cache optional carrier results only with
 `CarrierAnalysis::bind_cache_key`: it binds the analysis stage, annotation/decode
 mode, all five limits and the decoder version while preserving outer request,
@@ -250,10 +267,10 @@ Run `just issue-231-runtime` (offline, no credentials).
 | Cache identity and structured telemetry | `cache_consumes_canonical_policy_raw_bytes_and_trust_provenance`, `telemetry_is_versioned_deterministic_and_does_not_echo_text` |
 | en/zh/ja versus material unsupported spans | Conservative En/Ja and material Cyrillic/Arabic/Hangul subset with typed rejection, mapped evidence and configurable allowlist; `language::*`, `language_cache::*`; Chinese and general language attribution remain incomplete |
 | Code/URL/identifier/emoji/math/data segmentation | Bounded recognized-syntax subset, mapped spans; `segmentation::*` focused fixtures; exclusions are lexical, not safety approval |
-| Hidden HTML/Markdown, escaping, Base64, hex, nested decoding | Bounded explicit candidate subset, optional decoded views and composed maps; `carriers::*`; arbitrary hidden markup remains pending |
+| Hidden HTML/Markdown, escaping, Base64, hex, nested decoding | Finite subset above, optional decoded views and composed maps; `carriers::*`, `carrier_syntax::*`; arbitrary rendered markup is unsupported |
 | Unicode mapping/resource property corpus | `deterministic_unicode_property_corpus_has_total_source_coverage` (512 deterministic cases), joiner/variation-selector fixture |
 | Multilingual/hard-negative/nested-encoding fuzz fixtures | Carrier subset: 256 seeded nested UTF-8 mapping cases, 512 seeded malformed-input cases, quantum golden maps and code/URL/data negatives; complete language/markup coverage remains pending |
-| Spec/IR/compiler runtime routing | Explicit v1 single-terminal preparation contract, canonical IR v11 and observed ADK execution; `just issue-231-compiler` / `just issue-231-adk`; general graph routing, resume and cache reuse remain pending |
+| Spec/IR/compiler runtime routing | Explicit v1 single-terminal preparation contract, canonical IR v11 and observed ADK execution; `just issue-231-compiler` / `just issue-231-adk`; general routing, positive continuation and cache reuse are unsupported capabilities outside this one-shot contract |
 | Live semantic coverage | Bounded #232 model branches are implemented and exercised offline with scripted bindings ([sentinel-probes.md](sentinel-probes.md)); live semantic quality and authorized live binding remain unverified |
 
 Do not close #231 from this ledger. #232 remains responsible for model branches;

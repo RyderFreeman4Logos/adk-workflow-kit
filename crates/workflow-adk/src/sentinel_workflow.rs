@@ -10,9 +10,9 @@ use workflow_runtime::{
     ArtifactId, ArtifactStore, CarrierLimits, CarrierMode, LanguageAttribution, LanguagePolicy,
     NodeCacheKey, NodeCacheKeyMaterial, NormalizationLimits, SECURITY_MODEL_VERSION,
     SENTINEL_CARRIER_VERSION, SENTINEL_ENVELOPE_SCHEMA_VERSION, SENTINEL_LANGUAGE_POLICY_VERSION,
-    SENTINEL_NORMALIZATION_VERSION, SENTINEL_SCRIPT_DATA_VERSION, SENTINEL_SEGMENTATION_VERSION,
-    SegmentationLimits, SentinelPreparation, SentinelVerdict, TYPED_OUTPUT_SCHEMA_VERSION_V1,
-    TrustDomain, prepare_untrusted_text,
+    SENTINEL_NORMALIZATION_VERSION, SENTINEL_PREPARATION_BUDGET_MS, SENTINEL_SCRIPT_DATA_VERSION,
+    SENTINEL_SEGMENTATION_VERSION, SegmentationLimits, SentinelPreparation, SentinelVerdict,
+    TYPED_OUTPUT_SCHEMA_VERSION_V1, TrustDomain, prepare_untrusted_text,
 };
 use workflow_spec::UntrustedTextPreparation;
 
@@ -21,7 +21,7 @@ mod semantics;
 mod task_alignment;
 
 pub(crate) const STATE_KEY: &str = "__workflow_untrusted_preparation";
-const VERSION: &str = "sentinel-workflow-preparation-v5";
+const VERSION: &str = "sentinel-workflow-preparation-v6";
 
 /// Preparation-only terminal states. None means semantic Clean.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -73,6 +73,7 @@ impl PreparationWorkflow {
         mapper: &mut AdkEventMapper,
         model: Option<&std::sync::Arc<crate::model_profiles::ModelBinding>>,
     ) -> Result<(Value, Value), AdkGraphError> {
+        let preparation_started = std::time::Instant::now();
         let normalization = NormalizationLimits {
             max_input_bytes: self.policy.max_input_bytes,
             ..NormalizationLimits::default()
@@ -106,6 +107,7 @@ impl PreparationWorkflow {
             "unicode": std::char::UNICODE_VERSION,
             "security": SECURITY_MODEL_VERSION,
             "normalization_limits": normalization,
+            "preparation_budget_ms": SENTINEL_PREPARATION_BUDGET_MS,
             "carrier_limits": CarrierLimits::default(),
             "carrier_mode": CarrierMode::Decode,
             "segmentation_limits": SegmentationLimits::default(),
@@ -166,7 +168,7 @@ impl PreparationWorkflow {
         })
         .map_err(|_| AdkGraphError::Failed)?;
         report["cache_key"] = json!(key.digest());
-        let prepared = prepare_untrusted_text(store, &raw, normalization)
+        let prepared = prepare_untrusted_text(store, &raw, normalization, preparation_started)
             .map_err(|_| AdkGraphError::Failed)?;
         let text = match prepared {
             SentinelPreparation::Invalid { reason, .. } => {
@@ -175,9 +177,21 @@ impl PreparationWorkflow {
             SentinelPreparation::Prepared(text) => text,
         };
         report["normalization"] = text.telemetry();
-        report["envelope_artifact_id"] = json!(put_verified(
+        let envelope = text.envelope();
+        let staged = store
+            .stage(envelope.as_bytes())
+            .map_err(|_| AdkGraphError::Failed)?;
+        if text.check_preparation_deadline().is_err() {
+            return set_outcome(
+                report,
+                UntrustedTextState::InvalidInput,
+                json!("deadline_exceeded"),
+            );
+        }
+        report["envelope_artifact_id"] = json!(commit_verified(
             store,
-            text.envelope().as_bytes(),
+            staged,
+            envelope.as_bytes(),
             mapper,
             &self.node_id,
             "envelope"
@@ -221,15 +235,54 @@ impl PreparationWorkflow {
             report["cache_key"] = json!(digest_json(
                 &json!({"preparation":key.digest(), "behavioral":identity})
             )?);
+            if text.check_preparation_deadline().is_err() {
+                return set_outcome(
+                    report,
+                    UntrustedTextState::InvalidInput,
+                    json!("deadline_exceeded"),
+                );
+            }
             return set_outcome(report, state, json!(state));
         }
         let probes = probes::prepare(&carriers, state, self.trusted_goal.is_some())?;
-        let probe_id = put_verified(store, &probes.bytes, mapper, &self.node_id, "probes")?;
+        if text.check_preparation_deadline().is_err() {
+            return set_outcome(
+                report,
+                UntrustedTextState::InvalidInput,
+                json!("deadline_exceeded"),
+            );
+        }
+        let staged = store
+            .stage(&probes.bytes)
+            .map_err(|_| AdkGraphError::Failed)?;
+        if text.check_preparation_deadline().is_err() {
+            return set_outcome(
+                report,
+                UntrustedTextState::InvalidInput,
+                json!("deadline_exceeded"),
+            );
+        }
+        let probe_id = commit_verified(
+            store,
+            staged,
+            &probes.bytes,
+            mapper,
+            &self.node_id,
+            "probes",
+        )?;
         report["probes"] = json!({
             "version": probes::VERSION,
             "artifact_id": probe_id,
             "bytes": probes.bytes.len(),
         });
+        if text.check_preparation_deadline().is_err() {
+            return set_outcome(
+                report,
+                UntrustedTextState::InvalidInput,
+                json!("deadline_exceeded"),
+            );
+        }
+        // Preparation is complete; semantic inference has its own existing deadline.
         let semantic_bytes = semantics::run(
             probes.inputs,
             state,
@@ -288,6 +341,26 @@ pub(crate) fn put_verified(
     role: &str,
 ) -> Result<ArtifactId, AdkGraphError> {
     let id = store.put(bytes).map_err(|_| AdkGraphError::Failed)?;
+    record_verified(id, bytes, mapper, node_id, role)
+}
+fn commit_verified(
+    store: &mut impl ArtifactStore,
+    staged: workflow_runtime::StagedArtifact,
+    bytes: &[u8],
+    mapper: &mut AdkEventMapper,
+    node_id: &str,
+    role: &str,
+) -> Result<ArtifactId, AdkGraphError> {
+    let id = store.commit(staged).map_err(|_| AdkGraphError::Failed)?;
+    record_verified(id, bytes, mapper, node_id, role)
+}
+fn record_verified(
+    id: ArtifactId,
+    bytes: &[u8],
+    mapper: &mut AdkEventMapper,
+    node_id: &str,
+    role: &str,
+) -> Result<ArtifactId, AdkGraphError> {
     if id.as_str() != format!("{:x}", Sha256::digest(bytes)) {
         return Err(AdkGraphError::Failed);
     }

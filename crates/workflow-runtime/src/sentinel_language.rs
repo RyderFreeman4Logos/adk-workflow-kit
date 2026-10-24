@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
 /// Bump for changes to grammar, materiality, aggregation or policy semantics.
-pub const SENTINEL_LANGUAGE_POLICY_VERSION: &str = "sentinel-language-policy-v1";
+pub const SENTINEL_LANGUAGE_POLICY_VERSION: &str = "sentinel-language-policy-v2";
 
 /// Caller-owned allowlist. Unknown/missing fields fail; an empty allowlist is valid.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -109,7 +109,13 @@ impl SegmentedUntrustedText<'_> {
         &self,
         policy: LanguagePolicy,
     ) -> Result<LanguageAssessment<'_>, SegmentationReason> {
+        self.text()
+            .check_preparation_deadline()
+            .map_err(|_| SegmentationReason::DeadlineExceeded)?;
         let detected = attribute(self)?;
+        self.text()
+            .check_preparation_deadline()
+            .map_err(|_| SegmentationReason::DeadlineExceeded)?;
         let attribution = match detected {
             LanguageAttribution::Attributed(language)
                 if !match language {

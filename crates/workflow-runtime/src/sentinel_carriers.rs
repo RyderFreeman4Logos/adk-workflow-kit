@@ -1,13 +1,13 @@
 //! Explicit carrier candidates and opt-in decoded views, never safety verdicts.
 use crate::{CanonicalUntrustedText, CarrierKind, NormalizedSourceSpan, SourceSpan};
 use serde::{Deserialize, Serialize};
-use std::{fmt, ops::Range};
+use std::{fmt, ops::Range, time::Instant};
 
 #[path = "sentinel_carriers/codec.rs"]
 mod codec;
 
 /// Bump with recognition, decoding, source-map, or resource-accounting changes.
-pub const SENTINEL_CARRIER_VERSION: &str = "sentinel-carriers-v2";
+pub const SENTINEL_CARRIER_VERSION: &str = "sentinel-carriers-v3";
 
 /// Caller-owned policy, not parsed from the untrusted content.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -41,6 +41,7 @@ pub enum CarrierMode {
 pub enum CarrierReason {
     InvalidPolicy,
     ResourceLimit,
+    DeadlineExceeded,
 }
 /// None of these states is Clean, Injection, or a supported-language result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -186,6 +187,7 @@ impl CarrierAnalysis<'_> {
     }
 
     fn charge(&mut self, bytes: usize) -> Result<(), CarrierReason> {
+        check_deadline(self.text.preparation_deadline())?;
         self.work_units = self
             .work_units
             .checked_add(bytes)
@@ -205,6 +207,7 @@ impl CarrierAnalysis<'_> {
         self.charge(text.len())?;
         let mut start = 0;
         while start < text.len() {
+            check_deadline(self.text.preparation_deadline())?;
             let tail = &text[start..];
             if let Some(len) = codec::literal_len(tail) {
                 start += len;
@@ -215,7 +218,12 @@ impl CarrierAnalysis<'_> {
                     .chars()
                     .next_back()
                     .is_some_and(|c| !c.is_alphanumeric() && c != '_');
-            let Some(found) = codec::recognize(tail, boundary) else {
+            let Some(found) = codec::recognize(
+                tail,
+                boundary,
+                self.limits.max_candidates - self.candidates.len(),
+            )?
+            else {
                 start += tail
                     .chars()
                     .next()
@@ -223,66 +231,75 @@ impl CarrierAnalysis<'_> {
                     .len_utf8();
                 continue;
             };
-            if depth > self.limits.max_depth || self.candidates.len() >= self.limits.max_candidates
-            {
-                return Err(CarrierReason::ResourceLimit);
-            }
-            let index = self.candidates.len();
-            self.candidates.push(CarrierCandidate {
-                kind: found.kind,
-                source: cover(map, start..start + found.len)?,
-                depth,
-                parent,
-                status: CarrierStatus::Annotated,
-                decoded: None,
-            });
-            if self.mode == CarrierMode::Decode {
-                self.charge(found.body.len())?;
-                let remaining = self.limits.max_expanded_bytes - self.expanded_bytes;
-                let decoded = codec::decode(
-                    &tail[found.body.clone()],
-                    found.kind,
-                    found.closed,
-                    remaining,
-                )?;
-                // Includes attempted bytes from invalid UTF-8/encoding, not only retained views.
-                self.expanded_bytes += decoded.bytes.len();
-                self.charge(decoded.bytes.len())?;
-                if let Ok(value) = String::from_utf8(decoded.bytes)
-                    && decoded.valid
+            self.charge(found.work_units)?;
+            for candidate in found.candidates {
+                if depth > self.limits.max_depth
+                    || self.candidates.len() >= self.limits.max_candidates
                 {
-                    let mut source_map = Vec::new();
-                    for (offset, ch) in value.char_indices() {
-                        let end = offset + ch.len_utf8();
-                        let first = decoded
-                            .origins
-                            .get(offset)
-                            .ok_or(CarrierReason::InvalidPolicy)?;
-                        let last = decoded
-                            .origins
-                            .get(end - 1)
-                            .ok_or(CarrierReason::InvalidPolicy)?;
-                        let base = start + found.body.start;
-                        source_map.push(NormalizedSourceSpan::new(
-                            offset,
-                            end,
-                            cover(map, base + first.start..base + last.end)?,
-                        ));
+                    return Err(CarrierReason::ResourceLimit);
+                }
+                let index = self.candidates.len();
+                self.candidates.push(CarrierCandidate {
+                    kind: candidate.kind,
+                    source: cover(
+                        map,
+                        start + candidate.span.start..start + candidate.span.end,
+                    )?,
+                    depth,
+                    parent,
+                    status: CarrierStatus::Annotated,
+                    decoded: None,
+                });
+                if self.mode == CarrierMode::Decode {
+                    self.charge(candidate.body.len())?;
+                    let remaining = self.limits.max_expanded_bytes - self.expanded_bytes;
+                    let decoded = codec::decode(
+                        &tail[candidate.body.clone()],
+                        candidate.kind,
+                        candidate.closed,
+                        remaining,
+                        self.text.preparation_deadline(),
+                    )?;
+                    // Includes attempted bytes from invalid UTF-8/encoding, not only retained views.
+                    self.expanded_bytes += decoded.bytes.len();
+                    self.charge(decoded.bytes.len())?;
+                    if let Ok(value) = String::from_utf8(decoded.bytes)
+                        && decoded.valid
+                    {
+                        let mut source_map = Vec::new();
+                        for (offset, ch) in value.char_indices() {
+                            check_deadline(self.text.preparation_deadline())?;
+                            let end = offset + ch.len_utf8();
+                            let first = decoded
+                                .origins
+                                .get(offset)
+                                .ok_or(CarrierReason::InvalidPolicy)?;
+                            let last = decoded
+                                .origins
+                                .get(end - 1)
+                                .ok_or(CarrierReason::InvalidPolicy)?;
+                            let base = start + candidate.body.start;
+                            source_map.push(NormalizedSourceSpan::new(
+                                offset,
+                                end,
+                                cover(map, base + first.start..base + last.end)?,
+                            ));
+                        }
+                        let view = DecodedCarrierView {
+                            text: value,
+                            source_map,
+                        };
+                        self.candidates[index].status = CarrierStatus::Decoded;
+                        self.walk(&view.text, &view.source_map, depth + 1, Some(index))?;
+                        self.candidates[index].decoded = Some(view);
+                    } else {
+                        self.candidates[index].status = CarrierStatus::InvalidEncoding;
                     }
-                    let view = DecodedCarrierView {
-                        text: value,
-                        source_map,
-                    };
-                    self.candidates[index].status = CarrierStatus::Decoded;
-                    self.walk(&view.text, &view.source_map, depth + 1, Some(index))?;
-                    self.candidates[index].decoded = Some(view);
-                } else {
-                    self.candidates[index].status = CarrierStatus::InvalidEncoding;
                 }
             }
             start += found.len;
         }
-        Ok(())
+        check_deadline(self.text.preparation_deadline())
     }
 }
 impl CanonicalUntrustedText {
@@ -294,6 +311,7 @@ impl CanonicalUntrustedText {
         mode: CarrierMode,
         limits: CarrierLimits,
     ) -> Result<CarrierAnalysis<'_>, CarrierReason> {
+        check_deadline(self.preparation_deadline())?;
         if limits.max_input_bytes > 65_536
             || limits.max_candidates > 4_096
             || limits.max_depth > 8
@@ -314,6 +332,7 @@ impl CanonicalUntrustedText {
             work_units: 0,
         };
         analysis.walk(self.normalized(), self.source_map(), 1, None)?;
+        check_deadline(self.preparation_deadline())?;
         Ok(analysis)
     }
 }
@@ -329,4 +348,8 @@ fn cover(map: &[NormalizedSourceSpan], range: Range<usize>) -> Result<SourceSpan
         .ok_or(CarrierReason::InvalidPolicy)?
         .source();
     SourceSpan::new(a.artifact_id(), a.start(), b.end()).map_err(|_| CarrierReason::InvalidPolicy)
+}
+
+fn check_deadline(deadline: Instant) -> Result<(), CarrierReason> {
+    crate::sentinel_envelope::check_deadline(deadline).map_err(|_| CarrierReason::DeadlineExceeded)
 }

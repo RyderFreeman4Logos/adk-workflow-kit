@@ -90,7 +90,7 @@ invalid payload and empty input have no original, all other results retain one.
 A successful run means preparation completed, never semantic approval or graph
 continuation. The separate #232 report records executed model evidence or explicit
 abstention; the terminal is unchanged. Han-only Chinese remains unattributed.
-Adapter identity `sentinel-workflow-preparation-v5` binds the output contract and
+Adapter identity `sentinel-workflow-preparation-v6` binds the output contract and
 [source descriptors plus semantic evidence](sentinel-probes.md). No trusted
 task-alignment goal is inferred from input. Embedding hosts can separately bind an
 authenticated goal through `AdkGraph::with_sentinel_trusted_goal`; the CLI/JSON
@@ -102,6 +102,17 @@ bytes / 4,096 segments. Stage resource/delimiter failures produce `invalid_input
 with a typed reason and `failed_stage`. Language en/zh/ja flags are explicit and
 independent; zh is reserved pending genuine attribution, as described in
 [sentinel-envelope.md](sentinel-envelope.md).
+
+A single fixed 1,000 ms preparation deadline starts before ingress storage and is
+checked throughout analysis and before envelope/probe publication and the handoff
+to the semantic phase. Model-specific specification and graph construction follow
+that handoff; the preparation budget does not extend to physical provider entry.
+Blocking staging completes before the deadline check; an expired staged view is
+dropped without committing it. Original evidence stays retained. Expiry observed
+by preparation checks returns `invalid_input` / `deadline_exceeded`, with zero
+semantic provider dispatch. This cooperative budget is not an OS scheduling bound.
+The semantic phase retains its existing independent 30-second model-superstep
+deadline after preparation finishes.
 
 The existing `NodeCacheKey` binds raw-byte digest, artifact identity, canonical IR,
 workflow/node identity, every preparation stage and compact-output schema version,

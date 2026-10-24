@@ -46,6 +46,7 @@ pub(super) fn expected_report(steps: serde_json::Value, run: &str) -> ProbeRepor
         &mut store(),
         RAW,
         workflow_runtime::NormalizationLimits::default(),
+        std::time::Instant::now(),
     )
     .unwrap();
     let workflow_runtime::SentinelPreparation::Prepared(source) = source else {

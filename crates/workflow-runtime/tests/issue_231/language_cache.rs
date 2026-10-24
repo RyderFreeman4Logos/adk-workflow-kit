@@ -45,7 +45,7 @@ fn policy_hash(version: &str) -> String {
 fn language_cache_binds_real_stage_version_every_allowlist_bit_and_prior_stages() {
     assert_eq!(
         SENTINEL_LANGUAGE_POLICY_VERSION,
-        "sentinel-language-policy-v1"
+        "sentinel-language-policy-v2"
     );
     let text = prepared(b"This is a message", NormalizationLimits::default());
     let limits = SegmentationLimits::default();

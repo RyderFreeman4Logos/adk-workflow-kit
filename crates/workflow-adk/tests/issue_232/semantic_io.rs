@@ -28,6 +28,7 @@ use workflow_runtime::{ArtifactId, ArtifactStore, InMemoryArtifactStore, PageReq
 #[derive(Clone, Copy)]
 enum Mode {
     Agree,
+    DelayedAgree,
     Fail,
     Pending,
     ToolCall,
@@ -53,6 +54,8 @@ enum Mode {
     TaskUncertain,
 }
 
+#[path = "preparation_deadline.rs"]
+mod preparation_deadline;
 #[path = "task_alignment.rs"]
 mod task_alignment;
 struct Probe {
@@ -187,6 +190,9 @@ impl Llm for Probe {
                 if leader {
                     ready.notify_one();
                 }
+                if matches!(mode, Mode::DelayedAgree) {
+                    tokio::time::sleep(Duration::from_millis(1_100)).await;
+                }
                 match mode {
                     Mode::Pending => std::future::pending().await,
                     Mode::Fail if ordinal != 0 => std::future::pending().await,
@@ -250,8 +256,7 @@ fn setup_runtime_checked(
         .with_worker(
             FakeModelProfile::new("fake-model", "1", "fake", ["unused"]).with_runtime(runtime),
         )
-        .unwrap()
-        .bind_worker(&CredentialBroker::new());
+        .and_then(|registry| registry.bind_worker(&CredentialBroker::new()));
     let graph = binding.map(|binding| {
         let plan = workflow_compiler::compile_str("sentinel.toml", WORKFLOW).unwrap();
         AdkGraphTranslator::new()

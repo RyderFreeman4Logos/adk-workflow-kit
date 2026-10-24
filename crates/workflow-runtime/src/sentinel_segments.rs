@@ -8,7 +8,7 @@ use regex_syntax::hir::{Class, ClassUnicode, HirKind};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
-pub const SENTINEL_SEGMENTATION_VERSION: &str = "sentinel-segmentation-v1";
+pub const SENTINEL_SEGMENTATION_VERSION: &str = "sentinel-segmentation-v2";
 pub const SENTINEL_SCRIPT_DATA_VERSION: &str = "regex-syntax-0.8.11-unicode-16.0.0";
 
 /// Caller-owned lexical limits, independent of normalization limits.
@@ -42,6 +42,7 @@ pub enum SegmentationReason {
     InvalidPolicy,
     ResourceLimit,
     UnclosedDelimiter,
+    DeadlineExceeded,
 }
 
 /// Recognized syntax only, not an exhaustive code/Markdown/HTML parser.
@@ -152,6 +153,8 @@ impl CanonicalUntrustedText {
         &self,
         limits: SegmentationLimits,
     ) -> Result<SegmentedUntrustedText<'_>, SegmentationReason> {
+        self.check_preparation_deadline()
+            .map_err(|_| SegmentationReason::DeadlineExceeded)?;
         if limits.max_bytes > 65_536 || limits.max_segments > 16_384 {
             return Err(SegmentationReason::InvalidPolicy);
         }
@@ -166,6 +169,8 @@ impl CanonicalUntrustedText {
         let mut start = 0;
         let mut map_cursor = 0;
         while start < self.normalized().len() {
+            self.check_preparation_deadline()
+                .map_err(|_| SegmentationReason::DeadlineExceeded)?;
             if segments.len() >= limits.max_segments {
                 return Err(SegmentationReason::ResourceLimit);
             }
@@ -178,6 +183,8 @@ impl CanonicalUntrustedText {
             let source_start = first.source().start();
             let mut source_end = first.source().end();
             while let Some(mapping) = self.source_map().get(map_cursor) {
+                self.check_preparation_deadline()
+                    .map_err(|_| SegmentationReason::DeadlineExceeded)?;
                 if mapping.normalized_start() >= end {
                     break;
                 }
@@ -199,6 +206,8 @@ impl CanonicalUntrustedText {
             });
             start = end;
         }
+        self.check_preparation_deadline()
+            .map_err(|_| SegmentationReason::DeadlineExceeded)?;
         Ok(SegmentedUntrustedText {
             text: self,
             segments,

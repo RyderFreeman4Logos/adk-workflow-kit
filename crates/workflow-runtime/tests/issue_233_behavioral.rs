@@ -253,9 +253,13 @@ use workflow_runtime::{
 fn probe_with(script: Value, limits: ProbeLimits, run: &str, raw: &str) -> BehavioralProbe {
     let mut store =
         InMemoryArtifactStore::new(65_536.try_into().unwrap(), 65_536.try_into().unwrap());
-    let SentinelPreparation::Prepared(source) =
-        prepare_untrusted_text(&mut store, raw.as_bytes(), NormalizationLimits::default()).unwrap()
-    else {
+    let SentinelPreparation::Prepared(source) = prepare_untrusted_text(
+        &mut store,
+        raw.as_bytes(),
+        NormalizationLimits::default(),
+        std::time::Instant::now(),
+    )
+    .unwrap() else {
         panic!("prepared source required")
     };
     let provenance = TrustPolicy::new("test-scope", ["trusted"])
@@ -500,9 +504,13 @@ fn bounded_stops_crash_and_replay_preserve_deterministic_records() {
 fn admission_rejects_production_unknown_versions_and_unbounded_scripts() {
     let mut store =
         InMemoryArtifactStore::new(65_536.try_into().unwrap(), 65_536.try_into().unwrap());
-    let SentinelPreparation::Prepared(source) =
-        prepare_untrusted_text(&mut store, b"source", NormalizationLimits::default()).unwrap()
-    else {
+    let SentinelPreparation::Prepared(source) = prepare_untrusted_text(
+        &mut store,
+        b"source",
+        NormalizationLimits::default(),
+        std::time::Instant::now(),
+    )
+    .unwrap() else {
         panic!()
     };
     let provenance = TrustPolicy::new("scope", Vec::<String>::new())

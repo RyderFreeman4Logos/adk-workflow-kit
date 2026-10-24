@@ -255,6 +255,7 @@ async fn host_approved_authored_terminal_executes_and_retains_typed_report() {
         &mut store(),
         RAW,
         workflow_runtime::NormalizationLimits::default(),
+        std::time::Instant::now(),
     )
     .unwrap();
     let workflow_runtime::SentinelPreparation::Prepared(source) = source else {

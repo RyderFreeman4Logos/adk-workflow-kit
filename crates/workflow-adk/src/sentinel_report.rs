@@ -18,6 +18,7 @@ pub enum PreparationReason {
     InvalidUtf8,
     ResourceLimit,
     InvalidPolicy,
+    DeadlineExceeded,
     UnclosedDelimiter,
     UnsupportedLanguage,
     Unattributed,
@@ -60,6 +61,7 @@ impl UntrustedTextReport {
                     | PreparationReason::InvalidUtf8
                     | PreparationReason::ResourceLimit
                     | PreparationReason::InvalidPolicy
+                    | PreparationReason::DeadlineExceeded
                     | PreparationReason::UnclosedDelimiter
             ),
             UntrustedTextState::UnsupportedLanguage => {

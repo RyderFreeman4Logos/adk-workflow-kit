@@ -21,7 +21,7 @@ fn strict_hex_digits_do_not_accept_numeric_sign_syntax() {
 #[test]
 fn carrier_identity_is_exposed_before_analysis() {
     let text = prepared(b"text", NormalizationLimits::default());
-    assert_eq!(text.telemetry()["carrier_version"], "sentinel-carriers-v2");
+    assert_eq!(text.telemetry()["carrier_version"], "sentinel-carriers-v3");
 }
 
 #[test]
@@ -32,6 +32,7 @@ fn candidate_annotation_is_separate_from_optional_decoding_and_retained_bytes() 
         &mut artifacts,
         raw.as_bytes(),
         NormalizationLimits::default(),
+        std::time::Instant::now(),
     )
     .unwrap() else {
         panic!("prepared")
