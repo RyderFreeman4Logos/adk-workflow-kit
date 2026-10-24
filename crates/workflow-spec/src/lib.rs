@@ -1002,8 +1002,8 @@ fn read_source_file(source: &SourcePath) -> Result<Vec<u8>, SpecError> {
 
 /// Reads at most `max_bytes` from a regular file without blocking on special files.
 ///
-/// The read is capped at `max_bytes + 1` so oversized content is detected and
-/// rejected without unbounded allocation.
+/// The read cap is `max_bytes.saturating_add(1)` to detect oversized content
+/// without overflowing at `usize::MAX`.
 pub fn read_bounded_regular_file(
     source: &SourcePath,
     max_bytes: usize,
@@ -1034,7 +1034,7 @@ pub fn read_bounded_regular_file(
     }
 
     let mut bytes = Vec::new();
-    file.take((max_bytes + 1) as u64)
+    file.take(max_bytes.saturating_add(1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| source_read_error(source, error))?;
     if bytes.len() > max_bytes {
