@@ -30,6 +30,7 @@ enum Mode {
     Agree,
     DelayedAgree,
     Fail,
+    FailStatus,
     Pending,
     ToolCall,
     Oversize,
@@ -58,6 +59,8 @@ enum Mode {
     UsageSnapshots,
 }
 
+#[path = "failures.rs"]
+mod failures;
 #[path = "language_admission.rs"]
 mod language_admission;
 #[path = "observations.rs"]
@@ -219,8 +222,13 @@ impl Llm for Probe {
                 }
                 match mode {
                     Mode::Pending => std::future::pending().await,
-                    Mode::Fail if ordinal != 0 => std::future::pending().await,
+                    Mode::Fail | Mode::FailStatus if ordinal != 0 => std::future::pending().await,
                     Mode::Fail => Err(adk_rust::AdkError::agent("raw-secret-do-not-echo")),
+                    Mode::FailStatus => {
+                        let mut error = adk_rust::AdkError::agent("raw-secret-do-not-echo");
+                        error.details.upstream_status_code = Some(429);
+                        Err(error)
+                    }
                     _ => {
                         let mut response = LlmResponse::new(content);
                         let usage = match mode {

@@ -104,13 +104,13 @@ timeout and provider extensions), following the semantic Firewall identity contr
 raw runtime policy is never published. No semantic cache is
 read or written. The preparation key alone is **not** a semantic cache key.
 
-## Executed semantic report v3
+## Executed semantic report v4
 
 Read `preparation.semantics.artifact_id` from the same completion event. This
 content-addressed report has `schema_version`, `version`
-(`sentinel-semantic-probes-v3`), a closed `reason`, `task_alignment`
+(`sentinel-semantic-probes-v4`), a closed `reason`, `task_alignment`
 (`trusted_goal_unavailable`, `not_completed`, or a validated relation below),
-`causal_attribution` (`not_measured`), `findings`, `observations`, and
+`causal_attribution` (`not_measured`), `findings`, `observations`, `failure`, and
 `decision` (shared Sentinel `TypedOutput` or null).
 
 After the unchanged language gate, a fresh ADK graph superstep executes one
@@ -142,6 +142,18 @@ waiting for ADK's deferred error collection. Cancellation of the owning observed
 invocation also drops all probe streams. No branch artifacts/events are published;
 only a complete aggregate or content-free abstention report is committed after
 joining. Previously retained original/envelope/descriptor artifacts remain on failure.
+
+`failure` is null except for `invalid_or_failed`. Its host-created `stage` is
+`invocation`, `graph_execution`, `missing_completed`, `invalid_completed`,
+`task_alignment`, `typed_output`, `reducer_admission`, or `consensus`. Per-probe
+stages carry a zero-based `probe` ordinal in canonical request order. An invocation
+failure retains only the existing closed `kind`, `model_error`, and `output_error`
+classes, optional actual `upstream_status_code`, and validation `attempts`. Schema
+paths/indices, provider messages, prompts, responses, credentials and endpoints are
+excluded. A capacity-one signal retains the first observed failure; concurrent
+observation order is not a complete error inventory or a deterministic global root
+cause. Pending siblings remain cancelled and incomplete accounting remains null.
+These diagnostics do not enable retries, grant quality or establish wire-send counts.
 
 Reduction is canonical ordered → shuffled order → decoded order → task alignment,
 never completion order. It requires every expected source-bound typed finding and unanimous non-Clean

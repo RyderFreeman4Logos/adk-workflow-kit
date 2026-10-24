@@ -468,7 +468,7 @@ The model's `semantic_reason` is separate fallible evidence, never quality autho
 or a final security decision. Existing optional sorting-quality behavior is unchanged.
 
 Sentinel's private calls are reported separately in `sentinel_probe_calls`, sourced
-from the protected version-three semantic artifact, with branch, view, invocation
+from the protected version-four semantic artifact, with branch, view, invocation
 identity, schema hash and six optional raw usage counters. They remain available
 when clean or conflicting findings are discarded. Null accounting is unavailable;
 an empty list means verified language denial; a null per-call usage value means

@@ -9,7 +9,7 @@ use workflow_runtime::{
 };
 
 pub(super) const SOURCE: &str = "examples/03-sentinel-preparation/workflow.toml";
-const SEMANTIC_VERSION: &str = "sentinel-semantic-probes-v3";
+const SEMANTIC_VERSION: &str = "sentinel-semantic-probes-v4";
 #[cfg(test)]
 mod tests;
 
@@ -301,6 +301,8 @@ struct Semantic {
     findings: Vec<Value>,
     decision: Option<Value>,
     observations: Option<Vec<Observation>>,
+    /// Protected diagnostic only; never used to grant quality or model accounting.
+    failure: Option<Value>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -330,7 +332,7 @@ fn project_calls(
     let Some(semantic) = semantic else {
         return Ok(None);
     };
-    if semantic.schema_version != 3
+    if semantic.schema_version != 4
         || semantic.version != SEMANTIC_VERSION
         || semantic.causal_attribution != "not_measured"
         || semantic.task_alignment != "trusted_goal_unavailable"
@@ -347,6 +349,7 @@ fn project_calls(
         .contains(&semantic.reason.as_str())
         || (semantic.reason != "agreement"
             && (!semantic.findings.is_empty() || semantic.decision.is_some()))
+        || (semantic.reason == "invalid_or_failed") != semantic.failure.is_some()
     {
         return Err("invalid Sentinel semantic contract".to_owned());
     }
@@ -389,7 +392,7 @@ fn project_calls(
                 return Err("Sentinel observation binding mismatch".to_owned());
             }
             let mut value = serde_json::to_value(observation).map_err(error)?;
-            value["source"] = json!("protected-semantic-artifact-v3");
+            value["source"] = json!("protected-semantic-artifact-v4");
             value["artifact_id"] = preparation["semantics"]["artifact_id"].clone();
             Ok(value)
         })

@@ -65,7 +65,7 @@ fn sentinel_private_measurement_rebuilds_without_inventing_agent_calls_or_totals
         let calls = report["sentinel_probe_calls"].as_array().unwrap();
         assert_eq!(calls.len(), 2);
         for (call, branch) in calls.iter().zip(["ordered", "shuffled"]) {
-            assert_eq!(call["source"], "protected-semantic-artifact-v3");
+            assert_eq!(call["source"], "protected-semantic-artifact-v4");
             assert_eq!(call["branch"], branch);
             if usage.is_none() {
                 assert!(call["usage"].is_null());
