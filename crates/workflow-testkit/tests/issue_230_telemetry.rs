@@ -21,6 +21,8 @@ mod measured;
 mod semantic;
 #[path = "issue_230_telemetry/sentinel.rs"]
 mod sentinel;
+#[path = "issue_230_telemetry/sentinel_finite.rs"]
+mod sentinel_finite;
 
 fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -138,6 +140,7 @@ fn read_request(socket: &mut TcpStream, deadline: Instant) -> io::Result<Value> 
         bytes.extend_from_slice(&buffer[..count]);
     }
     let mut request: Value = serde_json::from_slice(&bytes[offset..end]).map_err(|_| invalid())?;
+    request["wire_body_bytes"] = json!(length);
     let headers = std::str::from_utf8(&bytes[..offset]).map_err(|_| invalid())?;
     // Finite synthetic observations only; never retain arbitrary authorization bytes.
     let carries = |expected| {

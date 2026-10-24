@@ -27,6 +27,20 @@ fn measured(
 }
 
 #[test]
+fn sentinel_finite_request_size_uses_original_http_content_length() {
+    let (_, output, requests) = measured(None, false);
+    success(output);
+    for request in requests.unwrap()["wire_requests"].as_array().unwrap() {
+        assert!(
+            request["wire_body_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 0 && bytes <= 16_384),
+            "finite admission requires the original HTTP body size"
+        );
+    }
+}
+
+#[test]
 fn sentinel_private_measurement_rebuilds_without_inventing_agent_calls_or_totals() {
     for usage in [
         None,
