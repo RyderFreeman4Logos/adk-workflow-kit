@@ -20,9 +20,9 @@ issue-323-release-consumer:
 clippy:
     {{_io}} cargo +1.98.0 clippy --workspace --all-targets --locked -- -D warnings
 
-test:
+test: issue-233-worker-binaries
     {{_io}} cargo +1.98.0 build -p workflowctl --locked
-    {{_io}} cargo +1.98.0 test --workspace --exclude workflow-adk --locked -- --test-threads=2
+    ADK_WORKER_INHERITED_CANARY=issue-233-fixed-test-only {{_io}} cargo +1.98.0 test --workspace --exclude workflow-adk --locked -- --test-threads=2
     {{_io}} cargo +1.98.0 test -p workflow-adk --locked -- --test-threads=1
     ./target/debug/workflowctl test crates/workflowctl/tests/fixtures/cli004-test.json
     ./target/debug/workflowctl eval crates/workflowctl/tests/fixtures/cli004-eval.json
@@ -253,6 +253,19 @@ issue-233-adk:
 
 issue-233-doc:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --doc behavioral --locked
+
+# Exact fixed binaries for the #233 worker and its separate OS-negative fixture.
+issue-233-worker-binaries:
+    {{_io}} cargo +1.98.0 build -p workflow-runtime --bin sentinel-probe-worker -p workflow-testkit --bin issue-233-boundary-child --locked
+    sha256sum target/debug/issue-233-boundary-child > target/debug/issue-233-boundary-child.sha256
+
+issue-233-worker test_name="": issue-233-worker-binaries
+    ADK_WORKER_INHERITED_CANARY=issue-233-fixed-test-only {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_233_worker {{test_name}} --locked -- --nocapture --test-threads=1
+
+# Existing authored shell/sandbox contracts must retain their own runtime view.
+issue-233-worker-sandbox:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --lib bubblewrap::supervision::tests --locked -- --nocapture --test-threads=1
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test bubblewrap_backend_contracts --test bubblewrap_conformance --locked -- --nocapture --test-threads=1
 
 # Focused #234 default-off canonical trajectory observer (offline fixtures only).
 issue-234-runtime:

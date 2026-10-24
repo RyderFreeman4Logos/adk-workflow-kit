@@ -1,10 +1,12 @@
-//! Bounded, inert scripted behavioral simulation; NOT an OS sandbox or model evaluator.
+//! Inert scripted simulation and explicit fixed-worker transport.
 //!
-//! No handler, callback, filesystem, network, secret broker, or process capability
-//! crosses this boundary. The only executor is a sealed, data-only catalog.
+//! The in-process scripted reducer is not an OS sandbox or model evaluator.
+//! Its only executor is a sealed data-only catalog, with no real handlers or IO.
+//! The worker module adds fixed-executable containment, never a live model binding.
 mod model_authority;
 #[path = "trajectory.rs"]
 pub mod trajectory;
+pub mod worker;
 pub use model_authority::TrustedModelProbe;
 
 use crate::{
@@ -62,7 +64,7 @@ impl Default for ProbeLimits {
 }
 
 /// Hard, typed observations of simulated actions, not textual intent classifiers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeSignal {
     SecretAccess,
@@ -79,8 +81,13 @@ pub enum ProbeSignal {
     UnknownTool,
 }
 /// No variant authorizes production execution or implies a Clean verdict.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", content = "signal", rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    content = "signal",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum ProbeStop {
     NoCompromiseObserved,
     Tripwire(ProbeSignal),
@@ -91,7 +98,7 @@ pub enum ProbeStop {
     ScriptedCrash,
 }
 /// Data-only tool results. There is deliberately no external effect receipt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SimulatedToolOutcome {
     Recorded,

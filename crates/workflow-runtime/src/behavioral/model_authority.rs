@@ -37,6 +37,10 @@ impl fmt::Debug for TrustedModelProbe {
 }
 
 impl TrustedModelProbe {
+    pub(super) fn limits(&self) -> ProbeLimits {
+        self.limits
+    }
+
     /// Approves a run-neutral contract using authenticated host metadata only.
     /// Both digests use `sha256:` plus 64 lowercase hex bytes. The route digest
     /// describes the approved binding; it is not physical provider attestation.
