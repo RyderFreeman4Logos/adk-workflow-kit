@@ -1,0 +1,49 @@
+schema_version = 1
+[workflow]
+id = "shared-cycle"
+version = "1"
+entry = "work"
+
+[[nodes]]
+id = "work"
+kind = "agent"
+model = { role = "worker", id = "worker", version = "1" }
+max_visits = 3
+instruction = { path = "prompt.md", sha256 = "sha256:f90ac2d28268aab5391d8cfbc9ef9edcb7cdb694d20f4cb0958a4a938dcf9b14" }
+input = { state_keys = ["input", "node:revise"] }
+output = { state_key = "node:work", schema = "output.json" }
+session = "shared"
+
+[[nodes]]
+id = "revise"
+kind = "agent"
+model = { role = "worker", id = "worker", version = "1" }
+max_visits = 1
+instruction = { path = "prompt.md", sha256 = "sha256:f90ac2d28268aab5391d8cfbc9ef9edcb7cdb694d20f4cb0958a4a938dcf9b14" }
+input = { state_keys = ["input", "node:revise"] }
+output = { state_key = "node:revise", schema = "output.json" }
+session = "shared"
+
+[[nodes]]
+id = "done"
+kind = "terminal"
+[[edges]]
+from = "revise"
+to = "work"
+[[routes]]
+from = "work"
+predicate = { id = "coverage.decision@v1", version = "1.0.0" }
+cases = { insufficient = "revise", sufficient = "done", impossible = "done" }
+[state]
+schema_id = "shared-cycle"
+schema_version = "1"
+required_keys = ["input"]
+[state.keys.input]
+schema_id = "json"
+schema_version = "1"
+[state.keys."node:work"]
+schema_id = "json"
+schema_version = "1"
+[state.keys."node:revise"]
+schema_id = "json"
+schema_version = "1"

@@ -17,3 +17,11 @@ Source input is bounded. Unknown fields, malformed values, unsupported schema ve
 Validator entry nodes may declare a versioned `firewall` invocation identity. The compiler and ADK translator require the exact trusted binding and never fall back to an ordinary validator. See [FIREWALL.md](FIREWALL.md).
 
 See [NODE_RESULT_CACHE.md](NODE_RESULT_CACHE.md) for the production node-result cache identity and replay dispositions.
+
+## Authored agent sessions
+
+An explicit `session = "isolated"` gives each node visit a fresh model conversation. An explicit `session = "shared"` grants access to the workflow run's previously accepted Shared turns: each turn contains only that node's mapped input and validated public output. Previous instructions, schemas, tool calls/results, and Isolated reviewer conversations are excluded. Current instructions and schemas remain local to each invocation. Uncontracted nodes keep their existing behavior.
+
+Shared visits serialize within their run; unrelated Isolated nodes and separate run identities retain their concurrency. Re-entering a node prepares its new mapped input once while preserving cumulative model/tool budgets and effect replay. Request/cache identity includes the effective history. The existing loop ledger binds accepted order and pending visit ownership to the checkpoint generation; supported execution-backend resume rebuilds the ADK session from that exact generation before effects. Reusing a run ID for a new graph invocation does not inherit an earlier invocation's history.
+
+Shared requires recoverable raw history. Profiles that redact raw loop history because they contain Skill packages are rejected before model/tool effects, rather than silently running Isolated. Generic caller-provided SDK checkpointers do not contain the Kit's accepted-turn ledger and are unsupported for Shared; use the execution backend for durable resume. SDK tool-confirmation events are never accepted Shared turns. Kit does not expose SDK confirmation pause/resume as an approval API: injected agents that request it fail the graph without executing the guarded tool. This is separate from the supported call-scoped ToolBridge/Firewall approval and durable-receipt contract.

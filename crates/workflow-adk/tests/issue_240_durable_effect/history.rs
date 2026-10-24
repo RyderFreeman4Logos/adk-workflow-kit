@@ -185,7 +185,7 @@ fn historical_audit_unavailability_keeps_verified_and_failed_snapshots() {
             .expect("run");
             let audit = serde_json::to_value(&receipt).expect("receipt")["effect_audits"].clone();
             let ledger = read_json(&receipt.run_root().join("loop-ledger.json"));
-            assert_eq!(ledger["schema_version"], json!(6));
+            assert_eq!(ledger["schema_version"], json!(7));
             assert_eq!(
                 ledger["nodes"]["work"]["completed_calls"][0]["call"]["effect"],
                 audit[0]
