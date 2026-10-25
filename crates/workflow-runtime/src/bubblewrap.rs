@@ -8,12 +8,14 @@
 //! unshared by default; network requests fail closed until a destination
 //! allowlist can be enforced.
 
+mod lifecycle;
 mod supervision;
 
+use lifecycle::ProcessOwner;
+
 use supervision::{
-    OutputBudget, ReapOutcome, WaitProgress, child_starttime, join_pipe_reader, join_stdin_writer,
-    matching_group_uninterruptible_io, receipt_exit_code, spawn_pipe_reader, spawn_stdin_writer,
-    terminate_and_reap, timed_out_status, wait_progress,
+    OutputBudget, ReapOutcome, WaitProgress, child_starttime, cleanup_deadline,
+    matching_group_uninterruptible_io, receipt_exit_code, timed_out_status, wait_progress,
 };
 
 use std::{
@@ -375,78 +377,22 @@ impl LinuxBubblewrapBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = command
-            .spawn()
+        let mut process = ProcessOwner::spawn(&mut command, staged_output)
             .map_err(|source| BubblewrapError::Spawn { source })?;
-        let process_group = child.id();
-        let stdout_pipe = match child.stdout.take() {
-            Some(pipe) => pipe,
-            None => {
-                let _ = terminate_and_reap(
-                    &mut child,
-                    process_group,
-                    child_starttime(process_group),
-                    request.wall_time,
-                );
-                return Err(BubblewrapError::Run {
-                    source: io::Error::other("bubblewrap stdout pipe was not captured"),
-                });
-            }
-        };
-        let stderr_pipe = match child.stderr.take() {
-            Some(pipe) => pipe,
-            None => {
-                let _ = terminate_and_reap(
-                    &mut child,
-                    process_group,
-                    child_starttime(process_group),
-                    request.wall_time,
-                );
-                return Err(BubblewrapError::Run {
-                    source: io::Error::other("bubblewrap stderr pipe was not captured"),
-                });
-            }
-        };
+        let process_group = process.child().id();
         let output_budget = request.output_limit.map(OutputBudget::new).map(Arc::new);
-        let stdout_reader = spawn_pipe_reader(stdout_pipe, output_budget.clone());
-        let stderr_reader = spawn_pipe_reader(stderr_pipe, output_budget.clone());
-        let stdin_writer = match request.stdin.as_ref() {
-            Some(bytes) => match child.stdin.take() {
-                Some(pipe) => Some(spawn_stdin_writer(pipe, bytes.clone())),
-                None => {
-                    let _ = terminate_and_reap(
-                        &mut child,
-                        process_group,
-                        child_starttime(process_group),
-                        request.wall_time,
-                    );
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    return Err(BubblewrapError::Run {
-                        source: io::Error::other("bubblewrap stdin pipe was not captured"),
-                    });
-                }
-            },
-            None => None,
-        };
+        if let Err(error) = process.capture(output_budget.clone(), request.stdin.as_deref()) {
+            return Err(process.abort(error, request.wall_time));
+        }
         if let Err(source) = publish_host_pid_witness(request, process_group) {
-            let _ = terminate_and_reap(
-                &mut child,
-                process_group,
-                child_starttime(process_group),
-                request.wall_time,
-            );
-            join_stdin_writer(stdin_writer);
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(BubblewrapError::Run { source });
+            return Err(process.abort(BubblewrapError::Run { source }, request.wall_time));
         }
 
         let recorded_starttime = child_starttime(process_group);
         let wall_deadline = request.wall_time.map(|limit| Instant::now() + limit);
         let mut d_state_deadline = None;
-        let outcome = loop {
-            match child.try_wait() {
+        let (outcome, settlement_deadline) = loop {
+            match process.child().try_wait() {
                 Ok(reaped) => match wait_progress(
                     reaped,
                     matching_group_uninterruptible_io(process_group, recorded_starttime),
@@ -458,28 +404,17 @@ impl LinuxBubblewrapBackend {
                         .is_some_and(|budget| budget.exceeded()),
                     request.wall_time,
                 ) {
-                    WaitProgress::Reaped(status) => break ReapOutcome::Reaped(status),
-                    WaitProgress::Poll => thread::sleep(Duration::from_millis(10)),
-                    WaitProgress::Kill => {
-                        break terminate_and_reap(
-                            &mut child,
-                            process_group,
-                            recorded_starttime,
-                            request.wall_time,
+                    WaitProgress::Reaped(status) => {
+                        break (
+                            ReapOutcome::Reaped(status),
+                            wall_deadline.unwrap_or_else(cleanup_deadline),
                         );
                     }
+                    WaitProgress::Poll => thread::sleep(Duration::from_millis(10)),
+                    WaitProgress::Kill => break process.terminate(request.wall_time),
                 },
                 Err(source) => {
-                    let _ = terminate_and_reap(
-                        &mut child,
-                        process_group,
-                        recorded_starttime,
-                        request.wall_time,
-                    );
-                    join_stdin_writer(stdin_writer);
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    return Err(BubblewrapError::Run { source });
+                    return Err(process.abort(BubblewrapError::Run { source }, request.wall_time));
                 }
             }
         };
@@ -489,19 +424,17 @@ impl LinuxBubblewrapBackend {
             ReapOutcome::Unreaped => timed_out_status(),
         };
 
-        join_stdin_writer(stdin_writer);
-        let stdout = join_pipe_reader(stdout_reader)?;
-        let stderr = join_pipe_reader(stderr_reader)?;
+        let captured = process.settle(outcome, settlement_deadline)?;
         if output_budget.is_some_and(|budget| budget.exceeded()) {
             return Err(BubblewrapError::OutputLimitExceeded);
         }
-        let staged_output = status.success().then_some(staged_output).flatten();
+        let staged_output = status.success().then_some(captured.staged_output).flatten();
 
         Ok(BubblewrapReceipt {
             status,
             exit_code,
-            stdout,
-            stderr,
+            stdout: captured.stdout,
+            stderr: captured.stderr,
             staged_output,
         })
     }

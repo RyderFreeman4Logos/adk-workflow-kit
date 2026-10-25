@@ -273,6 +273,13 @@ issue-233-worker-sandbox:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --lib bubblewrap::supervision::tests --locked -- --nocapture --test-threads=1
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test bubblewrap_backend_contracts --test bubblewrap_conformance --locked -- --nocapture --test-threads=1
 
+# Bounded child/pipe settlement and FIFO failure-path ownership regressions.
+issue-380-runtime test_name="bubblewrap::lifecycle::tests":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --lib {{test_name}} --locked -- --nocapture --test-threads=1
+
+issue-378-fifo test_name="":
+    {{_io}} cargo +1.98.0 test -p workflowctl --test cli003_run_explain_run {{test_name}} --locked -- --nocapture --test-threads=1
+
 # Focused #234 default-off canonical trajectory observer (offline fixtures only).
 issue-234-runtime:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_234_trajectory --locked -- --nocapture

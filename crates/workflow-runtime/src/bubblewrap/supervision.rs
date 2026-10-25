@@ -89,6 +89,10 @@ pub(super) fn join_pipe_reader(
 const D_STATE_REAP_TIMEOUT: Duration = Duration::from_secs(30);
 const CLEANUP_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
+pub(super) fn cleanup_deadline() -> Instant {
+    Instant::now() + CLEANUP_REAP_TIMEOUT
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReapOutcome {
     Reaped(ExitStatus),
@@ -328,8 +332,8 @@ pub(super) fn terminate_and_reap(
     process_group: u32,
     recorded_starttime: Option<u64>,
     wall_time: Option<Duration>,
+    cleanup_deadline: Instant,
 ) -> ReapOutcome {
-    let cleanup_deadline = Instant::now() + CLEANUP_REAP_TIMEOUT;
     let mut d_state_deadline = None;
     let mut kill_sent = false;
     loop {
@@ -355,7 +359,7 @@ pub(super) fn terminate_and_reap(
     }
 }
 
-fn kill_process_group(process_group: u32) -> io::Result<()> {
+pub(super) fn kill_process_group(process_group: u32) -> io::Result<()> {
     let process_group = i32::try_from(process_group).map_err(|_| {
         io::Error::new(io::ErrorKind::InvalidInput, "process group ID is too large")
     })?;
