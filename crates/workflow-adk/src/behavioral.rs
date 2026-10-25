@@ -22,6 +22,8 @@ use workflow_runtime::behavioral::{BEHAVIORAL_VERSION, BehavioralProbe, ProbeRep
 use workflow_runtime::behavioral::{ProbeLimits, TrustedScript};
 use workflow_runtime::{ArtifactId, ArtifactStore, CanonicalUntrustedText, RunId};
 
+pub(crate) mod model_probe;
+
 impl AdkGraphTranslator {
     /// Consume the same live host capability checked by compilation. No JSON identity
     /// can substitute for it. Rebinding and non-opted plans are rejected.

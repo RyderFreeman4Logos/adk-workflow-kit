@@ -805,6 +805,34 @@ impl ModelProfileRegistry {
     pub fn contains(&self, identity: &ModelProfileIdentity) -> bool {
         self.profiles.contains_key(identity)
     }
+
+    pub(crate) fn probe_profile(
+        &self,
+        identity: &ModelProfileIdentity,
+    ) -> Result<(&ModelProfile, ModelProfile), ModelProfileError> {
+        let original = self
+            .profiles
+            .get(identity)
+            .ok_or_else(ModelProfileError::missing)?;
+        Self::validate_entry(identity, original)?;
+        let runtime = original.runtime();
+        if !runtime.provider_extensions().is_empty()
+            || runtime.tool_parser().is_some()
+            || runtime.tool_template().is_some()
+        {
+            return Err(ModelProfileError::invalid());
+        }
+        let runtime = runtime
+            .clone()
+            .with_provider_extension("openai", serde_json::json!({"reasoning_effort":"low"}));
+        let mut effective = original.clone();
+        match &mut effective {
+            ModelProfile::Fake(profile) => profile.runtime = runtime,
+            ModelProfile::OpenAiCompatible(profile) => profile.runtime = runtime,
+        }
+        Ok((original, effective))
+    }
+
     /// Rejects non-finite sampling policy before creating any live model binding.
     pub fn bind(
         &self,

@@ -71,6 +71,7 @@ pub enum ModelRouteSnapshotErrorKind {
     DuplicateCandidate,
     MissingProfile,
     InvalidRegistry,
+    InvalidProbeContract,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +117,36 @@ impl Clone for ModelRouteSnapshot {
 }
 
 impl ModelRouteSnapshot {
+    /// Pure identity of the complete selected original/effective declaration and
+    /// fixed probe contract. Performs no IO or approval; the embedding host must
+    /// authenticate this declaration against independently owned policy.
+    pub fn probe_declaration_digest(&self) -> Result<String, ModelRouteSnapshotError> {
+        self.probe_declaration().map(|(_, digest)| digest)
+    }
+
+    fn probe_declaration(
+        &self,
+    ) -> Result<(crate::model_profiles::ModelProfile, String), ModelRouteSnapshotError> {
+        let invalid = || ModelRouteSnapshotError {
+            kind: ModelRouteSnapshotErrorKind::InvalidProbeContract,
+        };
+        if self.candidates.len() != 1 {
+            return Err(invalid());
+        }
+        let candidate = self.candidates.first().ok_or_else(invalid)?;
+        let (original, effective) = self
+            .registry
+            .probe_profile(candidate.profile())
+            .map_err(|_| invalid())?;
+        let material = serde_json::json!({
+            "role":candidate.role(), "profile":candidate.profile(),
+            "original":original, "effective":effective,
+            "contract":crate::behavioral::model_probe::declaration_contract(),
+        });
+        let digest = super::digest(super::canonical_json(&material).as_bytes());
+        Ok((effective, digest))
+    }
+
     pub fn new(
         registry: ModelProfileRegistry,
         candidates: impl IntoIterator<Item = ModelRouteCandidate>,

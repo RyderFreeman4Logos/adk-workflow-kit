@@ -255,6 +255,10 @@ issue-233-runtime:
 issue-233-adk:
     {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_233_behavioral --test issue_233_translation --locked -- --nocapture --test-threads=1
 
+# Public host route, real compatible SDK wire, and sealed inert worker boundary.
+issue-233-model-worker test_name="": issue-233-worker-binaries
+    {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_233_model_worker {{test_name}} --locked -- --nocapture --test-threads=1
+
 issue-233-doc:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --doc behavioral --locked
 
