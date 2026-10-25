@@ -156,7 +156,7 @@ pub(crate) fn output_schema() -> Value {
 
 pub(crate) fn declaration_contract() -> Value {
     json!({
-        "sdk_revision":"9761d14823008a96a558716e4883ac118d9143ff",
+        "sdk_revision":"3e9855cadee27cc38a761c70ea6cff8e8e9a0a46",
         "sdk_version":crate::ADK_RUST_VERSION,
         "adapter_version":"model-profile-binding-v1",
         "probe_version":"sentinel-host-model-probe-contract-v1",

@@ -38,7 +38,7 @@ dependencies = [
 [[package]]
 name = "adk-core"
 version = "2.3.0"
-source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=9761d14823008a96a558716e4883ac118d9143ff#9761d14823008a96a558716e4883ac118d9143ff"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=3e9855cadee27cc38a761c70ea6cff8e8e9a0a46#3e9855cadee27cc38a761c70ea6cff8e8e9a0a46"
 dependencies = [
  "async-trait",
  "chrono",
@@ -54,7 +54,7 @@ dependencies = [
 [[package]]
 name = "adk-graph"
 version = "2.3.0"
-source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=9761d14823008a96a558716e4883ac118d9143ff#9761d14823008a96a558716e4883ac118d9143ff"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=3e9855cadee27cc38a761c70ea6cff8e8e9a0a46#3e9855cadee27cc38a761c70ea6cff8e8e9a0a46"
 dependencies = [
  "adk-core",
  "async-stream",
@@ -89,10 +89,10 @@ dependencies = [
 [[package]]
 name = "adk-model"
 version = "2.3.0"
-source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=9761d14823008a96a558716e4883ac118d9143ff#9761d14823008a96a558716e4883ac118d9143ff"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=3e9855cadee27cc38a761c70ea6cff8e8e9a0a46#3e9855cadee27cc38a761c70ea6cff8e8e9a0a46"
 dependencies = [
  "adk-core",
- "adk-telemetry 2.3.0 (git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=9761d14823008a96a558716e4883ac118d9143ff)",
+ "adk-telemetry 2.3.0 (git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=3e9855cadee27cc38a761c70ea6cff8e8e9a0a46)",
  "anyhow",
  "async-openai",
  "async-stream",
@@ -182,7 +182,7 @@ dependencies = [
 [[package]]
 name = "adk-telemetry"
 version = "2.3.0"
-source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=9761d14823008a96a558716e4883ac118d9143ff#9761d14823008a96a558716e4883ac118d9143ff"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=3e9855cadee27cc38a761c70ea6cff8e8e9a0a46#3e9855cadee27cc38a761c70ea6cff8e8e9a0a46"
 dependencies = [
  "thiserror",
  "tracing",
@@ -3661,4 +3661,4 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[patch.unused]]
 name = "adk-action"
 version = "2.3.0"
-source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=9761d14823008a96a558716e4883ac118d9143ff#9761d14823008a96a558716e4883ac118d9143ff"
+source = "git+https://github.com/RyderFreeman4Logos/adk-rust.git?rev=3e9855cadee27cc38a761c70ea6cff8e8e9a0a46#3e9855cadee27cc38a761c70ea6cff8e8e9a0a46"
