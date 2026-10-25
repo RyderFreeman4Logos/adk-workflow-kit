@@ -2339,83 +2339,274 @@ mod retry_admission_tests {
         let _ = server.join();
     }
 
-    #[test]
-    fn openai_compatible_retry_keeps_absolute_deadline() {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RetryFixtureSchedule {
+        Retry,
+        FirstRequestExpires,
+        ClientPanics,
+    }
+
+    struct RetryFixtureAbort<'a>(&'a std::sync::atomic::AtomicBool);
+
+    impl Drop for RetryFixtureAbort<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    // Support only this retry fixture. The abort flag makes a failing oracle joinable.
+    fn serve_retry_deadline_fixture(
+        listener: std::net::TcpListener,
+        release: std::sync::mpsc::Receiver<()>,
+        first_request: tokio::sync::oneshot::Sender<()>,
+        abort: &std::sync::atomic::AtomicBool,
+        requests: &std::sync::atomic::AtomicUsize,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<usize> {
         use std::io::{Read, Write};
+        use std::sync::mpsc::RecvTimeoutError;
+        use std::time::Instant;
+
+        let remaining = || {
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|duration| !duration.is_zero())
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))
+        };
+        let mut first_request = Some(first_request);
+        'attempts: for attempt in 0..2 {
+            let (mut socket, _) = loop {
+                if abort.load(Ordering::Acquire) {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                // Client settlement closes the control channel; progress never renews the budget.
+                match release.try_recv() {
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'attempts,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Ok(()) => return Err(std::io::ErrorKind::InvalidData.into()),
+                }
+                remaining()?;
+                match listener.accept() {
+                    Ok(peer) => break peer,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            requests.fetch_add(1, Ordering::AcqRel);
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            loop {
+                socket.set_read_timeout(Some(remaining()?))?;
+                let bytes = socket.read(&mut buffer)?;
+                remaining()?;
+                if bytes == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                request.extend_from_slice(&buffer[..bytes]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            if attempt == 0 {
+                first_request
+                    .take()
+                    .expect("first request notification")
+                    .send(())
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::ConnectionAborted))?;
+                match release.recv_timeout(remaining()?) {
+                    Ok(()) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                }
+                socket.set_write_timeout(Some(remaining()?))?;
+                // An already expired client may have closed its first connection.
+                let _ = socket.write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n",
+                );
+                continue;
+            }
+            let partial = r#"{"choices":[{"message":{"role":"assistant","content":""#;
+            socket.set_write_timeout(Some(remaining()?))?;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2048\r\nconnection: close\r\n\r\n{partial}"
+            )?;
+            socket.flush()?;
+            match release.recv_timeout(remaining()?) {
+                Err(RecvTimeoutError::Disconnected) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+                Ok(()) => return Err(std::io::ErrorKind::InvalidData.into()),
+            }
+        }
+        match listener.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Ok(requests.load(Ordering::Acquire))
+            }
+            Ok(_) => {
+                requests.fetch_add(1, Ordering::AcqRel);
+                Err(std::io::ErrorKind::AlreadyExists.into())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn run_retry_deadline_fixture(schedule: RetryFixtureSchedule) {
         use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::mpsc;
         use std::time::Instant;
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
         let address = listener.local_addr().expect("addr");
-        let server = std::thread::spawn(move || {
-            for attempt in 0..2 {
-                let Ok((mut socket, _)) = listener.accept() else {
-                    return;
-                };
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("read timeout");
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 8192];
-                while let Ok(bytes) = socket.read(&mut buffer) {
-                    if bytes == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&buffer[..bytes]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                if attempt == 0 {
-                    std::thread::sleep(Duration::from_millis(600));
-                    let _ = write!(
-                        socket,
-                        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n"
-                    );
-                    continue;
-                }
-                let partial = r#"{"choices":[{"message":{"role":"assistant","content":""#;
-                let _ = write!(
-                    socket,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2048\r\nconnection: close\r\n\r\n{partial}"
-                );
-                let _ = socket.flush();
-                std::thread::sleep(Duration::from_secs(3));
-            }
-        });
-
-        tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("runtime")
-            .block_on(async {
-                let profile = OpenAiCompatibleProfile::new(
-                    "worker",
-                    "1",
-                    "oracle",
-                    format!("http://{address}/v1"),
-                    CredentialHandle::SecretProvider("fixture-key".to_owned()),
-                )
-                .with_runtime(
-                    ModelRuntimeConfig::default().with_timeout(Duration::from_millis(1_000)),
+            .expect("runtime");
+        let profile = OpenAiCompatibleProfile::new(
+            "worker",
+            "1",
+            "oracle",
+            format!("http://{address}/v1"),
+            CredentialHandle::SecretProvider("fixture-key".to_owned()),
+        )
+        .with_runtime(ModelRuntimeConfig::default().with_timeout(Duration::from_millis(1_000)));
+        let registry = ModelProfileRegistry::new().with_worker(profile).unwrap();
+        let binding = registry
+            .bind_worker(&CredentialBroker::new().with_secret_provider(Arc::new(FixtureSecrets)))
+            .unwrap();
+        let abort = AtomicBool::new(false);
+        let requests = AtomicUsize::new(0);
+        let (release, released) = mpsc::channel();
+        let (first_request, admitted) = tokio::sync::oneshot::channel();
+        let (completed, completion) = mpsc::sync_channel(1);
+        // One absolute fixture budget also bounds cleanup observation; it never renews.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        std::thread::scope(|scope| {
+            let release = release;
+            let _abort_on_unwind = RetryFixtureAbort(&abort);
+            let abort = &abort;
+            let requests = &requests;
+            let server = scope.spawn(move || {
+                let result = serve_retry_deadline_fixture(
+                    listener,
+                    released,
+                    first_request,
+                    abort,
+                    requests,
+                    deadline,
                 );
-                let registry = ModelProfileRegistry::new().with_worker(profile).unwrap();
-                let binding = registry
-                    .bind_worker(
-                        &CredentialBroker::new().with_secret_provider(Arc::new(FixtureSecrets)),
-                    )
-                    .unwrap();
-                let request =
-                    LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
-                let started = Instant::now();
-                let error = expect_profile_timeout(&binding, request).await;
-                assert!(
-                    started.elapsed() < Duration::from_millis(1_400),
-                    "elapsed {:?}",
-                    started.elapsed()
-                );
-                assert_eq!(error.category, ErrorCategory::Timeout);
+                let _ = completed.send(());
+                result
             });
-        let _ = server.join();
+            let client = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(async {
+                    let request =
+                        LlmRequest::new("ignored", vec![Content::new("user").with_text("hello")]);
+                    let started = Instant::now();
+                    let first_response = async {
+                        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), admitted)
+                            .await
+                            .expect("fixture admission deadline")
+                            .expect("actual first request admission");
+                        if schedule == RetryFixtureSchedule::ClientPanics {
+                            std::panic::panic_any("issue382 client sentinel");
+                        }
+                        if schedule == RetryFixtureSchedule::Retry {
+                            tokio::time::sleep(Duration::from_millis(600)).await;
+                            release.send(()).expect("first429 release");
+                        }
+                    };
+                    let (error, ()) =
+                        tokio::join!(expect_profile_timeout(&binding, request), first_response,);
+                    let elapsed = started.elapsed();
+                    assert!(
+                        elapsed < Duration::from_millis(1_400),
+                        "elapsed {elapsed:?}"
+                    );
+                    assert_eq!(error.category, ErrorCategory::Timeout);
+                    if schedule == RetryFixtureSchedule::FirstRequestExpires {
+                        assert!(
+                            elapsed >= Duration::from_millis(1_000),
+                            "elapsed {elapsed:?}"
+                        );
+                    }
+                    elapsed
+                })
+            }));
+            let release_ok = schedule != RetryFixtureSchedule::FirstRequestExpires
+                || client.is_err()
+                || release.send(()).is_ok();
+            drop(release);
+            let observed =
+                completion.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+            if observed.is_err() {
+                abort.store(true, Ordering::Release);
+            }
+            let server = server.join().expect("retry fixture checked join");
+            let count = requests.load(Ordering::Acquire);
+            eprintln!(
+                "issue382 {schedule:?}: requests={count} completion_before_abort={} joined=true server={:?}",
+                observed.is_ok(),
+                server.as_ref().map(|_| ()).map_err(|error| error.kind()),
+            );
+            drop(TcpListener::bind(address).expect("joined retry listener released"));
+            assert!(release_ok, "fixture first-response release failed");
+            if schedule == RetryFixtureSchedule::FirstRequestExpires
+                && client.is_ok()
+                && count == 1
+                && matches!(observed, Err(mpsc::RecvTimeoutError::Timeout))
+                && server
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::Interrupted)
+            {
+                panic!(
+                    "retry fixture waited for an absent second request; abort completed checked join"
+                );
+            }
+            observed.expect("fixture cleanup observation failure, not semantic RED");
+            let served =
+                server.expect("fixture must settle on client completion, not deadline/abort");
+            if let Err(panic) = client {
+                std::panic::resume_unwind(panic);
+            }
+            let expected = if schedule == RetryFixtureSchedule::Retry {
+                2
+            } else {
+                1
+            };
+            assert_eq!(served, expected, "genuine SDK request count");
+            assert_eq!(count, expected, "no extra physical request");
+        });
+    }
+
+    #[test]
+    fn openai_compatible_retry_keeps_absolute_deadline() {
+        run_retry_deadline_fixture(RetryFixtureSchedule::Retry);
+    }
+
+    #[test]
+    fn issue_382_retry_fixture_joins_on_first_request_expiry() {
+        run_retry_deadline_fixture(RetryFixtureSchedule::FirstRequestExpires);
+    }
+
+    #[test]
+    fn issue_382_retry_fixture_joins_and_preserves_client_panic() {
+        let panic = std::panic::catch_unwind(|| {
+            run_retry_deadline_fixture(RetryFixtureSchedule::ClientPanics);
+        })
+        .expect_err("client panic must survive checked server join");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"issue382 client sentinel")
+        );
     }
 }
