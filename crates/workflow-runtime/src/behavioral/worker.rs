@@ -96,6 +96,11 @@ impl SealedProbeWorker {
             digest: expected_sha256.to_owned(),
         })
     }
+    /// Content identity of the authenticated, sealed deployment; no executable access.
+    pub fn deployment_digest(&self) -> &str {
+        &self.digest
+    }
+
     /// Observe one batch under an already authenticated, run-neutral host approval.
     /// This does not bind a live model route, enable translation, issue a canary,
     /// publish evidence, or grant a Sentinel verdict. Callers must not treat the
@@ -108,22 +113,13 @@ impl SealedProbeWorker {
     ) -> Result<UnpublishedWorkerReport, WorkerError> {
         let batch = ModelBatch::parse(batch)?;
         let limits = approval.limits();
-        // Stable scope excludes the growing batch; its independent digest is below.
-        let scope = digest(
-            &serde_json::to_vec(&serde_json::json!({
-                "domain":"sentinel-model-worker-v1", "protocol":PROTOCOL,
-                "approval":approval.identity(), "run":workdir.run_id(),
-                "worker":self.digest, "tools":PROBE_TOOL_CATALOG,
-            }))
-            .map_err(|_| WorkerError::InvalidEnvelope)?,
-        );
-        let input = WorkerRequest {
-            protocol: PROTOCOL,
-            scope,
-            max_steps: limits.max_steps,
-            timeout_ms: limits.timeout_ms,
+        let input = recorded_request(
+            &approval.identity(),
+            workdir.run_id().as_str(),
+            &self.digest,
+            limits,
             batch,
-        };
+        )?;
         let expected = evaluate(&input, None)?;
         let bytes = serde_json::to_vec(&input).map_err(|_| WorkerError::InvalidEnvelope)?;
         let request = BubblewrapRequest::sealed_probe_worker(self.executable, workdir)
@@ -259,6 +255,67 @@ struct WorkerReply {
     prefix_digest: String,
     events: Vec<WorkerEvent>,
     stop: ProbeStop,
+}
+
+/// Reconstruct a recorded content-free result without approval, IO, model calls,
+/// worker execution or authority. All identities are historical claims: the caller
+/// must authenticate the enclosing artifact ID. Strict parsing and evaluation are
+/// shared with live admission, including scope, proposal and prefix digests.
+pub fn verify_recorded_batch(
+    approval_identity: &str,
+    run_id: &str,
+    deployment_digest: &str,
+    limits: super::ProbeLimits,
+    batch: &[u8],
+    report: &str,
+) -> Result<(), WorkerError> {
+    let input = recorded_request(
+        approval_identity,
+        run_id,
+        deployment_digest,
+        limits,
+        ModelBatch::parse(batch)?,
+    )?;
+    if report.len() > OUTPUT_BYTES.get() as usize {
+        return Err(WorkerError::InvalidReport);
+    }
+    let actual: WorkerReply =
+        serde_json::from_str(report).map_err(|_| WorkerError::InvalidReport)?;
+    if actual != evaluate(&input, None)? {
+        return Err(WorkerError::InvalidReport);
+    }
+    Ok(())
+}
+
+fn recorded_request(
+    approval: &str,
+    run: &str,
+    worker: &str,
+    limits: super::ProbeLimits,
+    batch: ModelBatch,
+) -> Result<WorkerRequest, WorkerError> {
+    if !valid_digest(approval)
+        || !valid_digest(worker)
+        || run.trim().is_empty()
+        || run.len() > 256
+        || limits.validate().is_err()
+    {
+        return Err(WorkerError::InvalidEnvelope);
+    }
+    let scope = digest(
+        &serde_json::to_vec(&serde_json::json!({
+            "domain":"sentinel-model-worker-v1", "protocol":PROTOCOL,
+            "approval":approval, "run":run, "worker":worker, "tools":PROBE_TOOL_CATALOG,
+        }))
+        .map_err(|_| WorkerError::InvalidEnvelope)?,
+    );
+    Ok(WorkerRequest {
+        protocol: PROTOCOL,
+        scope,
+        max_steps: limits.max_steps,
+        timeout_ms: limits.timeout_ms,
+        batch,
+    })
 }
 
 fn evaluate(input: &WorkerRequest, deadline: Option<Instant>) -> Result<WorkerReply, WorkerError> {

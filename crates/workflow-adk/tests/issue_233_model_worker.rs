@@ -1104,3 +1104,6 @@ async fn public_host_route_deadline_expires_during_pending_actual_http_transport
     assert_eq!(wire.count.load(Ordering::SeqCst), 1);
     wire.finish().await;
 }
+
+#[path = "issue_233_model_worker/publication.rs"]
+mod publication;

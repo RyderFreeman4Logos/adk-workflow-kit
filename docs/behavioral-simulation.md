@@ -79,7 +79,7 @@ content hash: a compromised script is not proof the source caused compromise.
 Retain `to_json()` under that reference if persisting the evidence. The report
 has no deserializer that could mint host authority from untrusted JSON.
 
-Deferred: real-model tool-call observation, independently enforced process/OS
+For the standalone scripted reducer, deferred: real-model tool-call observation, independently enforced process/OS
 containment, encoded-canary detection, profile-backed behavioral execution,
 live semantic quality/calibration, durable checkpoint/crash recovery and causal
 attribution. This milestone does not close all of #233's acceptance criteria.
@@ -143,6 +143,61 @@ artifact observer, checkpoint or inherited state is bound. The host deadline
 includes graph setup/queue time; the runtime still clamps its own ceiling.
 The direct runtime API is a deterministic data reducer, not a second agent loop.
 
+## Durable single-batch observation
+
+`HostModelProbe::observe()` remains storage-free and returns an unpublished
+observation. An embedding host may explicitly call
+`HostModelProbe::observe_and_publish(&mut FilesystemArtifactStore).await` to retain
+one completed model batch and its redacted, independently checked sealed-worker
+report. The original source must already be retained under its actual content ID
+in that same store; missing or altered source fails before credential resolution.
+The live `TrustedModelProbe`, compiled IR, selected route declaration, source,
+worker deployment and host run remain bound. This API accepts no mutable
+observation, serialized approval, new task or continuation authority.
+
+The route makes one physical model request, with 512 output tokens, a 65536-byte
+nonstream response-body cap, a separate 32768-byte exact semantic UTF-8 cap,
+32 proposed actions and zero retries. The approved step/time limits are unchanged
+(the connected acceptance fixture uses eight steps and 1000ms). Only
+`NoCompromiseObserved` or a typed hard tripwire may be published. Partial,
+malformed, non-text, failed-worker and nonfinal results produce no acknowledged
+artifact. The exact semantic text is the worker input, not reasoning-channel
+content or an HTTP transcript; semantically equivalent JSON can have different
+raw hashes while retaining the same canonical worker proposal digest.
+
+One strict v1 record binds source and normalization facts, canonical envelope,
+IR/approval/run identities, actual route and SDK contract, invocation provenance,
+exact semantic bytes, redacted worker report and provider usage. Missing counters
+remain null and genuine zero remains zero. The serialized record has an
+independent 1MiB ceiling and is never truncated to fit. It makes no measured cost,
+quality, cache-savings or causal-attribution claim.
+
+Publication stages and syncs bytes, checks the original absolute route deadline
+and cancellation, commits visibility once, then syncs the directory before
+returning `PublishedModelProbeArtifact`. `NotPublished` means this invocation did
+not publish the evidence. `PublishedUnacknowledged` identifies visible forensic
+content after a synchronization failure or late cancellation/deadline; it is not
+a successful acknowledgment. No failure deletes original artifacts, retries the
+model or worker, or promises rollback. Blocking filesystem work is cooperatively
+checked after it returns, rather than preemptively interrupted.
+
+Reopen the store and call `read_model_probe_evidence(&store, &expected_id)` with an
+ID authenticated independently by the caller. The bounded reader verifies exact
+content IDs, source normalization and invocation identities, then uses the same
+strict worker parser, scope construction and pure evaluator to verify every
+recorded event. It performs no broker, model or worker execution and never scans
+filenames for authority. Its `AuditedModelProbeArtifact` is deliberately distinct
+from a live publication acknowledgment. Hash integrity cannot authenticate past
+approval or physical provider identity, prove the caller received an acknowledgment,
+or create authority to resume work.
+
+Use a caller-controlled private store root. Artifact files use mode 0600; this
+API does not enforce a restricted-store ACL, expiration or reasoning-content
+capture policy. Retention expiry is metadata, not deletion. There is no automatic
+resume, feedback loop, canary continuation, full checkpoint recovery or `Clean`
+verdict. Actual model quality, latency and cost acceptance and the remaining #233
+work remain open.
+
 ## Verification
 
 Run `just issue-233-runtime`, `just issue-233-adk` (including authored execution and public default denial), and `just issue-233-doc` with the repository's safe
@@ -158,3 +213,11 @@ and
 `just conformance-contract 'workflowctl --test cli_contracts behavioral_opt_in_has_no_cli_authority_channel'`
 for sibling/CLI default denial. These are API capability tests, not evidence of
 an OS security boundary.
+
+`just issue-233-model-worker publication::` runs the durable unit through the
+actual loopback-compatible SDK, sealed OS worker and filesystem store. It covers
+exact bytes, missing versus zero usage, publication phase faults, offline tamper,
+privacy, and owned-process interruption after worker cleanup at stage, visibility
+and synchronization boundaries. Process termination is explicitly waited and
+reaped; these tests do not simulate power loss or full checkpoint recovery.
+The unfiltered recipe also retains the original thirteen Host controls.
