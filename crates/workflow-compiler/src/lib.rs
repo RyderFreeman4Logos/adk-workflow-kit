@@ -1,5 +1,6 @@
 //! Deterministic, stack-safe validation for canonical workflow graphs.
 
+mod behavioral;
 mod diagnostics;
 mod graph_builder;
 mod lock;
@@ -14,8 +15,9 @@ mod skill_runtime;
 
 use std::{collections::VecDeque, fmt};
 
+use behavioral::BehavioralAdmission;
 use workflow_ir::{IrNode, IrNodeKind, NodeId, WorkflowIr};
-use workflow_runtime::behavioral::{ProbeLimits, TrustedScript};
+use workflow_runtime::behavioral::{TrustedModelProbe, TrustedScript};
 use workflow_spec::{
     NodeKind, SourcePath, SpecError, WorkflowSpec, is_reserved_skill_tool_name, parse_file,
     parse_str,
@@ -113,6 +115,7 @@ pub struct CompiledPlan {
     ir: WorkflowIr,
     registry_binding_count: usize,
     sentinel_script_identity: Option<String>,
+    sentinel_model_probe_identity: Option<String>,
 }
 
 impl CompiledPlan {
@@ -120,6 +123,11 @@ impl CompiledPlan {
     /// An eventual behavioral executor must independently require the same live capability.
     pub fn sentinel_script_identity(&self) -> Option<&str> {
         self.sentinel_script_identity.as_deref()
+    }
+
+    /// Checked model-observation approval identity, never execution authority.
+    pub fn sentinel_model_probe_identity(&self) -> Option<&str> {
+        self.sentinel_model_probe_identity.as_deref()
     }
 
     /// Returns the normalized canonical workflow IR.
@@ -175,11 +183,32 @@ pub fn compile_spec_with_sentinel_script(
     spec: &WorkflowSpec,
     script: &TrustedScript,
 ) -> Result<CompiledPlan, CompileError> {
-    let ir = validated_ir(spec, Some(script))?;
+    let ir = validated_ir(spec, Some(BehavioralAdmission::Script(script)))?;
     Ok(CompiledPlan {
         ir,
         registry_binding_count: 0,
         sentinel_script_identity: Some(script.identity()),
+        sentinel_model_probe_identity: None,
+    })
+}
+
+/// Compiles model observation only against an independent live host approval.
+/// Script policy, mismatched IR/limits/route and missing opt-in fail closed.
+/// The returned identity cannot authorize execution without an attested worker.
+pub fn compile_spec_with_sentinel_model_probe(
+    spec: &WorkflowSpec,
+    probe: &TrustedModelProbe,
+    model_route_digest: &str,
+) -> Result<CompiledPlan, CompileError> {
+    let ir = validated_ir(
+        spec,
+        Some(BehavioralAdmission::Model(probe, model_route_digest)),
+    )?;
+    Ok(CompiledPlan {
+        ir,
+        registry_binding_count: 0,
+        sentinel_script_identity: None,
+        sentinel_model_probe_identity: Some(probe.identity()),
     })
 }
 
@@ -192,6 +221,7 @@ fn compile_without_predicates(spec: &WorkflowSpec) -> Result<CompiledPlan, Compi
         ir,
         registry_binding_count: 0,
         sentinel_script_identity: None,
+        sentinel_model_probe_identity: None,
     })
 }
 
@@ -210,54 +240,20 @@ fn compile_with_predicates<R: PredicateRegistry>(
         ir,
         registry_binding_count,
         sentinel_script_identity: None,
+        sentinel_model_probe_identity: None,
     })
 }
 
 fn validated_ir(
     spec: &WorkflowSpec,
-    script: Option<&TrustedScript>,
+    admission: Option<BehavioralAdmission<'_>>,
 ) -> Result<WorkflowIr, CompileError> {
     validate_approval_nodes(spec)?;
     validate_node_bindings(spec)?;
     let ir = WorkflowIr::from(spec);
     validate_graph(&ir).map_err(CompileError::Graph)?;
     validate_state(&ir).map_err(CompileError::State)?;
-    match (
-        ir.nodes()
-            .iter()
-            .find_map(|node| node.untrusted_text()?.behavioral),
-        script,
-    ) {
-        (None, None) => {}
-        (Some(policy), Some(script)) => {
-            let hash = format!(
-                "sha256:{}",
-                ir.canonical_hash()
-                    .as_bytes()
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            );
-            if !script.matches_trajectory_policy(policy.trajectory.map(|p| p.schema_version))
-                || !script.matches_approval(
-                    &hash,
-                    ProbeLimits {
-                        max_steps: policy.max_steps,
-                        timeout_ms: policy.timeout_ms,
-                    },
-                )
-            {
-                return Err(CompileError::Binding(
-                    BindingValidationError::InvalidSentinelScript,
-                ));
-            }
-        }
-        _ => {
-            return Err(CompileError::Binding(
-                BindingValidationError::InvalidSentinelScript,
-            ));
-        }
-    }
+    behavioral::validate_admission(&ir, admission)?;
     Ok(ir)
 }
 
@@ -274,6 +270,8 @@ pub enum BindingValidationError {
     InvalidUntrustedTextPreparation,
     /// Behavioral opt-in and the exact live host approval must both be present.
     InvalidSentinelScript,
+    /// Model observation requires its exact independent host contract and route.
+    InvalidSentinelModelProbe,
 }
 
 impl fmt::Display for BindingValidationError {
@@ -281,6 +279,9 @@ impl fmt::Display for BindingValidationError {
         formatter.write_str(match self {
             Self::InvalidSentinelScript => {
                 "behavioral policy requires matching host script authority"
+            }
+            Self::InvalidSentinelModelProbe => {
+                "model observation requires matching independent host authority and route"
             }
             Self::InvalidPlacement => "binding fields require an agent node",
             Self::ReviewerTool => "reviewer nodes cannot own tools",
@@ -300,7 +301,7 @@ fn validate_node_bindings(spec: &WorkflowSpec) -> Result<(), CompileError> {
             && (policy.schema_version != 1
                 || policy
                     .behavioral
-                    .is_some_and(|behavioral| behavioral.schema_version != 1)
+                    .is_some_and(|behavioral| !matches!(behavioral.schema_version, 1 | 2))
                 || policy.max_input_bytes > 65_536
                 || node.kind() != NodeKind::Terminal
                 || spec.nodes().len() != 1

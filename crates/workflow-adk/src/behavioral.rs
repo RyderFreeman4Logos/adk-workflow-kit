@@ -46,12 +46,14 @@ impl AdkGraphTranslator {
         &self,
         plan: &CompiledPlan,
     ) -> Result<(), TranslationError> {
-        if plan.sentinel_script_identity()
-            != self
-                .sentinel_script
-                .as_ref()
-                .map(|script| script.identity())
-                .as_deref()
+        // Model admission grants no execution until an attested worker is bound.
+        if plan.sentinel_model_probe_identity().is_some()
+            || plan.sentinel_script_identity()
+                != self
+                    .sentinel_script
+                    .as_ref()
+                    .map(|script| script.identity())
+                    .as_deref()
         {
             return Err(TranslationError::MissingNodeBackend {
                 node: plan.ir().entry_node_id().as_str().to_owned(),

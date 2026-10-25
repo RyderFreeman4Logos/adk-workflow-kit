@@ -193,6 +193,7 @@ where
             ir,
             registry_binding_count,
             sentinel_script_identity: None,
+            sentinel_model_probe_identity: None,
         })
     }
 

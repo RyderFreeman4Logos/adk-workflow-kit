@@ -38,6 +38,8 @@ mod behavioral_backend;
 mod behavioral_oracles;
 #[path = "support/behavioral_order.rs"]
 mod behavioral_order;
+#[path = "support/model_admission.rs"]
+mod model_admission;
 use behavioral_oracles::no_report;
 
 const WORKFLOW: &str = include_str!("fixtures/sentinel.workflow.toml");

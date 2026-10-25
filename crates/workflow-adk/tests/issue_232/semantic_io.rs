@@ -61,6 +61,8 @@ enum Mode {
 
 #[path = "failures.rs"]
 mod failures;
+#[path = "finite_admission.rs"]
+mod finite_admission;
 #[path = "language_admission.rs"]
 mod language_admission;
 #[path = "observations.rs"]

@@ -20,9 +20,9 @@ issue-323-release-consumer:
 clippy:
     {{_io}} cargo +1.98.0 clippy --workspace --all-targets --locked -- -D warnings
 
-test:
+test: issue-233-worker-binaries
     {{_io}} cargo +1.98.0 build -p workflowctl --locked
-    {{_io}} cargo +1.98.0 test --workspace --exclude workflow-adk --locked -- --test-threads=2
+    ADK_WORKER_INHERITED_CANARY=issue-233-fixed-test-only {{_io}} cargo +1.98.0 test --workspace --exclude workflow-adk --locked -- --test-threads=2
     {{_io}} cargo +1.98.0 test -p workflow-adk --locked -- --test-threads=1
     ./target/debug/workflowctl test crates/workflowctl/tests/fixtures/cli004-test.json
     ./target/debug/workflowctl eval crates/workflowctl/tests/fixtures/cli004-eval.json
@@ -47,6 +47,10 @@ m1-03-green:
 # Focused skill frontmatter compatibility during the YAML parser migration.
 issue-332-compiler test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-compiler --test skill_contracts {{test_name}} --locked -- --nocapture
+
+# Preserve specification, canonical IR, and compiler contracts across the private facade split.
+issue-376-contracts:
+    {{_io}} cargo +1.98.0 test -p workflow-spec -p workflow-ir -p workflow-compiler --locked -- --test-threads=2
 
 # Focused M3-02 per-node binding tests.
 m3-02-spec test_name:
@@ -253,6 +257,28 @@ issue-233-adk:
 
 issue-233-doc:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --doc behavioral --locked
+
+# Snapshot the fixed OS-negative fixture before later Cargo graphs can rebuild its canonical binary.
+issue-233-worker-binaries:
+    {{_io}} cargo +1.98.0 build -p workflow-runtime --bin sentinel-probe-worker -p workflow-testkit --bin issue-233-boundary-child --locked
+    test ! -L target/debug/issue-233-boundary-child.fixture && { test ! -e target/debug/issue-233-boundary-child.fixture || test -f target/debug/issue-233-boundary-child.fixture; } && test ! -L target/debug/issue-233-boundary-child.fixture.sha256 && { test ! -e target/debug/issue-233-boundary-child.fixture.sha256 || test -f target/debug/issue-233-boundary-child.fixture.sha256; }
+    cp --no-dereference --no-target-directory --remove-destination -- target/debug/issue-233-boundary-child target/debug/issue-233-boundary-child.fixture
+    sha256sum target/debug/issue-233-boundary-child.fixture > target/debug/issue-233-boundary-child.fixture.sha256
+
+issue-233-worker test_name="": issue-233-worker-binaries
+    ADK_WORKER_INHERITED_CANARY=issue-233-fixed-test-only {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_233_worker {{test_name}} --locked -- --nocapture --test-threads=1
+
+# Existing authored shell/sandbox contracts must retain their own runtime view.
+issue-233-worker-sandbox:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --lib bubblewrap::supervision::tests --locked -- --nocapture --test-threads=1
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test bubblewrap_backend_contracts --test bubblewrap_conformance --locked -- --nocapture --test-threads=1
+
+# Bounded child/pipe settlement and FIFO failure-path ownership regressions.
+issue-380-runtime test_name="bubblewrap::lifecycle::tests":
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --lib {{test_name}} --locked -- --nocapture --test-threads=1
+
+issue-378-fifo test_name="":
+    {{_io}} cargo +1.98.0 test -p workflowctl --test cli003_run_explain_run {{test_name}} --locked -- --nocapture --test-threads=1
 
 # Focused #234 default-off canonical trajectory observer (offline fixtures only).
 issue-234-runtime:

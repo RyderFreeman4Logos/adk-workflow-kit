@@ -8,6 +8,7 @@ use std::{
 use workflow_spec::{
     FieldPath, NodeKind, RouteOperator, SchemaVersion, SourcePath, SpecError,
     UnsupportedRouteOperator, WORKFLOW_SCHEMA_VERSION_V1, parse_file, parse_str,
+    read_bounded_regular_file,
 };
 
 const MINIMAL: &str = r#"
@@ -312,6 +313,52 @@ routes = [{ operator = "equals", target = "finish" }]"#,
         parse_str("routes.workflow.toml", &input),
         Err(SpecError::Decode { location, .. }) if location.field.as_str() == "routes[0].operator"
     ));
+}
+
+#[test]
+fn bounded_regular_file_accepts_maximum_usize_limit() {
+    let temp_dir = TempDir::new();
+    let path = temp_dir.path().join("maximum-limit.bin");
+    let expected = b"nonempty bounded input";
+    fs::write(&path, expected).expect("fixture should be writable");
+
+    let actual = read_bounded_regular_file(&SourcePath::from(path), usize::MAX)
+        .expect("maximum byte limit should accept a tiny regular file");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn bounded_regular_file_preserves_zero_exact_and_oversized_limits() {
+    let temp_dir = TempDir::new();
+    let path = temp_dir.path().join("ordinary-limits.bin");
+    let expected = b"bounded input";
+    fs::write(&path, expected).expect("fixture should be writable");
+    let source = SourcePath::from(path.as_path());
+
+    assert_eq!(
+        read_bounded_regular_file(&source, expected.len()).expect("exact limit should succeed"),
+        expected
+    );
+    for limit in [0, expected.len() - 1] {
+        match read_bounded_regular_file(&source, limit).expect_err("oversized input should fail") {
+            SpecError::Read {
+                location,
+                source: error,
+            } => {
+                assert_eq!(location.source, source);
+                assert_eq!(location.field, FieldPath::root());
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert_eq!(error.to_string(), "input file exceeds the byte limit");
+            }
+            other => panic!("expected read error, got {other:?}"),
+        }
+    }
+    fs::write(&path, []).expect("empty fixture should be writable");
+    assert_eq!(
+        read_bounded_regular_file(&source, 0).expect("empty input should fit the zero limit"),
+        Vec::<u8>::new()
+    );
 }
 
 #[test]

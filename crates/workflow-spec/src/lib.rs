@@ -1,5 +1,7 @@
 //! Strict, source-aware decoding for workflow specification version 1.
 
+mod agent_contract;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
@@ -9,6 +11,11 @@ use std::{
 
 use serde::Deserialize;
 use thiserror::Error;
+
+pub use agent_contract::{
+    AgentContractError, AgentNodeContract, InputContract, InstructionContract, OutputContract,
+    SessionMode,
+};
 
 /// The only workflow schema version supported by this crate.
 pub const WORKFLOW_SCHEMA_VERSION_V1: u32 = 1;
@@ -396,161 +403,9 @@ impl SkillReference {
     }
 }
 
-/// The execution-session scope of an agent node.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SessionMode {
-    /// Create a fresh model session for each node execution.
-    Isolated,
-    /// Reuse the workflow's shared model session.
-    Shared,
-}
-
-/// Errors returned when constructing an agent-node contract.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum AgentContractError {
-    /// A required contract field was empty.
-    #[error("agent-node contract field is empty: {0}")]
-    EmptyField(&'static str),
-    /// A state key was declared more than once.
-    #[error("agent-node input state key is duplicated")]
-    DuplicateStateKey,
-    /// The session scope is not part of the closed contract vocabulary.
-    #[error("agent-node session must be isolated or shared")]
-    InvalidSession,
-}
-
-/// Immutable instruction resource identity for an agent node.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InstructionContract {
-    path: String,
-    sha256: String,
-}
-
-impl InstructionContract {
-    pub fn new(
-        path: impl Into<String>,
-        sha256: impl Into<String>,
-    ) -> Result<Self, AgentContractError> {
-        let path = path.into();
-        let sha256 = sha256.into();
-        if path.is_empty() {
-            return Err(AgentContractError::EmptyField("instruction.path"));
-        }
-        if sha256.is_empty() {
-            return Err(AgentContractError::EmptyField("instruction.sha256"));
-        }
-        Ok(Self { path, sha256 })
-    }
-
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-
-    pub fn sha256(&self) -> &str {
-        &self.sha256
-    }
-}
-
-/// State visibility contract for an agent node.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InputContract {
-    state_keys: Vec<String>,
-}
-
-impl InputContract {
-    pub fn new(state_keys: Vec<String>) -> Result<Self, AgentContractError> {
-        let mut seen = BTreeSet::new();
-        for key in &state_keys {
-            if key.is_empty() {
-                return Err(AgentContractError::EmptyField("input.state_keys"));
-            }
-            if !seen.insert(key) {
-                return Err(AgentContractError::DuplicateStateKey);
-            }
-        }
-        Ok(Self { state_keys })
-    }
-
-    pub fn state_keys(&self) -> &[String] {
-        &self.state_keys
-    }
-}
-
-/// Output state and schema contract for an agent node.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OutputContract {
-    state_key: String,
-    schema: String,
-}
-
-impl OutputContract {
-    pub fn new(
-        state_key: impl Into<String>,
-        schema: impl Into<String>,
-    ) -> Result<Self, AgentContractError> {
-        let state_key = state_key.into();
-        let schema = schema.into();
-        if state_key.is_empty() {
-            return Err(AgentContractError::EmptyField("output.state_key"));
-        }
-        if schema.is_empty() {
-            return Err(AgentContractError::EmptyField("output.schema"));
-        }
-        Ok(Self { state_key, schema })
-    }
-
-    pub fn state_key(&self) -> &str {
-        &self.state_key
-    }
-
-    pub fn schema(&self) -> &str {
-        &self.schema
-    }
-}
-
-/// Complete authored contract for an agent node.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AgentNodeContract {
-    instruction: InstructionContract,
-    input: InputContract,
-    output: OutputContract,
-    session: SessionMode,
-}
-
-impl AgentNodeContract {
-    pub fn new(
-        instruction: InstructionContract,
-        input: InputContract,
-        output: OutputContract,
-        session: SessionMode,
-    ) -> Self {
-        Self {
-            instruction,
-            input,
-            output,
-            session,
-        }
-    }
-
-    pub fn instruction(&self) -> &InstructionContract {
-        &self.instruction
-    }
-
-    pub fn input(&self) -> &InputContract {
-        &self.input
-    }
-
-    pub fn output(&self) -> &OutputContract {
-        &self.output
-    }
-
-    pub fn session(&self) -> SessionMode {
-        self.session
-    }
-}
-
-/// Explicit opt-in to host-authorized scripted simulation, never execution authority.
-/// V1 requires 1..=32 steps and 1..=1000 milliseconds at compiler admission.
+/// Explicit behavioral opt-in, never execution authority: v1 is an authored script,
+/// v2 is host-approved model observation. Both require 1..=32 steps and 1..=1000 ms.
+/// Model observation cannot execute until its sealed worker is available.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BehavioralPolicy {
@@ -1147,8 +1002,8 @@ fn read_source_file(source: &SourcePath) -> Result<Vec<u8>, SpecError> {
 
 /// Reads at most `max_bytes` from a regular file without blocking on special files.
 ///
-/// The read is capped at `max_bytes + 1` so oversized content is detected and
-/// rejected without unbounded allocation.
+/// The read cap is `max_bytes.saturating_add(1)` to detect oversized content
+/// without overflowing at `usize::MAX`.
 pub fn read_bounded_regular_file(
     source: &SourcePath,
     max_bytes: usize,
@@ -1179,7 +1034,7 @@ pub fn read_bounded_regular_file(
     }
 
     let mut bytes = Vec::new();
-    file.take((max_bytes + 1) as u64)
+    file.take(max_bytes.saturating_add(1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| source_read_error(source, error))?;
     if bytes.len() > max_bytes {
