@@ -139,7 +139,7 @@ issue-337-profile:
 
 # Opt in without inspecting credentials; SKIP unless explicitly requested.
 m3-07-live profile="":
-    if test "${WORKFLOW_KIT_M3_07_LIVE:-0}" != 1; then echo "M3-07 live conformance: SKIP (set WORKFLOW_KIT_M3_07_LIVE=1 to opt in)"; exit 0; fi; if test -z "{{profile}}"; then echo "M3-07 live conformance: FAIL (missing profile)"; exit 2; fi; {{_io}} cargo +1.98.0 build -p workflowctl --locked; {{_io}} cargo +1.98.0 run -p workflow-testkit --bin m3-07-live --locked -- ./target/debug/workflowctl "{{profile}}"
+    if test "${WORKFLOW_KIT_M3_07_LIVE:-0}" != 1; then echo "M3-07 live conformance: SKIP (set WORKFLOW_KIT_M3_07_LIVE=1 to opt in)"; exit 0; fi; if test -z {{quote(profile)}}; then echo "M3-07 live conformance: FAIL (missing profile)"; exit 2; fi; {{_io}} cargo +1.98.0 build -p workflowctl --locked; {{_io}} cargo +1.98.0 run -p workflow-testkit --bin m3-07-live --locked -- ./target/debug/workflowctl {{quote(profile)}}
 
 # Focused #267 deterministic validator, approval, and write tests.
 issue-267-test:
@@ -366,6 +366,15 @@ issue-230-smoke:
 issue-230-fixture:
     {{_io}} cargo +1.98.0 run -p workflow-testkit --bin bench-230 --locked -- fixture
 
+# Four-source Sentinel adapters; public API controls plus private native parsers.
+issue-236-runtime:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_236_dataset_adapters --locked -- --nocapture
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --lib dataset::dataset_sentinel::tests:: --locked -- --nocapture
+
+# Explicit local raw-source acceptance; never fetches or runs a model.
+issue-236-offline source_dir cache_dir:
+    ADK_DATASET_SOURCE_DIR={{quote(source_dir)}} ADK_DATASET_CACHE_DIR={{quote(cache_dir)}} {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_236_dataset_adapters actual_sources_and_two_cache_only_reruns --locked -- --exact --ignored --nocapture
+
 # Focused #229 pinned dataset registry tests.
 issue-229-http test_name="dataset::dataset_http::":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --lib {{test_name}} --locked -- --nocapture
@@ -402,7 +411,7 @@ issue-229-cli-links:
 
 # Public, pinned FutureHouse product path (report is CACHE_DIR/ether0-report.json).
 issue-229-product cache license mode cases:
-    {{_io}} cargo +1.98.0 run -p workflow-testkit --bin ether0-eval --locked -- "{{cache}}" "{{license}}" "{{mode}}" "{{cases}}"
+    {{_io}} cargo +1.98.0 run -p workflow-testkit --bin ether0-eval --locked -- {{quote(cache)}} {{quote(license)}} {{quote(mode)}} {{quote(cases)}}
 
 # Focused #224 reference-workflow package and runner contract tests.
 m3-08-reference:

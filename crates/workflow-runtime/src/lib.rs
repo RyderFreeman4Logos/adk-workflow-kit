@@ -78,6 +78,10 @@ pub use dataset::{
     validated_dataset_cache_root,
 };
 pub use dataset::{DatasetCase, ParquetCaseError, decode_parquet_cases};
+pub use dataset::{
+    SentinelDatasetCase, SentinelDatasetError, SentinelDatasetLabel, prepare_sentinel_goldens,
+    validate_sentinel_splits,
+};
 pub use effect_journal::{
     EffectCommit, EffectJournal, EffectJournalError, EffectJournalErrorKind, EffectKey,
 };

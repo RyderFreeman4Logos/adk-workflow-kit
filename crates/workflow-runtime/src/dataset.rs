@@ -181,6 +181,12 @@ mod dataset_http;
 mod dataset_identity;
 #[path = "dataset_parquet.rs"]
 mod dataset_parquet;
+#[path = "dataset_sentinel.rs"]
+mod dataset_sentinel;
+pub use dataset_sentinel::{
+    SentinelDatasetCase, SentinelDatasetError, SentinelDatasetLabel, prepare_sentinel_goldens,
+    validate_sentinel_splits,
+};
 
 #[cfg(test)]
 #[path = "dataset_creation_tests.rs"]
