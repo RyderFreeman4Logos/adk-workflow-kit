@@ -71,6 +71,7 @@ pub enum ModelRouteSnapshotErrorKind {
     DuplicateCandidate,
     MissingProfile,
     InvalidRegistry,
+    InvalidProbeContract,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +117,50 @@ impl Clone for ModelRouteSnapshot {
 }
 
 impl ModelRouteSnapshot {
+    /// Pure identity of the complete selected original/effective declaration and
+    /// fixed probe contract. Performs no IO or approval; the embedding host must
+    /// authenticate this declaration against independently owned policy.
+    pub fn probe_declaration_digest(&self) -> Result<String, ModelRouteSnapshotError> {
+        self.probe_declaration().map(|(_, digest)| digest)
+    }
+
+    fn probe_declaration(
+        &self,
+    ) -> Result<(crate::model_profiles::ModelProfile, String), ModelRouteSnapshotError> {
+        self.probe_declaration_for(crate::behavioral::model_probe::declaration_contract())
+    }
+
+    /// Pure opt-in feedback contract identity. Authenticate this independently
+    /// before issuing a fresh approval; the single-batch identity is different.
+    pub fn probe_feedback_declaration_digest(&self) -> Result<String, ModelRouteSnapshotError> {
+        self.probe_declaration_for(crate::behavioral::model_probe_feedback::declaration_contract())
+            .map(|(_, digest)| digest)
+    }
+
+    fn probe_declaration_for(
+        &self,
+        contract: serde_json::Value,
+    ) -> Result<(crate::model_profiles::ModelProfile, String), ModelRouteSnapshotError> {
+        let invalid = || ModelRouteSnapshotError {
+            kind: ModelRouteSnapshotErrorKind::InvalidProbeContract,
+        };
+        if self.candidates.len() != 1 {
+            return Err(invalid());
+        }
+        let candidate = self.candidates.first().ok_or_else(invalid)?;
+        let (original, effective) = self
+            .registry
+            .probe_profile(candidate.profile())
+            .map_err(|_| invalid())?;
+        let material = serde_json::json!({
+            "role":candidate.role(), "profile":candidate.profile(),
+            "original":original, "effective":effective,
+            "contract":contract,
+        });
+        let digest = super::digest(super::canonical_json(&material).as_bytes());
+        Ok((effective, digest))
+    }
+
     pub fn new(
         registry: ModelProfileRegistry,
         candidates: impl IntoIterator<Item = ModelRouteCandidate>,
@@ -387,6 +432,10 @@ impl ModelRouteCancellation {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    pub(crate) fn flag(&self) -> &AtomicBool {
+        &self.cancelled
+    }
+
     async fn wait_cancelled(&self) {
         loop {
             let notified = self.notify.notified();
@@ -407,6 +456,128 @@ pub struct ModelRoutePolicy {
 }
 
 impl ModelRoutePolicy {
+    pub(crate) async fn bind_probe_feedback(
+        &self,
+        expected: &str,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+    ) -> Result<ModelBinding, ModelRouteTerminalError> {
+        let terminal = |kind| route_terminal(kind, Vec::new());
+        if let Some(kind) = route_stop(self.deadline, cancellation) {
+            return Err(terminal(kind));
+        }
+        let (profile, digest) = self
+            .snapshot
+            .probe_declaration_for(crate::behavioral::model_probe_feedback::declaration_contract())
+            .map_err(|_| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        let candidate = self
+            .snapshot
+            .candidates
+            .first()
+            .ok_or_else(|| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        if digest != expected || !self.snapshot.authorization.allows(candidate) {
+            return Err(terminal(ModelRouteTerminalErrorKind::AuthorizationDenied));
+        }
+        let limit = std::num::NonZeroUsize::new(32_768)
+            .ok_or_else(|| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        let binding = await_route(
+            profile.bind_for_route(candidate.role(), broker, Some(limit)),
+            self.deadline,
+            cancellation,
+        )
+        .await
+        .map_err(terminal)?
+        .map_err(|_| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        #[cfg(any(test, feature = "test-support"))]
+        let binding = match self.snapshot.test_llms.get(candidate) {
+            Some(llm) => binding.with_test_llm(Arc::clone(llm)),
+            None => binding,
+        };
+        Ok(binding)
+    }
+
+    pub(crate) async fn invoke_probe_feedback(
+        &self,
+        binding: &ModelBinding,
+        spec: &ModelInvocationSpec,
+        cancellation: &ModelRouteCancellation,
+        validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
+    ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
+        let spec = spec.with_route(ProviderRouteIdentity::from_binding(binding));
+        await_route(
+            spec.invoke_with_policy(binding, validate, ResponsePolicy::CompleteText),
+            self.deadline,
+            cancellation,
+        )
+        .await
+        .map_err(|kind| route_terminal(kind, Vec::new()))?
+        .map_err(|error| invocation_failure(error, 1, Vec::new()))
+    }
+
+    pub(crate) async fn invoke_model_probe(
+        &self,
+        spec: &ModelInvocationSpec,
+        expected_declaration: &str,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+        validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
+    ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
+        let terminal = |kind| route_terminal(kind, Vec::new());
+        if let Some(kind) = route_stop(self.deadline, cancellation) {
+            return Err(terminal(kind));
+        }
+        let (profile, digest) = self
+            .snapshot
+            .probe_declaration()
+            .map_err(|_| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        if digest != expected_declaration {
+            return Err(terminal(ModelRouteTerminalErrorKind::AuthorizationDenied));
+        }
+        let candidate = self
+            .snapshot
+            .candidates
+            .first()
+            .ok_or_else(|| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        if !self.snapshot.authorization.allows(candidate) {
+            return Err(terminal(ModelRouteTerminalErrorKind::AuthorizationDenied));
+        }
+        let limit = std::num::NonZeroUsize::new(crate::behavioral::model_probe::MAX_RESPONSE_BYTES)
+            .ok_or_else(|| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        let binding = await_route(
+            profile.bind_for_route(candidate.role(), broker, Some(limit)),
+            self.deadline,
+            cancellation,
+        )
+        .await
+        .map_err(terminal)?
+        .map_err(|error| {
+            route_terminal(
+                ModelRouteTerminalErrorKind::Configuration,
+                vec![ModelRouteAttempt {
+                    ordinal: 1,
+                    kind: ModelRouteAttemptKind::Configuration,
+                    profile_error: Some(error.kind()),
+                    upstream_status_code: error.upstream_status_code(),
+                    output_error: None,
+                }],
+            )
+        })?;
+        #[cfg(any(test, feature = "test-support"))]
+        let binding = match self.snapshot.test_llms.get(candidate) {
+            Some(llm) => binding.with_test_llm(Arc::clone(llm)),
+            None => binding,
+        };
+        let spec = spec.with_route(ProviderRouteIdentity::from_binding(&binding));
+        await_route(
+            spec.invoke_with_policy(&binding, validate, ResponsePolicy::CompleteText),
+            self.deadline,
+            cancellation,
+        )
+        .await
+        .map_err(terminal)?
+        .map_err(|error| invocation_failure(error, 1, Vec::new()))
+    }
+
     pub fn snapshot(&self) -> &ModelRouteSnapshot {
         &self.snapshot
     }
@@ -667,54 +838,62 @@ impl ModelRoutePolicy {
                 });
                 continue;
             }
-            let (attempt_kind, terminal_kind) = match error.kind() {
-                ModelInvocationErrorKind::RouteMismatch => (
-                    ModelRouteAttemptKind::Configuration,
-                    ModelRouteTerminalErrorKind::RouteMismatch,
-                ),
-                ModelInvocationErrorKind::StructuredOutput => (
-                    ModelRouteAttemptKind::Protocol,
-                    ModelRouteTerminalErrorKind::Protocol,
-                ),
-                ModelInvocationErrorKind::Session => (
-                    ModelRouteAttemptKind::Session,
-                    ModelRouteTerminalErrorKind::Session,
-                ),
-                ModelInvocationErrorKind::DeadlineExceeded => (
-                    ModelRouteAttemptKind::Timeout,
-                    ModelRouteTerminalErrorKind::DeadlineExceeded,
-                ),
-                ModelInvocationErrorKind::Cancelled => (
-                    ModelRouteAttemptKind::Timeout,
-                    ModelRouteTerminalErrorKind::Cancelled,
-                ),
-                ModelInvocationErrorKind::ModelProfile
-                    if error.model_error() == Some(ModelProfileErrorKind::Timeout) =>
-                {
-                    (
-                        ModelRouteAttemptKind::Timeout,
-                        ModelRouteTerminalErrorKind::Provider,
-                    )
-                }
-                ModelInvocationErrorKind::ModelProfile => (
-                    ModelRouteAttemptKind::TerminalProvider,
-                    ModelRouteTerminalErrorKind::Provider,
-                ),
-            };
-            attempts.push(ModelRouteAttempt {
-                ordinal,
-                kind: attempt_kind,
-                profile_error: error.model_error(),
-                upstream_status_code: error.upstream_status_code(),
-                output_error: error.output_error(),
-            });
-            return Err(route_terminal(terminal_kind, attempts));
+            return Err(invocation_failure(error, ordinal, attempts));
         }
         Err(route_terminal(
             ModelRouteTerminalErrorKind::Exhausted,
             attempts,
         ))
     }
+}
+
+fn invocation_failure(
+    error: super::ModelInvocationError,
+    ordinal: u8,
+    mut attempts: Vec<ModelRouteAttempt>,
+) -> ModelRouteTerminalError {
+    let (attempt_kind, terminal_kind) = match error.kind() {
+        ModelInvocationErrorKind::RouteMismatch => (
+            ModelRouteAttemptKind::Configuration,
+            ModelRouteTerminalErrorKind::RouteMismatch,
+        ),
+        ModelInvocationErrorKind::StructuredOutput => (
+            ModelRouteAttemptKind::Protocol,
+            ModelRouteTerminalErrorKind::Protocol,
+        ),
+        ModelInvocationErrorKind::Session => (
+            ModelRouteAttemptKind::Session,
+            ModelRouteTerminalErrorKind::Session,
+        ),
+        ModelInvocationErrorKind::DeadlineExceeded => (
+            ModelRouteAttemptKind::Timeout,
+            ModelRouteTerminalErrorKind::DeadlineExceeded,
+        ),
+        ModelInvocationErrorKind::Cancelled => (
+            ModelRouteAttemptKind::Timeout,
+            ModelRouteTerminalErrorKind::Cancelled,
+        ),
+        ModelInvocationErrorKind::ModelProfile
+            if error.model_error() == Some(ModelProfileErrorKind::Timeout) =>
+        {
+            (
+                ModelRouteAttemptKind::Timeout,
+                ModelRouteTerminalErrorKind::Provider,
+            )
+        }
+        ModelInvocationErrorKind::ModelProfile => (
+            ModelRouteAttemptKind::TerminalProvider,
+            ModelRouteTerminalErrorKind::Provider,
+        ),
+    };
+    attempts.push(ModelRouteAttempt {
+        ordinal,
+        kind: attempt_kind,
+        profile_error: error.model_error(),
+        upstream_status_code: error.upstream_status_code(),
+        output_error: error.output_error(),
+    });
+    route_terminal(terminal_kind, attempts)
 }
 
 fn session_failure(
