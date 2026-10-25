@@ -35,7 +35,7 @@ wasmi = "=0.41.3"
 
 [patch.crates-io]
 # Keep the released umbrella and one delivered source identity for the schema and graph fixes.
-adk-core = { git = "https://github.com/RyderFreeman4Logos/adk-rust.git", rev = "859b4bb7bf8754b74292743232bb0aca15470816" }
-adk-graph = { git = "https://github.com/RyderFreeman4Logos/adk-rust.git", rev = "859b4bb7bf8754b74292743232bb0aca15470816" }
-adk-action = { git = "https://github.com/RyderFreeman4Logos/adk-rust.git", rev = "859b4bb7bf8754b74292743232bb0aca15470816" }
-adk-model = { git = "https://github.com/RyderFreeman4Logos/adk-rust.git", rev = "859b4bb7bf8754b74292743232bb0aca15470816" }
+adk-core = { git = "https://github.com/RyderFreeman4Logos/adk-rust.git", rev = "9761d14823008a96a558716e4883ac118d9143ff" }
+adk-graph = { git = "https://github.com/RyderFreeman4Logos/adk-rust.git", rev = "9761d14823008a96a558716e4883ac118d9143ff" }
+adk-action = { git = "https://github.com/RyderFreeman4Logos/adk-rust.git", rev = "9761d14823008a96a558716e4883ac118d9143ff" }
+adk-model = { git = "https://github.com/RyderFreeman4Logos/adk-rust.git", rev = "9761d14823008a96a558716e4883ac118d9143ff" }
