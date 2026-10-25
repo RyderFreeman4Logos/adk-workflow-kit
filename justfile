@@ -257,6 +257,8 @@ issue-233-adk:
 
 # Public host route, real compatible SDK wire, and sealed inert worker boundary.
 issue-233-model-worker test_name="": issue-233-worker-binaries
+    test ! -L target/debug/sentinel-probe-worker.sha256 && { test ! -e target/debug/sentinel-probe-worker.sha256 || test -f target/debug/sentinel-probe-worker.sha256; }
+    sha256sum target/debug/sentinel-probe-worker > target/debug/sentinel-probe-worker.sha256
     {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_233_model_worker {{test_name}} --locked -- --nocapture --test-threads=1
 
 issue-233-doc:
@@ -540,7 +542,7 @@ check-branch:
 
 pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit pattern-catalog-test m2-02-green test-local-gates
 
-_quality-gates: fmt-check issue-323-release-consumer check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk issue-325-adk adk-action-check test-local-gates
+_quality-gates: fmt-check issue-323-release-consumer check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk issue-325-adk adk-action-check test-local-gates issue-233-model-worker
 
 quality-gates:
     scripts/local-gates.sh produce

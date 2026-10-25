@@ -1,9 +1,9 @@
-//! Host-authorized authored ADK execution and standalone inert simulation.
+//! Host-authorized authored execution, inert simulation, and model observation.
 //!
-//! Both routes use the runtime's sealed data reducer, never a model, production
-//! tool registry, or IO-bearing executor. Authored execution retains reports via
-//! its host observer; the standalone graph has no observer store. Neither is OS
-//! containment or source-causal evaluation.
+//! Authored execution and standalone simulation use the sealed data reducer.
+//! The separate model route observes one untrusted batch through an attested
+//! worker; it grants no translation, production tool execution, durable report
+//! publication, or source-causal verdict.
 use crate::events::AdkEventMapper;
 use crate::{AdkGraph, AdkGraphError, AdkGraphTranslator, TranslationError};
 use adk_rust::{
@@ -23,6 +23,7 @@ use workflow_runtime::behavioral::{ProbeLimits, TrustedScript};
 use workflow_runtime::{ArtifactId, ArtifactStore, CanonicalUntrustedText, RunId};
 
 pub(crate) mod model_probe;
+pub use model_probe::{HostModelProbe, ModelProbeObservation};
 
 impl AdkGraphTranslator {
     /// Consume the same live host capability checked by compilation. No JSON identity

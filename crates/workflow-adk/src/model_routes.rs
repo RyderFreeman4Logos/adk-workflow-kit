@@ -438,6 +438,70 @@ pub struct ModelRoutePolicy {
 }
 
 impl ModelRoutePolicy {
+    pub(crate) async fn invoke_model_probe(
+        &self,
+        spec: &ModelInvocationSpec,
+        expected_declaration: &str,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+        validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
+    ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
+        let terminal = |kind| route_terminal(kind, Vec::new());
+        if let Some(kind) = route_stop(self.deadline, cancellation) {
+            return Err(terminal(kind));
+        }
+        let (profile, digest) = self
+            .snapshot
+            .probe_declaration()
+            .map_err(|_| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        if digest != expected_declaration {
+            return Err(terminal(ModelRouteTerminalErrorKind::AuthorizationDenied));
+        }
+        let candidate = self
+            .snapshot
+            .candidates
+            .first()
+            .ok_or_else(|| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        if !self.snapshot.authorization.allows(candidate) {
+            return Err(terminal(ModelRouteTerminalErrorKind::AuthorizationDenied));
+        }
+        let limit = std::num::NonZeroUsize::new(crate::behavioral::model_probe::MAX_RESPONSE_BYTES)
+            .ok_or_else(|| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        let binding = await_route(
+            profile.bind_for_route(candidate.role(), broker, Some(limit)),
+            self.deadline,
+            cancellation,
+        )
+        .await
+        .map_err(terminal)?
+        .map_err(|error| {
+            route_terminal(
+                ModelRouteTerminalErrorKind::Configuration,
+                vec![ModelRouteAttempt {
+                    ordinal: 1,
+                    kind: ModelRouteAttemptKind::Configuration,
+                    profile_error: Some(error.kind()),
+                    upstream_status_code: error.upstream_status_code(),
+                    output_error: None,
+                }],
+            )
+        })?;
+        #[cfg(any(test, feature = "test-support"))]
+        let binding = match self.snapshot.test_llms.get(candidate) {
+            Some(llm) => binding.with_test_llm(Arc::clone(llm)),
+            None => binding,
+        };
+        let spec = spec.with_route(ProviderRouteIdentity::from_binding(&binding));
+        await_route(
+            spec.invoke_with_policy(&binding, validate, ResponsePolicy::CompleteText),
+            self.deadline,
+            cancellation,
+        )
+        .await
+        .map_err(terminal)?
+        .map_err(|error| invocation_failure(error, 1, Vec::new()))
+    }
+
     pub fn snapshot(&self) -> &ModelRouteSnapshot {
         &self.snapshot
     }
@@ -698,54 +762,62 @@ impl ModelRoutePolicy {
                 });
                 continue;
             }
-            let (attempt_kind, terminal_kind) = match error.kind() {
-                ModelInvocationErrorKind::RouteMismatch => (
-                    ModelRouteAttemptKind::Configuration,
-                    ModelRouteTerminalErrorKind::RouteMismatch,
-                ),
-                ModelInvocationErrorKind::StructuredOutput => (
-                    ModelRouteAttemptKind::Protocol,
-                    ModelRouteTerminalErrorKind::Protocol,
-                ),
-                ModelInvocationErrorKind::Session => (
-                    ModelRouteAttemptKind::Session,
-                    ModelRouteTerminalErrorKind::Session,
-                ),
-                ModelInvocationErrorKind::DeadlineExceeded => (
-                    ModelRouteAttemptKind::Timeout,
-                    ModelRouteTerminalErrorKind::DeadlineExceeded,
-                ),
-                ModelInvocationErrorKind::Cancelled => (
-                    ModelRouteAttemptKind::Timeout,
-                    ModelRouteTerminalErrorKind::Cancelled,
-                ),
-                ModelInvocationErrorKind::ModelProfile
-                    if error.model_error() == Some(ModelProfileErrorKind::Timeout) =>
-                {
-                    (
-                        ModelRouteAttemptKind::Timeout,
-                        ModelRouteTerminalErrorKind::Provider,
-                    )
-                }
-                ModelInvocationErrorKind::ModelProfile => (
-                    ModelRouteAttemptKind::TerminalProvider,
-                    ModelRouteTerminalErrorKind::Provider,
-                ),
-            };
-            attempts.push(ModelRouteAttempt {
-                ordinal,
-                kind: attempt_kind,
-                profile_error: error.model_error(),
-                upstream_status_code: error.upstream_status_code(),
-                output_error: error.output_error(),
-            });
-            return Err(route_terminal(terminal_kind, attempts));
+            return Err(invocation_failure(error, ordinal, attempts));
         }
         Err(route_terminal(
             ModelRouteTerminalErrorKind::Exhausted,
             attempts,
         ))
     }
+}
+
+fn invocation_failure(
+    error: super::ModelInvocationError,
+    ordinal: u8,
+    mut attempts: Vec<ModelRouteAttempt>,
+) -> ModelRouteTerminalError {
+    let (attempt_kind, terminal_kind) = match error.kind() {
+        ModelInvocationErrorKind::RouteMismatch => (
+            ModelRouteAttemptKind::Configuration,
+            ModelRouteTerminalErrorKind::RouteMismatch,
+        ),
+        ModelInvocationErrorKind::StructuredOutput => (
+            ModelRouteAttemptKind::Protocol,
+            ModelRouteTerminalErrorKind::Protocol,
+        ),
+        ModelInvocationErrorKind::Session => (
+            ModelRouteAttemptKind::Session,
+            ModelRouteTerminalErrorKind::Session,
+        ),
+        ModelInvocationErrorKind::DeadlineExceeded => (
+            ModelRouteAttemptKind::Timeout,
+            ModelRouteTerminalErrorKind::DeadlineExceeded,
+        ),
+        ModelInvocationErrorKind::Cancelled => (
+            ModelRouteAttemptKind::Timeout,
+            ModelRouteTerminalErrorKind::Cancelled,
+        ),
+        ModelInvocationErrorKind::ModelProfile
+            if error.model_error() == Some(ModelProfileErrorKind::Timeout) =>
+        {
+            (
+                ModelRouteAttemptKind::Timeout,
+                ModelRouteTerminalErrorKind::Provider,
+            )
+        }
+        ModelInvocationErrorKind::ModelProfile => (
+            ModelRouteAttemptKind::TerminalProvider,
+            ModelRouteTerminalErrorKind::Provider,
+        ),
+    };
+    attempts.push(ModelRouteAttempt {
+        ordinal,
+        kind: attempt_kind,
+        profile_error: error.model_error(),
+        upstream_status_code: error.upstream_status_code(),
+        output_error: error.output_error(),
+    });
+    route_terminal(terminal_kind, attempts)
 }
 
 fn session_failure(

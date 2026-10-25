@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{
     Arc, Mutex,
@@ -891,19 +892,7 @@ impl ModelProfileRegistry {
             .get(identity)
             .ok_or_else(ModelProfileError::missing)?;
         Self::validate_entry(identity, profile)?;
-        let secret = match profile {
-            ModelProfile::OpenAiCompatible(OpenAiCompatibleProfile {
-                auth: OpenAiCompatibleAuth::Credential(handle),
-                ..
-            }) => Some(
-                broker
-                    .resolve_for_route(handle)
-                    .await
-                    .map_err(ModelProfileError::credential)?,
-            ),
-            ModelProfile::Fake(_) | ModelProfile::OpenAiCompatible(_) => None,
-        };
-        profile.bind_resolved(role, secret)
+        profile.bind_for_route(role, broker, None).await
     }
 }
 
@@ -945,6 +934,28 @@ impl ModelBindingIdentity {
 }
 
 impl ModelProfile {
+    pub(crate) async fn bind_for_route(
+        &self,
+        role: ModelRole,
+        broker: &CredentialBroker,
+        response_body_limit: Option<NonZeroUsize>,
+    ) -> Result<ModelBinding, ModelProfileError> {
+        self.validate()?;
+        let secret = match self {
+            Self::OpenAiCompatible(OpenAiCompatibleProfile {
+                auth: OpenAiCompatibleAuth::Credential(handle),
+                ..
+            }) => Some(
+                broker
+                    .resolve_for_route(handle)
+                    .await
+                    .map_err(ModelProfileError::credential)?,
+            ),
+            Self::Fake(_) | Self::OpenAiCompatible(_) => None,
+        };
+        self.bind_resolved(role, secret, response_body_limit)
+    }
+
     fn bind(
         &self,
         role: ModelRole,
@@ -962,13 +973,14 @@ impl ModelProfile {
             ),
             Self::Fake(_) | Self::OpenAiCompatible(_) => None,
         };
-        self.bind_resolved(role, secret)
+        self.bind_resolved(role, secret, None)
     }
 
     fn bind_resolved(
         &self,
         role: ModelRole,
         secret: Option<SecretValue>,
+        response_body_limit: Option<NonZeroUsize>,
     ) -> Result<ModelBinding, ModelProfileError> {
         let (llm, requested, provider, fake_queue) = match self {
             Self::Fake(value) => {
@@ -1033,6 +1045,10 @@ impl ModelProfile {
                 .map_err(|_| ModelProfileError::provider())?
                 .with_response_schema_strict(false)
                 .with_retry_config(RetryConfig::disabled());
+                let llm = match response_body_limit {
+                    Some(limit) => llm.with_max_response_bytes(limit),
+                    None => llm,
+                };
                 (
                     Arc::new(llm) as Arc<dyn Llm>,
                     value.model.clone(),
