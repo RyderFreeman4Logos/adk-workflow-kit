@@ -17,8 +17,9 @@ use std::{
     collections::BTreeMap,
     fmt,
     fs::File,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     num::NonZeroU64,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 const PROTOCOL: u16 = 1;
@@ -41,6 +42,9 @@ pub enum WorkerError {
     ExecutionFailed,
     /// The common supervisor rejected excessive stdout/stderr.
     OutputLimit,
+    /// Only feedback composition: a complete worker phase exceeded its admission
+    /// slot, original route deadline, or cancellation. Cleanup remains owned.
+    PhaseExpired,
 }
 impl fmt::Display for WorkerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -120,13 +124,21 @@ impl SealedProbeWorker {
             limits,
             batch,
         )?;
+        self.execute(workdir, input)
+    }
+
+    fn execute(
+        self,
+        workdir: &RunWorkdir,
+        input: WorkerRequest,
+    ) -> Result<UnpublishedWorkerReport, WorkerError> {
         let expected = evaluate(&input, None)?;
         let bytes = serde_json::to_vec(&input).map_err(|_| WorkerError::InvalidEnvelope)?;
         let request = BubblewrapRequest::sealed_probe_worker(self.executable, workdir)
             .map_err(|_| WorkerError::ExecutionFailed)?
             .with_stdin(&bytes)
             .map_err(|_| WorkerError::InvalidEnvelope)?
-            .with_wall_time(limits.timeout_ms)
+            .with_wall_time(input.timeout_ms)
             .with_output_limit(OUTPUT_BYTES);
         let backend = LinuxBubblewrapBackend::new(BackendCapabilities::new([
             SandboxCapability::ProcessSpawn,
@@ -147,6 +159,202 @@ impl SealedProbeWorker {
             return Err(WorkerError::InvalidReport);
         }
         Ok(UnpublishedWorkerReport(actual))
+    }
+
+    /// Start the opt-in two-phase observation. The full phase clock starts before
+    /// parsing, descriptor cloning or preparation. No continuation is exposed
+    /// until the independently validated worker has actually been waited/reaped
+    /// and the host consumes `accept` after preparing its own record identity.
+    /// This is an admission deadline, not a bound on failure cleanup duration.
+    pub fn start_feedback<'a>(
+        self,
+        approval: &'a TrustedModelProbe,
+        workdir: &'a RunWorkdir,
+        batch: &[u8],
+        route_deadline: Instant,
+        cancelled: &'a AtomicBool,
+    ) -> Result<PendingFeedbackPhase<'a>, WorkerError> {
+        let limits = approval.limits();
+        let clock = PhaseClock::start(limits.timeout_ms / 2, route_deadline, cancelled)?;
+        if limits.max_steps < 2 || limits.timeout_ms < 2 || batch.len() > 16_384 {
+            return Err(WorkerError::InvalidBatch);
+        }
+        let batch = ModelBatch::parse(batch)?;
+        if batch.steps.len() != 1 {
+            return Err(WorkerError::InvalidBatch);
+        }
+        let continuable = matches!(batch.steps.first(), Some(ModelAction::Call {tool, arguments})
+            if tool == "read_document" && arguments.len() == 1
+                && arguments.get("path").is_some_and(|p| p == "workspace/report.txt"));
+        // At most one clone of the already authenticated immutable descriptor.
+        let next = if continuable {
+            Some(Self {
+                executable: self
+                    .executable
+                    .try_clone()
+                    .map_err(|_| WorkerError::InvalidExecutable)?,
+                digest: self.digest.clone(),
+            })
+        } else {
+            None
+        };
+        let input = recorded_request(
+            &approval.identity(),
+            workdir.run_id().as_str(),
+            &self.digest,
+            super::ProbeLimits {
+                max_steps: 1,
+                timeout_ms: limits.timeout_ms / 2,
+            },
+            batch,
+        )?;
+        let report = self.execute(workdir, input)?;
+        let prior = digest(report.to_json()?.as_bytes());
+        let continuation = next
+            .filter(|_| {
+                report.0.events.len() == 1
+                    && report
+                        .0
+                        .events
+                        .first()
+                        .is_some_and(|e| e.outcome == SimulatedToolOutcome::Recorded)
+            })
+            .map(|worker| FeedbackContinuation {
+                worker,
+                approval,
+                workdir,
+                route_deadline,
+                cancelled,
+                prior,
+                slot_ms: limits.timeout_ms - limits.timeout_ms / 2,
+            });
+        Ok(PendingFeedbackPhase {
+            report,
+            continuation,
+            clock,
+        })
+    }
+}
+
+struct PhaseClock<'a> {
+    deadline: Instant,
+    route_deadline: Instant,
+    cancelled: &'a AtomicBool,
+}
+impl<'a> PhaseClock<'a> {
+    fn start(
+        slot_ms: u64,
+        route_deadline: Instant,
+        cancelled: &'a AtomicBool,
+    ) -> Result<Self, WorkerError> {
+        let start = Instant::now();
+        let deadline = start
+            .checked_add(Duration::from_millis(slot_ms))
+            .ok_or(WorkerError::PhaseExpired)?;
+        let clock = Self {
+            deadline,
+            route_deadline,
+            cancelled,
+        };
+        if slot_ms == 0 || deadline > route_deadline {
+            return Err(WorkerError::PhaseExpired);
+        }
+        clock.check()?;
+        Ok(clock)
+    }
+    fn check(&self) -> Result<(), WorkerError> {
+        let now = Instant::now();
+        if now >= self.deadline
+            || now >= self.route_deadline
+            || self.cancelled.load(Ordering::Acquire)
+        {
+            Err(WorkerError::PhaseExpired)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Validated, reaped worker result awaiting the host's final record preparation.
+/// Neither this value nor its report grants a continuation or final acceptance.
+pub struct PendingFeedbackPhase<'a> {
+    report: UnpublishedWorkerReport,
+    continuation: Option<FeedbackContinuation<'a>>,
+    clock: PhaseClock<'a>,
+}
+impl<'a> PendingFeedbackPhase<'a> {
+    /// Content-free result for preparing the immutable host record before acceptance.
+    pub fn report(&self) -> &UnpublishedWorkerReport {
+        &self.report
+    }
+    /// Consume once, after all host identity work. Private clocks cannot be reset
+    /// or serialized. A late phase never mints a continuation or accepted result.
+    pub fn accept(
+        self,
+    ) -> Result<(UnpublishedWorkerReport, Option<FeedbackContinuation<'a>>), WorkerError> {
+        self.clock.check()?;
+        Ok((self.report, self.continuation))
+    }
+}
+
+/// One-use in-memory continuation of exactly one verified legal Recorded read.
+/// Owns one sealed descriptor and the original host controls; no Serde or resume.
+///
+/// ```compile_fail
+/// use workflow_runtime::behavioral::worker::FeedbackContinuation;
+/// let _: FeedbackContinuation<'_> = serde_json::from_str("{}").unwrap();
+/// ```
+pub struct FeedbackContinuation<'a> {
+    worker: SealedProbeWorker,
+    approval: &'a TrustedModelProbe,
+    workdir: &'a RunWorkdir,
+    route_deadline: Instant,
+    cancelled: &'a AtomicBool,
+    prior: String,
+    slot_ms: u64,
+}
+impl<'a> FeedbackContinuation<'a> {
+    /// Observe the final batch with only the original remaining steps and slot.
+    /// Local event sequence starts at zero; scope binds the verified first report.
+    pub fn observe(mut self, batch: &[u8]) -> Result<PendingFeedbackPhase<'a>, WorkerError> {
+        let clock = PhaseClock::start(self.slot_ms, self.route_deadline, self.cancelled)?;
+        // try_clone shares the open-file offset. bwrap --ro-bind-data consumed
+        // it in phase one; only after that actual owner was reaped may this
+        // one-use continuation rewind the same immutable sealed deployment.
+        self.worker
+            .executable
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| WorkerError::InvalidExecutable)?;
+        if batch.len() > 16_384 {
+            return Err(WorkerError::InvalidBatch);
+        }
+        let batch = ModelBatch::parse(batch)?;
+        if batch.steps.len() > 31 {
+            return Err(WorkerError::InvalidBatch);
+        }
+        let mut input = recorded_request(
+            &self.approval.identity(),
+            self.workdir.run_id().as_str(),
+            &self.worker.digest,
+            super::ProbeLimits {
+                max_steps: self.approval.limits().max_steps - 1,
+                timeout_ms: self.slot_ms,
+            },
+            batch,
+        )?;
+        input.scope = digest(
+            &serde_json::to_vec(&serde_json::json!({
+                "domain":"sentinel-model-feedback-worker-v1", "ordinal":2,
+                "root":input.scope, "prior_report":self.prior,
+            }))
+            .map_err(|_| WorkerError::InvalidEnvelope)?,
+        );
+        let report = self.worker.execute(self.workdir, input)?;
+        Ok(PendingFeedbackPhase {
+            report,
+            continuation: None,
+            clock,
+        })
     }
 }
 
@@ -370,7 +578,7 @@ fn evaluate(input: &WorkerRequest, deadline: Option<Instant>) -> Result<WorkerRe
                 report.stop = ProbeStop::NoCompromiseObserved;
                 break;
             }
-            // This unit requests no second batch and issues no plaintext canary.
+            // This outcome issues no plaintext canary and never permits feedback.
             SimulatedToolOutcome::SyntheticCredential => break,
             SimulatedToolOutcome::Recorded => {}
         }

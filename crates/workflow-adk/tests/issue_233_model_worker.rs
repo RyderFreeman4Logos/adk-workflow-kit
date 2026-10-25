@@ -177,16 +177,20 @@ impl Drop for Fixture {
 }
 
 fn worker() -> SealedProbeWorker {
+    attested_fixture_worker("sentinel-probe-worker")
+}
+fn attested_fixture_worker(name: &str) -> SealedProbeWorker {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
         .parent()
         .unwrap();
-    let bytes = fs::read(root.join("target/debug/sentinel-probe-worker")).unwrap();
-    let stamp = fs::read_to_string(root.join("target/debug/sentinel-probe-worker.sha256")).unwrap();
+    let path = format!("target/debug/{name}");
+    let bytes = fs::read(root.join(&path)).unwrap();
+    let stamp = fs::read_to_string(root.join(format!("{path}.sha256"))).unwrap();
     let mut fields = stamp.split_whitespace();
     let expected = format!("sha256:{}", fields.next().unwrap());
-    assert_eq!(fields.next(), Some("target/debug/sentinel-probe-worker"));
+    assert_eq!(fields.next(), Some(path.as_str()));
     assert_eq!(fields.next(), None);
     SealedProbeWorker::authorize(&bytes, &expected).unwrap()
 }
@@ -380,7 +384,20 @@ fn prepared(bytes: &[u8], started: Instant) -> workflow_runtime::CanonicalUntrus
 }
 
 fn approved(declaration: &str) -> (workflow_compiler::CompiledPlan, TrustedModelProbe) {
-    let spec = workflow_spec::parse_str("host-model.toml", &format!("{}\n[nodes.untrusted_text.behavioral]\nschema_version = 2\nmax_steps = 8\ntimeout_ms = 1000\n", include_str!("fixtures/sentinel.workflow.toml"))).unwrap();
+    approved_limits(
+        declaration,
+        ProbeLimits {
+            max_steps: 8,
+            timeout_ms: 1000,
+        },
+    )
+}
+
+fn approved_limits(
+    declaration: &str,
+    limits: ProbeLimits,
+) -> (workflow_compiler::CompiledPlan, TrustedModelProbe) {
+    let spec = workflow_spec::parse_str("host-model.toml", &format!("{}\n[nodes.untrusted_text.behavioral]\nschema_version = 2\nmax_steps = {}\ntimeout_ms = {}\n", include_str!("fixtures/sentinel.workflow.toml"),limits.max_steps,limits.timeout_ms)).unwrap();
     let ir = workflow_ir::WorkflowIr::from(&spec);
     let hash = ir.canonical_hash();
     let ir_hash = format!(
@@ -405,10 +422,7 @@ fn approved(declaration: &str) -> (workflow_compiler::CompiledPlan, TrustedModel
         provenance,
         "host-owned-revision",
         declaration,
-        ProbeLimits {
-            max_steps: 8,
-            timeout_ms: 1000,
-        },
+        limits,
     )
     .unwrap();
     let plan =
@@ -1105,5 +1119,7 @@ async fn public_host_route_deadline_expires_during_pending_actual_http_transport
     wire.finish().await;
 }
 
+#[path = "issue_233_model_worker/feedback.rs"]
+mod feedback;
 #[path = "issue_233_model_worker/publication.rs"]
 mod publication;

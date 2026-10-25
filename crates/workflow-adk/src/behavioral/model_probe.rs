@@ -9,9 +9,10 @@ pub struct ModelProbeObservation {
     pub usage: Option<crate::ProviderTokenUsage>,
 }
 
-/// Host-owned inputs for one approved model action batch, with no retry or session.
+/// Host-owned inputs for bounded model observation, with no retry or session.
 /// The host must independently authenticate the declaration before authorizing
-/// and compiling it. This consumes one sealed worker, without enabling translation.
+/// and compiling it. Default observation consumes one sealed worker; the separate
+/// feedback opt-in permits one continuation. Neither enables translation.
 pub struct HostModelProbe<'a> {
     pub plan: &'a workflow_compiler::CompiledPlan,
     pub approval: &'a workflow_runtime::behavioral::TrustedModelProbe,
@@ -100,7 +101,7 @@ impl HostModelProbe<'_> {
         })
     }
 
-    fn check_worker_budget(
+    pub(super) fn check_worker_budget(
         &self,
         limits: workflow_runtime::behavioral::ProbeLimits,
     ) -> Result<(), crate::AdkGraphError> {
@@ -130,6 +131,15 @@ pub(super) struct CapturedModelProbe {
 pub(super) fn invocation_spec(
     envelope: String,
 ) -> Result<crate::ModelInvocationSpec, crate::AdkGraphError> {
+    bounded_spec(envelope, TASK_SUFFIX, MAX_MODEL_TOKENS, MAX_SEMANTIC_BYTES)
+}
+
+pub(super) fn bounded_spec(
+    envelope: String,
+    suffix: &str,
+    tokens: usize,
+    semantic_bytes: usize,
+) -> Result<crate::ModelInvocationSpec, crate::AdkGraphError> {
     use crate::{
         AdkGraphError, InferenceBudget, ModelInvocationSpec, ModelProfileIdentity, PromptProtocol,
         ProviderRouteIdentity, ReasoningEffort, StructuredOutputContract, ToolDefinition,
@@ -149,10 +159,10 @@ pub(super) fn invocation_spec(
         TrustDomain::UntrustedContent,
     )
     .map_err(|_| AdkGraphError::Failed)?;
-    let output = StructuredOutputContract::new(schema, MAX_SEMANTIC_BYTES)
-        .map_err(|_| AdkGraphError::Failed)?;
-    let budget = InferenceBudget::new(ReasoningEffort::Low, MAX_MODEL_TOKENS, 0)
-        .map_err(|_| AdkGraphError::Failed)?;
+    let output =
+        StructuredOutputContract::new(schema, semantic_bytes).map_err(|_| AdkGraphError::Failed)?;
+    let budget =
+        InferenceBudget::new(ReasoningEffort::Low, tokens, 0).map_err(|_| AdkGraphError::Failed)?;
     let placeholder = ProviderRouteIdentity::new(
         ModelProfileIdentity::new("host-model-probe", "1"),
         "unbound",
@@ -160,7 +170,7 @@ pub(super) fn invocation_spec(
         "unbound",
         "unbound",
     );
-    ModelInvocationSpec::new(protocol, TASK_SUFFIX, placeholder, budget, output)
+    ModelInvocationSpec::new(protocol, suffix, placeholder, budget, output)
         .map_err(|_| AdkGraphError::Failed)
 }
 

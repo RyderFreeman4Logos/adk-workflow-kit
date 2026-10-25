@@ -193,10 +193,60 @@ or create authority to resume work.
 
 Use a caller-controlled private store root. Artifact files use mode 0600; this
 API does not enforce a restricted-store ACL, expiration or reasoning-content
-capture policy. Retention expiry is metadata, not deletion. There is no automatic
+capture policy. Retention expiry is metadata, not deletion. This publication API has no automatic
 resume, feedback loop, canary continuation, full checkpoint recovery or `Clean`
 verdict. Actual model quality, latency and cost acceptance and the remaining #233
 work remain open.
+
+## Opt-in single feedback continuation
+
+`HostModelProbe::observe_with_feedback().await` requires a fresh live approval
+of the independently authenticated `probe_feedback_declaration_digest()`. The
+single-batch declaration cannot authorize this mode. Existing compilation,
+source/provenance, IR, route, worker deployment and run checks still apply;
+fewer than two approved steps or two milliseconds fails before the broker.
+The original one-call APIs and v1 publisher/offline reader retain their contracts.
+
+This invocation resolves one credential and retains one actual SDK binding, with
+one candidate, zero retries and at most two physical requests. The first response
+must propose exactly one action. Only the exact inert
+`read_document(path=workspace/report.txt)` and its independently verified
+`Recorded` result, after actual worker wait/reap, can mint a private, one-use
+in-memory continuation. Completion and hard tripwires stop after one request.
+`synthetic_credentials` remains `Incomplete`, with no plaintext canary or second
+request. There is no production read or tool execution.
+
+The second request keeps the same stable system/source prefix and binding.
+Only its untrusted dynamic suffix contains the exact first semantic UTF-8 text,
+the canonical inert acknowledgment and the fixed final task. Each response has
+256 requested output tokens, a 32768-byte decoded body cap and a separate
+16384-byte semantic cap: at most 512 requested tokens, 65536 decoded bytes and
+32768 semantic bytes total. The second batch proposes at most 31 actions and
+executes only the original remaining steps (seven after the connected eight-step
+fixture's first read). Requested ceilings do not measure provider computation,
+usage, cost or quality. Actual missing usage remains unknown; actual zero is zero.
+
+The original approved worker time `T` is partitioned into fixed slots
+`floor(T/2)` and the remainder, without transfer. Each private absolute phase
+clock starts before descriptor cloning, parsing/preparation and spawn. Acceptance
+occurs only after actual successful wait/reap, capture settlement, strict result
+validation and host identity preparation, while the original phase and route
+deadlines remain live and cancellation is false. In the connected `T=1000ms`
+fixture each slot is 500ms. A late valid worker phase yields the finite
+`PhaseExpired` category, mapped to host `AuthorizationDenied`; malformed/failed
+workers remain failures. Cleanup remains owned and may exceed admission time;
+there is no hard physical cleanup deadline or retry after expiry.
+
+`ModelProbeFeedbackObservation` borrows ordinary content-free worker reports by
+zero-based batch ordinal and exposes actual SDK provenance, completion and
+optional usage. Its cumulative identity binds the exact private semantics,
+actual reports, approval/source/IR/route/deployment/run, requested token ceilings,
+retained semantic byte counts and executed steps.
+This result is unpublished: it accepts no artifact store, returns no durable
+acknowledgment, and grants no offline audit or resume authority. The sealed fd
+continuation has no serialization or public constructor. Full canary lifecycle,
+checkpoint/crash recovery, automatic resume and live model quality/cost acceptance
+remain unfinished #233 work; this bounded continuation does not complete #233.
 
 ## Verification
 
@@ -221,3 +271,15 @@ privacy, and owned-process interruption after worker cleanup at stage, visibilit
 and synchronization boundaries. Process termination is explicitly waited and
 reaped; these tests do not simulate power loss or full checkpoint recovery.
 The unfiltered recipe also retains the original thirteen Host controls.
+
+`just issue-233-model-worker feedback::` exercises the actual SDK loopback and
+sealed workers for one/two-request boundaries, exact feedback bytes and stable
+prefixes, prebroker identity/limit denial, per-turn/aggregate caps, remaining
+steps, missing/zero usage, forged reports, and pending SDK cancellation/deadline.
+Test-owned FIFO controls delay the existing PID-witness write before the old
+supervisor timer. They establish exact invocation-thread child-set deltas,
+PID/start identity, normal exit with `WNOWAIT`, matching complete witness records
+and actual owner reap. Late first/second phases reject while prompt release and
+the unchanged one-call control discriminate the boundary. Setup/unwind and
+notification-timeout controls exercise release without detaching a Host/Child
+owner; exceptional OS cleanup remains cooperative.
