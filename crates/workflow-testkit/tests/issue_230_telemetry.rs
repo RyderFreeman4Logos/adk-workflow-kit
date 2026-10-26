@@ -42,10 +42,61 @@ fn cli(args: &[&str]) -> Output {
 fn success(output: Output) -> Value {
     assert!(
         output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        "CLI failed: status={}; stdout_bytes={}; stdout_sha256={:x}; stderr_bytes={}; stderr_sha256={:x}",
+        output.status,
+        output.stdout.len(),
+        Sha256::digest(&output.stdout),
+        output.stderr.len(),
+        Sha256::digest(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn cli_failure_diagnostic_retains_status_without_payloads() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    for (raw_status, stdout, stderr, stdout_sha256, stderr_sha256) in [
+        (
+            1 << 8,
+            b"PRIVATE_STDOUT_NEVER_REPORT".as_slice(),
+            b"".as_slice(),
+            "1c28776d9e3d54b0935ef54952c6e441e2b323309ca9b0ef2b7e661900821e85",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            9,
+            b"\xffPRIVATE_STDOUT_NEVER_REPORT\0".as_slice(),
+            b"PRIVATE_STDERR_NEVER_REPORT\xff".as_slice(),
+            "a081440631878f683fa8004de94ba3f75c6b0f055b3971023742a4fea1fa3bef",
+            "5b5e80440085e8bf8e5f13cffaa805dbf53100783a1cf559f2281334ebac9737",
+        ),
+    ] {
+        let status = ExitStatus::from_raw(raw_status);
+        let output = Output {
+            status,
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        };
+        let panic = std::panic::catch_unwind(|| success(output)).unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(!message.contains("PRIVATE_STDOUT_NEVER_REPORT"));
+        assert!(!message.contains("PRIVATE_STDERR_NEVER_REPORT"));
+        assert!(message.contains(&format!("status={status}")));
+        assert!(message.contains(&format!("stdout_bytes={}", stdout.len())));
+        assert!(message.contains(&format!("stderr_bytes={}", stderr.len())));
+        assert!(message.contains(&format!("stdout_sha256={stdout_sha256}")));
+        assert!(message.contains(&format!("stderr_sha256={stderr_sha256}")));
+    }
+    assert_eq!(
+        success(Output {
+            status: ExitStatus::from_raw(0),
+            stdout: br#"{"ready":true}"#.to_vec(),
+            stderr: b"PRIVATE_STDERR_NEVER_REPORT".to_vec(),
+        }),
+        json!({"ready": true})
+    );
 }
 
 fn measured(usage: Option<Value>) -> (PathBuf, Value, Value) {
