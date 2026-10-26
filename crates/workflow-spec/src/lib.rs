@@ -423,6 +423,19 @@ pub struct BehavioralPolicy {
 #[serde(deny_unknown_fields)]
 pub struct TrajectoryPolicy {
     pub schema_version: u16,
+    /// Required only for model monitor schema3; legacy policies omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer_mode: Option<TrajectoryObserverMode>,
+}
+
+/// Closed declarative selector; neither mode grants live model authority.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrajectoryObserverMode {
+    /// Capture and deterministic closed claims only; no observer invocation.
+    Disabled,
+    /// Requires a separate host grant; currently rejected by execution admission.
+    Semantic,
 }
 
 /// Versioned, deterministic untrusted-text terminal contract.

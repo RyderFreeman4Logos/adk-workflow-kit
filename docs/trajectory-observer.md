@@ -24,8 +24,8 @@ terminal stop. Events contain closed tool names, action digests and typed
 outcomes/policy tripwires. They contain no original source, argument values,
 output text, canary plaintext or raw CoT. Unknown tool names are not copied.
 No semantic inference over the trusted task is claimed by this deterministic
-observer. Richer argument/destination classes and bounded excerpts are deferred;
-this milestone reuses existing safe event features rather than reconstructing
+observer. The offline path has no richer argument/destination classes or excerpts;
+it reuses existing safe event features rather than reconstructing
 information that the report intentionally discarded.
 
 ## Compact fixture, not raw reasoning
@@ -42,7 +42,7 @@ retaining bytes. No fixture produces `Unavailable`; disabled mode does not
 parse submitted bytes. `Present` describes only this compact fixture, **never
 provider reasoning availability**. The report separates `summary_status` from
 `raw_reasoning`, which is always `disabled` or `unavailable` in this milestone.
-There is no raw-reasoning adapter.
+The offline path has no raw-reasoning adapter.
 
 The first three flags map to typed weak hints. `claims_no_tools` conflicts with
 any observed call (including an unknown tool). This narrow syntactic consistency
@@ -63,8 +63,8 @@ artifact it references; retaining only the observation is insufficient. Both
 artifacts omit task text, raw fixtures, attacker arguments and CoT. Never retain
 the task-bearing canonical input as ordinary telemetry. There is deliberately
 no raw artifact API, retention timer or purported access-control guarantee.
-Raw reasoning capture requires a separately verified storage/access/retention
-policy and provider authorization before implementation.
+The separate M1 model capture path uses an independently admitted private
+process-local lease; this offline path does not access it.
 
 Identity binds the versioned input (including exact report and trusted task),
 mode, availability and canonical parsed claims. Invalid fixture bytes are neither
@@ -119,3 +119,73 @@ Run `just issue-234-authored`, `just issue-234-runtime`, `just issue-231-compile
 Live-provider availability, semantic quality, token/decode overhead measurement,
 raw-artifact access/retention tests and independent OS isolation
 remain deferred. This milestone does not close #234 or #233.
+
+## Explicit model trajectory monitoring (schema3, deterministic only)
+
+The separate public `HostModelProbe::observe_trajectory(None)` consumes the exact
+`CompiledPlan`, live `TrustedModelProbe`, actual ADK binding and sealed worker.
+It adds safe model-action features to the offline foundation above; it does not
+make ordinary graph translation execute model terminals or enable an observer.
+
+```toml
+[nodes.untrusted_text.behavioral.trajectory]
+schema_version = 3
+observer_mode = "disabled"
+```
+
+The enclosing behavioral policy is model schema2. Authenticate the exact capture
+route and task independently; attach `TrustedTrajectoryMonitor::authorize(task,
+TrajectoryObserverMode::Disabled, None)` to a capture-enabled approval before
+compilation. Tasks must be nonblank and at most 2048 UTF-8 bytes. Task text remains
+host-only and never enters IR, reports, errors, events or Debug. The task digest,
+fixed capture/feature/claim/observer versions and caps seal the host approval.
+Schema3 requires its closed mode; v1/v2 forbid a mode field. The new selector uses
+canonical wire v15; omitted/v1/v2 policies, including compact-state v14 plans,
+retain their exact existing bytes and behavior. M1 capture APIs remain unchanged.
+
+`semantic` is recognized as a declarative mode but compilation and live execution
+reject it in this milestone, even with a separately constructed observer grant.
+An observer route supplied to the disabled entry is rejected before credentials
+or SDK invocation. Existing default/capture/feedback entries cannot reinterpret
+a schema3 approval. No second call, retry, fallback or new deadline is admitted.
+
+The worker compares actual output with its independently reconstructed reply.
+Only after equality does the host expose the prepared safe executed-prefix
+projection, including the terminating event and excluding every unexecuted tail.
+Features include closed tool/argument/path/destination/account classes, existing
+synthetic-token presence and typed policy outcomes. Invalid input types fail the
+strict batch schema before worker execution. Exact approved literals remain
+`workspace/report.txt`, `reviewer.invalid` and `reader`; there is no normalization
+or public/private address classifier. Excerpts are fixed templates under 128 bytes,
+never raw attacker substrings. Unknown names, argument values and output text are
+redacted. Reports and projections remain unpublished, without Sentinel verdict or
+production-tool authority.
+
+The monitor reads at most 1025 bytes through M1's private checked reader to detect
+an oversize 1024-byte claim object without accepting a truncated valid prefix.
+Only the entire closed schema1 four-boolean object above becomes typed claims.
+Raw visibility, claims parse status and observer status remain independent:
+natural-language Thinking can be raw `Present` and claims `Malformed`; this is
+not clean intent. Declared `claims_no_tools` versus an executed call supplies a
+narrow deterministic weak inconsistency. Absent/all-false/malformed claims never
+produce Allow/Clean or remove hard observations. Withheld arbitrary prose cannot
+be credited as observed semantic reasoning or injection detection.
+
+`TrajectoryMonitorFailure` owns the same verified report/projection after worker
+equality, retaining completed role metadata if capture later fails, expires or
+is cancelled. Pre-verification failure has no bundle. A failure is never a
+completed monitor with empty claims. Original absolute route deadline and the
+same cancellation govern reads and late settlement; cancellation remains
+cooperative. Role usage retains the existing optional provider counters, where
+unknown differs from zero. Capture processing is local elapsed time; server
+`decode_ns` remains unavailable and is not inferred from client latency.
+
+Run `just issue-233-model-worker capture::trajectory::`,
+`just issue-234-capture-unit` and `just issue-376-contracts` for this milestone.
+The public FIFO cancellation control sets cancellation after actual worker exit
+but before host equality; the late failure retains the subsequently verified
+bundle. An internal settlement control introduces cancellation/expiry strictly
+after obtaining a verified bundle. A future semantic observer needs its own
+separate admission and public post-verification provider callback controls.
+Live semantic/provider visibility and separate decode-overhead acceptance remain
+unmet; this deterministic milestone does not close the original #234.

@@ -8,6 +8,7 @@ mod admission;
 mod collector;
 mod identity;
 mod lifecycle;
+mod trajectory;
 
 fn approval_for_capture(declaration: &str) -> (workflow_compiler::CompiledPlan, TrustedModelProbe) {
     let text = format!(

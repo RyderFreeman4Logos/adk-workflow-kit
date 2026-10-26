@@ -4,7 +4,7 @@ use workflow_adk::{AdkGraphError, behavioral::ModelProbeFeedbackObservation};
 use workflow_runtime::behavioral::{ProbeSignal, ProbeStop};
 
 #[path = "feedback/phase.rs"]
-mod phase;
+pub(crate) mod phase;
 use phase::make_fifo;
 
 const READ: &str = r#"{ "schema_version":1, "steps":[{"kind":"call","tool":"read_document","arguments":{"path":"workspace/report.txt"}}] }"#;

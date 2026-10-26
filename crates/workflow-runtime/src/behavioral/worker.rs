@@ -22,6 +22,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
+pub mod trajectory;
 const PROTOCOL: u16 = 1;
 const MAX_BATCH_BYTES: usize = 32_768;
 const MAX_EXECUTABLE_BYTES: usize = 128 * 1024 * 1024;
@@ -127,12 +128,43 @@ impl SealedProbeWorker {
         self.execute(workdir, input)
     }
 
+    /// Observe the same strict batch with an immutable host-produced safe prefix.
+    /// Projection material is prepared privately before spawn and exposed only
+    /// after exact report equality, with no fallible step after verification.
+    pub fn observe_batch_with_trajectory(
+        self,
+        approval: &TrustedModelProbe,
+        workdir: &RunWorkdir,
+        batch: &[u8],
+    ) -> Result<trajectory::VerifiedWorkerTrajectory, WorkerError> {
+        let input = recorded_request(
+            &approval.identity(),
+            workdir.run_id().as_str(),
+            &self.digest,
+            approval.limits(),
+            ModelBatch::parse(batch)?,
+        )?;
+        let expected = evaluate(&input, None)?;
+        let projection = trajectory::CanonicalModelTrajectory::prepare(&input, &expected)?;
+        let report = self.execute_expected(workdir, input, expected)?;
+        Ok(trajectory::VerifiedWorkerTrajectory { report, projection })
+    }
+
     fn execute(
         self,
         workdir: &RunWorkdir,
         input: WorkerRequest,
     ) -> Result<UnpublishedWorkerReport, WorkerError> {
         let expected = evaluate(&input, None)?;
+        self.execute_expected(workdir, input, expected)
+    }
+
+    fn execute_expected(
+        self,
+        workdir: &RunWorkdir,
+        input: WorkerRequest,
+        expected: WorkerReply,
+    ) -> Result<UnpublishedWorkerReport, WorkerError> {
         let bytes = serde_json::to_vec(&input).map_err(|_| WorkerError::InvalidEnvelope)?;
         let request = BubblewrapRequest::sealed_probe_worker(self.executable, workdir)
             .map_err(|_| WorkerError::ExecutionFailed)?

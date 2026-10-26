@@ -7,6 +7,7 @@ use workflow_spec::{
 };
 
 pub mod compact_state;
+pub use workflow_spec::TrajectoryObserverMode;
 
 /// The canonical byte-wire version used for content identity.
 pub const CANONICAL_IR_WIRE_VERSION_V1: u16 = 1;
@@ -42,6 +43,9 @@ pub const CANONICAL_IR_WIRE_VERSION_V13: u16 = 13;
 
 /// Canonical wire for a normalized compact-state exchange declaration.
 pub const CANONICAL_IR_WIRE_VERSION_V14: u16 = 14;
+
+/// Canonical wire for the explicit schema3 trajectory observer selector.
+pub const CANONICAL_IR_WIRE_VERSION_V15: u16 = 15;
 
 const DOMAIN: &[u8] = b"adk-workflow-kit/workflow-ir\0";
 const IR_SCHEMA_VERSION_V1: u32 = 1;
@@ -803,9 +807,31 @@ impl ChunkSink for Vec<u8> {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CANONICAL_LAYOUT_WORK: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+    static CANONICAL_DEFAULT_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
+    // Layout discovery is graph-wide; reuse its immutable facts for every frame.
+    let wire_version = canonical_wire_version(ir);
+    let has_cycle_policy = ir.nodes.iter().any(|candidate| {
+        #[cfg(test)]
+        CANONICAL_LAYOUT_WORK.with(|work| {
+            let mut count = work.get();
+            count.2 += 1;
+            work.set(count);
+        });
+        candidate.max_visits.is_some() || candidate.idempotent
+    });
+    let has_route_defaults = ir.routes.iter().any(|candidate| {
+        #[cfg(test)]
+        CANONICAL_DEFAULT_WORK.with(|work| work.set(work.get() + 1));
+        candidate.default.is_some()
+    });
     sink.write_chunk(DOMAIN);
-    write_u16(sink, canonical_wire_version(ir));
+    write_u16(sink, wire_version);
     write_u32(sink, ir.schema_version.tag());
     write_frame(sink, ir.workflow_id.as_str());
     write_frame(sink, &ir.workflow_version);
@@ -814,7 +840,7 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
     for node in &ir.nodes {
         write_frame(sink, node.id.as_str());
         sink.write_chunk(&[node.kind.tag()]);
-        if canonical_wire_version(ir) >= CANONICAL_IR_WIRE_VERSION_V11 {
+        if wire_version >= CANONICAL_IR_WIRE_VERSION_V11 {
             match node.untrusted_text {
                 Some(policy) => {
                     sink.write_chunk(&[1]);
@@ -825,18 +851,30 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
                         u8::from(policy.zh),
                         u8::from(policy.ja),
                     ]);
-                    if canonical_wire_version(ir) >= CANONICAL_IR_WIRE_VERSION_V12 {
+                    if wire_version >= CANONICAL_IR_WIRE_VERSION_V12 {
                         match policy.behavioral {
                             Some(behavioral) => {
                                 sink.write_chunk(&[1]);
                                 write_u16(sink, behavioral.schema_version);
                                 write_u64(sink, u64_from_usize(behavioral.max_steps));
                                 write_u64(sink, behavioral.timeout_ms);
-                                if canonical_wire_version(ir) >= CANONICAL_IR_WIRE_VERSION_V13 {
+                                if wire_version >= CANONICAL_IR_WIRE_VERSION_V13 {
                                     match behavioral.trajectory {
                                         Some(observer) => {
                                             sink.write_chunk(&[1]);
                                             write_u16(sink, observer.schema_version);
+                                            if wire_version >= CANONICAL_IR_WIRE_VERSION_V15 {
+                                                match observer.observer_mode {
+                                                    None => sink.write_chunk(&[0]),
+                                                    Some(mode) => sink.write_chunk(&[
+                                                        1,
+                                                        match mode {
+                                                            TrajectoryObserverMode::Disabled => 0,
+                                                            TrajectoryObserverMode::Semantic => 1,
+                                                        },
+                                                    ]),
+                                                }
+                                            }
                                         }
                                         None => sink.write_chunk(&[0]),
                                     }
@@ -858,11 +896,7 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
                 None => sink.write_chunk(&[0]),
             }
         }
-        if ir
-            .nodes
-            .iter()
-            .any(|candidate| candidate.max_visits.is_some() || candidate.idempotent)
-        {
+        if has_cycle_policy {
             match node.max_visits {
                 Some(value) => {
                     sink.write_chunk(&[1]);
@@ -872,7 +906,7 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
             }
             sink.write_chunk(&[u8::from(node.idempotent)]);
         }
-        if canonical_wire_version(ir) >= CANONICAL_IR_WIRE_VERSION_V6 {
+        if wire_version >= CANONICAL_IR_WIRE_VERSION_V6 {
             match &node.model {
                 Some(model) => {
                     sink.write_chunk(&[1, model.role.tag()]);
@@ -881,7 +915,7 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
                 }
                 None => sink.write_chunk(&[0]),
             }
-            if canonical_wire_version(ir) == CANONICAL_IR_WIRE_VERSION_V6 {
+            if wire_version == CANONICAL_IR_WIRE_VERSION_V6 {
                 sink.write_chunk(&[0]);
             } else {
                 write_u64(sink, u64_from_usize(node.tools.len()));
@@ -890,14 +924,14 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
                     write_frame(sink, &tool.version);
                 }
             }
-            if canonical_wire_version(ir) >= CANONICAL_IR_WIRE_VERSION_V8 {
+            if wire_version >= CANONICAL_IR_WIRE_VERSION_V8 {
                 write_u64(sink, u64_from_usize(node.skills.len()));
                 for skill in &node.skills {
                     write_frame(sink, &skill.id);
                     write_frame(sink, &skill.version);
                 }
             }
-            if canonical_wire_version(ir) >= CANONICAL_IR_WIRE_VERSION_V9 {
+            if wire_version >= CANONICAL_IR_WIRE_VERSION_V9 {
                 match &node.agent_contract {
                     Some(contract) => {
                         sink.write_chunk(&[1]);
@@ -919,7 +953,7 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
             }
         }
     }
-    if canonical_wire_version(ir) >= CANONICAL_IR_WIRE_VERSION_V10 {
+    if wire_version >= CANONICAL_IR_WIRE_VERSION_V10 {
         for node in &ir.nodes {
             match &node.firewall {
                 Some(contract) => {
@@ -947,11 +981,7 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
                 write_frame(sink, case.key());
                 write_frame(sink, case.target().as_str());
             }
-            if ir
-                .routes
-                .iter()
-                .any(|candidate| candidate.default.is_some())
-            {
+            if has_route_defaults {
                 match &route.default {
                     Some(target) => {
                         sink.write_chunk(&[1]);
@@ -997,7 +1027,26 @@ fn encode_canonical(ir: &WorkflowIr, sink: &mut impl ChunkSink) {
 }
 
 fn canonical_wire_version(ir: &WorkflowIr) -> u16 {
-    if ir.compact_state_exchange.is_some() {
+    #[cfg(test)]
+    CANONICAL_LAYOUT_WORK.with(|work| {
+        let mut count = work.get();
+        count.0 += 1;
+        work.set(count);
+    });
+    if ir.nodes.iter().any(|node| {
+        #[cfg(test)]
+        CANONICAL_LAYOUT_WORK.with(|work| {
+            let mut count = work.get();
+            count.1 += 1;
+            work.set(count);
+        });
+        node.untrusted_text
+            .and_then(|p| p.behavioral)
+            .and_then(|p| p.trajectory)
+            .is_some_and(|p| p.schema_version == 3)
+    }) {
+        CANONICAL_IR_WIRE_VERSION_V15
+    } else if ir.compact_state_exchange.is_some() {
         CANONICAL_IR_WIRE_VERSION_V14
     } else if ir.nodes.iter().any(|node| {
         node.untrusted_text
@@ -1124,6 +1173,120 @@ to = "b"
         let mut bytes = Vec::new();
         encode_canonical(ir, &mut bytes);
         bytes
+    }
+
+    fn legacy_compact_graph(nodes: usize, first_idempotent: bool) -> WorkflowIr {
+        let mut source =
+            String::from("schema_version=1\n[workflow]\nid='w'\nversion='1'\nentry='n0000'\n");
+        for index in 0..nodes {
+            let kind = if index + 1 == nodes {
+                "terminal"
+            } else {
+                "agent"
+            };
+            source.push_str(&format!(
+                "[[nodes]]\nid='n{index:04}'\nkind='{kind}'\nidempotent={}\n",
+                index == 0 && first_idempotent
+            ));
+        }
+        for index in 1..nodes {
+            source.push_str(&format!(
+                "[[edges]]\nfrom='n{:04}'\nto='n{index:04}'\n",
+                index - 1
+            ));
+        }
+        source.push_str(
+            "[compact_state_exchange]\nfrom='code.investigation'\nto='grounded.answer'\n",
+        );
+        ir(&source)
+    }
+
+    #[test]
+    fn canonical_hash_discovers_layout_once_for_growing_legacy_compact_graphs() {
+        let mut observed = Vec::new();
+        for nodes in [16, 64] {
+            let graph = legacy_compact_graph(nodes, true);
+            assert!(graph.nodes().first().unwrap().idempotent());
+            assert_eq!(graph.nodes().len(), nodes);
+            assert_eq!(graph.edges().len(), nodes - 1);
+            assert_eq!(super::canonical_wire_version(&graph), 14);
+            super::CANONICAL_LAYOUT_WORK.with(|work| work.set((0, 0, 0)));
+            let hash = graph.canonical_hash();
+            observed.push(super::CANONICAL_LAYOUT_WORK.with(std::cell::Cell::get));
+            assert_eq!(
+                hash.as_bytes(),
+                Sha256::digest(canonical_bytes(&graph)).as_slice()
+            );
+        }
+        assert_eq!(observed, [(1, 16, 1), (1, 64, 1)]);
+    }
+
+    #[test]
+    fn canonical_hash_discovers_default_layout_once_for_growing_route_collections() {
+        let mut observed = Vec::new();
+        for routes in [16, 64] {
+            for has_default in [false, true] {
+                let mut source = String::from(
+                    "schema_version=1\nedges=[]\n[workflow]\nid='w'\nversion='1'\nentry='a'\n[[nodes]]\nid='a'\nkind='agent'\n[[nodes]]\nid='b'\nkind='terminal'\n[compact_state_exchange]\nfrom='code.investigation'\nto='grounded.answer'\n",
+                );
+                for index in 0..routes {
+                    source.push_str(&format!(
+                        "[[routes]]\nfrom='a'\npredicate={{id='p{index:04}',version='1'}}\ncases={{only='b'}}\n",
+                    ));
+                    if index == 0 && has_default {
+                        source.push_str("default='b'\n");
+                    }
+                }
+                let graph = ir(&source);
+                assert_eq!(graph.routes().len(), routes);
+                assert_eq!(
+                    graph.routes().first().unwrap().default().is_some(),
+                    has_default
+                );
+                super::CANONICAL_DEFAULT_WORK.with(|work| work.set(0));
+                let hash = graph.canonical_hash();
+                observed.push((
+                    routes,
+                    has_default,
+                    super::CANONICAL_DEFAULT_WORK.with(std::cell::Cell::get),
+                ));
+                assert_eq!(
+                    hash.as_bytes(),
+                    Sha256::digest(canonical_bytes(&graph)).as_slice()
+                );
+            }
+        }
+        assert_eq!(
+            observed,
+            [
+                (16, false, 16),
+                (16, true, 1),
+                (64, false, 64),
+                (64, true, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_cycle_framing_retains_independent_v14_goldens() {
+        for (first_idempotent, expected) in [
+            (
+                false,
+                "a80d264d2bf476941d991d9033c548624d5983ad53f68e1a9c4487c2168952c4",
+            ),
+            (
+                true,
+                "c16077290a4ee6d0a1baecc7279d184627bf7f79d11a05b8a05488ac73f2a557",
+            ),
+        ] {
+            assert_eq!(
+                format!(
+                    "{:x}",
+                    Sha256::digest(canonical_bytes(&legacy_compact_graph(2, first_idempotent)))
+                ),
+                expected
+            );
+        }
     }
 
     #[test]

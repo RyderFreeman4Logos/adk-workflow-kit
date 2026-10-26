@@ -267,6 +267,9 @@ issue-233-doc:
 # Snapshot the fixed OS-negative fixture before later Cargo graphs can rebuild its canonical binary.
 issue-233-worker-binaries:
     {{_io}} cargo +1.98.0 build -p workflow-runtime --bin sentinel-probe-worker -p workflow-testkit --bin issue-233-boundary-child --locked
+    test ! -L target/debug/sentinel-probe-worker.fixture && { test ! -e target/debug/sentinel-probe-worker.fixture || test -f target/debug/sentinel-probe-worker.fixture; } && test ! -L target/debug/sentinel-probe-worker.fixture.sha256 && { test ! -e target/debug/sentinel-probe-worker.fixture.sha256 || test -f target/debug/sentinel-probe-worker.fixture.sha256; }
+    cp --no-dereference --no-target-directory --remove-destination -- target/debug/sentinel-probe-worker target/debug/sentinel-probe-worker.fixture
+    sha256sum target/debug/sentinel-probe-worker.fixture > target/debug/sentinel-probe-worker.fixture.sha256
     test ! -L target/debug/issue-233-boundary-child.fixture && { test ! -e target/debug/issue-233-boundary-child.fixture || test -f target/debug/issue-233-boundary-child.fixture; } && test ! -L target/debug/issue-233-boundary-child.fixture.sha256 && { test ! -e target/debug/issue-233-boundary-child.fixture.sha256 || test -f target/debug/issue-233-boundary-child.fixture.sha256; }
     cp --no-dereference --no-target-directory --remove-destination -- target/debug/issue-233-boundary-child target/debug/issue-233-boundary-child.fixture
     sha256sum target/debug/issue-233-boundary-child.fixture > target/debug/issue-233-boundary-child.fixture.sha256
@@ -294,8 +297,8 @@ issue-234-authored:
     {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_233_translation trajectory_authored:: --locked -- --nocapture --test-threads=1
 
 # Process-local capture access/owner controls; the regular test gate also runs them.
-issue-234-capture-unit:
-    {{_io}} cargo +1.98.0 test -p workflow-adk --lib behavioral::reasoning_capture::tests --locked -- --nocapture --test-threads=1
+issue-234-capture-unit: issue-233-worker-binaries
+    {{_io}} cargo +1.98.0 test -p workflow-adk --lib behavioral:: --locked -- --nocapture --test-threads=1
 
 issue-234-capture-doc:
     {{_io}} cargo +1.98.0 test -p workflow-adk --doc reasoning_capture --locked -- --nocapture

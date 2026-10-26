@@ -43,6 +43,7 @@ pub(super) fn validate_admission(
             match admission {
                 BehavioralAdmission::Script(script) => {
                     policy.schema_version == 1
+                        && policy.trajectory.is_none_or(|p| p.observer_mode.is_none())
                         && script
                             .matches_trajectory_policy(policy.trajectory.map(|p| p.schema_version))
                         && script.matches_approval(&hash, limits)
@@ -50,8 +51,25 @@ pub(super) fn validate_admission(
                 BehavioralAdmission::Model(probe, route) => {
                     policy.schema_version == 2
                         && match policy.trajectory.map(|p| p.schema_version) {
-                            None => !probe.reasoning_capture_enabled(),
-                            Some(2) => probe.reasoning_capture_enabled(),
+                            None => {
+                                !probe.reasoning_capture_enabled()
+                                    && probe.trajectory_monitor().is_none()
+                            }
+                            Some(2) => {
+                                probe.reasoning_capture_enabled()
+                                    && probe.trajectory_monitor().is_none()
+                                    && policy.trajectory.is_some_and(|p| p.observer_mode.is_none())
+                            }
+                            Some(3) => {
+                                probe.reasoning_capture_enabled()
+                                    && policy.trajectory.is_some_and(|p| {
+                                        p.observer_mode
+                                            == Some(workflow_ir::TrajectoryObserverMode::Disabled)
+                                    })
+                                    && probe
+                                        .trajectory_monitor()
+                                        .is_some_and(|m| m.valid_disabled())
+                            }
                             _ => false,
                         }
                         && probe.matches_approval(&hash, limits, route)

@@ -23,6 +23,11 @@ use workflow_runtime::behavioral::{ProbeLimits, TrustedScript};
 use workflow_runtime::{ArtifactId, ArtifactStore, CanonicalUntrustedText, RunId};
 
 pub(crate) mod model_probe;
+mod model_trajectory;
+pub use model_trajectory::{
+    ObserverStatus, RoleMetadata, RolePhase, TrajectoryMonitorErrorKind, TrajectoryMonitorFailure,
+    TrajectoryMonitorObservation, TrajectoryMonitorPhase, VerifiedTrajectoryBundle,
+};
 pub(crate) mod model_probe_feedback;
 mod model_probe_receipt;
 pub(crate) mod reasoning_capture;
@@ -90,6 +95,9 @@ impl AdkGraphTranslator {
             (None, None) => true,
             (Some(policy), Some(script)) => {
                 policy.schema_version == 1
+                    && policy
+                        .trajectory
+                        .is_none_or(|trajectory| trajectory.observer_mode.is_none())
                     && script.matches_trajectory_policy(policy.trajectory.map(|p| p.schema_version))
                     && script.matches_approval(
                         &format!("sha256:{}", crate::canonical_ir_hash(ir)),

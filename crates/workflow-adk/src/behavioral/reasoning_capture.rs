@@ -245,3 +245,66 @@ pub(crate) fn declaration_contract() -> serde_json::Value {
     });
     contract
 }
+
+/// Completed typed facts and their independent lease disposition. A late denial
+/// must not erase a parse that already completed; no raw bytes cross this seam.
+pub(super) struct ClosedClaimsRead {
+    pub parsed: Option<(
+        ReasoningStatus,
+        Option<workflow_runtime::behavioral::trajectory::ClosedTrajectoryClaims>,
+    )>,
+    pub disposition: Result<(), AdkGraphError>,
+}
+
+/// Consume the same private lease through its checked reader, exporting typed claims only.
+pub(super) fn read_closed_claims(
+    bytes: Vec<u8>,
+    binding: String,
+    deadline: Instant,
+    cancellation: &ModelRouteCancellation,
+) -> ClosedClaimsRead {
+    read_closed_claims_after_parse(bytes, binding, deadline, cancellation, || {})
+}
+
+/// The private callback runs after typed parsing and before the unchanged late
+/// lease check; it cannot receive or export reasoning bytes.
+pub(super) fn read_closed_claims_after_parse(
+    bytes: Vec<u8>,
+    binding: String,
+    deadline: Instant,
+    cancellation: &ModelRouteCancellation,
+    after_parse: impl FnOnce(),
+) -> ClosedClaimsRead {
+    let owner = match ReasoningArtifact::new(bytes, binding.clone()) {
+        Ok(owner) => owner,
+        Err(error) => {
+            return ClosedClaimsRead {
+                parsed: None,
+                disposition: Err(error),
+            };
+        }
+    };
+    let mut parsed = None;
+    let disposition = visit(&owner, &binding, deadline, cancellation, |reader| {
+        let result = if reader.status() == ReasoningStatus::Unavailable {
+            (ReasoningStatus::Unavailable, None)
+        } else {
+            match reader.read(
+                0,
+                NonZeroU64::new(1025).expect("positive oversize witness bound"),
+            ) {
+                Ok(bytes) => {
+                    workflow_runtime::behavioral::trajectory::parse_closed_claims(Some(bytes))
+                }
+                Err(_) => return ReasoningCaptureCompletion::Rejected,
+            }
+        };
+        parsed = Some(result);
+        after_parse();
+        ReasoningCaptureCompletion::Complete
+    });
+    ClosedClaimsRead {
+        parsed,
+        disposition,
+    }
+}
