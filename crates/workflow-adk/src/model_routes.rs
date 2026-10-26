@@ -127,6 +127,20 @@ impl ModelRouteSnapshot {
     fn probe_declaration(
         &self,
     ) -> Result<(crate::model_profiles::ModelProfile, String), ModelRouteSnapshotError> {
+        self.probe_declaration_for(crate::behavioral::model_probe::declaration_contract())
+    }
+
+    /// Pure opt-in feedback contract identity. Authenticate this independently
+    /// before issuing a fresh approval; the single-batch identity is different.
+    pub fn probe_feedback_declaration_digest(&self) -> Result<String, ModelRouteSnapshotError> {
+        self.probe_declaration_for(crate::behavioral::model_probe_feedback::declaration_contract())
+            .map(|(_, digest)| digest)
+    }
+
+    fn probe_declaration_for(
+        &self,
+        contract: serde_json::Value,
+    ) -> Result<(crate::model_profiles::ModelProfile, String), ModelRouteSnapshotError> {
         let invalid = || ModelRouteSnapshotError {
             kind: ModelRouteSnapshotErrorKind::InvalidProbeContract,
         };
@@ -141,7 +155,7 @@ impl ModelRouteSnapshot {
         let material = serde_json::json!({
             "role":candidate.role(), "profile":candidate.profile(),
             "original":original, "effective":effective,
-            "contract":crate::behavioral::model_probe::declaration_contract(),
+            "contract":contract,
         });
         let digest = super::digest(super::canonical_json(&material).as_bytes());
         Ok((effective, digest))
@@ -418,6 +432,10 @@ impl ModelRouteCancellation {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    pub(crate) fn flag(&self) -> &AtomicBool {
+        &self.cancelled
+    }
+
     async fn wait_cancelled(&self) {
         loop {
             let notified = self.notify.notified();
@@ -438,6 +456,64 @@ pub struct ModelRoutePolicy {
 }
 
 impl ModelRoutePolicy {
+    pub(crate) async fn bind_probe_feedback(
+        &self,
+        expected: &str,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+    ) -> Result<ModelBinding, ModelRouteTerminalError> {
+        let terminal = |kind| route_terminal(kind, Vec::new());
+        if let Some(kind) = route_stop(self.deadline, cancellation) {
+            return Err(terminal(kind));
+        }
+        let (profile, digest) = self
+            .snapshot
+            .probe_declaration_for(crate::behavioral::model_probe_feedback::declaration_contract())
+            .map_err(|_| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        let candidate = self
+            .snapshot
+            .candidates
+            .first()
+            .ok_or_else(|| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        if digest != expected || !self.snapshot.authorization.allows(candidate) {
+            return Err(terminal(ModelRouteTerminalErrorKind::AuthorizationDenied));
+        }
+        let limit = std::num::NonZeroUsize::new(32_768)
+            .ok_or_else(|| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        let binding = await_route(
+            profile.bind_for_route(candidate.role(), broker, Some(limit)),
+            self.deadline,
+            cancellation,
+        )
+        .await
+        .map_err(terminal)?
+        .map_err(|_| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        #[cfg(any(test, feature = "test-support"))]
+        let binding = match self.snapshot.test_llms.get(candidate) {
+            Some(llm) => binding.with_test_llm(Arc::clone(llm)),
+            None => binding,
+        };
+        Ok(binding)
+    }
+
+    pub(crate) async fn invoke_probe_feedback(
+        &self,
+        binding: &ModelBinding,
+        spec: &ModelInvocationSpec,
+        cancellation: &ModelRouteCancellation,
+        validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
+    ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
+        let spec = spec.with_route(ProviderRouteIdentity::from_binding(binding));
+        await_route(
+            spec.invoke_with_policy(binding, validate, ResponsePolicy::CompleteText),
+            self.deadline,
+            cancellation,
+        )
+        .await
+        .map_err(|kind| route_terminal(kind, Vec::new()))?
+        .map_err(|error| invocation_failure(error, 1, Vec::new()))
+    }
+
     pub(crate) async fn invoke_model_probe(
         &self,
         spec: &ModelInvocationSpec,

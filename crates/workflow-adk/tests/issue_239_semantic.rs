@@ -1,5 +1,5 @@
 use adk_rust::graph::prelude::{ExecutionConfig, State};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -340,5 +340,130 @@ async fn observed_semantic_gate_records_independent_bounded_escalation_without_r
         }
         assert!(!report.to_string().contains("IGNORE ALL"));
         assert!(!report.to_string().contains("payroll"));
+    }
+}
+
+// The finite acceptance tests own this bounded loopback transport and join it.
+async fn semantic_wire_fixture(
+    requests: usize,
+    reply: fn(&serde_json::Value) -> serde_json::Value,
+) -> (
+    workflow_adk::model_profiles::OpenAiCompatibleProfile,
+    std::net::SocketAddr,
+    tokio::task::JoinSet<usize>,
+) {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        time::timeout,
+    };
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut server = tokio::task::JoinSet::new();
+    server.spawn(async move {
+        let mut physical=0;
+        for _ in 0..requests {
+            let (mut stream,_)=timeout(Duration::from_secs(10),listener.accept()).await.unwrap().unwrap();
+            timeout(Duration::from_secs(5),async {
+                let mut request=Vec::new();
+                let (header_end,length)=loop {
+                    let mut buf=[0u8;4096];let n=stream.read(&mut buf).await.unwrap();assert!(n>0);
+                    request.extend_from_slice(&buf[..n]);assert!(request.len()<=65536);
+                    if let Some(end)=request.windows(4).position(|w|w==b"\r\n\r\n") {
+                        let headers=std::str::from_utf8(&request[..end]).unwrap();
+                        let len=headers.lines().find_map(|line|line.split_once(':').filter(|(k,_)|k.eq_ignore_ascii_case("content-length")).map(|(_,v)|v.trim().parse::<usize>().unwrap())).unwrap();break (end+4,len);
+                    }
+                };
+                while request.len()<header_end+length { let mut buf=[0u8;4096];let n=stream.read(&mut buf).await.unwrap();assert!(n>0);request.extend_from_slice(&buf[..n]);assert!(request.len()<=65536); }
+                let request:serde_json::Value=serde_json::from_slice(&request[header_end..header_end+length]).unwrap();
+                assert_eq!(request["max_completion_tokens"],96);
+                let body=reply(&request).to_string();
+                let response=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
+                stream.write_all(response.as_bytes()).await.unwrap();stream.shutdown().await.unwrap();physical+=1;
+            }).await.unwrap();
+        }
+        physical
+    });
+    let profile = workflow_adk::model_profiles::OpenAiCompatibleProfile::new_no_auth(
+        "wire-firewall",
+        "1",
+        "wire-model",
+        format!("http://{address}/v1"),
+    )
+    .with_runtime(
+        workflow_adk::ModelRuntimeConfig::default().with_timeout(Duration::from_secs(30)),
+    );
+    (profile, address, server)
+}
+
+fn budget_wire_echo(request: &Value) -> Value {
+    let observed = json!({"effort":request["reasoning_effort"],"cap":request["max_completion_tokens"],
+        "legacy_cap":request["max_tokens"],"trace":request["fixture_trace"]});
+    json!({"id":"budget-wire","object":"chat.completion","created":0,"model":"wire-model",
+        "choices":[{"index":0,"message":{"role":"assistant","content":observed.to_string()},"finish_reason":"stop"}]})
+}
+
+#[tokio::test]
+async fn invocation_budget_effort_and_cap_reach_compatible_wire() {
+    use workflow_adk::model_invocation::{
+        InferenceBudget, ModelInvocationSpec, PromptProtocol, ProviderRouteIdentity,
+        ReasoningEffort, StructuredOutputContract,
+    };
+    for (effort, expected) in [
+        (ReasoningEffort::Low, "low"),
+        (ReasoningEffort::Medium, "medium"),
+        (ReasoningEffort::XHigh, "xhigh"),
+    ] {
+        for conflict in 0..3 {
+            let (profile, address, mut server) = semantic_wire_fixture(1, budget_wire_echo).await;
+            let profile = if conflict == 0 {
+                profile
+            } else {
+                profile.with_runtime(workflow_adk::ModelRuntimeConfig::default()
+                    .with_timeout(Duration::from_secs(30))
+                    .with_sampling(|s|s.with_max_output_tokens(999))
+                    .with_provider_extension("openai",if conflict==1 {
+                        json!({"reasoning_effort":"high","max_completion_tokens":999,"max_tokens":998,"fixture_trace":"preserved"})
+                    } else {json!("malformed-profile-namespace")})
+                    .with_provider_extension("workflow_kit",json!({"reasoning_effort":"medium","prompt_protocol":"profile-conflict"})))
+            };
+            let binding = ModelProfileRegistry::new()
+                .with_worker(profile)
+                .unwrap()
+                .bind_worker(&CredentialBroker::new())
+                .unwrap();
+            let output = StructuredOutputContract::new(json!({"type":"object"}), 512).unwrap();
+            let protocol = PromptProtocol::new(
+                "Synthetic wire budget control",
+                vec![],
+                output.schema().clone(),
+                json!({}),
+                workflow_runtime::TrustDomain::TrustedGoal,
+            )
+            .unwrap();
+            let spec = ModelInvocationSpec::new(
+                protocol,
+                "synthetic task",
+                ProviderRouteIdentity::from_binding(&binding),
+                InferenceBudget::new(effort, 96, 0).unwrap(),
+                output,
+            )
+            .unwrap();
+            let result = spec.invoke(&binding).await;
+            assert_eq!(server.join_next().await.unwrap().unwrap(), 1);
+            drop(tokio::net::TcpListener::bind(address).await.unwrap());
+            let observed = result.expect("successful valid invocation before wire assertions");
+            assert_eq!(observed.attempts(), 1);
+            eprintln!(
+                "BUDGET_WIRE effort={expected} conflict={conflict} observed={}",
+                observed.output()
+            );
+            assert_eq!(observed.output()["cap"], 96);
+            assert!(observed.output()["legacy_cap"].is_null());
+            assert_eq!(observed.output()["effort"], expected);
+            if conflict == 1 {
+                assert_eq!(observed.output()["trace"], "preserved");
+            }
+        }
     }
 }

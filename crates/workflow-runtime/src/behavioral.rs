@@ -577,6 +577,10 @@ pub struct ProbeReport {
     stop: ProbeStop,
 }
 impl ProbeReport {
+    /// Original retained input addressed by this genuine host-produced report.
+    pub fn original_artifact_id(&self) -> &str {
+        &self.original_artifact_id
+    }
     pub fn stop(&self) -> ProbeStop {
         self.stop
     }

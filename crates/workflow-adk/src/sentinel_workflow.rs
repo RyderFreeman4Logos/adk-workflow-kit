@@ -10,8 +10,9 @@ use workflow_runtime::{
     ArtifactId, ArtifactStore, CarrierLimits, CarrierMode, LanguageAttribution, LanguagePolicy,
     NodeCacheKey, NodeCacheKeyMaterial, NormalizationLimits, SECURITY_MODEL_VERSION,
     SENTINEL_CARRIER_VERSION, SENTINEL_ENVELOPE_SCHEMA_VERSION, SENTINEL_LANGUAGE_POLICY_VERSION,
-    SENTINEL_NORMALIZATION_VERSION, SENTINEL_PREPARATION_BUDGET_MS, SENTINEL_SCRIPT_DATA_VERSION,
-    SENTINEL_SEGMENTATION_VERSION, SegmentationLimits, SentinelPreparation, SentinelVerdict,
+    SENTINEL_NORMALIZATION_VERSION, SENTINEL_PREPARATION_BUDGET_MS,
+    SENTINEL_REDUCTION_POLICY_VERSION, SENTINEL_SCRIPT_DATA_VERSION, SENTINEL_SEGMENTATION_VERSION,
+    SegmentationLimits, SentinelPreparation, SentinelVerdict, SourceSpan,
     TYPED_OUTPUT_SCHEMA_VERSION_V1, TrustDomain, prepare_untrusted_text,
 };
 use workflow_spec::UntrustedTextPreparation;
@@ -83,7 +84,7 @@ impl PreparationWorkflow {
             zh: self.policy.zh,
             ja: self.policy.ja,
         };
-        let policy = json!({
+        let mut policy = json!({
             "version": VERSION,
             "probe_version": probes::VERSION,
             "probe_budget": probes::BUDGET,
@@ -115,6 +116,12 @@ impl PreparationWorkflow {
             "language_policy": language,
             "trust_domain": TrustDomain::UntrustedContent,
         });
+        // Scripted behavioral preparation returns before semantic inference; retain its policy identity.
+        if self.policy.behavioral.is_some() {
+            policy["semantic_version"] = json!("sentinel-semantic-probes-v4");
+        } else {
+            policy["reduction_policy_version"] = json!(SENTINEL_REDUCTION_POLICY_VERSION);
+        }
         let policy_digest = digest_json(&policy)?;
         let mut report = json!({
             "schema_version": 1,
@@ -276,12 +283,15 @@ impl PreparationWorkflow {
             );
         }
         // Preparation is complete; semantic inference has its own existing deadline.
+        let source_cover = SourceSpan::new(text.original_id().as_str(), 0, raw.len() as u64)
+            .map_err(|_| AdkGraphError::Failed)?;
         let semantic_bytes = semantics::run(
             probes.inputs,
             state,
             model,
             key.digest(),
             self.trusted_goal.as_ref(),
+            &source_cover,
         )
         .await?;
         let semantic_id = put_verified(store, &semantic_bytes, mapper, &self.node_id, "semantics")?;

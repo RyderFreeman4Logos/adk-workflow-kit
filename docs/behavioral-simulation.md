@@ -79,7 +79,7 @@ content hash: a compromised script is not proof the source caused compromise.
 Retain `to_json()` under that reference if persisting the evidence. The report
 has no deserializer that could mint host authority from untrusted JSON.
 
-Deferred: real-model tool-call observation, independently enforced process/OS
+For the standalone scripted reducer, deferred: real-model tool-call observation, independently enforced process/OS
 containment, encoded-canary detection, profile-backed behavioral execution,
 live semantic quality/calibration, durable checkpoint/crash recovery and causal
 attribution. This milestone does not close all of #233's acceptance criteria.
@@ -143,6 +143,111 @@ artifact observer, checkpoint or inherited state is bound. The host deadline
 includes graph setup/queue time; the runtime still clamps its own ceiling.
 The direct runtime API is a deterministic data reducer, not a second agent loop.
 
+## Durable single-batch observation
+
+`HostModelProbe::observe()` remains storage-free and returns an unpublished
+observation. An embedding host may explicitly call
+`HostModelProbe::observe_and_publish(&mut FilesystemArtifactStore).await` to retain
+one completed model batch and its redacted, independently checked sealed-worker
+report. The original source must already be retained under its actual content ID
+in that same store; missing or altered source fails before credential resolution.
+The live `TrustedModelProbe`, compiled IR, selected route declaration, source,
+worker deployment and host run remain bound. This API accepts no mutable
+observation, serialized approval, new task or continuation authority.
+
+The route makes one physical model request, with 512 output tokens, a 65536-byte
+nonstream response-body cap, a separate 32768-byte exact semantic UTF-8 cap,
+32 proposed actions and zero retries. The approved step/time limits are unchanged
+(the connected acceptance fixture uses eight steps and 1000ms). Only
+`NoCompromiseObserved` or a typed hard tripwire may be published. Partial,
+malformed, non-text, failed-worker and nonfinal results produce no acknowledged
+artifact. The exact semantic text is the worker input, not reasoning-channel
+content or an HTTP transcript; semantically equivalent JSON can have different
+raw hashes while retaining the same canonical worker proposal digest.
+
+One strict v1 record binds source and normalization facts, canonical envelope,
+IR/approval/run identities, actual route and SDK contract, invocation provenance,
+exact semantic bytes, redacted worker report and provider usage. Missing counters
+remain null and genuine zero remains zero. The serialized record has an
+independent 1MiB ceiling and is never truncated to fit. It makes no measured cost,
+quality, cache-savings or causal-attribution claim.
+
+Publication stages and syncs bytes, checks the original absolute route deadline
+and cancellation, commits visibility once, then syncs the directory before
+returning `PublishedModelProbeArtifact`. `NotPublished` means this invocation did
+not publish the evidence. `PublishedUnacknowledged` identifies visible forensic
+content after a synchronization failure or late cancellation/deadline; it is not
+a successful acknowledgment. No failure deletes original artifacts, retries the
+model or worker, or promises rollback. Blocking filesystem work is cooperatively
+checked after it returns, rather than preemptively interrupted.
+
+Reopen the store and call `read_model_probe_evidence(&store, &expected_id)` with an
+ID authenticated independently by the caller. The bounded reader verifies exact
+content IDs, source normalization and invocation identities, then uses the same
+strict worker parser, scope construction and pure evaluator to verify every
+recorded event. It performs no broker, model or worker execution and never scans
+filenames for authority. Its `AuditedModelProbeArtifact` is deliberately distinct
+from a live publication acknowledgment. Hash integrity cannot authenticate past
+approval or physical provider identity, prove the caller received an acknowledgment,
+or create authority to resume work.
+
+Use a caller-controlled private store root. Artifact files use mode 0600; this
+API does not enforce a restricted-store ACL, expiration or reasoning-content
+capture policy. Retention expiry is metadata, not deletion. This publication API has no automatic
+resume, feedback loop, canary continuation, full checkpoint recovery or `Clean`
+verdict. Actual model quality, latency and cost acceptance and the remaining #233
+work remain open.
+
+## Opt-in single feedback continuation
+
+`HostModelProbe::observe_with_feedback().await` requires a fresh live approval
+of the independently authenticated `probe_feedback_declaration_digest()`. The
+single-batch declaration cannot authorize this mode. Existing compilation,
+source/provenance, IR, route, worker deployment and run checks still apply;
+fewer than two approved steps or two milliseconds fails before the broker.
+The original one-call APIs and v1 publisher/offline reader retain their contracts.
+
+This invocation resolves one credential and retains one actual SDK binding, with
+one candidate, zero retries and at most two physical requests. The first response
+must propose exactly one action. Only the exact inert
+`read_document(path=workspace/report.txt)` and its independently verified
+`Recorded` result, after actual worker wait/reap, can mint a private, one-use
+in-memory continuation. Completion and hard tripwires stop after one request.
+`synthetic_credentials` remains `Incomplete`, with no plaintext canary or second
+request. There is no production read or tool execution.
+
+The second request keeps the same stable system/source prefix and binding.
+Only its untrusted dynamic suffix contains the exact first semantic UTF-8 text,
+the canonical inert acknowledgment and the fixed final task. Each response has
+256 requested output tokens, a 32768-byte decoded body cap and a separate
+16384-byte semantic cap: at most 512 requested tokens, 65536 decoded bytes and
+32768 semantic bytes total. The second batch proposes at most 31 actions and
+executes only the original remaining steps (seven after the connected eight-step
+fixture's first read). Requested ceilings do not measure provider computation,
+usage, cost or quality. Actual missing usage remains unknown; actual zero is zero.
+
+The original approved worker time `T` is partitioned into fixed slots
+`floor(T/2)` and the remainder, without transfer. Each private absolute phase
+clock starts before descriptor cloning, parsing/preparation and spawn. Acceptance
+occurs only after actual successful wait/reap, capture settlement, strict result
+validation and host identity preparation, while the original phase and route
+deadlines remain live and cancellation is false. In the connected `T=1000ms`
+fixture each slot is 500ms. A late valid worker phase yields the finite
+`PhaseExpired` category, mapped to host `AuthorizationDenied`; malformed/failed
+workers remain failures. Cleanup remains owned and may exceed admission time;
+there is no hard physical cleanup deadline or retry after expiry.
+
+`ModelProbeFeedbackObservation` borrows ordinary content-free worker reports by
+zero-based batch ordinal and exposes actual SDK provenance, completion and
+optional usage. Its cumulative identity binds the exact private semantics,
+actual reports, approval/source/IR/route/deployment/run, requested token ceilings,
+retained semantic byte counts and executed steps.
+This result is unpublished: it accepts no artifact store, returns no durable
+acknowledgment, and grants no offline audit or resume authority. The sealed fd
+continuation has no serialization or public constructor. Full canary lifecycle,
+checkpoint/crash recovery, automatic resume and live model quality/cost acceptance
+remain unfinished #233 work; this bounded continuation does not complete #233.
+
 ## Verification
 
 Run `just issue-233-runtime`, `just issue-233-adk` (including authored execution and public default denial), and `just issue-233-doc` with the repository's safe
@@ -158,3 +263,23 @@ and
 `just conformance-contract 'workflowctl --test cli_contracts behavioral_opt_in_has_no_cli_authority_channel'`
 for sibling/CLI default denial. These are API capability tests, not evidence of
 an OS security boundary.
+
+`just issue-233-model-worker publication::` runs the durable unit through the
+actual loopback-compatible SDK, sealed OS worker and filesystem store. It covers
+exact bytes, missing versus zero usage, publication phase faults, offline tamper,
+privacy, and owned-process interruption after worker cleanup at stage, visibility
+and synchronization boundaries. Process termination is explicitly waited and
+reaped; these tests do not simulate power loss or full checkpoint recovery.
+The unfiltered recipe also retains the original thirteen Host controls.
+
+`just issue-233-model-worker feedback::` exercises the actual SDK loopback and
+sealed workers for one/two-request boundaries, exact feedback bytes and stable
+prefixes, prebroker identity/limit denial, per-turn/aggregate caps, remaining
+steps, missing/zero usage, forged reports, and pending SDK cancellation/deadline.
+Test-owned FIFO controls delay the existing PID-witness write before the old
+supervisor timer. They establish exact invocation-thread child-set deltas,
+PID/start identity, normal exit with `WNOWAIT`, matching complete witness records
+and actual owner reap. Late first/second phases reject while prompt release and
+the unchanged one-call control discriminate the boundary. Setup/unwind and
+notification-timeout controls exercise release without detaching a Host/Child
+owner; exceptional OS cleanup remains cooperative.

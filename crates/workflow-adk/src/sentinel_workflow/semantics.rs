@@ -16,11 +16,12 @@ use adk_rust::tokio::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use workflow_runtime::{
-    Completeness, SentinelEvidence, SentinelVerdict, StructuredOutputError, TrustDomain,
-    TypedOutput, TypedPayload, admit_for_reducer, argument_fingerprint, parse_typed_output,
+    Completeness, SemanticReductionInput, SentinelEvidence, SentinelReductionInput,
+    SentinelVerdict, SourceSpan, StructuredOutputError, TrustDomain, TypedOutput, TypedPayload,
+    admit_for_reducer, argument_fingerprint, parse_typed_output, reduce_sentinel,
 };
 
-pub(super) const VERSION: &str = "sentinel-semantic-probes-v4";
+pub(super) const VERSION: &str = "sentinel-semantic-probes-v5";
 pub(super) const MAX_REQUESTS: usize = 8;
 pub(super) const DEADLINE_MS: u64 = 30_000;
 pub(super) const OUTPUT_BYTES: usize = 512;
@@ -163,11 +164,21 @@ struct Report {
     /// None means aggregate accounting is unavailable, never zero cost.
     observations: Option<Vec<Observation>>,
     failure: Option<Failure>,
+    /// Present only after complete admitted non-Clean agreement, never null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reduction: Option<Reduction>,
+}
+
+#[derive(Serialize)]
+struct Reduction {
+    policy_version: &'static str,
+    policy_digest: String,
+    identity: String,
 }
 impl Report {
     fn new(reason: Reason, has_goal: bool) -> Self {
         Self {
-            schema_version: 4,
+            schema_version: 5,
             version: VERSION,
             reason,
             task_alignment: if has_goal {
@@ -180,6 +191,7 @@ impl Report {
             decision: None,
             observations: None,
             failure: None,
+            reduction: None,
         }
     }
     fn failed(mut self, failure: Failure) -> Result<Vec<u8>, AdkGraphError> {
@@ -204,6 +216,7 @@ pub(super) async fn run(
     binding: Option<&std::sync::Arc<ModelBinding>>,
     preparation_identity: &str,
     goal: Option<&task_alignment::TrustedGoal>,
+    source_cover: &SourceSpan,
 ) -> Result<Vec<u8>, AdkGraphError> {
     let report = |reason| Report::new(reason, goal.is_some());
     if gate != UntrustedTextState::PendingClassification {
@@ -311,6 +324,7 @@ pub(super) async fn run(
     report.observations = Some(observations);
     let mut consensus = None;
     let mut relation = None;
+    let mut first_semantic = None;
     for (probe, finding) in expected.iter().enumerate() {
         let value = &finding.output;
         let verdict = if finding.branch == "task_alignment" {
@@ -328,7 +342,11 @@ pub(super) async fn run(
             let Ok(TypedPayload::Sentinel(evidence)) = admit_for_reducer(&output) else {
                 return report.failed(Failure::ReducerAdmission { probe });
             };
-            evidence.verdict()
+            let verdict = evidence.verdict();
+            if first_semantic.is_none() {
+                first_semantic = Some(output);
+            }
+            verdict
         };
         if consensus.is_some_and(|previous| previous != verdict) {
             report.reason = Reason::Conflict;
@@ -354,7 +372,50 @@ pub(super) async fn run(
     if let Some(relation) = relation {
         report.task_alignment = relation.code();
     }
-    report.decision = expected.first().map(|finding| finding.output.clone());
+    let Some(output) = first_semantic else {
+        return report.failed(Failure::Consensus);
+    };
+    let branches: Vec<_> = expected.iter().map(|finding| json!({
+        "branch":finding.branch, "view":finding.view,
+        "invocation_identity":finding.invocation_identity, "schema_hash":finding.schema_hash,
+    })).collect();
+    let producer_identity =
+        argument_fingerprint(&json!({"schema_version":1,"producer":VERSION,"branches":branches}));
+    let Ok(reduction) = reduce_sentinel(SentinelReductionInput {
+        source_cover: Some(source_cover),
+        preparation_terminal: None,
+        preparation_identity,
+        semantic: Some(SemanticReductionInput {
+            output: &output,
+            producer_identity: &producer_identity,
+        }),
+        behavior: None,
+        observation: None,
+    }) else {
+        return report.failed(Failure::Consensus);
+    };
+    let receipt = Reduction {
+        policy_version: reduction.policy_version(),
+        policy_digest: reduction.policy_digest().to_owned(),
+        identity: reduction.identity().to_owned(),
+    };
+    if serde_json::to_vec(&receipt)
+        .map_err(|_| AdkGraphError::Failed)?
+        .len()
+        > 512
+    {
+        return Err(AdkGraphError::Failed);
+    }
+    report.decision = Some(
+        serde_json::from_str(
+            &reduction
+                .output()
+                .to_json()
+                .map_err(|_| AdkGraphError::Failed)?,
+        )
+        .map_err(|_| AdkGraphError::Failed)?,
+    );
+    report.reduction = Some(receipt);
     report.findings = expected;
     report.encode()
 }

@@ -207,8 +207,15 @@ pub struct TrajectoryObservation {
     hard_stop: ProbeStop,
     #[serde(skip)]
     hard_evidence: Option<TypedOutput>,
+    #[serde(skip)]
+    report_digest: String,
 }
 impl TrajectoryObservation {
+    /// Binds this genuine observation to the exact retained report bytes.
+    /// The private binding does not change published bytes or evidence addresses.
+    pub fn matches_report(&self, report: &ProbeReport) -> Result<bool, TypedOutputError> {
+        Ok(self.report_digest == hash(report.to_json()?.as_bytes()))
+    }
     /// Compact fixture availability, never evidence of provider reasoning visibility.
     pub fn summary_status(&self) -> ReasoningStatus {
         self.summary_status
@@ -321,5 +328,6 @@ fn observe_parsed(
         weak_signals,
         hard_stop: report.stop(),
         hard_evidence: report.evidence()?,
+        report_digest: input.report_digest.to_owned(),
     })
 }
