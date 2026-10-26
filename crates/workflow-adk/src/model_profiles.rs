@@ -1164,6 +1164,7 @@ impl ModelBinding {
 
     fn apply_runtime(&self, mut request: LlmRequest) -> LlmRequest {
         let config = request.config.get_or_insert_with(Default::default);
+        let invocation = config.extensions.get("workflow_kit").cloned();
         let sampling = self.runtime.sampling();
         if sampling.temperature.is_some() {
             config.temperature = sampling.temperature;
@@ -1199,6 +1200,45 @@ impl ModelBinding {
             } else {
                 config.extensions.insert(namespace.clone(), value.clone());
             }
+        }
+        if let Some((metadata, effort)) = invocation.and_then(|metadata| {
+            let effort = serde_json::from_value::<crate::model_invocation::ReasoningEffort>(
+                metadata.get("reasoning_effort")?.clone(),
+            )
+            .ok()?;
+            Some((metadata, effort))
+        }) {
+            // SDK extensions merge after typed fields. An invocation owns its budget
+            // and metadata; profile defaults cannot replace either on the wire.
+            if let (Some(combined), Some(original)) = (
+                config
+                    .extensions
+                    .get_mut("workflow_kit")
+                    .and_then(Value::as_object_mut),
+                metadata.as_object(),
+            ) {
+                combined.extend(original.clone());
+            } else {
+                config.extensions.insert("workflow_kit".into(), metadata);
+            }
+            let mut openai = config
+                .extensions
+                .remove("openai")
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            let effort = match effort {
+                crate::model_invocation::ReasoningEffort::Low => "low",
+                crate::model_invocation::ReasoningEffort::Medium => "medium",
+                crate::model_invocation::ReasoningEffort::XHigh => "xhigh",
+            };
+            openai.insert("reasoning_effort".into(), serde_json::json!(effort));
+            if let Some(cap) = config.max_output_tokens {
+                openai.remove("max_tokens");
+                openai.insert("max_completion_tokens".into(), serde_json::json!(cap));
+            }
+            config
+                .extensions
+                .insert("openai".into(), serde_json::json!(openai));
         }
         request
     }
@@ -1860,7 +1900,9 @@ mod retry_admission_tests {
             "request-capture",
         );
         binding.runtime = ModelRuntimeConfig::default()
-            .with_sampling(|sampling| sampling.with_max_output_tokens(999).with_seed(123));
+            .with_sampling(|sampling| sampling.with_max_output_tokens(999).with_seed(123))
+            .with_provider_extension("openai",serde_json::json!({"reasoning_effort":"low","max_completion_tokens":999,"max_tokens":998,"trace":"preserved"}))
+            .with_provider_extension("workflow_kit",serde_json::json!({"reasoning_effort":"low","prompt_protocol":"profile-conflict","fixture_tag":"preserved"}));
         let mut request = LlmRequest::new(
             "request-capture",
             vec![Content::new("user").with_text("hello")],
@@ -1868,6 +1910,11 @@ mod retry_admission_tests {
         let config = request.config.get_or_insert_with(Default::default);
         config.max_output_tokens = Some(2048);
         config.seed = Some(77);
+        config.response_schema = Some(serde_json::json!({"type":"object"}));
+        let metadata = serde_json::json!({"reasoning_effort":"x_high","prompt_protocol":"invocation-owned","escalation":null});
+        config
+            .extensions
+            .insert("workflow_kit".into(), metadata.clone());
 
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1887,6 +1934,29 @@ mod retry_admission_tests {
         let config = request.config.expect("request config");
         assert_eq!(config.max_output_tokens, Some(2048));
         assert_eq!(config.seed, Some(77));
+        assert_eq!(
+            config.response_schema,
+            Some(serde_json::json!({"type":"object"}))
+        );
+        let mut expected_metadata = metadata;
+        expected_metadata["fixture_tag"] = serde_json::json!("preserved");
+        assert_eq!(config.extensions["workflow_kit"], expected_metadata);
+        assert_eq!(
+            config.extensions["openai"],
+            serde_json::json!({"reasoning_effort":"xhigh","max_completion_tokens":2048,"trace":"preserved"})
+        );
+        let ordinary = binding.apply_runtime(LlmRequest::new("request-capture", vec![]));
+        let config = ordinary.config.unwrap();
+        assert_eq!(config.max_output_tokens, Some(999));
+        assert_eq!(config.seed, Some(123));
+        assert_eq!(
+            config.extensions["openai"],
+            binding.runtime.provider_extensions()["openai"]
+        );
+        assert_eq!(
+            config.extensions["workflow_kit"],
+            binding.runtime.provider_extensions()["workflow_kit"]
+        );
     }
 
     fn test_binding(llm: Arc<dyn Llm>, model: &str) -> ModelBinding {
