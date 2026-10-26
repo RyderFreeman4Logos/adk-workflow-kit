@@ -342,7 +342,8 @@ fn actual_path_cache_key_has_an_independent_versioned_policy_oracle() {
         "version":"sentinel-workflow-preparation-v7",
         "probe_version":"sentinel-source-probes-v2",
         "probe_budget":{"max_views_per_branch":32,"max_bytes_per_branch":65536,"max_report_bytes":32768,"chunk_bytes":256,"overlap_bytes":64},
-        "semantic_version":"sentinel-semantic-probes-v4",
+        "semantic_version":"sentinel-semantic-probes-v5",
+        "reduction_policy_version":"sentinel-reduction-policy-v1",
         "task_alignment_version":"sentinel-task-alignment-v1",
         "max_goal_bytes":4096,
         "trusted_goal":null,
@@ -398,6 +399,50 @@ fn actual_path_cache_key_has_an_independent_versioned_policy_oracle() {
         )
     };
     assert_eq!(result["cache_key"], expected_key(&expected_policy));
+    let fields = [
+        ("WORKFLOW_ID", "sentinel-preparation"),
+        ("WORKFLOW_VERSION", "1"),
+        ("NODE_ID", "prepare"),
+        ("NODE_VERSION", "sentinel-workflow-preparation-v7"),
+        ("INVOCATION_IDENTITY", ir_hash.as_str()),
+        ("INPUT_ARTIFACT_HASHES", raw_digest.as_str()),
+        ("REQUEST_INPUT_DIGEST", raw_digest.as_str()),
+        ("POLICY_DIGEST", expected_policy.as_str()),
+    ];
+    for ordinal in 0..8 {
+        let changed_value = format!("{}-changed", fields[ordinal].1);
+        let mut changed = fields;
+        changed[ordinal].1 = &changed_value;
+        let changed_key = digest(
+            changed
+                .iter()
+                .map(|(label, value)| format!("{label}_BYTES:{}\n{value}", value.len()))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .as_bytes(),
+        );
+        assert_ne!(
+            result["cache_key"], changed_key,
+            "field {} was omitted",
+            fields[ordinal].0
+        );
+    }
+    for (field, value) in [
+        ("semantic_version", "sentinel-semantic-probes-v4"),
+        ("reduction_policy_version", "sentinel-reduction-policy-v2"),
+    ] {
+        let mut changed = policy.clone();
+        changed[field] = json!(value);
+        assert_ne!(
+            result["cache_key"],
+            expected_key(&digest(&serde_json::to_vec(&changed).unwrap()))
+        );
+        changed.as_object_mut().unwrap().remove(field);
+        assert_ne!(
+            result["cache_key"],
+            expected_key(&digest(&serde_json::to_vec(&changed).unwrap()))
+        );
+    }
     let mut deadline_policy = policy.clone();
     deadline_policy["preparation_budget_ms"] = json!(1001);
     assert_ne!(

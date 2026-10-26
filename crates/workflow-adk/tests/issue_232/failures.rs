@@ -111,7 +111,7 @@ async fn private_failure_is_absent_after_complete_or_denied_execution() {
             .await
             .unwrap();
         let report = report(&store, &mapper);
-        assert_eq!(report["schema_version"], 4);
+        assert_eq!(report["schema_version"], 5);
         assert_eq!(report["reason"], reason);
         assert_eq!(report.get("failure"), Some(&Value::Null));
         assert_eq!(probe.active.load(Ordering::SeqCst), 0);

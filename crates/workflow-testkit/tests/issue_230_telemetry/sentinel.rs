@@ -27,6 +27,74 @@ fn measured(
 }
 
 #[test]
+fn sentinel_private_agreement_binds_reducer_identity_through_measure_and_rebuild() {
+    for verdict in ["inj", "sus"] {
+        let (root, output, requests) = wire_scenario(
+            None,
+            false,
+            json!({}),
+            (
+                SOURCE,
+                "sentinel-worker",
+                json!({"schema_version":1,"bytes":RAW.as_bytes()}),
+                json!(verdict),
+            ),
+            2,
+            |path, output| cli(&["measure", path.to_str().unwrap(), output.to_str().unwrap()]),
+        );
+        let report = success(output);
+        assert_eq!(requests.unwrap()["wire_request_count"], 2);
+        assert_eq!(report["hard_invariant_failed"], false);
+        assert_eq!(report["completed_model_observed"], true);
+        assert_eq!(report["model_calls"], json!([]));
+        let execution: Value =
+            serde_json::from_slice(&fs::read(root.join("run/execution.json")).unwrap()).unwrap();
+        let run_root = PathBuf::from(execution["receipt"]["run_root"].as_str().unwrap());
+        let calls = report["sentinel_probe_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        let bytes = fs::read(
+            run_root
+                .join("artifacts")
+                .join(calls[0]["artifact_id"].as_str().unwrap()),
+        )
+        .unwrap();
+        let semantic: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(semantic["schema_version"], 5);
+        assert_eq!(semantic["version"], "sentinel-semantic-probes-v5");
+        assert_eq!(semantic["reason"], "agreement");
+        assert_eq!(semantic["decision"]["payload"]["verdict"], verdict);
+        assert_eq!(
+            semantic["reduction"]["policy_version"],
+            "sentinel-reduction-policy-v1"
+        );
+        for field in ["policy_digest", "identity"] {
+            assert!(
+                semantic["reduction"][field]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("sha256:") && value.len() == 71)
+            );
+        }
+        for call in calls {
+            assert_eq!(call["source"], "protected-semantic-artifact-v5");
+            assert_eq!(call["artifact_id"], calls[0]["artifact_id"]);
+            assert!(call["usage"].is_null());
+        }
+        assert_eq!(
+            report["measured"]["sentinel_probe_calls"],
+            report["sentinel_probe_calls"]
+        );
+        assert_eq!(
+            success(cli(&["measure-report", root.join("run").to_str().unwrap()])),
+            report
+        );
+        for private in [RAW, "WIRE_SECRET_NEVER_REPORT", "http://127.0.0.1"] {
+            assert!(!report.to_string().contains(private));
+            assert!(!String::from_utf8_lossy(&bytes).contains(private));
+        }
+    }
+}
+
+#[test]
 fn sentinel_finite_request_size_uses_original_http_content_length() {
     let (_, output, requests) = measured(None, false);
     success(output);
@@ -65,7 +133,7 @@ fn sentinel_private_measurement_rebuilds_without_inventing_agent_calls_or_totals
         let calls = report["sentinel_probe_calls"].as_array().unwrap();
         assert_eq!(calls.len(), 2);
         for (call, branch) in calls.iter().zip(["ordered", "shuffled"]) {
-            assert_eq!(call["source"], "protected-semantic-artifact-v4");
+            assert_eq!(call["source"], "protected-semantic-artifact-v5");
             assert_eq!(call["branch"], branch);
             if usage.is_none() {
                 assert!(call["usage"].is_null());

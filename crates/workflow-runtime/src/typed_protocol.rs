@@ -435,6 +435,16 @@ impl SentinelEvidence {
     pub fn verdict(&self) -> SentinelVerdict {
         self.verdict
     }
+
+    /// Half-open references into retained source bytes; never copied source text.
+    pub fn spans(&self) -> &[SourceSpan] {
+        &self.spans
+    }
+
+    /// Content-addressed retained evidence, without granting artifact authority.
+    pub fn artifacts(&self) -> &[ArtifactRef] {
+        &self.artifacts
+    }
 }
 
 /// Firewall decision bound to artifact references.

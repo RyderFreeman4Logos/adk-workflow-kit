@@ -92,7 +92,12 @@ wall-time guarantees. No unbounded task text or semantic prose is serialized.
 
 Adapter identity is `sentinel-workflow-preparation-v7`; the preparation key binds
 both probe versions and fixed budgets, retaining raw-byte, workflow/IR, language
-policy and preparation identities. A host goal additionally binds its domain-separated
+policy and preparation identities. The semantic path also binds `sentinel-reduction-policy-v1`;
+scripted behavioral preparation retains its prior policy identity without this unused version.
+The existing eight-field framing remains `WORKFLOW_ID`, `WORKFLOW_VERSION`,
+`NODE_ID`, `NODE_VERSION`, `INVOCATION_IDENTITY`, `INPUT_ARTIFACT_HASHES`,
+`REQUEST_INPUT_DIGEST`, and `POLICY_DIGEST`; the reducer version belongs inside
+the policy digest. A host goal additionally binds its domain-separated
 SHA-256 identity (goal bytes, host revision, fixed `authenticated_host_api_v1` origin,
 `sentinel-task-alignment-v1`), and the fixed 4,096-byte goal ceiling. Goal/revision
 changes invalidate preparation and all semantic invocation identities; goal data is
@@ -104,11 +109,11 @@ timeout and provider extensions), following the semantic Firewall identity contr
 raw runtime policy is never published. No semantic cache is
 read or written. The preparation key alone is **not** a semantic cache key.
 
-## Executed semantic report v4
+## Executed semantic report v5
 
 Read `preparation.semantics.artifact_id` from the same completion event. This
 content-addressed report has `schema_version`, `version`
-(`sentinel-semantic-probes-v4`), a closed `reason`, `task_alignment`
+(`sentinel-semantic-probes-v5`, schema version 5), a closed `reason`, `task_alignment`
 (`trusted_goal_unavailable`, `not_completed`, or a validated relation below),
 `causal_attribution` (`not_measured`), `findings`, `observations`, `failure`, and
 `decision` (shared Sentinel `TypedOutput` or null).
@@ -167,6 +172,36 @@ not a causal attack proof or Firewall authorization. Terminal preparation stays
 pending/null. Absent goals abstain; present-but-uncompleted task branches report
 `not_completed`. On unanimous Clean the validated relation may be reported, but
 findings and decision remain absent.
+
+### Deterministic reduction receipt
+
+Only complete non-Clean `agreement` carries the optional `reduction` object:
+`policy_version` (`sentinel-reduction-policy-v1`), `policy_digest`, and `identity`.
+Both digests are canonical lowercase `sha256:` values. The closed object is at
+most 512 serialized bytes within the unchanged 32,768-byte report ceiling.
+Every other reason omits the field; an explicit null is invalid. Strict benchmark
+consumers accept only the paired semantic-v5/schema-5 contract, reject duplicate
+or unknown fields, and reconstruct the receipt from the protected preparation,
+original bytes, ordered findings and invocation/schema provenance before projecting
+`protected-semantic-artifact-v5` calls. The same validator serves execution and
+public measurement reconstruction.
+
+The pure runtime reducer takes ordinary evidence, never an execution approval.
+It validates all supplied bindings before precedence: InvalidInput, then
+UnsupportedLanguage, admitted semantic Injection, genuine behavioral tripwire,
+semantic Suspicious, exact-report observer weak evidence, then evidence-free
+Suspicious. It never emits Clean or promotes simulation/observer evidence to causal
+Injection. It retains one dominant bounded envelope rather than concatenating facts.
+The source cover addresses the entire retained original byte extent; normalized
+character or byte length cannot replace it. Identity binds policy, preparation,
+cover, terminal, exact semantic output and producer, report bytes, observation bytes,
+and explicit absences. Determinism means identical genuine inputs, including run IDs;
+independent simulations keep their existing run identities.
+
+The ADK adapter invokes this reducer only after its existing complete schema, source,
+task-alignment and unanimous non-Clean admission. Model and behavioral paths remain
+mutually exclusive. This first unit does not provide replay/escalation policy,
+calibrated Clean, mixed-host scheduling, causal experiments or live quality acceptance.
 
 | Reason | Meaning for consumers |
 | --- | --- |

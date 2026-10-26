@@ -3,13 +3,16 @@ use super::{ExecutedCase, ExecutionReceipt, Path, Value, digest, error, fs, jour
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, num::NonZeroU64};
 use workflow_runtime::{
-    ArtifactId, ArtifactStore, CheckpointManifestV1, DurableCheckpointV1, FilesystemArtifactStore,
-    PageRequest, ProtectedArtifactReferenceV1, RunId, SqliteCheckpointStore,
-    WorkflowRuntimeEventKindV1 as Kind, WorkflowRuntimeEventLogV1, WorkflowRuntimeEventV1,
+    ArtifactId, ArtifactStore, CheckpointManifestV1, Completeness, DurableCheckpointV1,
+    FilesystemArtifactStore, PageRequest, ProtectedArtifactReferenceV1, RunId,
+    SemanticReductionInput, SentinelEvidence, SentinelReductionInput, SentinelVerdict, SourceSpan,
+    SqliteCheckpointStore, TypedOutput, TypedPayload, WorkflowRuntimeEventKindV1 as Kind,
+    WorkflowRuntimeEventLogV1, WorkflowRuntimeEventV1, admit_for_reducer, argument_fingerprint,
+    parse_typed_output, reduce_sentinel,
 };
 
 pub(super) const SOURCE: &str = "examples/03-sentinel-preparation/workflow.toml";
-const SEMANTIC_VERSION: &str = "sentinel-semantic-probes-v4";
+const SEMANTIC_VERSION: &str = "sentinel-semantic-probes-v5";
 #[cfg(test)]
 mod tests;
 
@@ -182,7 +185,7 @@ pub(super) fn validate(
                 ),
                 32_768,
             )?;
-            serde_json::from_slice::<Semantic>(&bytes).map_err(error)
+            parse_semantic(&bytes)
         })
         .transpose()?;
     if let Some(probes) = &probes
@@ -200,7 +203,25 @@ pub(super) fn validate(
     let probe_calls = if selected["state"] == "invalid_input" && semantic.is_none() {
         Some(Vec::new())
     } else {
-        project_calls(preparation, probes.as_ref(), semantic.as_ref())?
+        let source_cover = original
+            .as_ref()
+            .map(|bytes| {
+                SourceSpan::new(
+                    preparation["original_artifact_id"]
+                        .as_str()
+                        .ok_or("missing Sentinel original")?,
+                    0,
+                    bytes.len() as u64,
+                )
+                .map_err(error)
+            })
+            .transpose()?;
+        project_calls(
+            preparation,
+            probes.as_ref(),
+            semantic.as_ref(),
+            source_cover.as_ref(),
+        )?
     };
     let quality = expected(&input).map(|expected| {
         if selected["state"] != expected.state || selected["reason"] != expected.reason
@@ -299,17 +320,126 @@ struct Semantic {
     reason: String,
     task_alignment: String,
     causal_attribution: String,
-    findings: Vec<Value>,
-    decision: Option<Value>,
+    findings: Vec<Finding>,
+    decision: Option<Wire>,
     observations: Option<Vec<Observation>>,
     /// Protected diagnostic only; never used to grant quality or model accounting.
     failure: Option<Value>,
+    #[serde(default, deserialize_with = "present_reduction")]
+    reduction: Option<Reduction>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Reduction {
+    policy_version: String,
+    policy_digest: String,
+    identity: String,
+}
+
+// Missing is allowed; an explicitly present null/array is not an absent receipt.
+fn present_reduction<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Reduction>, D::Error> {
+    struct Object;
+    impl<'de> serde::de::Visitor<'de> for Object {
+        type Value = Option<Reduction>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a closed reduction object")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+            Reduction::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(Some)
+        }
+    }
+    deserializer.deserialize_map(Object)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Finding {
+    branch: String,
+    view: View,
+    invocation_identity: String,
+    schema_hash: String,
+    output: Wire,
+}
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct View {
+    start: u64,
+    end: u64,
+    source: Span,
+    sha256: String,
+    // The producer always emits this nullable field; absence must not become null.
+    #[serde(deserialize_with = "Option::deserialize")]
+    candidate: Option<u64>,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Wire {
+    schema_version: u32,
+    node: String,
+    completeness: String,
+    payload: Payload,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Payload {
+    kind: String,
+    verdict: String,
+    spans: Vec<Span>,
+    artifacts: Vec<()>,
+}
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Span {
+    artifact_id: String,
+    start: u64,
+    end: u64,
+}
+
+fn parse_semantic(bytes: &[u8]) -> Result<Semantic, String> {
+    let invalid = || "invalid closed Sentinel semantic report".to_owned();
+    let report = serde_json::from_slice::<Semantic>(bytes).map_err(|_| invalid())?;
+    // Named-struct Serde also accepts positional sequences. Preserve object wire
+    // shapes while the independent named decoder rejects duplicate/unknown keys.
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    let wire_object = |wire: &Value| {
+        wire.is_object()
+            && wire["payload"].is_object()
+            && wire["payload"]["spans"]
+                .as_array()
+                .is_some_and(|spans| spans.iter().all(Value::is_object))
+    };
+    if !value.is_object()
+        || value["findings"].as_array().is_none_or(|findings| {
+            findings.iter().any(|finding| {
+                !finding.is_object()
+                    || !finding["view"].is_object()
+                    || !finding["view"]["source"].is_object()
+                    || !wire_object(&finding["output"])
+            })
+        })
+        || (!value["decision"].is_null() && !wire_object(&value["decision"]))
+        || value["observations"]
+            .as_array()
+            .is_some_and(|observations| {
+                observations.iter().any(|observation| {
+                    !observation.is_object()
+                        || !observation["view"].is_object()
+                        || !observation["view"]["source"].is_object()
+                })
+            })
+    {
+        return Err(invalid());
+    }
+    Ok(report)
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Observation {
     branch: String,
-    view: Value,
+    view: View,
     invocation_identity: String,
     schema_hash: String,
     usage: Option<Usage>,
@@ -329,11 +459,12 @@ fn project_calls(
     preparation: &Value,
     probes: Option<&Value>,
     semantic: Option<&Semantic>,
+    source_cover: Option<&SourceSpan>,
 ) -> Result<Option<Vec<Value>>, String> {
     let Some(semantic) = semantic else {
         return Ok(None);
     };
-    if semantic.schema_version != 4
+    if semantic.schema_version != 5
         || semantic.version != SEMANTIC_VERSION
         || semantic.causal_attribution != "not_measured"
         || semantic.task_alignment != "trusted_goal_unavailable"
@@ -351,6 +482,8 @@ fn project_calls(
         || (semantic.reason != "agreement"
             && (!semantic.findings.is_empty() || semantic.decision.is_some()))
         || (semantic.reason == "invalid_or_failed") != semantic.failure.is_some()
+        || (semantic.reason == "agreement") != semantic.reduction.is_some()
+        || (semantic.reason == "agreement" && semantic.observations.is_none())
     {
         return Err("invalid Sentinel semantic contract".to_owned());
     }
@@ -376,12 +509,12 @@ fn project_calls(
         return Err("invalid Sentinel observation cardinality".to_owned());
     }
     let mut identities = BTreeSet::new();
-    observations
+    let calls = observations
         .iter()
         .zip(descriptors)
         .map(|(observation, (branch, view))| {
             if branch.as_str() != Some(observation.branch.as_str())
-                || view != &observation.view
+                || view != &serde_json::to_value(&observation.view).map_err(error)?
                 || ArtifactId::parse(&observation.invocation_identity).is_none()
                 || observation
                     .schema_hash
@@ -393,12 +526,121 @@ fn project_calls(
                 return Err("Sentinel observation binding mismatch".to_owned());
             }
             let mut value = serde_json::to_value(observation).map_err(error)?;
-            value["source"] = json!("protected-semantic-artifact-v4");
+            value["source"] = json!("protected-semantic-artifact-v5");
             value["artifact_id"] = preparation["semantics"]["artifact_id"].clone();
             Ok(value)
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+        .collect::<Result<Vec<_>, _>>()?;
+    if semantic.reason == "agreement" {
+        verify_reduction(
+            preparation,
+            semantic,
+            observations,
+            source_cover.ok_or("missing Sentinel source cover")?,
+        )?;
+    }
+    Ok(Some(calls))
+}
+
+fn verify_reduction(
+    preparation: &Value,
+    semantic: &Semantic,
+    observations: &[Observation],
+    source_cover: &SourceSpan,
+) -> Result<(), String> {
+    let invalid = || "Sentinel reduction binding mismatch".to_owned();
+    let receipt = semantic.reduction.as_ref().ok_or_else(invalid)?;
+    if serde_json::to_vec(receipt).map_err(error)?.len() > 512
+        || semantic.findings.len() != observations.len()
+    {
+        return Err(invalid());
+    }
+    let mut consensus = None;
+    let mut first = None;
+    let mut branches = Vec::with_capacity(observations.len());
+    for (finding, observation) in semantic.findings.iter().zip(observations) {
+        if finding.branch != observation.branch
+            || finding.view != observation.view
+            || finding.invocation_identity != observation.invocation_identity
+            || finding.schema_hash != observation.schema_hash
+        {
+            return Err(invalid());
+        }
+        let source = &finding.view.source;
+        let span = SourceSpan::new(&source.artifact_id, source.start, source.end).map_err(error)?;
+        let bytes = serde_json::to_vec(&finding.output).map_err(error)?;
+        if bytes.len() > 512 {
+            return Err(invalid());
+        }
+        let output = parse_typed_output(&bytes).map_err(error)?;
+        let TypedPayload::Sentinel(evidence) = admit_for_reducer(&output).map_err(error)? else {
+            return Err(invalid());
+        };
+        let verdict = evidence.verdict();
+        if evidence.spans() != [span.clone()]
+            || !evidence.artifacts().is_empty()
+            || !matches!(
+                verdict,
+                SentinelVerdict::Injection | SentinelVerdict::Suspicious
+            )
+            || consensus.is_some_and(|previous| previous != verdict)
+        {
+            return Err(invalid());
+        }
+        let choices = [
+            SentinelVerdict::Injection,
+            SentinelVerdict::Suspicious,
+            SentinelVerdict::Clean,
+        ]
+        .into_iter()
+        .map(|verdict| {
+            let output = TypedOutput::new(
+                TypedPayload::Sentinel(SentinelEvidence::new(verdict, vec![span.clone()], vec![])),
+                Completeness::Complete,
+            )
+            .map_err(error)?;
+            serde_json::from_str::<Value>(&output.to_json().map_err(error)?).map_err(error)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+        let schema = workflow_adk::StructuredOutputContract::new(
+            json!({"$id":format!("urn:{SEMANTIC_VERSION}:source"),"enum":choices}),
+            512,
+        )
+        .map_err(error)?;
+        if schema.schema_hash() != finding.schema_hash {
+            return Err(invalid());
+        }
+        branches.push(json!({"branch":finding.branch,"view":finding.view,"invocation_identity":finding.invocation_identity,"schema_hash":finding.schema_hash}));
+        consensus = Some(verdict);
+        first.get_or_insert(output);
+    }
+    let output = first.as_ref().ok_or_else(invalid)?;
+    let producer = argument_fingerprint(
+        &json!({"schema_version":1,"producer":SEMANTIC_VERSION,"branches":branches}),
+    );
+    let reduction = reduce_sentinel(SentinelReductionInput {
+        source_cover: Some(source_cover),
+        preparation_terminal: None,
+        preparation_identity: preparation["cache_key"].as_str().ok_or_else(invalid)?,
+        semantic: Some(SemanticReductionInput {
+            output,
+            producer_identity: &producer,
+        }),
+        behavior: None,
+        observation: None,
+    })
+    .map_err(error)?;
+    let decision = semantic.decision.as_ref().ok_or_else(invalid)?;
+    let decision =
+        parse_typed_output(&serde_json::to_vec(decision).map_err(error)?).map_err(error)?;
+    if receipt.policy_version != reduction.policy_version()
+        || receipt.policy_digest != reduction.policy_digest()
+        || receipt.identity != reduction.identity()
+        || &decision != reduction.output()
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn positive_probes(probes: &Value, raw: &[u8]) -> Result<(), String> {
