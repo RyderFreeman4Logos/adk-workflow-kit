@@ -82,8 +82,10 @@ impl SentinelDatasetCase {
         self.label
     }
     /// Compact UTF-8 JSON with sorted object keys and fixed array order; no final newline.
+    /// Object ordering is independent of dependency `preserve_order` feature unification.
     pub fn canonical_json(&self) -> Result<Vec<u8>, SentinelDatasetError> {
-        let value = serde_json::to_value(self).map_err(|_| SentinelDatasetError::Schema)?;
+        let mut value = serde_json::to_value(self).map_err(|_| SentinelDatasetError::Schema)?;
+        value.sort_all_objects();
         serde_json::to_vec(&value).map_err(|_| SentinelDatasetError::Schema)
     }
     /// SHA-256 of canonical bytes, including every actual admission report binding.
@@ -482,8 +484,10 @@ fn native_rows(
     Ok(rows)
 }
 fn row_hash(value: &Value) -> Result<String, SentinelDatasetError> {
+    let mut value = value.clone();
+    value.sort_all_objects();
     Ok(
-        digest_bytes(&serde_json::to_vec(value).map_err(|_| SentinelDatasetError::Schema)?)
+        digest_bytes(&serde_json::to_vec(&value).map_err(|_| SentinelDatasetError::Schema)?)
             .strip_prefix("sha256:")
             .ok_or(SentinelDatasetError::Checksum)?
             .to_owned(),
@@ -879,6 +883,42 @@ mod tests {
             bytes[start..start + segment.len()].copy_from_slice(segment);
         }
         bytes
+    }
+
+    #[test]
+    fn canonical_order_public_json_sorts_nested_objects_and_preserves_arrays() {
+        let record = serde_json::from_str(
+            r#"{"case_id":"order-case","label":"attack_attempt","z":{"b":2,"a":1},"a":[{"z":{"d":4,"c":3},"a":0},2,1]}"#,
+        )
+        .expect("ordered record");
+        let case = case_from_record(record).expect("case");
+        let expected = br#"{"a":[{"a":0,"z":{"c":3,"d":4}},2,1],"case_id":"order-case","label":"attack_attempt","z":{"a":1,"b":2}}"#;
+        assert_eq!(case.canonical_json().expect("canonical bytes"), expected);
+        assert_eq!(
+            case.canonical_sha256().expect("canonical digest"),
+            digest_bytes(expected)
+        );
+    }
+
+    #[test]
+    fn canonical_order_row_hash_ignores_recursive_object_insertion_order() {
+        let forward: Value = serde_json::from_str(r#"{"z":{"b":2,"a":1},"a":[{"d":4,"c":3},2,1]}"#)
+            .expect("forward row");
+        let reverse: Value = serde_json::from_str(r#"{"a":[{"c":3,"d":4},2,1],"z":{"a":1,"b":2}}"#)
+            .expect("reverse row");
+        let hash = row_hash(&forward).expect("row hash");
+        assert_eq!(hash, row_hash(&reverse).expect("equivalent row hash"));
+        assert_eq!(
+            format!("sha256:{hash}"),
+            digest_bytes(br#"{"a":[{"c":3,"d":4},2,1],"z":{"a":1,"b":2}}"#)
+        );
+        let reordered_array =
+            serde_json::from_str(r#"{"a":[2,1,{"c":3,"d":4}],"z":{"a":1,"b":2}}"#)
+                .expect("different array");
+        assert_ne!(
+            hash,
+            row_hash(&reordered_array).expect("array order is semantic")
+        );
     }
 
     #[test]

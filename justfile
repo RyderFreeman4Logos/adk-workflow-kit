@@ -551,7 +551,7 @@ check-branch:
 
 pre-commit-fast: check-branch fmt-check lock-check check clippy dependency-audit pattern-catalog-test m2-02-green test-local-gates
 
-_quality-gates: fmt-check issue-323-release-consumer check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk issue-325-adk adk-action-check test-local-gates issue-233-model-worker
+_quality-gates: fmt-check issue-323-release-consumer check clippy dependency-audit pattern-catalog-test m2-02-green issue-269-bootstrap-test issue-269-acceptance issue-269-semantics-test test issue-233-adk issue-311-adk issue-325-adk adk-action-check test-local-gates issue-233-model-worker (issue-229-http "dataset::dataset_sentinel::tests::canonical_order_ --features serde_json/preserve_order --offline")
 
 quality-gates:
     scripts/local-gates.sh produce
