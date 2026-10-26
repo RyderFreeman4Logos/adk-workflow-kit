@@ -3,7 +3,7 @@
 use super::{
     ByteSource, DatasetEntry, DatasetError, DatasetErrorKind, DatasetManifest, DatasetReport,
     DatasetSourceIdentity, EvalSuite, PrepareRequest, PreparedDataset, artifact_path, digest_bytes,
-    prepare_dataset, validated_dataset_cache_root,
+    prepare_dataset_with_limit, validated_dataset_cache_root,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -56,7 +56,10 @@ impl fmt::Display for SentinelDatasetError {
 impl std::error::Error for SentinelDatasetError {}
 impl From<DatasetError> for SentinelDatasetError {
     fn from(error: DatasetError) -> Self {
-        Self::Admission(error.kind())
+        match error.kind() {
+            DatasetErrorKind::ArtifactTooLarge => Self::Limit,
+            kind => Self::Admission(kind),
+        }
     }
 }
 
@@ -217,8 +220,7 @@ fn checked_cache_root(path: &Path) -> Result<PathBuf, SentinelDatasetError> {
 /// Admits exactly fifteen registered local artifacts and returns four source-native goldens.
 /// `Some(source_dir)` imports the fixed filenames; `None` requires verified cache hits only.
 /// License/fixed-descriptor checks precede all path access. No network, Python, model or tool runs.
-/// The shared manual importer reads before digest validation; parser/cache-read bounds do not
-/// establish an allocation bound on that earlier operator-supplied file acquisition.
+/// Source acquisition and cache verification each read at most the artifact budget plus one byte.
 /// Complete source licenses/NOTICE remain in the cache and must accompany redistributed derivatives.
 pub fn prepare_sentinel_goldens(
     manifest: &DatasetManifest,
@@ -248,11 +250,15 @@ pub fn prepare_sentinel_goldens(
         if let Some(path) = &manual {
             let metadata = fs::metadata(path)
                 .map_err(|_| SentinelDatasetError::Admission(DatasetErrorKind::Io))?;
-            if !metadata.is_file() || metadata.len() > 1_048_576 {
+            if !metadata.is_file() || metadata.len() > MAX_ARTIFACT_BYTES as u64 {
                 return Err(SentinelDatasetError::Limit);
             }
+            #[cfg(test)]
+            if let Some(barrier) = AFTER_METADATA.with(|slot| slot.take()) {
+                barrier(path);
+            }
         }
-        let prepared = prepare_dataset(
+        let prepared = prepare_dataset_with_limit(
             manifest,
             id,
             &PrepareRequest {
@@ -263,6 +269,7 @@ pub fn prepare_sentinel_goldens(
                 license_accepted,
                 manual_path: manual.as_deref(),
             },
+            Some(MAX_ARTIFACT_BYTES),
         )?;
         let mut bytes = Vec::new();
         fs::File::open(artifact_path(&cache, entry)?)
@@ -296,6 +303,11 @@ pub fn prepare_sentinel_goldens(
             .collect::<Vec<_>>(),
     )?;
     Ok(cases)
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_METADATA: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
 }
 
 fn case_from_record(mut record: Value) -> Result<SentinelDatasetCase, SentinelDatasetError> {
@@ -867,6 +879,44 @@ mod tests {
             bytes[start..start + segment.len()].copy_from_slice(segment);
         }
         bytes
+    }
+
+    #[test]
+    fn growth_after_metadata_is_bounded_before_publication() {
+        let root = super::super::issue_229_creation::ssd_root("sentinel-growth");
+        let sources = root.join("sources");
+        fs::create_dir(&sources).expect("source root");
+        let source = sources.join(ARTIFACTS[0].1);
+        fs::write(&source, b"x").expect("small initial source");
+        AFTER_METADATA.with(|slot| {
+            slot.set(Some(|path| {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .expect("grow same source")
+                    .set_len((MAX_ARTIFACT_BYTES + 2) as u64)
+                    .expect("controlled growth");
+            }))
+        });
+        let cache = root.join("cache");
+        let manifest = DatasetManifest::parse_str(REGISTRY).expect("registry");
+        assert_eq!(
+            prepare_sentinel_goldens(&manifest, &cache, Some(&sources), true)
+                .expect_err("growth must hit byte bound"),
+            SentinelDatasetError::Limit
+        );
+        assert!(
+            AFTER_METADATA.with(|slot| slot.get()).is_none(),
+            "barrier actually executed"
+        );
+        let entry = manifest.dataset(ARTIFACTS[0].0).expect("first entry");
+        let artifact = artifact_path(&cache, entry).expect("artifact path");
+        assert!(!artifact.exists(), "no oversized artifact publication");
+        assert!(
+            !super::super::identity_path(&artifact).exists(),
+            "no identity publication"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

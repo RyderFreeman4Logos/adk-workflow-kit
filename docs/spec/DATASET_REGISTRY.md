@@ -143,9 +143,12 @@ shell-quoted data; literal dollar signs, quotes, backticks and command-substitut
 text are covered at the actual command argv/environment boundary.
 
 The native/parser and post-admission cache readers cap each artifact at 1 MiB.
-The existing manual importer still uses `fs::read` before checksum validation;
-a source metadata check and later parser limits do not prove an allocation bound
-against a concurrently growing operator file. Publisher documentation body
+For Sentinel, shared manual acquisition and warm-cache verification read at most
+1 MiB plus one lookahead byte, rejecting oversize before checksum validation or
+publication even if an operator file grows after metadata inspection. Identity
+verification reads at most its expected encoding length plus one byte. Ordinary
+`prepare_dataset` callers retain their existing artifact-size policy.
+Publisher documentation body
 snapshots missing from the prepared bundle are not invented: the goldens retain
 the verified source-preparation receipt and exact authority URLs.
 
