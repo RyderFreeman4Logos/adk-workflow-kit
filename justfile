@@ -293,6 +293,13 @@ issue-234-runtime:
 issue-234-authored:
     {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_233_translation trajectory_authored:: --locked -- --nocapture --test-threads=1
 
+# Process-local capture access/owner controls; the regular test gate also runs them.
+issue-234-capture-unit:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --lib behavioral::reasoning_capture::tests --locked -- --nocapture --test-threads=1
+
+issue-234-capture-doc:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --doc reasoning_capture --locked -- --nocapture
+
 # Focused #238 deterministic Firewall policy and workflow boundary tests.
 issue-238-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_238_firewall {{test_name}} --locked -- --nocapture

@@ -1,5 +1,7 @@
 //! Public host declaration and single-batch model observation contracts.
 #![cfg(feature = "test-support")]
+#[path = "issue_234_capture/mod.rs"]
+mod capture;
 use std::time::Duration;
 use workflow_adk::model_profiles::{CredentialHandle, OpenAiCompatibleProfile};
 use workflow_adk::{

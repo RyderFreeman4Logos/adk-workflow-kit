@@ -26,6 +26,7 @@ pub struct TrustedModelProbe {
     revision: String,
     model_route_digest: String,
     limits: ProbeLimits,
+    reasoning_capture: bool,
 }
 
 impl fmt::Debug for TrustedModelProbe {
@@ -69,12 +70,26 @@ impl TrustedModelProbe {
             revision: revision.to_owned(),
             model_route_digest: model_route_digest.to_owned(),
             limits,
+            reasoning_capture: false,
         })
+    }
+
+    /// Explicitly admits the process-local reasoning lease for model/trajectory
+    /// policy v2. Authenticate its separate capture declaration before calling;
+    /// ordinary observation, publication and feedback do not use this approval.
+    pub fn with_reasoning_capture(mut self) -> Self {
+        self.reasoning_capture = true;
+        self
+    }
+
+    /// Whether this live host capability explicitly admits raw reasoning capture.
+    pub fn reasoning_capture_enabled(&self) -> bool {
+        self.reasoning_capture
     }
 
     /// Deterministic content-free identity, distinct from authored-script approval.
     pub fn identity(&self) -> String {
-        let material = serde_json::json!({
+        let mut material = serde_json::json!({
             "admission_version": "sentinel-trusted-model-probe-v1",
             "trust_origin": "authenticated_host_api_v1",
             "version": BEHAVIORAL_VERSION,
@@ -87,6 +102,9 @@ impl TrustedModelProbe {
             "model_route_digest": self.model_route_digest,
             "limits": self.limits,
         });
+        if self.reasoning_capture {
+            material["reasoning_capture"] = serde_json::json!("process-local-lease-v1");
+        }
         format!("sha256:{}", crate::argument_fingerprint(&material))
     }
 

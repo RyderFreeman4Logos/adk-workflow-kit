@@ -37,6 +37,15 @@ impl HostModelProbe<'_> {
     }
 
     pub(super) async fn capture(self) -> Result<CapturedModelProbe, crate::AdkGraphError> {
+        self.capture_with_reasoning(false)
+            .await
+            .map(|(probe, _)| probe)
+    }
+
+    pub(super) async fn capture_with_reasoning(
+        self,
+        reasoning_capture: bool,
+    ) -> Result<(CapturedModelProbe, Vec<u8>), crate::AdkGraphError> {
         use crate::AdkGraphError;
         use workflow_runtime::{StructuredOutputError, behavioral::ProbeLimits};
         let policy = self
@@ -50,12 +59,16 @@ impl HostModelProbe<'_> {
             max_steps: policy.max_steps,
             timeout_ms: policy.timeout_ms,
         };
-        let digest = self
-            .route
-            .snapshot()
-            .probe_declaration_digest()
-            .map_err(|_| AdkGraphError::AuthorizationDenied)?;
+        let snapshot = self.route.snapshot();
+        let digest = if reasoning_capture {
+            snapshot.probe_reasoning_capture_declaration_digest()
+        } else {
+            snapshot.probe_declaration_digest()
+        }
+        .map_err(|_| AdkGraphError::AuthorizationDenied)?;
         if policy.schema_version != 2
+            || policy.trajectory.map(|p| p.schema_version) != reasoning_capture.then_some(2)
+            || self.approval.reasoning_capture_enabled() != reasoning_capture
             || self.plan.sentinel_script_identity().is_some()
             || self.plan.sentinel_model_probe_identity() != Some(self.approval.identity().as_str())
             || !self.approval.approves_source(self.source.original_id())
@@ -72,14 +85,28 @@ impl HostModelProbe<'_> {
         let spec = invocation_spec(self.source.envelope())?;
         let worker_digest = self.worker.deployment_digest().to_owned();
         let raw = std::sync::Mutex::new(Vec::new());
-        let result = self
-            .route
-            .invoke_model_probe(&spec, &digest, self.broker, self.cancellation, |bytes| {
-                *raw.lock().map_err(|_| StructuredOutputError::InvalidJson)? = bytes.to_vec();
-                Ok(())
-            })
-            .await
-            .map_err(|_| AdkGraphError::Failed)?;
+        let mut reasoning = Vec::new();
+        let validate = |bytes: &[u8]| {
+            *raw.lock().map_err(|_| StructuredOutputError::InvalidJson)? = bytes.to_vec();
+            Ok(())
+        };
+        let result = if reasoning_capture {
+            self.route
+                .invoke_model_probe_with_capture(
+                    &spec,
+                    &digest,
+                    self.broker,
+                    self.cancellation,
+                    validate,
+                    Some(&mut reasoning),
+                )
+                .await
+        } else {
+            self.route
+                .invoke_model_probe(&spec, &digest, self.broker, self.cancellation, validate)
+                .await
+        }
+        .map_err(|_| AdkGraphError::Failed)?;
         self.check_worker_budget(limits)?;
         let raw = raw.into_inner().map_err(|_| AdkGraphError::Failed)?;
         // The worker owns strict parsing and spawn admission over these same bytes.
@@ -87,18 +114,21 @@ impl HostModelProbe<'_> {
         if self.cancellation.is_cancelled() || std::time::Instant::now() >= self.route.deadline() {
             return Err(AdkGraphError::AuthorizationDenied);
         }
-        Ok(CapturedModelProbe {
-            observation: ModelProbeObservation {
-                report: report.map_err(|_| AdkGraphError::Failed)?,
-                provenance: result.provenance().clone(),
-                usage: result.usage().cloned(),
+        Ok((
+            CapturedModelProbe {
+                observation: ModelProbeObservation {
+                    report: report.map_err(|_| AdkGraphError::Failed)?,
+                    provenance: result.provenance().clone(),
+                    usage: result.usage().cloned(),
+                },
+                raw,
+                completion: *result.completion_evidence(),
+                worker_digest,
+                declaration_digest: digest,
+                limits,
             },
-            raw,
-            completion: *result.completion_evidence(),
-            worker_digest,
-            declaration_digest: digest,
-            limits,
-        })
+            reasoning,
+        ))
     }
 
     pub(super) fn check_worker_budget(

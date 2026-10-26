@@ -49,7 +49,11 @@ pub(super) fn validate_admission(
                 }
                 BehavioralAdmission::Model(probe, route) => {
                     policy.schema_version == 2
-                        && policy.trajectory.is_none()
+                        && match policy.trajectory.map(|p| p.schema_version) {
+                            None => !probe.reasoning_capture_enabled(),
+                            Some(2) => probe.reasoning_capture_enabled(),
+                            _ => false,
+                        }
                         && probe.matches_approval(&hash, limits, route)
                 }
             }

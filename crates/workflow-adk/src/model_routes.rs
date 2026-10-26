@@ -1,4 +1,8 @@
 //! Ordered, authorized model routes over the existing ModelBinding adapter.
+#[cfg(test)]
+#[path = "model_capture_identity_tests.rs"]
+mod capture_identity_tests;
+
 use super::{
     ModelInvocationErrorKind, ModelInvocationResult, ModelInvocationSpec, ProviderRouteIdentity,
     ResponsePolicy,
@@ -122,6 +126,15 @@ impl ModelRouteSnapshot {
     /// authenticate this declaration against independently owned policy.
     pub fn probe_declaration_digest(&self) -> Result<String, ModelRouteSnapshotError> {
         self.probe_declaration().map(|(_, digest)| digest)
+    }
+
+    /// Deterministic identity of the separate, default-off reasoning capture
+    /// contract. Authenticate this declaration before enabling the host lease.
+    pub fn probe_reasoning_capture_declaration_digest(
+        &self,
+    ) -> Result<String, ModelRouteSnapshotError> {
+        self.probe_declaration_for(crate::behavioral::reasoning_capture::declaration_contract())
+            .map(|(_, digest)| digest)
     }
 
     fn probe_declaration(
@@ -522,13 +535,37 @@ impl ModelRoutePolicy {
         cancellation: &ModelRouteCancellation,
         validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
     ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
+        self.invoke_model_probe_with_capture(
+            spec,
+            expected_declaration,
+            broker,
+            cancellation,
+            validate,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn invoke_model_probe_with_capture(
+        &self,
+        spec: &ModelInvocationSpec,
+        expected_declaration: &str,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+        validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
+        reasoning: Option<&mut Vec<u8>>,
+    ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
         let terminal = |kind| route_terminal(kind, Vec::new());
         if let Some(kind) = route_stop(self.deadline, cancellation) {
             return Err(terminal(kind));
         }
         let (profile, digest) = self
             .snapshot
-            .probe_declaration()
+            .probe_declaration_for(if reasoning.is_some() {
+                crate::behavioral::reasoning_capture::declaration_contract()
+            } else {
+                crate::behavioral::model_probe::declaration_contract()
+            })
             .map_err(|_| terminal(ModelRouteTerminalErrorKind::Configuration))?;
         if digest != expected_declaration {
             return Err(terminal(ModelRouteTerminalErrorKind::AuthorizationDenied));
@@ -569,7 +606,15 @@ impl ModelRoutePolicy {
         };
         let spec = spec.with_route(ProviderRouteIdentity::from_binding(&binding));
         await_route(
-            spec.invoke_with_policy(&binding, validate, ResponsePolicy::CompleteText),
+            async {
+                match reasoning {
+                    Some(bytes) => spec.invoke_with_reasoning(&binding, validate, bytes).await,
+                    None => {
+                        spec.invoke_with_policy(&binding, validate, ResponsePolicy::CompleteText)
+                            .await
+                    }
+                }
+            },
             self.deadline,
             cancellation,
         )

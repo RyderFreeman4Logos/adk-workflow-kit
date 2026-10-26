@@ -36,7 +36,8 @@ pub const CANONICAL_IR_WIRE_VERSION_V11: u16 = 11;
 /// Canonical wire for opt-in host-authorized behavioral policy (not authority).
 pub const CANONICAL_IR_WIRE_VERSION_V12: u16 = 12;
 
-/// Canonical wire for default-off offline trajectory policy, never host authority.
+/// Canonical presence/schema framing for contextual trajectory policy: authored
+/// offline observer v1 or model capture v2, never live host authority.
 pub const CANONICAL_IR_WIRE_VERSION_V13: u16 = 13;
 
 /// Canonical wire for a normalized compact-state exchange declaration.

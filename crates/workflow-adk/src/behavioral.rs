@@ -25,6 +25,7 @@ use workflow_runtime::{ArtifactId, ArtifactStore, CanonicalUntrustedText, RunId}
 pub(crate) mod model_probe;
 pub(crate) mod model_probe_feedback;
 mod model_probe_receipt;
+pub(crate) mod reasoning_capture;
 pub use model_probe::{HostModelProbe, ModelProbeObservation};
 pub use model_probe_feedback::ModelProbeFeedbackObservation;
 #[cfg(feature = "test-support")]
@@ -32,6 +33,9 @@ pub use model_probe_receipt::ModelProbePublicationPhase;
 pub use model_probe_receipt::{
     AuditedModelProbeArtifact, ModelProbeEvidenceError, ModelProbePublicationError,
     ModelProbePublicationFailure, PublishedModelProbeArtifact, read_model_probe_evidence,
+};
+pub use reasoning_capture::{
+    ReasoningCaptureCompletion, ReasoningCaptureReader, ReasoningReadError,
 };
 
 impl AdkGraphTranslator {
