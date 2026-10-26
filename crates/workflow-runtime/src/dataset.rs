@@ -5,7 +5,7 @@ use std::{
     fmt,
     fs::{self, OpenOptions},
     hash::BuildHasher,
-    io::{Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
     os::unix::{
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
         io::AsRawFd,
@@ -52,6 +52,8 @@ pub enum DatasetErrorKind {
     SourceIdentityMismatch,
     /// Cache metadata does not describe the stored artifact.
     InvalidCacheIdentity,
+    /// Artifact acquisition exceeded the consuming adapter's byte budget.
+    ArtifactTooLarge,
     /// Cache or source IO failed.
     Io,
 }
@@ -103,6 +105,7 @@ impl fmt::Debug for DatasetErrorKind {
             Self::SourceIdentityRequired => "SourceIdentityRequired",
             Self::SourceIdentityMismatch => "SourceIdentityMismatch",
             Self::InvalidCacheIdentity => "InvalidCacheIdentity",
+            Self::ArtifactTooLarge => "ArtifactTooLarge",
             Self::Io => "Io",
         })
     }
@@ -123,6 +126,7 @@ impl fmt::Display for DatasetError {
             DatasetErrorKind::SourceIdentityRequired => "dataset source identity is required",
             DatasetErrorKind::SourceIdentityMismatch => "dataset source identity mismatch",
             DatasetErrorKind::InvalidCacheIdentity => "dataset cache identity is invalid",
+            DatasetErrorKind::ArtifactTooLarge => "dataset artifact exceeds the byte budget",
             DatasetErrorKind::Io => "dataset storage failed",
         })
     }
@@ -181,6 +185,12 @@ mod dataset_http;
 mod dataset_identity;
 #[path = "dataset_parquet.rs"]
 mod dataset_parquet;
+#[path = "dataset_sentinel.rs"]
+mod dataset_sentinel;
+pub use dataset_sentinel::{
+    SentinelDatasetCase, SentinelDatasetError, SentinelDatasetLabel, prepare_sentinel_goldens,
+    validate_sentinel_splits,
+};
 
 #[cfg(test)]
 #[path = "dataset_creation_tests.rs"]
@@ -348,6 +358,16 @@ pub fn prepare_dataset(
     id: &str,
     request: &PrepareRequest<'_>,
 ) -> Result<PreparedDataset, DatasetError> {
+    prepare_dataset_with_limit(manifest, id, request, None)
+}
+
+// Only bounded consumers opt in; ordinary datasets retain their existing size policy.
+fn prepare_dataset_with_limit(
+    manifest: &DatasetManifest,
+    id: &str,
+    request: &PrepareRequest<'_>,
+    max_bytes: Option<usize>,
+) -> Result<PreparedDataset, DatasetError> {
     let entry = manifest
         .dataset(id)
         .ok_or(DatasetError::new(DatasetErrorKind::UnknownDataset))?;
@@ -368,7 +388,8 @@ pub fn prepare_dataset(
     let expected_identity = expected_identity(entry);
     let dest = artifact_path(&cache_root, entry)?;
     validate_cache_entry_ancestors(&cache_root, &dest)?;
-    if let Some(prepared) = load_verified(entry, &dest, &cache_root, &expected_identity)? {
+    if let Some(prepared) = load_verified(entry, &dest, &cache_root, &expected_identity, max_bytes)?
+    {
         return Ok(prepared);
     }
     match entry.distribution {
@@ -376,7 +397,14 @@ pub fn prepare_dataset(
             let path = request
                 .manual_path
                 .ok_or(DatasetError::new(DatasetErrorKind::ManualPathRequired))?;
-            copy_manual(entry, path, &dest, &cache_root, &expected_identity)
+            copy_manual(
+                entry,
+                path,
+                &dest,
+                &cache_root,
+                &expected_identity,
+                max_bytes,
+            )
         }
         DatasetDistribution::Fetch => {
             if request.offline {
@@ -664,21 +692,30 @@ fn load_verified(
     dest: &Path,
     cache_dir: &Path,
     expected_identity: &DatasetSourceIdentity,
+    max_bytes: Option<usize>,
 ) -> Result<Option<PreparedDataset>, DatasetError> {
     reject_symlink_components(dest, Some(cache_dir))?;
     let identity = identity_path(dest);
     reject_symlink_components(&identity, Some(cache_dir))?;
-    match fs::read(dest) {
-        Ok(bytes) => {
+    match fs::File::open(dest) {
+        Ok(file) => {
+            let bytes = read_artifact(file, max_bytes)?;
             if digest_bytes(&bytes) != entry.sha256 {
                 return Err(DatasetError::new(DatasetErrorKind::ChecksumMismatch));
             }
-            let stored = match fs::read(&identity) {
-                Ok(stored) => stored,
+            let expected = expected_identity.cache_bytes().into_bytes();
+            let stored = match fs::File::open(&identity) {
+                Ok(file) => match read_artifact(file, Some(expected.len())) {
+                    Ok(stored) => stored,
+                    Err(error) if error.kind() == DatasetErrorKind::ArtifactTooLarge => {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                },
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(_) => return Err(DatasetError::new(DatasetErrorKind::Io)),
             };
-            if stored != expected_identity.cache_bytes().into_bytes() {
+            if stored != expected {
                 return Ok(None);
             }
             Ok(Some(prepared(entry, expected_identity, true)))
@@ -953,9 +990,11 @@ fn copy_manual(
     dest: &Path,
     cache_dir: &Path,
     expected_identity: &DatasetSourceIdentity,
+    max_bytes: Option<usize>,
 ) -> Result<PreparedDataset, DatasetError> {
     reject_symlink_components(path, None)?;
-    let bytes = fs::read(path).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+    let file = fs::File::open(path).map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+    let bytes = read_artifact(file, max_bytes)?;
     if digest_bytes(&bytes) != entry.sha256 {
         return Err(DatasetError::new(DatasetErrorKind::ChecksumMismatch));
     }
@@ -969,6 +1008,30 @@ fn copy_manual(
         cache_dir,
     )?;
     Ok(prepared(entry, expected_identity, false))
+}
+
+// Stream from the opened file without reserving from attacker-controlled metadata.
+// The single lookahead byte distinguishes an exact-length artifact from an oversized one.
+fn read_artifact(mut reader: impl Read, max_bytes: Option<usize>) -> Result<Vec<u8>, DatasetError> {
+    let mut bytes = Vec::new();
+    if let Some(max_bytes) = max_bytes {
+        let lookahead = u64::try_from(max_bytes)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or(DatasetError::new(DatasetErrorKind::Io))?;
+        reader
+            .take(lookahead)
+            .read_to_end(&mut bytes)
+            .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+        if bytes.len() > max_bytes {
+            return Err(DatasetError::new(DatasetErrorKind::ArtifactTooLarge));
+        }
+    } else {
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|_| DatasetError::new(DatasetErrorKind::Io))?;
+    }
+    Ok(bytes)
 }
 
 fn fetch_resumable(
@@ -1125,6 +1188,88 @@ suites = ["smoke"]
         let _ = fs::remove_dir_all(&root);
         fs::create_dir(&root).expect("root");
         root
+    }
+
+    #[test]
+    fn bounded_reader_stops_after_budget_plus_one() {
+        struct Counted<'a> {
+            bytes: &'a [u8],
+            consumed: &'a std::cell::Cell<usize>,
+        }
+        impl Read for Counted<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.bytes.read(out)?;
+                self.consumed.set(self.consumed.get() + n);
+                Ok(n)
+            }
+        }
+        let consumed = std::cell::Cell::new(0);
+        let result = read_artifact(
+            Counted {
+                bytes: b"0123456789",
+                consumed: &consumed,
+            },
+            Some(8),
+        );
+        assert!(consumed.get() <= 9, "must not consume the tenth byte");
+        assert_eq!(
+            result.expect_err("over budget").kind(),
+            DatasetErrorKind::ArtifactTooLarge
+        );
+        assert_eq!(
+            read_artifact(&b"01234567"[..], Some(8)).expect("exact budget"),
+            b"01234567"
+        );
+        assert_eq!(
+            read_artifact(&b"0123456789"[..], None).expect("unbounded consumer"),
+            b"0123456789"
+        );
+    }
+
+    #[test]
+    fn bounded_cache_rejects_oversized_artifact_and_identity() {
+        let root = ssd_root("bounded-cache");
+        let manifest = smoke();
+        let entry = manifest.dataset("smoke-fixture").expect("entry");
+        let identity = expected_identity(entry);
+        let source = Source;
+        prepare_dataset(&manifest, "smoke-fixture", &request(&root, &source)).expect("valid seed");
+        let dest = artifact_path(&root, entry).expect("dest");
+        assert!(
+            load_verified(entry, &dest, &root, &identity, Some(SMOKE.len()))
+                .expect("valid cache")
+                .is_some()
+        );
+        fs::write(&dest, [SMOKE, b"xx"].concat()).expect("oversize artifact");
+        assert_eq!(
+            load_verified(entry, &dest, &root, &identity, Some(SMOKE.len()))
+                .expect_err("oversize before checksum")
+                .kind(),
+            DatasetErrorKind::ArtifactTooLarge
+        );
+        fs::write(&dest, SMOKE).expect("restore artifact");
+        let identity_file = identity_path(&dest);
+        fs::write(
+            &identity_file,
+            [identity.cache_bytes().as_bytes(), b"xx"].concat(),
+        )
+        .expect("oversize identity");
+        assert!(
+            load_verified(entry, &dest, &root, &identity, Some(SMOKE.len()))
+                .expect("identity mismatch")
+                .is_none()
+        );
+        fs::write(&identity_file, identity.cache_bytes()).expect("restore identity");
+        let mut wrong = SMOKE.to_vec();
+        wrong[0] ^= 1;
+        fs::write(&dest, wrong).expect("checksum fixture");
+        assert_eq!(
+            load_verified(entry, &dest, &root, &identity, Some(SMOKE.len()))
+                .expect_err("checksum")
+                .kind(),
+            DatasetErrorKind::ChecksumMismatch
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
