@@ -10,8 +10,9 @@ use workflow_runtime::{
     ArtifactId, ArtifactStore, CarrierLimits, CarrierMode, LanguageAttribution, LanguagePolicy,
     NodeCacheKey, NodeCacheKeyMaterial, NormalizationLimits, SECURITY_MODEL_VERSION,
     SENTINEL_CARRIER_VERSION, SENTINEL_ENVELOPE_SCHEMA_VERSION, SENTINEL_LANGUAGE_POLICY_VERSION,
-    SENTINEL_NORMALIZATION_VERSION, SENTINEL_PREPARATION_BUDGET_MS, SENTINEL_SCRIPT_DATA_VERSION,
-    SENTINEL_SEGMENTATION_VERSION, SegmentationLimits, SentinelPreparation, SentinelVerdict,
+    SENTINEL_NORMALIZATION_VERSION, SENTINEL_PREPARATION_BUDGET_MS,
+    SENTINEL_REDUCTION_POLICY_VERSION, SENTINEL_SCRIPT_DATA_VERSION, SENTINEL_SEGMENTATION_VERSION,
+    SegmentationLimits, SentinelPreparation, SentinelVerdict, SourceSpan,
     TYPED_OUTPUT_SCHEMA_VERSION_V1, TrustDomain, prepare_untrusted_text,
 };
 use workflow_spec::UntrustedTextPreparation;
@@ -88,6 +89,7 @@ impl PreparationWorkflow {
             "probe_version": probes::VERSION,
             "probe_budget": probes::BUDGET,
             "semantic_version": semantics::VERSION,
+            "reduction_policy_version": SENTINEL_REDUCTION_POLICY_VERSION,
             "task_alignment_version": task_alignment::VERSION,
             "max_goal_bytes": task_alignment::MAX_GOAL_BYTES,
             "trusted_goal": self.trusted_goal.as_ref().map(task_alignment::TrustedGoal::binding),
@@ -276,12 +278,15 @@ impl PreparationWorkflow {
             );
         }
         // Preparation is complete; semantic inference has its own existing deadline.
+        let source_cover = SourceSpan::new(text.original_id().as_str(), 0, raw.len() as u64)
+            .map_err(|_| AdkGraphError::Failed)?;
         let semantic_bytes = semantics::run(
             probes.inputs,
             state,
             model,
             key.digest(),
             self.trusted_goal.as_ref(),
+            &source_cover,
         )
         .await?;
         let semantic_id = put_verified(store, &semantic_bytes, mapper, &self.node_id, "semantics")?;

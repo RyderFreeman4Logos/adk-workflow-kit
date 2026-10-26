@@ -249,6 +249,17 @@ fn wire_scenario(
     assert!((1..=2).contains(&replies));
     let (workflow, model_name, input, response_output) = case;
     let sentinel = workflow == "examples/03-sentinel-preparation/workflow.toml";
+    let sentinel_reply = if sentinel {
+        match response_output.as_str() {
+            None if response_output.is_null() => "cln",
+            Some("cln") => "cln",
+            Some("inj") => "inj",
+            Some("sus") => "sus",
+            _ => panic!("Sentinel fixture requires cln, inj, sus, or the default null"),
+        }
+    } else {
+        "cln"
+    };
     let scratch = std::env::var_os("TMPDIR").expect("explicit SSD TMPDIR");
     let root = PathBuf::from(scratch).join(format!(
         "wire230-{}-{}",
@@ -288,7 +299,7 @@ fn wire_scenario(
                     .as_array()
                     .unwrap()
                     .iter()
-                    .find(|value| value["payload"]["verdict"] == "cln")
+                    .find(|value| value["payload"]["verdict"] == sentinel_reply)
                     .unwrap()
                     .to_string()
             } else {

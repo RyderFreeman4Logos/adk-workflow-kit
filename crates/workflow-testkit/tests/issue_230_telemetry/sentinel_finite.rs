@@ -127,7 +127,7 @@ fn check_requests(request: &Value, model: &str) -> Value {
         let branch = suffix.split_once('/').unwrap().1.split(';').next().unwrap();
         branches.insert(branch.to_owned());
         assert!(!system.contains("AUTHENTICATED_GOAL_BYTES:"));
-        assert_eq!(schema["$id"], "urn:sentinel-semantic-probes-v4:source");
+        assert_eq!(schema["$id"], "urn:sentinel-semantic-probes-v5:source");
         let prefix = format!(
             "{system}\n{}",
             user.split_once("TASK_SUFFIX_BYTES:").unwrap().0
