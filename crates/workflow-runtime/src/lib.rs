@@ -34,6 +34,7 @@ pub mod semantic_firewall;
 mod sentinel_carriers;
 mod sentinel_envelope;
 mod sentinel_language;
+mod sentinel_reduction;
 mod sentinel_segments;
 mod session;
 mod tool;
@@ -163,6 +164,10 @@ pub use sentinel_envelope::{
 pub use sentinel_language::{
     LanguageAssessment, LanguageAttribution, LanguagePolicy, SENTINEL_LANGUAGE_MODEL_ID,
     SENTINEL_LANGUAGE_POLICY_VERSION, SentinelLanguage,
+};
+pub use sentinel_reduction::{
+    SENTINEL_REDUCTION_POLICY_VERSION, SemanticReductionInput, SentinelReduction,
+    SentinelReductionError, SentinelReductionInput, reduce_sentinel,
 };
 pub use sentinel_segments::{
     LanguageScreening, SENTINEL_SCRIPT_DATA_VERSION, SENTINEL_SEGMENTATION_VERSION, ScriptEvidence,
