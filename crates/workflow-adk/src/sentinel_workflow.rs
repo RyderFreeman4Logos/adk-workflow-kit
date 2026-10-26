@@ -84,12 +84,11 @@ impl PreparationWorkflow {
             zh: self.policy.zh,
             ja: self.policy.ja,
         };
-        let policy = json!({
+        let mut policy = json!({
             "version": VERSION,
             "probe_version": probes::VERSION,
             "probe_budget": probes::BUDGET,
             "semantic_version": semantics::VERSION,
-            "reduction_policy_version": SENTINEL_REDUCTION_POLICY_VERSION,
             "task_alignment_version": task_alignment::VERSION,
             "max_goal_bytes": task_alignment::MAX_GOAL_BYTES,
             "trusted_goal": self.trusted_goal.as_ref().map(task_alignment::TrustedGoal::binding),
@@ -117,6 +116,12 @@ impl PreparationWorkflow {
             "language_policy": language,
             "trust_domain": TrustDomain::UntrustedContent,
         });
+        // Scripted behavioral preparation returns before semantic inference; retain its policy identity.
+        if self.policy.behavioral.is_some() {
+            policy["semantic_version"] = json!("sentinel-semantic-probes-v4");
+        } else {
+            policy["reduction_policy_version"] = json!(SENTINEL_REDUCTION_POLICY_VERSION);
+        }
         let policy_digest = digest_json(&policy)?;
         let mut report = json!({
             "schema_version": 1,

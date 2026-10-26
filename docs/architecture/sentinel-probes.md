@@ -92,7 +92,8 @@ wall-time guarantees. No unbounded task text or semantic prose is serialized.
 
 Adapter identity is `sentinel-workflow-preparation-v7`; the preparation key binds
 both probe versions and fixed budgets, retaining raw-byte, workflow/IR, language
-policy and preparation identities. It also binds `sentinel-reduction-policy-v1`.
+policy and preparation identities. The semantic path also binds `sentinel-reduction-policy-v1`;
+scripted behavioral preparation retains its prior policy identity without this unused version.
 The existing eight-field framing remains `WORKFLOW_ID`, `WORKFLOW_VERSION`,
 `NODE_ID`, `NODE_VERSION`, `INVOCATION_IDENTITY`, `INPUT_ARTIFACT_HASHES`,
 `REQUEST_INPUT_DIGEST`, and `POLICY_DIGEST`; the reducer version belongs inside
