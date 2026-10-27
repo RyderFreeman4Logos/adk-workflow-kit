@@ -303,6 +303,12 @@ issue-234-capture-unit: issue-233-worker-binaries
 issue-234-capture-doc:
     {{_io}} cargo +1.98.0 test -p workflow-adk --doc reasoning_capture --locked -- --nocapture
 
+# Deny before dependencies/build/private inputs. Admission is separately reviewed.
+issue-234-live:
+    @test "${ADK_ISSUE234_LIVE:-}" = YES && [[ "${ADK_ISSUE234_ADMISSION:-}" = /* ]] && [[ "${ADK_ISSUE234_ADMISSION_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || { echo 'DENIED: explicit live opt-in and external admission required' >&2; exit 2; }
+    just issue-233-worker-binaries
+    timeout --signal=TERM --kill-after=5s 175s {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_233_model_worker --locked -- capture::live::admitted_real_pair --ignored --exact --nocapture --test-threads=1
+
 # Focused #238 deterministic Firewall policy and workflow boundary tests.
 issue-238-runtime test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_238_firewall {{test_name}} --locked -- --nocapture

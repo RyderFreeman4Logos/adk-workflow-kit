@@ -8,6 +8,7 @@ mod admission;
 mod collector;
 mod identity;
 mod lifecycle;
+mod live;
 mod observer;
 mod trajectory;
 
