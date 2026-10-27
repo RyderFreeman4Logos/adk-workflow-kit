@@ -1141,6 +1141,37 @@ impl ModelInvocationSpec {
         validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
         policy: ResponsePolicy,
     ) -> Result<ModelInvocationResult, ModelInvocationError> {
+        self.invoke_collect(binding, validate, policy, None).await
+    }
+
+    /// Private side channel for the independently admitted single-batch host probe.
+    /// Bytes stay attempt-local until strict Text validation succeeds, and never
+    /// become part of the Clone/Debug public invocation result or its usage.
+    pub(crate) async fn invoke_with_reasoning(
+        &self,
+        binding: &ModelBinding,
+        validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
+        reasoning: &mut Vec<u8>,
+    ) -> Result<ModelInvocationResult, ModelInvocationError> {
+        self.invoke_collect(
+            binding,
+            validate,
+            ResponsePolicy::CompleteText,
+            Some(reasoning),
+        )
+        .await
+    }
+
+    async fn invoke_collect(
+        &self,
+        binding: &ModelBinding,
+        validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
+        policy: ResponsePolicy,
+        mut reasoning: Option<&mut Vec<u8>>,
+    ) -> Result<ModelInvocationResult, ModelInvocationError> {
+        if let Some(target) = reasoning.as_mut() {
+            target.clear();
+        }
         if !self.route.matches_binding(binding) {
             return Err(ModelInvocationError::route_mismatch());
         }
@@ -1160,6 +1191,7 @@ impl ModelInvocationSpec {
                     )
                 })?;
             let mut output = String::new();
+            let mut attempt_reasoning = Vec::new();
             let mut complete = false;
             let mut completion_evidence = ModelCompletionEvidence::default();
             let mut usage = None;
@@ -1221,6 +1253,23 @@ impl ModelInvocationSpec {
                                 ));
                             }
                             output.push_str(&text);
+                        } else if let Part::Thinking { thinking, .. } = part
+                            && reasoning.is_some()
+                        {
+                            if attempt_reasoning
+                                .len()
+                                .checked_add(thinking.len())
+                                .is_none_or(|length| {
+                                    length
+                                        > crate::behavioral::reasoning_capture::MAX_REASONING_BYTES
+                                })
+                            {
+                                return Err(ModelInvocationError::structured(
+                                    StructuredOutputError::OutputTooLarge,
+                                    attempts,
+                                ));
+                            }
+                            attempt_reasoning.extend_from_slice(thinking.as_bytes());
                         } else if policy == ResponsePolicy::CompleteText {
                             return Err(ModelInvocationError::structured(
                                 StructuredOutputError::InvalidJson,
@@ -1239,6 +1288,9 @@ impl ModelInvocationSpec {
             }
             match validate(output.as_bytes()).and_then(|()| self.output.decode(output.as_bytes())) {
                 Ok(output) => {
+                    if let Some(target) = reasoning.as_mut() {
+                        **target = attempt_reasoning;
+                    }
                     return Ok(ModelInvocationResult {
                         output,
                         attempts,

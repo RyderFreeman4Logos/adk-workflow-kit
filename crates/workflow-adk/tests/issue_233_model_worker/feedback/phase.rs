@@ -2,7 +2,7 @@
 use super::*;
 use workflow_runtime::behavioral::worker::WorkerError;
 
-pub(super) fn make_fifo(path: &Path) {
+pub(crate) fn make_fifo(path: &Path) {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
     // SAFETY: valid NUL-terminated fixture-only path and fixed private mode.
@@ -12,14 +12,14 @@ pub(super) fn make_fifo(path: &Path) {
 // This fixture blocks the existing host PID-witness write, after actual spawn
 // and before the old supervisor timer. It changes no worker bytes or production
 // timing seams. The reader is retained until the invocation signals settlement.
-struct FifoHold {
+pub(crate) struct FifoHold {
     release: Arc<std::sync::atomic::AtomicBool>,
     done: std::sync::mpsc::Receiver<Result<FifoWitness, String>>,
     owner: Option<std::thread::JoinHandle<()>>,
     observed: Arc<std::sync::Mutex<Option<(i32, u64)>>>,
 }
 #[derive(Debug)]
-struct FifoWitness {
+pub(crate) struct FifoWitness {
     pid: i32,
     start: u64,
     held: Duration,
@@ -27,9 +27,22 @@ struct FifoWitness {
 }
 impl FifoHold {
     fn new(path: PathBuf, delay: Duration) -> Self {
-        Self::with_fault(path, delay, None)
+        Self::with_control(path, delay, None, None)
     }
     fn with_fault(path: PathBuf, delay: Duration, fault: Option<bool>) -> Self {
+        Self::with_control(path, delay, fault, None)
+    }
+    /// Cancel after actual exit0, before host equality; the late host check runs
+    /// only after verification. This does not claim post-verification signal time.
+    pub(crate) fn cancel_after_exit(path: PathBuf, cancellation: ModelRouteCancellation) -> Self {
+        Self::with_control(path, Duration::ZERO, None, Some(cancellation))
+    }
+    fn with_control(
+        path: PathBuf,
+        delay: Duration,
+        fault: Option<bool>,
+        cancellation: Option<ModelRouteCancellation>,
+    ) -> Self {
         use std::{
             io::Read,
             os::unix::fs::{FileTypeExt, OpenOptionsExt},
@@ -133,6 +146,9 @@ impl FifoHold {
                         std::thread::sleep(Duration::from_millis(2));
                     }
                     let held = observed.elapsed();
+                    if let Some(cancellation) = &cancellation {
+                        cancellation.cancel();
+                    }
                     if let Some(unwind) = fault {
                         if unwind {
                             panic!("intentional FIFO setup unwind");
@@ -227,7 +243,7 @@ impl FifoHold {
         owner.join().map_err(|_| "controller panicked".to_owned())?;
         result
     }
-    fn finish(mut self) -> FifoWitness {
+    pub(crate) fn finish(mut self) -> FifoWitness {
         let evidence = self.settle().expect("qualified pre-timer FIFO seam");
         assert_eq!(
             assert_reaped_record(&evidence.record),

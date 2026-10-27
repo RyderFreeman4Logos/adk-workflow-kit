@@ -23,8 +23,15 @@ use workflow_runtime::behavioral::{ProbeLimits, TrustedScript};
 use workflow_runtime::{ArtifactId, ArtifactStore, CanonicalUntrustedText, RunId};
 
 pub(crate) mod model_probe;
+mod model_trajectory;
+pub(crate) mod trajectory_observer;
+pub use model_trajectory::{
+    ObserverStatus, RoleMetadata, RolePhase, TrajectoryMonitorErrorKind, TrajectoryMonitorFailure,
+    TrajectoryMonitorObservation, TrajectoryMonitorPhase, VerifiedTrajectoryBundle,
+};
 pub(crate) mod model_probe_feedback;
 mod model_probe_receipt;
+pub(crate) mod reasoning_capture;
 pub use model_probe::{HostModelProbe, ModelProbeObservation};
 pub use model_probe_feedback::ModelProbeFeedbackObservation;
 #[cfg(feature = "test-support")]
@@ -32,6 +39,9 @@ pub use model_probe_receipt::ModelProbePublicationPhase;
 pub use model_probe_receipt::{
     AuditedModelProbeArtifact, ModelProbeEvidenceError, ModelProbePublicationError,
     ModelProbePublicationFailure, PublishedModelProbeArtifact, read_model_probe_evidence,
+};
+pub use reasoning_capture::{
+    ReasoningCaptureCompletion, ReasoningCaptureReader, ReasoningReadError,
 };
 
 impl AdkGraphTranslator {
@@ -86,6 +96,9 @@ impl AdkGraphTranslator {
             (None, None) => true,
             (Some(policy), Some(script)) => {
                 policy.schema_version == 1
+                    && policy
+                        .trajectory
+                        .is_none_or(|trajectory| trajectory.observer_mode.is_none())
                     && script.matches_trajectory_policy(policy.trajectory.map(|p| p.schema_version))
                     && script.matches_approval(
                         &format!("sha256:{}", crate::canonical_ir_hash(ir)),

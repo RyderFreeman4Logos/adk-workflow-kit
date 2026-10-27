@@ -26,6 +26,8 @@ pub struct TrustedModelProbe {
     revision: String,
     model_route_digest: String,
     limits: ProbeLimits,
+    reasoning_capture: bool,
+    monitor: Option<TrustedTrajectoryMonitor>,
 }
 
 impl fmt::Debug for TrustedModelProbe {
@@ -69,12 +71,44 @@ impl TrustedModelProbe {
             revision: revision.to_owned(),
             model_route_digest: model_route_digest.to_owned(),
             limits,
+            reasoning_capture: false,
+            monitor: None,
         })
+    }
+
+    /// Explicitly admits the process-local reasoning lease for model/trajectory
+    /// policy v2. Authenticate its separate capture declaration before calling;
+    /// ordinary observation, publication and feedback do not use this approval.
+    pub fn with_reasoning_capture(mut self) -> Self {
+        self.reasoning_capture = true;
+        self
+    }
+
+    /// Attach one independently authenticated schema3 monitor after capture approval.
+    pub fn with_trajectory_monitor(
+        mut self,
+        monitor: TrustedTrajectoryMonitor,
+    ) -> Result<Self, ProbeError> {
+        if !self.reasoning_capture || self.monitor.is_some() {
+            return Err(ProbeError::InvalidIdentity);
+        }
+        self.monitor = Some(monitor);
+        Ok(self)
+    }
+
+    /// Content-free monitor authority; absent on every legacy admission.
+    pub fn trajectory_monitor(&self) -> Option<&TrustedTrajectoryMonitor> {
+        self.monitor.as_ref()
+    }
+
+    /// Whether this live host capability explicitly admits raw reasoning capture.
+    pub fn reasoning_capture_enabled(&self) -> bool {
+        self.reasoning_capture
     }
 
     /// Deterministic content-free identity, distinct from authored-script approval.
     pub fn identity(&self) -> String {
-        let material = serde_json::json!({
+        let mut material = serde_json::json!({
             "admission_version": "sentinel-trusted-model-probe-v1",
             "trust_origin": "authenticated_host_api_v1",
             "version": BEHAVIORAL_VERSION,
@@ -87,6 +121,12 @@ impl TrustedModelProbe {
             "model_route_digest": self.model_route_digest,
             "limits": self.limits,
         });
+        if self.reasoning_capture {
+            material["reasoning_capture"] = serde_json::json!("process-local-lease-v1");
+        }
+        if let Some(monitor) = &self.monitor {
+            material["trajectory_monitor"] = monitor.identity_material();
+        }
         format!("sha256:{}", crate::argument_fingerprint(&material))
     }
 
@@ -115,4 +155,95 @@ fn valid_digest(value: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
+}
+
+/// Separate independently authenticated admission for one exact observer declaration.
+/// No parser, workflow field or model response can construct this capability.
+pub struct TrustedTrajectoryObserverGrant {
+    declaration_digest: String,
+}
+impl TrustedTrajectoryObserverGrant {
+    /// Authorize only an out-of-band authenticated declaration digest.
+    pub fn authorize(declaration_digest: &str) -> Result<Self, ProbeError> {
+        if !valid_digest(declaration_digest) {
+            return Err(ProbeError::InvalidIdentity);
+        }
+        Ok(Self {
+            declaration_digest: declaration_digest.to_owned(),
+        })
+    }
+}
+
+/// Host-only task and fixed monitor contract. No serialization or payload Debug.
+pub struct TrustedTrajectoryMonitor {
+    task: String,
+    task_digest: String,
+    mode: workflow_ir::TrajectoryObserverMode,
+    observer: Option<TrustedTrajectoryObserverGrant>,
+}
+impl TrustedTrajectoryMonitor {
+    /// Authenticate task independently of model/source/config data; nonblank <=2048 bytes.
+    /// Disabled forbids a grant; semantic requires one exact observer declaration.
+    pub fn authorize(
+        task: &str,
+        mode: workflow_ir::TrajectoryObserverMode,
+        observer: Option<TrustedTrajectoryObserverGrant>,
+    ) -> Result<Self, ProbeError> {
+        if task.trim().is_empty()
+            || task.len() > 2048
+            || (mode == workflow_ir::TrajectoryObserverMode::Semantic) != observer.is_some()
+        {
+            return Err(ProbeError::InvalidIdentity);
+        }
+        use sha2::{Digest, Sha256};
+        Ok(Self {
+            task: task.to_owned(),
+            task_digest: format!("sha256:{:x}", Sha256::digest(task.as_bytes())),
+            mode,
+            observer,
+        })
+    }
+    /// Exact declarative selector matched by compilation and live admission.
+    pub fn mode(&self) -> workflow_ir::TrajectoryObserverMode {
+        self.mode
+    }
+    /// Task identity only; full trusted task never enters IR/reports/events/errors.
+    pub fn task_digest(&self) -> &str {
+        &self.task_digest
+    }
+    /// Deterministic fixed contract material, without raw task or credentials.
+    pub fn identity_material(&self) -> serde_json::Value {
+        serde_json::json!({"version":"model-trajectory-monitor-v1", "mode":self.mode,
+            "task_digest":self.task_digest, "capture":"process-local-lease-v1", "feature":"model-trajectory-v1",
+            "claims":"closed-claims-v1", "prompt":"trajectory-observer-v1", "output_schema":"weak-signals-v1",
+            "trust_domain":"trusted-task-safe-features-v1", "observer_digest":self.observer.as_ref().map(|o| &o.declaration_digest),
+            "input_bytes":32768,"output_bytes":1024,"requested_output_tokens":128,"candidates":1,"attempts":1,"retries":0,"fallbacks":0})
+    }
+    /// Borrow the authenticated task solely to construct the bounded observer input.
+    /// Never forward this text into reports, events, diagnostics or telemetry.
+    pub fn observer_task(&self) -> &str {
+        &self.task
+    }
+    /// Exact separately authenticated declaration; absent only in disabled mode.
+    pub fn observer_declaration_digest(&self) -> Option<&str> {
+        self.observer
+            .as_ref()
+            .map(|grant| grant.declaration_digest.as_str())
+    }
+    /// Recheck the closed mode/grant shape before compilation and live admission.
+    pub fn valid(&self) -> bool {
+        !self.task.trim().is_empty()
+            && self.task.len() <= 2048
+            && match self.mode {
+                workflow_ir::TrajectoryObserverMode::Disabled => self.observer.is_none(),
+                workflow_ir::TrajectoryObserverMode::Semantic => self
+                    .observer
+                    .as_ref()
+                    .is_some_and(|grant| valid_digest(&grant.declaration_digest)),
+            }
+    }
+    /// Rechecks the task and fixed grant shape without exposing task content.
+    pub fn valid_disabled(&self) -> bool {
+        self.valid() && self.mode == workflow_ir::TrajectoryObserverMode::Disabled
+    }
 }

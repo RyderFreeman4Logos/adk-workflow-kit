@@ -39,7 +39,7 @@ fn cli(args: &[&str]) -> Output {
         .output()
         .unwrap()
 }
-fn success(output: Output) -> Value {
+fn assert_cli_success(output: &Output) {
     assert!(
         output.status.success(),
         "CLI failed: status={}; stdout_bytes={}; stdout_sha256={:x}; stderr_bytes={}; stderr_sha256={:x}",
@@ -49,6 +49,10 @@ fn success(output: Output) -> Value {
         output.stderr.len(),
         Sha256::digest(&output.stderr)
     );
+}
+
+fn success(output: Output) -> Value {
+    assert_cli_success(&output);
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
@@ -79,7 +83,7 @@ fn cli_failure_diagnostic_retains_status_without_payloads() {
             stdout: stdout.to_vec(),
             stderr: stderr.to_vec(),
         };
-        let panic = std::panic::catch_unwind(|| success(output)).unwrap_err();
+        let panic = std::panic::catch_unwind(|| assert_cli_success(&output)).unwrap_err();
         let message = panic.downcast_ref::<String>().unwrap();
         assert!(!message.contains("PRIVATE_STDOUT_NEVER_REPORT"));
         assert!(!message.contains("PRIVATE_STDERR_NEVER_REPORT"));
@@ -89,6 +93,11 @@ fn cli_failure_diagnostic_retains_status_without_payloads() {
         assert!(message.contains(&format!("stdout_sha256={stdout_sha256}")));
         assert!(message.contains(&format!("stderr_sha256={stderr_sha256}")));
     }
+    assert_cli_success(&Output {
+        status: ExitStatus::from_raw(0),
+        stdout: b"1 passed; 0 failed".to_vec(),
+        stderr: b"PRIVATE_STDERR_NEVER_REPORT".to_vec(),
+    });
     assert_eq!(
         success(Output {
             status: ExitStatus::from_raw(0),
@@ -297,9 +306,40 @@ fn wire_scenario(
     replies: usize,
     run: impl FnOnce(&std::path::Path, &std::path::Path) -> Output,
 ) -> (PathBuf, Output, Result<Value, String>) {
+    wire_scenario_with_windows(
+        usage,
+        retry,
+        options,
+        case,
+        replies,
+        FixtureWindows::Shared(Duration::from_secs(20)),
+        |path, output, _| run(path, output),
+    )
+}
+
+enum FixtureWindows {
+    Shared(Duration),
+    PerCli(Duration),
+}
+
+fn wire_scenario_with_windows(
+    usage: Option<Value>,
+    retry: bool,
+    options: Value,
+    case: (&str, &str, Value, Value),
+    replies: usize,
+    windows: FixtureWindows,
+    run: impl FnOnce(&std::path::Path, &std::path::Path, &dyn Fn()) -> Output,
+) -> (PathBuf, Output, Result<Value, String>) {
+    let separate_cli_windows = matches!(&windows, FixtureWindows::PerCli(_));
+    let budget = match windows {
+        FixtureWindows::Shared(budget) | FixtureWindows::PerCli(budget) => budget,
+    };
     assert!((1..=2).contains(&replies));
+    assert!(!separate_cli_windows || (replies == 2 && !retry));
     let (workflow, model_name, input, response_output) = case;
     let sentinel = workflow == "examples/03-sentinel-preparation/workflow.toml";
+    assert!(!separate_cli_windows || !sentinel);
     let sentinel_reply = if sentinel {
         match response_output.as_str() {
             None if response_output.is_null() => "cln",
@@ -324,12 +364,19 @@ fn wire_scenario(
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + budget;
+    let (window_sender, admitted_window) = std::sync::mpsc::channel::<Instant>();
     let server = WireServer(Some(thread::spawn(move || {
+        let mut deadline = deadline;
         let mut last = None;
         let mut salts = Vec::new();
         let mut requests = Vec::new();
         for attempt in 0..replies + usize::from(retry && !sentinel) {
+            if separate_cli_windows && attempt == 1 {
+                deadline = admitted_window
+                    .recv()
+                    .map_err(|_| "second fixture window was not admitted".to_owned())?;
+            }
             let mut socket = match accept_request(&listener, deadline) {
                 Ok(socket) => socket,
                 Err(_) if sentinel && retry && last.is_some() => break,
@@ -388,6 +435,8 @@ fn wire_scenario(
         })
         .ok_or_else(|| "no request served".to_owned())
     })));
+    // Drop the sender before WireServer joins if the client closure unwinds.
+    let next_window = window_sender;
     let mut profile: Value = serde_json::from_slice(
         &fs::read(repo().join("examples/00-runtime-smoke/profiles/fake.json")).unwrap(),
     )
@@ -396,7 +445,10 @@ fn wire_scenario(
     let manifest = json!({"schema_version":1,"origin":"local_wire_test","workflow_source":workflow,"profile":profile,"input":input});
     let path = root.join("binding.json");
     fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-    let output = run(&path, &root.join("run"));
+    let output = run(&path, &root.join("run"), &|| {
+        next_window.send(Instant::now() + budget).unwrap();
+    });
+    drop(next_window);
     // Join even on a missing CLI command; never leak the listener thread.
     let request = server.finish().unwrap();
     (root, output, request)
@@ -432,7 +484,7 @@ fn wire_measurement_is_runtime_evidence_and_rejects_tampering() {
         .args(["rev-parse", "HEAD"])
         .output()
         .unwrap();
-    assert!(revision.status.success());
+    assert_cli_success(&revision);
     assert_eq!(
         manifest["source_revision"],
         String::from_utf8(revision.stdout).unwrap().trim()
@@ -796,6 +848,127 @@ fn fixture_eof_is_an_owned_error_in_headers_and_body() {
             .kind(),
             io::ErrorKind::UnexpectedEof
         );
+    }
+}
+
+#[test]
+fn fixture_second_cli_owns_a_new_fixed_window_on_the_same_listener() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    let (_, _, served) = wire_scenario_with_windows(
+        None,
+        false,
+        json!({}),
+        (
+            "templates/minimal/workflow.toml",
+            "minimal-worker",
+            json!({"request":"Return ready."}),
+            json!({"status":"ready"}),
+        ),
+        2,
+        FixtureWindows::PerCli(Duration::from_millis(200)),
+        |binding, _, admit_next_window| {
+            let binding: Value = serde_json::from_slice(&fs::read(binding).unwrap()).unwrap();
+            let address = binding["profile"]["model"]["base_url"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("http://")
+                .unwrap()
+                .strip_suffix("/v1")
+                .unwrap();
+            let exchange = || -> io::Result<()> {
+                let mut socket = TcpStream::connect(address)?;
+                socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+                socket.write_all(
+                    b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}",
+                )?;
+                let mut reply = Vec::new();
+                socket.read_to_end(&mut reply)?;
+                if !reply.starts_with(b"HTTP/1.1 200 OK") {
+                    return Err(io::Error::other("missing fixture reply"));
+                }
+                Ok(())
+            };
+            exchange().expect("first owned window");
+            thread::sleep(Duration::from_millis(250));
+            admit_next_window();
+            exchange().expect("second owned window on the same listener");
+            Output {
+                status: ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }
+        },
+    );
+    let served = served.unwrap();
+    assert_eq!(served["wire_request_count"], 2);
+    assert_eq!(served["wire_requests"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn fixture_missing_second_window_settles_on_return_and_unwind() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    for panic_after_first in [false, true] {
+        let outcome = std::panic::catch_unwind(|| {
+            wire_scenario_with_windows(
+                None,
+                false,
+                json!({}),
+                (
+                    "templates/minimal/workflow.toml",
+                    "minimal-worker",
+                    json!({"request":"Return ready."}),
+                    json!({"status":"ready"}),
+                ),
+                2,
+                FixtureWindows::PerCli(Duration::from_millis(200)),
+                |binding, _, _| {
+                    let binding: Value =
+                        serde_json::from_slice(&fs::read(binding).unwrap()).unwrap();
+                    let address = binding["profile"]["model"]["base_url"]
+                        .as_str()
+                        .unwrap()
+                        .strip_prefix("http://")
+                        .unwrap()
+                        .strip_suffix("/v1")
+                        .unwrap();
+                    let mut socket = TcpStream::connect(address).unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    socket
+                        .write_all(
+                            b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}",
+                        )
+                        .unwrap();
+                    let mut reply = Vec::new();
+                    socket.read_to_end(&mut reply).unwrap();
+                    assert!(reply.starts_with(b"HTTP/1.1 200 OK"));
+                    if panic_after_first {
+                        panic!("synthetic client assertion failure");
+                    }
+                    Output {
+                        status: ExitStatus::from_raw(0),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    }
+                },
+            )
+        });
+        if panic_after_first {
+            assert_eq!(
+                outcome.unwrap_err().downcast_ref::<&str>(),
+                Some(&"synthetic client assertion failure")
+            );
+        } else {
+            assert_eq!(
+                outcome.unwrap().2.unwrap_err(),
+                "second fixture window was not admitted"
+            );
+        }
     }
 }
 

@@ -208,7 +208,7 @@ fn oracle_abort_outer_fixture() {
     }
     assert_eq!(mode, "helper", "fixture role");
     let mut command = fixture_command(&root, "child");
-    let result = abort_fixture_output(&mut command, &root);
+    let result = abort_fixture_output(&mut command, &root, ORACLE_TIMEOUT);
     let child_id = fs::read_to_string(root.join("child-id")).expect("child identity witness");
     let pid: i32 = child_id
         .split_whitespace()
@@ -444,7 +444,7 @@ fn oracle_abort_outer_deadline_is_bounded() {
 fn oracle_abort_outer_refuses_discarded_child_status_before_work() {
     for mode in ["ignore-sigchld", "discard-sigchld"] {
         let root = temp_root("abort-outer-refusal");
-        let output = abort_fixture_output(&mut fixture_command(&root, mode), &root)
+        let output = abort_fixture_output(&mut fixture_command(&root, mode), &root, ORACLE_TIMEOUT)
             .expect("isolated refusal fixture");
         assert!(output.status.success(), "isolated SIGCHLD refusal failed");
     }

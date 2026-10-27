@@ -52,6 +52,9 @@ issue-332-compiler test_name="":
 issue-376-contracts:
     {{_io}} cargo +1.98.0 test -p workflow-spec -p workflow-ir -p workflow-compiler --locked -- --test-threads=2
 
+m3-00-cli test_name:
+    {{_io}} cargo +1.98.0 test -p workflowctl --test m3_00_runtime_smoke --locked {{quote(test_name)}} -- --exact --nocapture --test-threads=1
+
 # Focused M3-02 per-node binding tests.
 m3-02-spec test_name:
     {{_io}} cargo +1.98.0 test -p workflow-spec --test m3_02_node_bindings {{test_name}} --locked -- --exact --nocapture
@@ -267,6 +270,9 @@ issue-233-doc:
 # Snapshot the fixed OS-negative fixture before later Cargo graphs can rebuild its canonical binary.
 issue-233-worker-binaries:
     {{_io}} cargo +1.98.0 build -p workflow-runtime --bin sentinel-probe-worker -p workflow-testkit --bin issue-233-boundary-child --locked
+    test ! -L target/debug/sentinel-probe-worker.fixture && { test ! -e target/debug/sentinel-probe-worker.fixture || test -f target/debug/sentinel-probe-worker.fixture; } && test ! -L target/debug/sentinel-probe-worker.fixture.sha256 && { test ! -e target/debug/sentinel-probe-worker.fixture.sha256 || test -f target/debug/sentinel-probe-worker.fixture.sha256; }
+    cp --no-dereference --no-target-directory --remove-destination -- target/debug/sentinel-probe-worker target/debug/sentinel-probe-worker.fixture
+    sha256sum target/debug/sentinel-probe-worker.fixture > target/debug/sentinel-probe-worker.fixture.sha256
     test ! -L target/debug/issue-233-boundary-child.fixture && { test ! -e target/debug/issue-233-boundary-child.fixture || test -f target/debug/issue-233-boundary-child.fixture; } && test ! -L target/debug/issue-233-boundary-child.fixture.sha256 && { test ! -e target/debug/issue-233-boundary-child.fixture.sha256 || test -f target/debug/issue-233-boundary-child.fixture.sha256; }
     cp --no-dereference --no-target-directory --remove-destination -- target/debug/issue-233-boundary-child target/debug/issue-233-boundary-child.fixture
     sha256sum target/debug/issue-233-boundary-child.fixture > target/debug/issue-233-boundary-child.fixture.sha256
@@ -292,6 +298,19 @@ issue-234-runtime:
 
 issue-234-authored:
     {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_233_translation trajectory_authored:: --locked -- --nocapture --test-threads=1
+
+# Process-local capture access/owner controls; the regular test gate also runs them.
+issue-234-capture-unit: issue-233-worker-binaries
+    {{_io}} cargo +1.98.0 test -p workflow-adk --lib behavioral:: --locked -- --nocapture --test-threads=1
+
+issue-234-capture-doc:
+    {{_io}} cargo +1.98.0 test -p workflow-adk --doc reasoning_capture --locked -- --nocapture
+
+# Deny before dependencies/build/private inputs. Admission is separately reviewed.
+issue-234-live:
+    @test "${ADK_ISSUE234_LIVE:-}" = YES && [[ "${ADK_ISSUE234_ADMISSION:-}" = /* ]] && [[ "${ADK_ISSUE234_ADMISSION_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || { echo 'DENIED: explicit live opt-in and external admission required' >&2; exit 2; }
+    just issue-233-worker-binaries
+    timeout --signal=TERM --kill-after=5s 175s {{_io}} cargo +1.98.0 test -p workflow-adk --features test-support --test issue_233_model_worker --locked -- capture::live::admitted_real_pair --ignored --exact --nocapture --test-threads=1
 
 # Focused #238 deterministic Firewall policy and workflow boundary tests.
 issue-238-runtime test_name="":
@@ -437,6 +456,9 @@ m3-04-cli test_name:
 
 m1-10-adk test_name:
     {{_io}} cargo +1.98.0 test -p workflowctl --test m1_10_adk_run {{test_name}} --locked -- --exact --nocapture --test-threads=2
+
+m1-12-effect-journal:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test m1_12_effect_journal --locked
 
 # Focused M1-15 conformance contract tests.
 m1-15-test:

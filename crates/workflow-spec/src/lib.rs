@@ -415,12 +415,27 @@ pub struct BehavioralPolicy {
     pub trajectory: Option<TrajectoryPolicy>,
 }
 
-/// Offline observer opt-in, not task authority or provider reasoning capture.
-/// V1 fixes task/summary/event ceilings at 2048 bytes/1024 bytes/32 events.
+/// Contextual trajectory policy, never task or reader authority.
+/// V1 is the authored offline observer (2048/1024 bytes, 32 events). V2 only
+/// requests model reasoning capture and requires a separate live host approval;
+/// it neither enables an offline observer nor makes raw reasoning observer input.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TrajectoryPolicy {
     pub schema_version: u16,
+    /// Required only for model monitor schema3; legacy policies omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer_mode: Option<TrajectoryObserverMode>,
+}
+
+/// Closed declarative selector; neither mode grants live model authority.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrajectoryObserverMode {
+    /// Capture and deterministic closed claims only; no observer invocation.
+    Disabled,
+    /// Requires a separate host grant for the approved Reviewer declaration.
+    Semantic,
 }
 
 /// Versioned, deterministic untrusted-text terminal contract.

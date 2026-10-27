@@ -1,5 +1,5 @@
 //! Real host request observations remain distinct from admitted cache intent.
-use super::{cli, json, success, wire_scenario};
+use super::{FixtureWindows, cli, json, success, wire_scenario, wire_scenario_with_windows};
 use sha2::{Digest, Sha256};
 
 #[test]
@@ -86,7 +86,7 @@ fn actual_request_prefix_and_field_sources_are_not_inferred_provider_metrics() {
 #[test]
 fn admitted_kv_schedule_drives_wire_salt_and_rejects_changed_or_ambiguous_predecessors() {
     let mut first = None;
-    let (_, second, requests) = wire_scenario(
+    let (_, second, requests) = wire_scenario_with_windows(
         Some(
             json!({"prompt_tokens":9,"completion_tokens":4,"total_tokens":13,"prompt_tokens_details":{"cached_tokens":0}}),
         ),
@@ -99,7 +99,8 @@ fn admitted_kv_schedule_drives_wire_salt_and_rejects_changed_or_ambiguous_predec
             json!({"status":"ready"}),
         ),
         2,
-        |binding, output| {
+        FixtureWindows::PerCli(std::time::Duration::from_secs(20)),
+        |binding, output, admit_next_window| {
             let original: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(binding).unwrap()).unwrap();
             let mut cold = original;
@@ -120,6 +121,7 @@ fn admitted_kv_schedule_drives_wire_salt_and_rejects_changed_or_ambiguous_predec
             warm["kv_intent"]["predecessor"] = json!(output);
             std::fs::write(binding, serde_json::to_vec(&warm).unwrap()).unwrap();
             let warm_root = output.with_file_name("warm");
+            admit_next_window();
             let second = cli(&[
                 "measure",
                 binding.to_str().unwrap(),

@@ -1,4 +1,8 @@
 //! Ordered, authorized model routes over the existing ModelBinding adapter.
+#[cfg(test)]
+#[path = "model_capture_identity_tests.rs"]
+mod capture_identity_tests;
+
 use super::{
     ModelInvocationErrorKind, ModelInvocationResult, ModelInvocationSpec, ProviderRouteIdentity,
     ResponsePolicy,
@@ -124,6 +128,15 @@ impl ModelRouteSnapshot {
         self.probe_declaration().map(|(_, digest)| digest)
     }
 
+    /// Deterministic identity of the separate, default-off reasoning capture
+    /// contract. Authenticate this declaration before enabling the host lease.
+    pub fn probe_reasoning_capture_declaration_digest(
+        &self,
+    ) -> Result<String, ModelRouteSnapshotError> {
+        self.probe_declaration_for(crate::behavioral::reasoning_capture::declaration_contract())
+            .map(|(_, digest)| digest)
+    }
+
     fn probe_declaration(
         &self,
     ) -> Result<(crate::model_profiles::ModelProfile, String), ModelRouteSnapshotError> {
@@ -135,6 +148,28 @@ impl ModelRouteSnapshot {
     pub fn probe_feedback_declaration_digest(&self) -> Result<String, ModelRouteSnapshotError> {
         self.probe_declaration_for(crate::behavioral::model_probe_feedback::declaration_contract())
             .map(|(_, digest)| digest)
+    }
+
+    /// Pure identity of one separately authorized Reviewer and its fixed safe-input
+    /// observer contract. Resolves no credentials and admits no application call.
+    pub fn trajectory_observer_declaration_digest(
+        &self,
+    ) -> Result<String, ModelRouteSnapshotError> {
+        self.trajectory_observer_declaration()
+            .map(|(_, digest)| digest)
+    }
+
+    fn trajectory_observer_declaration(
+        &self,
+    ) -> Result<(crate::model_profiles::ModelProfile, String), ModelRouteSnapshotError> {
+        let invalid = || ModelRouteSnapshotError {
+            kind: ModelRouteSnapshotErrorKind::InvalidProbeContract,
+        };
+        let candidate = self.candidates.first().ok_or_else(invalid)?;
+        if candidate.role() != ModelRole::Reviewer || !self.authorization.allows(candidate) {
+            return Err(invalid());
+        }
+        self.probe_declaration_for(crate::behavioral::trajectory_observer::declaration_contract())
     }
 
     fn probe_declaration_for(
@@ -456,6 +491,71 @@ pub struct ModelRoutePolicy {
 }
 
 impl ModelRoutePolicy {
+    /// One fixed observer admission, using the original probe clock and no fallback.
+    /// Deliver genuinely completed accounting before the unchanged late route guard.
+    pub(crate) async fn invoke_trajectory_observer(
+        &self,
+        spec: &ModelInvocationSpec,
+        expected: &str,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+        probe_deadline: Instant,
+        on_complete: impl FnOnce(&ModelInvocationResult),
+    ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
+        let deadline = self.deadline.min(probe_deadline);
+        let terminal = |kind| route_terminal(kind, Vec::new());
+        if let Some(kind) = route_stop(deadline, cancellation) {
+            return Err(terminal(kind));
+        }
+        let (profile, digest) = self
+            .snapshot
+            .trajectory_observer_declaration()
+            .map_err(|_| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        if digest != expected {
+            return Err(terminal(ModelRouteTerminalErrorKind::AuthorizationDenied));
+        }
+        let candidate = self
+            .snapshot
+            .candidates
+            .first()
+            .ok_or_else(|| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        let limit = std::num::NonZeroUsize::new(32_768)
+            .ok_or_else(|| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        let binding = await_route(
+            profile.bind_for_route(candidate.role(), broker, Some(limit)),
+            deadline,
+            cancellation,
+        )
+        .await
+        .map_err(terminal)?
+        .map_err(|_| terminal(ModelRouteTerminalErrorKind::Configuration))?;
+        #[cfg(any(test, feature = "test-support"))]
+        let binding = match self.snapshot.test_llms.get(candidate) {
+            Some(llm) => binding.with_test_llm(Arc::clone(llm)),
+            None => binding,
+        };
+        let spec = spec.with_route(ProviderRouteIdentity::from_binding(&binding));
+        await_route(
+            async {
+                let result = spec
+                    .invoke_with_policy(
+                        &binding,
+                        crate::behavioral::trajectory_observer::validate,
+                        ResponsePolicy::CompleteText,
+                    )
+                    .await;
+                if let Ok(completed) = &result {
+                    on_complete(completed);
+                }
+                result
+            },
+            deadline,
+            cancellation,
+        )
+        .await
+        .map_err(terminal)?
+        .map_err(|error| invocation_failure(error, 1, Vec::new()))
+    }
     pub(crate) async fn bind_probe_feedback(
         &self,
         expected: &str,
@@ -522,13 +622,39 @@ impl ModelRoutePolicy {
         cancellation: &ModelRouteCancellation,
         validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
     ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
+        self.invoke_model_probe_with_capture(
+            spec,
+            expected_declaration,
+            broker,
+            cancellation,
+            validate,
+            (None, |_| {}),
+        )
+        .await
+    }
+
+    /// Deliver strict completion facts before the unchanged late route guard.
+    pub(crate) async fn invoke_model_probe_with_capture(
+        &self,
+        spec: &ModelInvocationSpec,
+        expected_declaration: &str,
+        broker: &CredentialBroker,
+        cancellation: &ModelRouteCancellation,
+        validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
+        capture: (Option<&mut Vec<u8>>, impl FnOnce(&ModelInvocationResult)),
+    ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
+        let (reasoning, on_complete) = capture;
         let terminal = |kind| route_terminal(kind, Vec::new());
         if let Some(kind) = route_stop(self.deadline, cancellation) {
             return Err(terminal(kind));
         }
         let (profile, digest) = self
             .snapshot
-            .probe_declaration()
+            .probe_declaration_for(if reasoning.is_some() {
+                crate::behavioral::reasoning_capture::declaration_contract()
+            } else {
+                crate::behavioral::model_probe::declaration_contract()
+            })
             .map_err(|_| terminal(ModelRouteTerminalErrorKind::Configuration))?;
         if digest != expected_declaration {
             return Err(terminal(ModelRouteTerminalErrorKind::AuthorizationDenied));
@@ -569,7 +695,19 @@ impl ModelRoutePolicy {
         };
         let spec = spec.with_route(ProviderRouteIdentity::from_binding(&binding));
         await_route(
-            spec.invoke_with_policy(&binding, validate, ResponsePolicy::CompleteText),
+            async {
+                let result = match reasoning {
+                    Some(bytes) => spec.invoke_with_reasoning(&binding, validate, bytes).await,
+                    None => {
+                        spec.invoke_with_policy(&binding, validate, ResponsePolicy::CompleteText)
+                            .await
+                    }
+                };
+                if let Ok(completed) = &result {
+                    on_complete(completed);
+                }
+                result
+            },
             self.deadline,
             cancellation,
         )

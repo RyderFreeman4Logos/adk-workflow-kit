@@ -113,6 +113,8 @@ fn held_real_cli_fixture() {
     );
     signal_oracle_child_done(&done_tx);
     let joined = server.join();
+    oracle_phase::mark(74, if joined.is_ok() { 0 } else { 2 });
+    oracle_phase::mark(75, u32::from(child.is_err()));
     if let Some(capture) = capture {
         capture.finish(true);
     }
@@ -221,10 +223,14 @@ fn normal_real_cli_fixture() {
 }
 
 fn read_fixture_capture(output: &Output, sink: &Path, kind: &'static str) -> Value {
-    let value: Value = fs::read(sink)
+    let (bytes, value) = fs::read(sink)
         .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_else(|| json!({"capture_unavailable":true}));
+        .and_then(|bytes| {
+            serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .map(|value| (Some(bytes), value))
+        })
+        .unwrap_or_else(|| (None, json!({"capture_unavailable":true})));
     // Explicit opt-in evidence, never a fallback for a refused publication.
     // These two predeclared sidecars cannot claim the real worker sink.
     if std::env::var_os(ORACLE_FAILURE_BOUNDARY_OPERATION_ENV).as_deref()
@@ -232,8 +238,14 @@ fn read_fixture_capture(output: &Output, sink: &Path, kind: &'static str) -> Val
         && let Some(mut path) = std::env::var_os(ORACLE_FAILURE_BOUNDARY_SINK_ENV)
     {
         path.push(format!(".{kind}"));
-        if let Some(file) = oracle_failure_file(&path) {
-            let _ = serde_json::to_writer(file, &value);
+        if let Some(mut file) = oracle_failure_file(&path) {
+            if let Some(bytes) = &bytes {
+                // Keep the successfully parsed producer bytes, including valid
+                // whitespace, before the original failure assertion and cleanup.
+                let _ = file.write_all(bytes);
+            } else {
+                let _ = serde_json::to_writer(file, &value);
+            }
         }
     }
     let rows = value["rows"].as_array();
@@ -250,3 +262,6 @@ fn read_fixture_capture(output: &Output, sink: &Path, kind: &'static str) -> Val
     );
     value
 }
+
+#[path = "oracle_phase_custody_tests.rs"]
+mod custody_tests;

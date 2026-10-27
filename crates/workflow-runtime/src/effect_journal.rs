@@ -6,7 +6,7 @@ use std::{
     sync::Mutex,
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -118,16 +118,22 @@ pub struct EffectJournal {
 
 impl EffectJournal {
     /// Opens or creates a run-scoped journal with durable SQLite settings.
+    /// Schema creation and version validation commit in one transaction.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, EffectJournalError> {
         let path = path.into();
         secure_path(&path)?;
-        let connection = Connection::open(&path)
+        let mut connection = Connection::open(&path)
             .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Unavailable))?;
         connection
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")
+            .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Corrupt))?;
+        // Acquire the writer before schema reads instead of upgrading a stale snapshot.
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Corrupt))?;
+        transaction
             .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA synchronous = FULL;
-                 CREATE TABLE IF NOT EXISTS kit_effect_journal_meta (
+                "CREATE TABLE IF NOT EXISTS kit_effect_journal_meta (
                      id INTEGER PRIMARY KEY CHECK (id = 1),
                      schema_version INTEGER NOT NULL
                  );
@@ -140,7 +146,7 @@ impl EffectJournal {
                  ON CONFLICT(id) DO NOTHING;",
             )
             .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Corrupt))?;
-        let version: i64 = connection
+        let version: i64 = transaction
             .query_row(
                 "SELECT schema_version FROM kit_effect_journal_meta WHERE id = 1",
                 [],
@@ -150,6 +156,9 @@ impl EffectJournal {
         if version != 1 {
             return Err(EffectJournalError::new(EffectJournalErrorKind::Corrupt));
         }
+        transaction
+            .commit()
+            .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Corrupt))?;
         Ok(Self {
             path,
             connection: Mutex::new(connection),
@@ -259,3 +268,7 @@ fn secure_path(path: &Path) -> Result<(), EffectJournalError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "effect_journal_tests.rs"]
+mod tests;

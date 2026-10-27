@@ -298,3 +298,148 @@ fn preserves_duplicates_and_dangling_references_without_validation() {
         2
     );
 }
+
+#[test]
+fn trajectory_v15_closed_modes_and_legacy_compact_bytes_match_independent_goldens() {
+    fn frame(out: &mut Vec<u8>, text: &str) {
+        out.extend_from_slice(&(text.len() as u64).to_be_bytes());
+        out.extend_from_slice(text.as_bytes());
+    }
+    let cases = [
+        (
+            None,
+            false,
+            12u16,
+            "e8842fc3a5f41c393b1c14c090d837b44575cb42f84b8caa35fa1679a77c3e57",
+        ),
+        (
+            None,
+            true,
+            14,
+            "e3bfdb5ef1748a3dcf5654bd03ecaa198672c388efb072418d4f0ef63223a5b8",
+        ),
+        (
+            Some((1, None)),
+            false,
+            13,
+            "31bb3410a0145f51258faf1da99cab453bc03f67616663f7fbeefdebff162e56",
+        ),
+        (
+            Some((1, None)),
+            true,
+            14,
+            "505898ace984a48f55556af69373b85d2590517e58a24e462162858f14f7505e",
+        ),
+        (
+            Some((2, None)),
+            false,
+            13,
+            "72d3c1e0f0dd42fe3a7ded0337141ac77f0aa1dda4fb5704cc7e027889aed186",
+        ),
+        (
+            Some((2, None)),
+            true,
+            14,
+            "5197e527354a8041c7de9b8377c468e7c68d44ee3d2ed6a5168d355a90742bf7",
+        ),
+        (
+            Some((3, Some("disabled"))),
+            false,
+            15,
+            "7ae2e0ed9cbaf9c0c7e4f53690edf3c39ebe1bfc4ca6087c2d9ae215b3acb1a8",
+        ),
+        (
+            Some((3, Some("disabled"))),
+            true,
+            15,
+            "256e82a65e5fcff19352795aa92252d527200199abb96edb3f1d271cec20c1bb",
+        ),
+        (
+            Some((3, Some("semantic"))),
+            false,
+            15,
+            "7ddd41987c4fa116c367e25c58300e520c2a659cac7731436366ea08d7c35e3b",
+        ),
+        (
+            Some((3, Some("semantic"))),
+            true,
+            15,
+            "ce126cfd6b262386dede86fe0d399f1630563f5c8d81fa9747988a0905c74570",
+        ),
+    ];
+    for (trajectory, compact, version, golden) in cases {
+        let behavioral = if trajectory.is_some_and(|(schema, _)| schema == 1) {
+            1u16
+        } else {
+            2
+        };
+        let mut text = format!(
+            "schema_version=1\nedges=[]\n[workflow]\nid='w'\nversion='1'\nentry='a'\n[[nodes]]\nid='a'\nkind='terminal'\n[nodes.untrusted_text]\nschema_version=1\nmax_input_bytes=65536\nen=true\nzh=true\nja=true\n[nodes.untrusted_text.behavioral]\nschema_version={behavioral}\nmax_steps=8\ntimeout_ms=1000\n"
+        );
+        if let Some((schema, mode)) = trajectory {
+            text.push_str(&format!(
+                "[nodes.untrusted_text.behavioral.trajectory]\nschema_version={schema}\n"
+            ));
+            if let Some(mode) = mode {
+                text.push_str(&format!("observer_mode='{mode}'\n"));
+            }
+        }
+        if compact {
+            text.push_str(
+                "[compact_state_exchange]\nfrom='code.investigation'\nto='grounded.answer'\n",
+            );
+        }
+        let ir = WorkflowIr::from(&parse_str("wire", &text).unwrap());
+        let mut bytes = b"adk-workflow-kit/workflow-ir\0".to_vec();
+        bytes.extend_from_slice(&version.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        for value in ["w", "1", "a"] {
+            frame(&mut bytes, value);
+        }
+        bytes.extend_from_slice(&1u64.to_be_bytes());
+        frame(&mut bytes, "a");
+        bytes.extend_from_slice(&[6, 1]);
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&65536u64.to_be_bytes());
+        bytes.extend_from_slice(&[1, 1, 1, 1]);
+        bytes.extend_from_slice(&behavioral.to_be_bytes());
+        bytes.extend_from_slice(&8u64.to_be_bytes());
+        bytes.extend_from_slice(&1000u64.to_be_bytes());
+        if version >= 13 {
+            match trajectory {
+                None => bytes.push(0),
+                Some((schema, mode)) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&(schema as u16).to_be_bytes());
+                    if version == 15 {
+                        match mode {
+                            None => bytes.push(0),
+                            Some(mode) => {
+                                bytes.extend_from_slice(&[1, u8::from(mode == "semantic")])
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bytes.push(0);
+        bytes.extend_from_slice(&0u64.to_be_bytes());
+        bytes.extend_from_slice(&0u64.to_be_bytes());
+        bytes.extend_from_slice(&[0, 0]);
+        bytes.extend_from_slice(&0u64.to_be_bytes());
+        if compact {
+            frame(&mut bytes, "code.investigation");
+            frame(&mut bytes, "grounded.answer");
+        }
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            golden,
+            "independent fixture encoding"
+        );
+        assert_eq!(ir.canonical_wire_version(), version);
+        assert_eq!(
+            ir.canonical_hash().as_bytes(),
+            Sha256::digest(&bytes).as_slice()
+        );
+    }
+}

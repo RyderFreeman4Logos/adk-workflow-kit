@@ -2576,7 +2576,11 @@ fn retained_child_status() -> bool {
         && action.sa_flags & libc::SA_NOCLDWAIT == 0
 }
 
-fn abort_fixture_output(command: &mut Command, root: &Path) -> Result<Output, String> {
+fn abort_fixture_output(
+    command: &mut Command,
+    root: &Path,
+    wait_budget: Duration,
+) -> Result<Output, String> {
     use std::os::unix::process::CommandExt;
 
     fn exited_without_reap(child: &Child) -> bool {
@@ -2602,7 +2606,7 @@ fn abort_fixture_output(command: &mut Command, root: &Path) -> Result<Output, St
     if !retained_child_status() {
         return Err("abort fixture requires retained child status".to_string());
     }
-    let deadline = Instant::now() + ORACLE_TIMEOUT;
+    let deadline = Instant::now() + wait_budget;
     let stdout_path = root.join("abort-fixture.stdout");
     let stderr_path = root.join("abort-fixture.stderr");
     let stdout = fs::File::create(&stdout_path)
@@ -2703,7 +2707,8 @@ fn oracle_unproven_reap_aborts_without_root_cleanup() {
         ])
         .env(UNPROVEN_REAP_FIXTURE_ENV, "1")
         .env(UNPROVEN_REAP_ROOT_ENV, &receipt_path);
-    let output = abort_fixture_output(&mut command, &receipt_root).expect("abort fixture child");
+    let output = abort_fixture_output(&mut command, &receipt_root, ORACLE_TIMEOUT)
+        .expect("abort fixture child");
     let fixture_root = PathBuf::from(
         std::str::from_utf8(&fs::read(&receipt_path).expect("abort root receipt"))
             .expect("UTF-8 abort root"),

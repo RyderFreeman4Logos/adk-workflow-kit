@@ -43,13 +43,34 @@ pub(super) fn validate_admission(
             match admission {
                 BehavioralAdmission::Script(script) => {
                     policy.schema_version == 1
+                        && policy.trajectory.is_none_or(|p| p.observer_mode.is_none())
                         && script
                             .matches_trajectory_policy(policy.trajectory.map(|p| p.schema_version))
                         && script.matches_approval(&hash, limits)
                 }
                 BehavioralAdmission::Model(probe, route) => {
                     policy.schema_version == 2
-                        && policy.trajectory.is_none()
+                        && match policy.trajectory.map(|p| p.schema_version) {
+                            None => {
+                                !probe.reasoning_capture_enabled()
+                                    && probe.trajectory_monitor().is_none()
+                            }
+                            Some(2) => {
+                                probe.reasoning_capture_enabled()
+                                    && probe.trajectory_monitor().is_none()
+                                    && policy.trajectory.is_some_and(|p| p.observer_mode.is_none())
+                            }
+                            Some(3) => {
+                                probe.reasoning_capture_enabled()
+                                    && probe.trajectory_monitor().is_some_and(|monitor| {
+                                        monitor.valid()
+                                            && policy.trajectory.is_some_and(|p| {
+                                                p.observer_mode == Some(monitor.mode())
+                                            })
+                                    })
+                            }
+                            _ => false,
+                        }
                         && probe.matches_approval(&hash, limits, route)
                 }
             }

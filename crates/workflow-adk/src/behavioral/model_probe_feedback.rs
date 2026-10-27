@@ -146,6 +146,8 @@ impl HostModelProbe<'_> {
             .probe_feedback_declaration_digest()
             .map_err(|_| AdkGraphError::AuthorizationDenied)?;
         if policy.schema_version != 2
+            || policy.trajectory.is_some()
+            || self.approval.reasoning_capture_enabled()
             || limits.max_steps < 2
             || limits.timeout_ms < 2
             || self.plan.sentinel_script_identity().is_some()

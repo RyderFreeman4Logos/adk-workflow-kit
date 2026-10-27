@@ -114,9 +114,10 @@ impl CanonicalTrajectory<'_> {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+/// Strict bounded declarations, not an interpretation of arbitrary natural-language reasoning.
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Summary {
+pub struct ClosedTrajectoryClaims {
     schema_version: u32,
     goal_override: bool,
     secret_seeking: bool,
@@ -128,7 +129,7 @@ struct Summary {
 pub(super) struct AuthoredObserver {
     task: String,
     status: ReasoningStatus,
-    summary: Option<Summary>,
+    summary: Option<ClosedTrajectoryClaims>,
 }
 impl AuthoredObserver {
     pub(super) fn identity_material(&self) -> serde_json::Value {
@@ -265,13 +266,16 @@ pub fn observe(
     observe_parsed(mode, task, report, status, parsed.as_ref())
 }
 
-fn parse_summary(mode: ObserverMode, summary: Option<&[u8]>) -> (ReasoningStatus, Option<Summary>) {
+fn parse_summary(
+    mode: ObserverMode,
+    summary: Option<&[u8]>,
+) -> (ReasoningStatus, Option<ClosedTrajectoryClaims>) {
     let parsed = if mode == ObserverMode::OfflineSummary {
         summary
             .filter(|bytes| bytes.len() <= 1024)
             // Serde's named-struct parser also accepts positional arrays.
             .filter(|bytes| bytes.trim_ascii_start().starts_with(b"{"))
-            .and_then(|bytes| serde_json::from_slice::<Summary>(bytes).ok())
+            .and_then(|bytes| serde_json::from_slice::<ClosedTrajectoryClaims>(bytes).ok())
             .filter(|value| value.schema_version == 1)
     } else {
         None
@@ -290,7 +294,7 @@ fn observe_parsed(
     task: &TrustedObserverTask,
     report: &ProbeReport,
     reasoning: ReasoningStatus,
-    parsed: Option<&Summary>,
+    parsed: Option<&ClosedTrajectoryClaims>,
 ) -> Result<TrajectoryObservation, TypedOutputError> {
     let input = task.canonical_input(report)?;
     let mut weak_signals = Vec::new();
@@ -330,4 +334,29 @@ fn observe_parsed(
         hard_evidence: report.evidence()?,
         report_digest: input.report_digest.to_owned(),
     })
+}
+
+/// Parse the entire closed <=1024-byte schema1 object, preserving missing versus malformed.
+/// Callers using a private reader must detect a 1025th byte rather than truncate.
+pub fn parse_closed_claims(
+    bytes: Option<&[u8]>,
+) -> (ReasoningStatus, Option<ClosedTrajectoryClaims>) {
+    parse_summary(ObserverMode::OfflineSummary, bytes)
+}
+impl ClosedTrajectoryClaims {
+    /// Weak untrusted hints only; an all-false record grants no negative evidence.
+    pub fn weak_signals(&self, executed_call: bool) -> Vec<WeakSignal> {
+        [
+            (self.goal_override, WeakSignal::GoalOverride),
+            (self.secret_seeking, WeakSignal::SecretSeeking),
+            (self.tool_manipulation, WeakSignal::ToolManipulation),
+            (
+                self.claims_no_tools && executed_call,
+                WeakSignal::ReasoningActionInconsistency,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(yes, signal)| yes.then_some(signal))
+        .collect()
+    }
 }

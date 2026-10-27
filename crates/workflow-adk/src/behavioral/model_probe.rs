@@ -24,6 +24,13 @@ pub struct HostModelProbe<'a> {
     pub workdir: &'a workflow_runtime::RunWorkdir,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum CaptureMode {
+    Ordinary,
+    Reasoning,
+    Trajectory,
+}
+
 impl HostModelProbe<'_> {
     /// Observe one raw UTF-8 batch through the single authorized SDK binding and
     /// sealed worker. The full canonical envelope stays in untrusted common data.
@@ -37,7 +44,64 @@ impl HostModelProbe<'_> {
     }
 
     pub(super) async fn capture(self) -> Result<CapturedModelProbe, crate::AdkGraphError> {
-        use crate::AdkGraphError;
+        self.capture_with_reasoning(false)
+            .await
+            .map(|(probe, _)| probe)
+    }
+
+    pub(super) async fn capture_with_reasoning(
+        self,
+        reasoning_capture: bool,
+    ) -> Result<(CapturedModelProbe, Vec<u8>), crate::AdkGraphError> {
+        let mode = if reasoning_capture {
+            CaptureMode::Reasoning
+        } else {
+            CaptureMode::Ordinary
+        };
+        let deadline = self.route.deadline();
+        let cancellation = self.cancellation;
+        let (captured, reasoning, _) =
+            self.capture_core(mode)
+                .await
+                .map_err(|failure| match failure.kind {
+                    super::model_trajectory::TrajectoryMonitorErrorKind::WorkerVerification
+                        if cancellation.is_cancelled() || std::time::Instant::now() >= deadline =>
+                    {
+                        crate::AdkGraphError::AuthorizationDenied
+                    }
+                    super::model_trajectory::TrajectoryMonitorErrorKind::AuthorizationDenied
+                        if failure.phase
+                            != super::model_trajectory::TrajectoryMonitorPhase::Probe =>
+                    {
+                        crate::AdkGraphError::AuthorizationDenied
+                    }
+                    _ => crate::AdkGraphError::Failed,
+                })?;
+        if cancellation.is_cancelled() || std::time::Instant::now() >= deadline {
+            return Err(crate::AdkGraphError::AuthorizationDenied);
+        }
+        Ok((captured, reasoning))
+    }
+
+    pub(super) async fn capture_core(
+        self,
+        mode: CaptureMode,
+    ) -> Result<
+        (
+            CapturedModelProbe,
+            Vec<u8>,
+            super::model_trajectory::RoleMetadata,
+        ),
+        super::model_trajectory::TrajectoryMonitorFailure,
+    > {
+        use super::model_trajectory::{
+            RoleMetadata, TrajectoryMonitorErrorKind as Kind, TrajectoryMonitorFailure,
+            TrajectoryMonitorPhase as Phase,
+        };
+        let before = |phase, kind| {
+            TrajectoryMonitorFailure::before(phase, kind, RoleMetadata::not_started())
+        };
+        let reasoning_capture = mode != CaptureMode::Ordinary;
         use workflow_runtime::{StructuredOutputError, behavioral::ProbeLimits};
         let policy = self
             .plan
@@ -45,17 +109,42 @@ impl HostModelProbe<'_> {
             .nodes()
             .iter()
             .find_map(|node| node.untrusted_text()?.behavioral)
-            .ok_or(AdkGraphError::AuthorizationDenied)?;
+            .ok_or_else(|| before(Phase::Preflight, Kind::AuthorizationDenied))?;
         let limits = ProbeLimits {
             max_steps: policy.max_steps,
             timeout_ms: policy.timeout_ms,
         };
-        let digest = self
-            .route
-            .snapshot()
-            .probe_declaration_digest()
-            .map_err(|_| AdkGraphError::AuthorizationDenied)?;
+        let snapshot = self.route.snapshot();
+        let digest = if reasoning_capture {
+            snapshot.probe_reasoning_capture_declaration_digest()
+        } else {
+            snapshot.probe_declaration_digest()
+        }
+        .map_err(|_| before(Phase::Preflight, Kind::AuthorizationDenied))?;
         if policy.schema_version != 2
+            || match mode {
+                CaptureMode::Ordinary => {
+                    policy.trajectory.is_some() || self.approval.trajectory_monitor().is_some()
+                }
+                CaptureMode::Reasoning => {
+                    policy
+                        .trajectory
+                        .is_none_or(|p| p.schema_version != 2 || p.observer_mode.is_some())
+                        || self.approval.trajectory_monitor().is_some()
+                }
+                CaptureMode::Trajectory => {
+                    !self.approval.trajectory_monitor().is_some_and(|monitor| {
+                        monitor.valid()
+                            && policy.trajectory.is_some_and(|p| {
+                                p.schema_version == 3 && p.observer_mode == Some(monitor.mode())
+                            })
+                    }) || snapshot
+                        .candidates()
+                        .first()
+                        .is_none_or(|c| c.role() != crate::ModelRole::Worker)
+                }
+            }
+            || self.approval.reasoning_capture_enabled() != reasoning_capture
             || self.plan.sentinel_script_identity().is_some()
             || self.plan.sentinel_model_probe_identity() != Some(self.approval.identity().as_str())
             || !self.approval.approves_source(self.source.original_id())
@@ -66,39 +155,134 @@ impl HostModelProbe<'_> {
             )
             || self.source.check_preparation_deadline().is_err()
         {
-            return Err(AdkGraphError::AuthorizationDenied);
+            return Err(before(Phase::Preflight, Kind::AuthorizationDenied));
         }
-        self.check_worker_budget(limits)?;
-        let spec = invocation_spec(self.source.envelope())?;
+        self.check_worker_budget(limits)
+            .map_err(|_| before(Phase::Preflight, Kind::AuthorizationDenied))?;
+        let spec = invocation_spec(self.source.envelope())
+            .map_err(|_| before(Phase::Preflight, Kind::Configuration))?;
+        let started = std::time::Instant::now();
         let worker_digest = self.worker.deployment_digest().to_owned();
         let raw = std::sync::Mutex::new(Vec::new());
-        let result = self
-            .route
-            .invoke_model_probe(&spec, &digest, self.broker, self.cancellation, |bytes| {
-                *raw.lock().map_err(|_| StructuredOutputError::InvalidJson)? = bytes.to_vec();
-                Ok(())
-            })
-            .await
-            .map_err(|_| AdkGraphError::Failed)?;
-        self.check_worker_budget(limits)?;
-        let raw = raw.into_inner().map_err(|_| AdkGraphError::Failed)?;
-        // The worker owns strict parsing and spawn admission over these same bytes.
-        let report = self.worker.observe_batch(self.approval, self.workdir, &raw);
-        if self.cancellation.is_cancelled() || std::time::Instant::now() >= self.route.deadline() {
-            return Err(AdkGraphError::AuthorizationDenied);
+        let mut reasoning = Vec::new();
+        let mut completed_probe = None;
+        let validate = |bytes: &[u8]| {
+            *raw.lock().map_err(|_| StructuredOutputError::InvalidJson)? = bytes.to_vec();
+            Ok(())
+        };
+        let result = if reasoning_capture {
+            self.route
+                .invoke_model_probe_with_capture(
+                    &spec,
+                    &digest,
+                    self.broker,
+                    self.cancellation,
+                    validate,
+                    (Some(&mut reasoning), |result| {
+                        completed_probe = Some(RoleMetadata::completed(result, started));
+                    }),
+                )
+                .await
+        } else {
+            self.route
+                .invoke_model_probe(&spec, &digest, self.broker, self.cancellation, validate)
+                .await
         }
-        Ok(CapturedModelProbe {
-            observation: ModelProbeObservation {
-                report: report.map_err(|_| AdkGraphError::Failed)?,
-                provenance: result.provenance().clone(),
-                usage: result.usage().cloned(),
+        .map_err(|error| {
+            use crate::ModelRouteTerminalErrorKind as Route;
+            let kind = match error.kind() {
+                Route::AuthorizationDenied | Route::RouteMismatch => Kind::AuthorizationDenied,
+                Route::Configuration => Kind::Configuration,
+                Route::DeadlineExceeded => Kind::Deadline,
+                Route::Cancelled => Kind::Cancelled,
+                Route::Protocol => Kind::OutputSchema,
+                _ => Kind::Provider,
+            };
+            TrajectoryMonitorFailure::before(
+                Phase::Probe,
+                kind,
+                completed_probe.take().unwrap_or_else(|| RoleMetadata {
+                    phase: super::model_trajectory::RolePhase::Failed,
+                    provenance: None,
+                    usage: None,
+                    elapsed_ns: u64::try_from(started.elapsed().as_nanos()).ok(),
+                }),
+            )
+        })?;
+        let probe = completed_probe.unwrap_or_else(|| RoleMetadata::completed(&result, started));
+        if self.check_worker_budget(limits).is_err() {
+            return Err(TrajectoryMonitorFailure::before(
+                Phase::Worker,
+                Kind::AuthorizationDenied,
+                probe,
+            ));
+        }
+        let raw = match raw.into_inner() {
+            Ok(raw) => raw,
+            Err(_) => {
+                return Err(TrajectoryMonitorFailure::before(
+                    Phase::Worker,
+                    Kind::Configuration,
+                    probe,
+                ));
+            }
+        };
+        // The worker owns strict parsing and spawn admission over these same bytes.
+        let observed = if mode == CaptureMode::Trajectory {
+            self.worker
+                .observe_batch_with_trajectory(self.approval, self.workdir, &raw)
+                .map(|v| (v.report, Some(v.projection)))
+        } else {
+            self.worker
+                .observe_batch(self.approval, self.workdir, &raw)
+                .map(|r| (r, None))
+        };
+        let (report, projection) = match observed {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(TrajectoryMonitorFailure::before(
+                    Phase::Worker,
+                    Kind::WorkerVerification,
+                    probe,
+                ));
+            }
+        };
+        // Freeze the actual source and run at the private worker-equality handoff.
+        // A binding failure remains attached to the forensic bundle and can never
+        // become successful monitor completion.
+        let reduction_facts = projection.as_ref().and_then(|projection| {
+            report
+                .bind_trajectory(
+                    self.approval,
+                    self.workdir,
+                    projection,
+                    workflow_runtime::behavioral::worker::trajectory::ModelTrajectoryBinding {
+                        source: self.source.original_id(),
+                        worker_digest: &worker_digest,
+                        ir_hash: &format!("sha256:{}", crate::canonical_ir_hash(self.plan.ir())),
+                        declaration_digest: &digest,
+                    },
+                )
+                .ok()
+        });
+        Ok((
+            CapturedModelProbe {
+                observation: ModelProbeObservation {
+                    report,
+                    provenance: result.provenance().clone(),
+                    usage: result.usage().cloned(),
+                },
+                raw,
+                completion: *result.completion_evidence(),
+                worker_digest,
+                declaration_digest: digest,
+                limits,
+                projection,
+                reduction_facts,
             },
-            raw,
-            completion: *result.completion_evidence(),
-            worker_digest,
-            declaration_digest: digest,
-            limits,
-        })
+            reasoning,
+            probe,
+        ))
     }
 
     pub(super) fn check_worker_budget(
@@ -121,6 +305,10 @@ impl HostModelProbe<'_> {
 
 pub(super) struct CapturedModelProbe {
     pub observation: ModelProbeObservation,
+    pub projection:
+        Option<workflow_runtime::behavioral::worker::trajectory::CanonicalModelTrajectory>,
+    pub reduction_facts:
+        Option<workflow_runtime::behavioral::worker::trajectory::ModelTrajectoryEvidence>,
     pub raw: Vec<u8>,
     pub completion: crate::ModelCompletionEvidence,
     pub worker_digest: String,

@@ -207,6 +207,21 @@ async fn observer_policy_cannot_bypass_helper_or_sibling_translation() {
         let (resolved, ir) = super::resolved(&text);
         assert!(translator.translate_resolved(&resolved, &ir).is_err());
     }
+    // Install genuine authority for the legal legacy plan first. Its unchanged
+    // wire format does not encode illegal selectors, so live admission must reject
+    // both direct-IR variants even though their canonical hash still matches.
+    for mode in ["disabled", "semantic"] {
+        let (invalid_plan, invalid_ir) = super::resolved(&format!(
+            "{WORKFLOW}{BEHAVIORAL}{POLICY}observer_mode = '{mode}'\n"
+        ));
+        assert_eq!(invalid_ir.canonical_hash(), ir.canonical_hash());
+        assert!(
+            translator
+                .translate_resolved(&invalid_plan, &invalid_ir)
+                .is_err(),
+            "legacy direct IR must reject explicit mode {mode}"
+        );
+    }
     // Correct live authority executes the direct-IR sibling with observation retention.
     let graph = translator.translate_resolved(&resolved, &ir).unwrap();
     let mut mapper = AdkEventMapper::new("sibling-run", "sentinel-preparation").unwrap();

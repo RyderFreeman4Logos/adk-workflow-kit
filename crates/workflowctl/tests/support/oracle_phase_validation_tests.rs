@@ -21,6 +21,10 @@ fn normal() -> Received {
             seq += 1;
         }
     }
+    for (stage, value) in [(74, 0), (75, 0)] {
+        out.push(frame(1, stage, parent, seq, value));
+        seq += 1;
+    }
     out.push(frame(1, 35, parent, seq, 0));
     for (seq, (stage, value)) in [
         (2, 0),
@@ -172,4 +176,67 @@ fn bounded_records_identity_loss_and_publication() {
     let start = Instant::now();
     publish(fifo.as_os_str(), &value);
     assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn inner_outcome_requires_unique_finite_lossless_parent_markers() {
+    for (server, child, expected) in [
+        (0, 0, "child-supervision-completed"),
+        (0, 1, "child-supervision-error"),
+        (1, 0, "server-error"),
+        (1, 1, "server-error"),
+        (2, 1, "server-panicked"),
+        (3, 0, "UNKNOWN"),
+        (0, 2, "UNKNOWN"),
+        (u32::MAX, 0, "UNKNOWN"),
+    ] {
+        let mut received = normal();
+        for (stage, value) in [(74, server), (75, child)] {
+            let row = received
+                .frames
+                .iter_mut()
+                .find(|row| row[1] == 1 && row[2] == stage)
+                .unwrap();
+            row[12..16].copy_from_slice(&value.to_le_bytes());
+        }
+        let value = report(received);
+        assert_eq!(value["inner_outcome"], expected);
+        assert_eq!(
+            value["capture_qualified"], true,
+            "outcome must not change qualification"
+        );
+    }
+    for fault in [
+        "missing-parent-tail",
+        "gap",
+        "duplicate-marker",
+        "duplicate-sequence",
+        "overflow",
+        "receive-error",
+        "parent-loss",
+    ] {
+        let mut received = normal();
+        match fault {
+            "missing-parent-tail" => received.frames.retain(|row| !(row[1] == 1 && row[2] == 35)),
+            "gap" => {
+                received.frames.remove(0);
+            }
+            "duplicate-marker" => {
+                received.frames[0][2] = 74;
+            }
+            "duplicate-sequence" => received.frames.push(received.frames[0]),
+            "overflow" => received.overflow = 1,
+            "receive-error" => received.io_error = true,
+            "parent-loss" => {
+                received
+                    .frames
+                    .iter_mut()
+                    .find(|row| row[1] == 1 && row[2] == 35)
+                    .unwrap()[12..16]
+                    .copy_from_slice(&1_u32.to_le_bytes());
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(report(received)["inner_outcome"], "UNKNOWN", "{fault}");
+    }
 }

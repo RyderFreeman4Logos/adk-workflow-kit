@@ -227,6 +227,12 @@ fn observe_child_exit_without_reaping(
 // Keep the helper live for the serial historical-order mutation proof.
 const _: fn(u32, Instant) -> Result<bool, &'static str> = observe_child_exit_without_reaping;
 
+fn timeout_summary(stdout_bytes: usize, stderr_bytes: usize) -> String {
+    format!(
+        "smoke_timeout completion_not_observed_by_deadline stdout_bytes={stdout_bytes} stderr_bytes={stderr_bytes}"
+    )
+}
+
 fn bounded_output(
     command: &mut Command,
     timeout: Duration,
@@ -299,6 +305,9 @@ fn bounded_output(
             .then_some("subprocess output limit exceeded")
     });
     if let Some(failure) = failure {
+        if failure == "subprocess timed out" {
+            eprintln!("{}", timeout_summary(stdout.len(), stderr.len()));
+        }
         return Err(failure);
     }
     Ok(Output {
@@ -915,6 +924,74 @@ fn subprocess_and_file_helpers_are_bounded() {
         Err("subprocess timed out")
     );
     assert!(started.elapsed().as_secs() < 2);
+}
+
+#[test]
+#[ignore = "Invoked by the timeout diagnostic regression"]
+fn timeout_diagnostic_fixture() {
+    let mut command = Command::new("bash");
+    command.args(["-c", "sleep 30 & wait"]);
+    assert_eq!(
+        bounded_output(&mut command, Duration::from_millis(50), 32),
+        Err("subprocess timed out")
+    );
+}
+
+#[test]
+fn timeout_diagnostic_is_emitted_after_settlement() {
+    let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+    command.args([
+        "--exact",
+        "timeout_diagnostic_fixture",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    let output = bounded_output(&mut command, SUBPROCESS_TIMEOUT, MAX_FIXTURE_BYTES)
+        .expect("synthetic timeout fixture must settle");
+    assert!(output.status.success(), "synthetic timeout fixture failed");
+    let stdout = String::from_utf8(output.stdout).expect("test runner UTF-8");
+    assert!(
+        stdout.contains("running 1 test")
+            && stdout.contains("timeout_diagnostic_fixture ... ok")
+            && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+        "synthetic timeout fixture must select and pass exactly one test"
+    );
+    assert!(
+        output.stderr
+            == b"smoke_timeout completion_not_observed_by_deadline stdout_bytes=0 stderr_bytes=0\n",
+        "settled timeout diagnostic absent or malformed"
+    );
+}
+
+#[test]
+fn timeout_summary_is_finite_and_content_free() {
+    let mut command = Command::new("bash");
+    command.args([
+        "-c",
+        "printf 'private stdout canary'; printf 'private stderr canary!' >&2",
+    ]);
+    let output = bounded_output(&mut command, Duration::from_secs(1), MAX_FIXTURE_BYTES)
+        .expect("synthetic output must settle");
+    assert!(output.status.success(), "synthetic output child failed");
+    assert!(
+        output.stdout == b"private stdout canary" && output.stderr == b"private stderr canary!",
+        "both synthetic canaries must actually be captured"
+    );
+    let summary = timeout_summary(output.stdout.len(), output.stderr.len());
+    assert_eq!(
+        summary,
+        "smoke_timeout completion_not_observed_by_deadline stdout_bytes=21 stderr_bytes=22"
+    );
+    assert!(!summary.contains("private"));
+    assert_eq!(
+        timeout_summary(0, 0),
+        "smoke_timeout completion_not_observed_by_deadline stdout_bytes=0 stderr_bytes=0"
+    );
+    assert_eq!(
+        timeout_summary(MAX_FIXTURE_BYTES, MAX_FIXTURE_BYTES),
+        "smoke_timeout completion_not_observed_by_deadline stdout_bytes=65536 stderr_bytes=65536"
+    );
 }
 
 #[test]

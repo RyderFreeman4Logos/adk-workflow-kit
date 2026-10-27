@@ -22,6 +22,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
+pub mod trajectory;
 const PROTOCOL: u16 = 1;
 const MAX_BATCH_BYTES: usize = 32_768;
 const MAX_EXECUTABLE_BYTES: usize = 128 * 1024 * 1024;
@@ -127,12 +128,43 @@ impl SealedProbeWorker {
         self.execute(workdir, input)
     }
 
+    /// Observe the same strict batch with an immutable host-produced safe prefix.
+    /// Projection material is prepared privately before spawn and exposed only
+    /// after exact report equality, with no fallible step after verification.
+    pub fn observe_batch_with_trajectory(
+        self,
+        approval: &TrustedModelProbe,
+        workdir: &RunWorkdir,
+        batch: &[u8],
+    ) -> Result<trajectory::VerifiedWorkerTrajectory, WorkerError> {
+        let input = recorded_request(
+            &approval.identity(),
+            workdir.run_id().as_str(),
+            &self.digest,
+            approval.limits(),
+            ModelBatch::parse(batch)?,
+        )?;
+        let expected = evaluate(&input, None)?;
+        let projection = trajectory::CanonicalModelTrajectory::prepare(&input, &expected)?;
+        let report = self.execute_expected(workdir, input, expected)?;
+        Ok(trajectory::VerifiedWorkerTrajectory { report, projection })
+    }
+
     fn execute(
         self,
         workdir: &RunWorkdir,
         input: WorkerRequest,
     ) -> Result<UnpublishedWorkerReport, WorkerError> {
         let expected = evaluate(&input, None)?;
+        self.execute_expected(workdir, input, expected)
+    }
+
+    fn execute_expected(
+        self,
+        workdir: &RunWorkdir,
+        input: WorkerRequest,
+        expected: WorkerReply,
+    ) -> Result<UnpublishedWorkerReport, WorkerError> {
         let bytes = serde_json::to_vec(&input).map_err(|_| WorkerError::InvalidEnvelope)?;
         let request = BubblewrapRequest::sealed_probe_worker(self.executable, workdir)
             .map_err(|_| WorkerError::ExecutionFailed)?
@@ -510,13 +542,7 @@ fn recorded_request(
     {
         return Err(WorkerError::InvalidEnvelope);
     }
-    let scope = digest(
-        &serde_json::to_vec(&serde_json::json!({
-            "domain":"sentinel-model-worker-v1", "protocol":PROTOCOL,
-            "approval":approval, "run":run, "worker":worker, "tools":PROBE_TOOL_CATALOG,
-        }))
-        .map_err(|_| WorkerError::InvalidEnvelope)?,
-    );
+    let scope = worker_scope(approval, run, worker)?;
     Ok(WorkerRequest {
         protocol: PROTOCOL,
         scope,
@@ -524,6 +550,20 @@ fn recorded_request(
         timeout_ms: limits.timeout_ms,
         batch,
     })
+}
+
+fn worker_scope(approval: &str, run: &str, worker: &str) -> Result<String, WorkerError> {
+    if !valid_digest(approval) || !valid_digest(worker) || run.trim().is_empty() || run.len() > 256
+    {
+        return Err(WorkerError::InvalidEnvelope);
+    }
+    Ok(digest(
+        &serde_json::to_vec(&serde_json::json!({
+            "domain":"sentinel-model-worker-v1", "protocol":PROTOCOL,
+            "approval":approval, "run":run, "worker":worker, "tools":PROBE_TOOL_CATALOG,
+        }))
+        .map_err(|_| WorkerError::InvalidEnvelope)?,
+    ))
 }
 
 fn evaluate(input: &WorkerRequest, deadline: Option<Instant>) -> Result<WorkerReply, WorkerError> {

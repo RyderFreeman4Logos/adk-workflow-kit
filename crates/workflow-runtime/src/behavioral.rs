@@ -7,7 +7,9 @@ mod model_authority;
 #[path = "trajectory.rs"]
 pub mod trajectory;
 pub mod worker;
-pub use model_authority::TrustedModelProbe;
+pub use model_authority::{
+    TrustedModelProbe, TrustedTrajectoryMonitor, TrustedTrajectoryObserverGrant,
+};
 
 use crate::{
     ArtifactId, ArtifactRef, CanonicalUntrustedText, Completeness, ContentProvenance,
