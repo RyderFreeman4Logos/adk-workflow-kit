@@ -628,11 +628,12 @@ impl ModelRoutePolicy {
             broker,
             cancellation,
             validate,
-            None,
+            (None, |_| {}),
         )
         .await
     }
 
+    /// Deliver strict completion facts before the unchanged late route guard.
     pub(crate) async fn invoke_model_probe_with_capture(
         &self,
         spec: &ModelInvocationSpec,
@@ -640,8 +641,9 @@ impl ModelRoutePolicy {
         broker: &CredentialBroker,
         cancellation: &ModelRouteCancellation,
         validate: impl Fn(&[u8]) -> Result<(), StructuredOutputError>,
-        reasoning: Option<&mut Vec<u8>>,
+        capture: (Option<&mut Vec<u8>>, impl FnOnce(&ModelInvocationResult)),
     ) -> Result<ModelInvocationResult, ModelRouteTerminalError> {
+        let (reasoning, on_complete) = capture;
         let terminal = |kind| route_terminal(kind, Vec::new());
         if let Some(kind) = route_stop(self.deadline, cancellation) {
             return Err(terminal(kind));
@@ -694,13 +696,17 @@ impl ModelRoutePolicy {
         let spec = spec.with_route(ProviderRouteIdentity::from_binding(&binding));
         await_route(
             async {
-                match reasoning {
+                let result = match reasoning {
                     Some(bytes) => spec.invoke_with_reasoning(&binding, validate, bytes).await,
                     None => {
                         spec.invoke_with_policy(&binding, validate, ResponsePolicy::CompleteText)
                             .await
                     }
+                };
+                if let Ok(completed) = &result {
+                    on_complete(completed);
                 }
+                result
             },
             self.deadline,
             cancellation,

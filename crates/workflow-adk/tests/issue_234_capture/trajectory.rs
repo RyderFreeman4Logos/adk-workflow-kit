@@ -85,6 +85,106 @@ fn monitor_fixture(batch: &str, claims: Option<&str>) -> CaptureFixture {
     .unwrap();
     fixture
 }
+
+struct CancelDuringProbe {
+    inner: Arc<Responses>,
+    cancellation: ModelRouteCancellation,
+    pending: bool,
+}
+#[adk_rust::async_trait]
+impl adk_rust::Llm for CancelDuringProbe {
+    fn name(&self) -> &str {
+        "cancel-during-probe-fixture"
+    }
+    async fn generate_content(
+        &self,
+        request: adk_rust::LlmRequest,
+        stream: bool,
+    ) -> adk_rust::Result<adk_rust::LlmResponseStream> {
+        let response =
+            adk_rust::Llm::generate_content(self.inner.as_ref(), request, stream).await?;
+        self.cancellation.cancel();
+        if self.pending {
+            std::future::pending().await
+        } else {
+            Ok(response)
+        }
+    }
+}
+
+#[tokio::test]
+async fn completed_probe_accounting_survives_route_cancellation() {
+    use workflow_adk::behavioral::{RolePhase, TrajectoryMonitorErrorKind, TrajectoryMonitorPhase};
+    for (pending, valid) in [(true, true), (false, false), (false, true)] {
+        let mut fixture = monitor_fixture(BATCH, Some(CLAIMS));
+        let mut completed = response(vec![
+            thinking(REASONING),
+            text(if valid { BATCH } else { "{" }),
+        ]);
+        completed.usage_metadata = Some(Default::default());
+        completed.usage_metadata.as_mut().unwrap().provider_usage = Some(json!({
+            "prompt_tokens":7,"completion_tokens":3,"total_tokens":10,
+            "prompt_tokens_details":{"cached_tokens":0},
+            "completion_tokens_details":{"reasoning_tokens":2}
+        }));
+        fixture.llm = Arc::new(Responses {
+            responses: vec![completed],
+            calls: AtomicUsize::new(0),
+        });
+        let controlled = Arc::new(CancelDuringProbe {
+            inner: fixture.llm.clone(),
+            cancellation: fixture.cancel.clone(),
+            pending,
+        });
+        fixture.route = ModelRoutePublisher::new(
+            snapshot(profile())
+                .with_test_llm(
+                    ModelRouteCandidate::new(ModelRole::Worker, "probe", "1"),
+                    controlled,
+                )
+                .unwrap(),
+        )
+        .policy(Instant::now() + Duration::from_secs(5));
+        let failure = match timeout(
+            Duration::from_secs(2),
+            fixture.host().observe_trajectory(None),
+        )
+        .await
+        .expect("cancellation must settle the probe")
+        {
+            Err(failure) => failure,
+            Ok(_) => panic!("cancelled probe cannot reach the worker or return hints"),
+        };
+        assert_eq!(fixture.llm.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failure.kind, TrajectoryMonitorErrorKind::Cancelled);
+        assert_eq!(failure.phase, TrajectoryMonitorPhase::Probe);
+        assert!(failure.verified.is_none());
+        assert_eq!(failure.observer.phase, RolePhase::NotStarted);
+        assert!(failure.observer.provenance.is_none());
+        assert!(failure.observer.usage.is_none());
+        assert!(failure.probe.elapsed_ns.is_some());
+        if valid && !pending {
+            assert_eq!(failure.probe.phase, RolePhase::Completed);
+            let provenance = failure.probe.provenance.as_ref().unwrap();
+            assert!(provenance.invocation_identity().starts_with("sha256:"));
+            assert_eq!(provenance.provider_route().requested_model(), "model");
+            assert_eq!(provenance.max_output_tokens(), 512);
+            let usage = failure.probe.usage.as_ref().unwrap();
+            assert_eq!(usage.input_tokens(), Some(7));
+            assert_eq!(usage.output_tokens(), Some(3));
+            assert_eq!(usage.total_tokens(), Some(10));
+            assert_eq!(usage.reasoning_tokens(), Some(2));
+            assert_eq!(usage.cache_read_tokens(), Some(0));
+            assert_eq!(usage.cache_write_tokens(), None);
+        } else {
+            assert_eq!(failure.probe.phase, RolePhase::Failed);
+            assert!(failure.probe.provenance.is_none());
+            assert!(failure.probe.usage.is_none());
+        }
+        assert!(!format!("{failure:?} {failure}").contains(REASONING));
+    }
+}
+
 #[tokio::test]
 async fn verified_prefix_excludes_unexecuted_tail() {
     let fixture = monitor_fixture(PREFIX_BATCH, Some(CLAIMS));

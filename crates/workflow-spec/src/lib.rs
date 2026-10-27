@@ -434,7 +434,7 @@ pub struct TrajectoryPolicy {
 pub enum TrajectoryObserverMode {
     /// Capture and deterministic closed claims only; no observer invocation.
     Disabled,
-    /// Requires a separate host grant; currently rejected by execution admission.
+    /// Requires a separate host grant for the approved Reviewer declaration.
     Semantic,
 }
 

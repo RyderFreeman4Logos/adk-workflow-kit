@@ -165,6 +165,7 @@ impl HostModelProbe<'_> {
         let worker_digest = self.worker.deployment_digest().to_owned();
         let raw = std::sync::Mutex::new(Vec::new());
         let mut reasoning = Vec::new();
+        let mut completed_probe = None;
         let validate = |bytes: &[u8]| {
             *raw.lock().map_err(|_| StructuredOutputError::InvalidJson)? = bytes.to_vec();
             Ok(())
@@ -177,7 +178,9 @@ impl HostModelProbe<'_> {
                     self.broker,
                     self.cancellation,
                     validate,
-                    Some(&mut reasoning),
+                    (Some(&mut reasoning), |result| {
+                        completed_probe = Some(RoleMetadata::completed(result, started));
+                    }),
                 )
                 .await
         } else {
@@ -198,15 +201,15 @@ impl HostModelProbe<'_> {
             TrajectoryMonitorFailure::before(
                 Phase::Probe,
                 kind,
-                RoleMetadata {
+                completed_probe.take().unwrap_or_else(|| RoleMetadata {
                     phase: super::model_trajectory::RolePhase::Failed,
                     provenance: None,
                     usage: None,
                     elapsed_ns: u64::try_from(started.elapsed().as_nanos()).ok(),
-                },
+                }),
             )
         })?;
-        let probe = RoleMetadata::completed(&result, started);
+        let probe = completed_probe.unwrap_or_else(|| RoleMetadata::completed(&result, started));
         if self.check_worker_budget(limits).is_err() {
             return Err(TrajectoryMonitorFailure::before(
                 Phase::Worker,
