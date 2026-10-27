@@ -127,9 +127,24 @@ mismatched IR/schema/limits are rejected, never silently ignored or clamped.
 
 Consume that same capability with `AdkGraphTranslator::new().with_sentinel_trusted_script(&compiled, script)` before `translate(&compiled)`. Translation without live authority still rejects behavioral opt-in, including direct/resolved IR. Different compiled approval, IR, duplicate binding, profile adapters, model bindings and checkpoint continuation fail closed.
 
-Call `graph.invoke_observed_with_sentinel_script(state, config, mapper, artifacts, cancelled, deadline).await` with explicit host cancellation and an absolute deadline. `config.thread_id` must equal the fresh mapper's host run ID. Ordinary `invoke`/`invoke_observed` cannot execute this mode. Actual source identity is checked before retention; prepared normalization telemetry, host provenance/approval and run ID bind the sealed probe and preparation cache identity. Preparation skips semantic/model work. The existing authored terminal consumes its probe once, using invocation-local typed state rather than graph JSON, and returns `(State, ProbeReport)` only after report retention. Events reference that report's digest and optional Suspicious evidence, never Clean or causal attribution.
+Call `graph.invoke_observed_with_sentinel_script(state, config, mapper, artifacts, cancelled, deadline).await` with explicit host cancellation and an absolute deadline. `config.thread_id` must equal the fresh mapper's host run ID. Ordinary `invoke`/`invoke_observed` cannot execute this mode. Actual source identity is checked before retention; prepared normalization telemetry, host provenance/approval and run ID bind the sealed probe and preparation cache identity. Preparation skips semantic/model work. The existing authored terminal consumes its probe once, using invocation-local typed state rather than graph JSON, and returns `(State, ProbeReport, SentinelReduction)` only after report and reduction retention. Events reference content-addressed evidence, never Clean or causal attribution.
 
-The production backend also exposes `ExecutionBackend::run_with_sentinel_script(&spec, script, input, &mut artifacts, cancelled, deadline)`. It owns compilation, closed-input/source admission, a fresh backend RunId, authority-bound translation and observed invocation. It returns `BehavioralExecutionReceipt { run_id, report, observer }` only after report retention. Call this synchronous API outside a Tokio runtime; inspect `report.stop()` rather than treating receipt delivery as benign completion. Cancelled, timed-out and scripted-crash trajectories remain typed non-benign stops.
+The production backend also exposes `ExecutionBackend::run_with_sentinel_script(&spec, script, input, &mut artifacts, cancelled, deadline)`. It owns compilation, closed-input/source admission, a fresh backend RunId, authority-bound translation and observed invocation. It returns `BehavioralExecutionReceipt { run_id, report, reduction, observer }` only after report and reduction retention. Call this synchronous API outside a Tokio runtime; inspect `report.stop()` rather than treating receipt delivery as benign completion. Cancelled, timed-out and scripted-crash trajectories remain typed non-benign stops.
+
+The host-owned preparation binds the retained original-byte cover and its base
+preparation key before the probe-specific cache key is formed. That key includes
+`SENTINEL_REDUCTION_POLICY_VERSION`; caller State cannot supply the binding.
+The existing deterministic reducer consumes the actual report and optional
+trajectory observation. Retention order is report, optional observation, then a
+closed schema1 `sentinel-reduction` artifact with policy version/digest, reduction
+identity and the bounded typed decision. The returned reduction is that same
+object. A hard inert tripwire keeps its report reference. Affirmative weak hints
+produce only Suspicious evidence; absent, unavailable, malformed or all-false weak
+observations abstain. Without hard or affirmative weak evidence, the final reducer
+still returns unreferenced Suspicious, never Clean or execution permission. Late
+reduction-store failure returns an error without completion or acknowledgment;
+earlier forensic artifacts remain retained. This adds no checkpoint, causal
+replay, calibrated verdict or cache-resume capability.
 
 This overload accepts no execution profile, model, tool registry, credentials, caller run ID or checkpoint. It creates no durable run directory/manifest, so `inspect`/`resume` cannot recover it. The host chooses artifact storage; storage failure returns an execution error, with no rollback claim for previously retained preparation artifacts. Default `ExecutionBackend::run` siblings and CLI still reject behavioral opt-in before adapters/credential resolution. Profile execution and durable resume remain unsupported. No result cache, approval serialization, new executor registry or production action was added. Cancellation/deadlines cover preparation/queue time cooperatively; host artifact-store IO is outside the inert reducer, not preemptively bounded. This is not full #233 acceptance.
 

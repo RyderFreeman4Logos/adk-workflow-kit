@@ -119,9 +119,8 @@ impl PreparationWorkflow {
         // Scripted behavioral preparation returns before semantic inference; retain its policy identity.
         if self.policy.behavioral.is_some() {
             policy["semantic_version"] = json!("sentinel-semantic-probes-v4");
-        } else {
-            policy["reduction_policy_version"] = json!(SENTINEL_REDUCTION_POLICY_VERSION);
         }
+        policy["reduction_policy_version"] = json!(SENTINEL_REDUCTION_POLICY_VERSION);
         let policy_digest = digest_json(&policy)?;
         let mut report = json!({
             "schema_version": 1,
@@ -227,11 +226,13 @@ impl PreparationWorkflow {
             | LanguageAttribution::Attributed(_)
             | LanguageAttribution::MixedSupported => UntrustedTextState::PendingClassification,
         };
+        let source_cover = SourceSpan::new(text.original_id().as_str(), 0, raw.len() as u64)
+            .map_err(|_| AdkGraphError::Failed)?;
         if self.policy.behavioral.is_some() {
             if state != UntrustedTextState::PendingClassification {
                 return Err(AdkGraphError::Failed);
             }
-            let identity = crate::behavioral::prepare_probe(&text)?;
+            let identity = crate::behavioral::prepare_probe(&text, source_cover, key.digest())?;
             report["cache_key"] = json!(digest_json(
                 &json!({"preparation":key.digest(), "behavioral":identity})
             )?);
@@ -283,8 +284,6 @@ impl PreparationWorkflow {
             );
         }
         // Preparation is complete; semantic inference has its own existing deadline.
-        let source_cover = SourceSpan::new(text.original_id().as_str(), 0, raw.len() as u64)
-            .map_err(|_| AdkGraphError::Failed)?;
         let semantic_bytes = semantics::run(
             probes.inputs,
             state,

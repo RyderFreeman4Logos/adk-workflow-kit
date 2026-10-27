@@ -14,17 +14,19 @@ use std::{
     time::Instant,
 };
 use workflow_runtime::{
-    ArtifactId, ArtifactStore, RunId,
+    ArtifactId, ArtifactStore, RunId, SentinelReduction,
     behavioral::{ProbeReport, TrustedScript},
 };
 use workflow_spec::WorkflowSpec;
 
 /// In-memory execution evidence; not a durable checkpoint or replay capability.
-/// The host's artifact store has retained the report before this is returned.
+/// The host's store has retained report, optional observation and reduction in order.
 /// `NoCompromiseObserved` is not a Clean verdict.
 pub struct BehavioralExecutionReceipt {
     pub run_id: RunId,
     pub report: ProbeReport,
+    /// The same compact decision retained by the observed invocation, never authority.
+    pub reduction: SentinelReduction,
     pub observer: AdkEventMapper,
 }
 
@@ -92,7 +94,7 @@ impl ExecutionBackend {
             .map_err(|_| ExecutionError::new(ExecutionErrorKind::Adk))?;
         let mut state = State::new();
         state.insert("input".to_owned(), input);
-        let (_, report) = runtime
+        let (_, report, reduction) = runtime
             .block_on(graph.invoke_observed_with_sentinel_script(
                 state,
                 ExecutionConfig::new(run_id.as_str()),
@@ -105,6 +107,7 @@ impl ExecutionBackend {
         Ok(BehavioralExecutionReceipt {
             run_id,
             report,
+            reduction,
             observer,
         })
     }

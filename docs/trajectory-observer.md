@@ -84,8 +84,9 @@ schema_version = 1
 V1 fixes the existing 2048-byte task, 1024-byte compact fixture and 32-event
 ceilings. Unknown/duplicate fields and missing versions are rejected. It accepts
 no task, summary, report, raw reasoning or authority. Omission disables the
-observer and preserves existing v12 IR, script identity, report and preparation
-cache bytes. Opt-in uses canonical IR v13; the observer version and canonical
+observer and preserves existing v12 IR, script identity and report bytes. Authored
+preparation cache identity also binds the shared reduction policy, independently
+of observer opt-in. Opt-in uses canonical IR v13; the observer version and canonical
 fixture status/claims plus task digest participate in host approval identity.
 Malformed fixture bytes are discarded, never hashed or stored.
 
@@ -107,11 +108,14 @@ or checkpoints. Only validated compact claims, not raw fixture bytes, are retain
 ephemerally inside the host capability.
 
 Observed invocation retains the original behavioral report, then the content-free
-trajectory observation before publishing node/workflow completion. The
+trajectory observation and the shared `sentinel-reduction` artifact before
+publishing node/workflow completion. Both public authored entries return the
+same typed reduction retained in that artifact. Hard report evidence dominates
+weak observer claims; absent, malformed or all-false claims cannot become Clean. The
 `sentinel-trajectory` artifact event and `preparation.trajectory` reference the
 observation; weak evidence references it, hard evidence still references the
 original report. Artifact-store failure returns an error, not success; previously
-retained preparation/report artifacts are not rolled back. Host storage remains
+retained preparation/report/observation artifacts are not rolled back. Host storage remains
 outside the inert reducer, with no new raw-CoT retention/access-control claim.
 
 Run `just issue-234-authored`, `just issue-234-runtime`, `just issue-231-compiler`,
