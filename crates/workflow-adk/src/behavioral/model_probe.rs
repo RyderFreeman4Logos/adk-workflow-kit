@@ -244,6 +244,24 @@ impl HostModelProbe<'_> {
                 ));
             }
         };
+        // Freeze the actual source and run at the private worker-equality handoff.
+        // A binding failure remains attached to the forensic bundle and can never
+        // become successful monitor completion.
+        let reduction_facts = projection.as_ref().and_then(|projection| {
+            report
+                .bind_trajectory(
+                    self.approval,
+                    self.workdir,
+                    projection,
+                    workflow_runtime::behavioral::worker::trajectory::ModelTrajectoryBinding {
+                        source: self.source.original_id(),
+                        worker_digest: &worker_digest,
+                        ir_hash: &format!("sha256:{}", crate::canonical_ir_hash(self.plan.ir())),
+                        declaration_digest: &digest,
+                    },
+                )
+                .ok()
+        });
         Ok((
             CapturedModelProbe {
                 observation: ModelProbeObservation {
@@ -257,6 +275,7 @@ impl HostModelProbe<'_> {
                 declaration_digest: digest,
                 limits,
                 projection,
+                reduction_facts,
             },
             reasoning,
             probe,
@@ -285,6 +304,8 @@ pub(super) struct CapturedModelProbe {
     pub observation: ModelProbeObservation,
     pub projection:
         Option<workflow_runtime::behavioral::worker::trajectory::CanonicalModelTrajectory>,
+    pub reduction_facts:
+        Option<workflow_runtime::behavioral::worker::trajectory::ModelTrajectoryEvidence>,
     pub raw: Vec<u8>,
     pub completion: crate::ModelCompletionEvidence,
     pub worker_digest: String,

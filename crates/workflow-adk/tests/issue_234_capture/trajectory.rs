@@ -144,6 +144,22 @@ async fn strict_claims_visibility_and_weak_only_statuses() {
             workflow_adk::behavioral::RolePhase::NotStarted
         );
         assert!(result.observer.usage.is_none());
+        let reduced = result
+            .verified
+            .reduction()
+            .expect("disabled monitor still reduces genuine facts");
+        let workflow_runtime::TypedPayload::Sentinel(evidence) = reduced.output().payload() else {
+            panic!("Sentinel")
+        };
+        assert_eq!(
+            evidence.verdict(),
+            workflow_runtime::SentinelVerdict::Suspicious
+        );
+        assert_eq!(
+            evidence.artifacts().len(),
+            usize::from(status == ReasoningStatus::Present),
+            "unavailable/malformed/disabled do not fabricate exculpatory evidence"
+        );
         assert_eq!(fixture.llm.calls.load(Ordering::SeqCst), 1);
     }
     let mut exact = CLAIMS.to_owned();

@@ -170,8 +170,9 @@ strict batch schema before worker execution. Exact approved literals remain
 `workspace/report.txt`, `reviewer.invalid` and `reader`; there is no normalization
 or public/private address classifier. Excerpts are fixed templates under 128 bytes,
 never raw attacker substrings. Unknown names, argument values and output text are
-redacted. Reports and projections remain unpublished, without Sentinel verdict or
-production-tool authority.
+redacted. Reports and projections themselves remain unpublished and do not grant
+verdict or production-tool authority; the separate ordinary reduction is described
+below.
 
 The monitor reads at most 1025 bytes through M1's private checked reader to detect
 an oversize 1024-byte claim object without accepting a truncated valid prefix.
@@ -208,8 +209,8 @@ After worker equality, observer bind/provider/schema/cancel/expiry failure retur
 the same owned verified bundle with known claims and deterministic facts. Separate
 probe/observer metadata retains genuinely completed provenance and provider usage;
 a pending or failed SDK call does not imply completed usage. Even valid bytes
-arriving after cancellation cannot publish weak hints. No new Sentinel verdict,
-publication or production-tool authority is granted.
+arriving after cancellation cannot publish weak hints. The ordinary reduction
+below grants no publication or production-tool authority.
 
 Run `just issue-233-model-worker capture::trajectory::`,
 `just issue-234-capture-unit` and `just issue-376-contracts` for this milestone.
@@ -222,6 +223,26 @@ cancel or wait past the original deadline. Both return failure while preserving
 the verified bundle. The synchronous valid-response cancellation case preserves
 actual completed accounting while discarding late hints; the pending expiry case
 has unknown usage and no completed provenance.
+
+The actual model path also consumes the existing deterministic Sentinel reducer.
+At the private worker handoff, `UnpublishedWorkerReport::bind_trajectory` checks
+source, approved IR/declaration, approval, actual run/deployment scope and exact
+report/projection binding. Only a genuine privately constructed worker report can
+produce its opaque input. The monitor freezes actual probe invocation provenance,
+then admits closed claims and completed observer hints under the original clock.
+`VerifiedTrajectoryBundle::reduction()` exposes the privately computed result on
+success and any established post-worker failure; pre-worker failure has no bundle.
+Changing public observation fields cannot rewrite that immutable result.
+
+Authored and model entrances share one precedence implementation and policy:
+hard tripwires dominate weak hints and reference the exact actual worker-report
+digest; weak-only evidence references a separate versioned safe observation
+identity. Both yield only `Suspicious`. Absent, unavailable, malformed or all-false
+weak observations abstain without fabricated negative evidence. Observer errors
+and late hints cannot erase established hard/deterministic facts or create a
+successful monitor. These unpublished references grant no publication, causal
+attribution, calibrated Clean, Allow or production-tool permission. Full #235
+mixed aggregation, replay and calibration remain separate acceptance work.
 
 Run `just issue-233-model-worker capture::observer::` for these public fake-ADK,
 real-worker controls. They cover safe actual input, separate authority, strict
@@ -270,8 +291,11 @@ command receives TERM at 175s and a hard-kill after 5s grace. A separate admissi
 owner must enforce the original total 180s across build, setup, test and owning wait.
 
 The pair requires equal complete probe provenance and exact executed safe features,
-stop, visibility and typed claims. Only predeclared report/projection/verified
-identity fields are excluded. The positive oracle is a newly observer-added
+stop, visibility and typed claims; report/projection/verified identities are not
+compared. Both results must also carry the production-owned reduction, recorded
+separately with its policy identity and compact output. Reduction output can differ
+between disabled and semantic runs and is not part of feature equality. The
+positive oracle is a newly observer-added
 `SecretSeeking` flag supported by an executed `synthetic_credentials` event.
 Overlapping deterministic flags cannot establish observer attribution. Explicit
 `Unavailable` remains valid and can continue using safe features; it proves no raw

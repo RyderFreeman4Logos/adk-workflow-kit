@@ -542,13 +542,7 @@ fn recorded_request(
     {
         return Err(WorkerError::InvalidEnvelope);
     }
-    let scope = digest(
-        &serde_json::to_vec(&serde_json::json!({
-            "domain":"sentinel-model-worker-v1", "protocol":PROTOCOL,
-            "approval":approval, "run":run, "worker":worker, "tools":PROBE_TOOL_CATALOG,
-        }))
-        .map_err(|_| WorkerError::InvalidEnvelope)?,
-    );
+    let scope = worker_scope(approval, run, worker)?;
     Ok(WorkerRequest {
         protocol: PROTOCOL,
         scope,
@@ -556,6 +550,20 @@ fn recorded_request(
         timeout_ms: limits.timeout_ms,
         batch,
     })
+}
+
+fn worker_scope(approval: &str, run: &str, worker: &str) -> Result<String, WorkerError> {
+    if !valid_digest(approval) || !valid_digest(worker) || run.trim().is_empty() || run.len() > 256
+    {
+        return Err(WorkerError::InvalidEnvelope);
+    }
+    Ok(digest(
+        &serde_json::to_vec(&serde_json::json!({
+            "domain":"sentinel-model-worker-v1", "protocol":PROTOCOL,
+            "approval":approval, "run":run, "worker":worker, "tools":PROBE_TOOL_CATALOG,
+        }))
+        .map_err(|_| WorkerError::InvalidEnvelope)?,
+    ))
 }
 
 fn evaluate(input: &WorkerRequest, deadline: Option<Instant>) -> Result<WorkerReply, WorkerError> {

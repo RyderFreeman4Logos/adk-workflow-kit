@@ -220,6 +220,7 @@ async fn matched_pair_counts_safe_receipt_and_positive_oracle() {
     );
     assert!(!measurements(&a, &b));
     assert!(!baseline_ready(&a), "unknown baseline work stops before A1");
+    let reduction_identity = b.verified.reduction().unwrap().identity().to_owned();
     let safe = observation(&Ok(b));
     let encoded = safe.to_string();
     for canary in [
@@ -231,6 +232,15 @@ async fn matched_pair_counts_safe_receipt_and_positive_oracle() {
     ] {
         assert!(!encoded.contains(canary), "unsafe receipt content");
     }
+    assert!(safe["verified"]["reduction"].is_object());
+    assert_eq!(
+        safe["verified"]["reduction"]["policy_version"],
+        workflow_runtime::SENTINEL_REDUCTION_POLICY_VERSION
+    );
+    assert_eq!(
+        safe["verified"]["reduction"]["identity"], reduction_identity,
+        "safe receipt reads the production computed result"
+    );
     assert!(safe["observer"]["usage"].is_null());
     let (_, changed, _, _) = fake_pair(true).await;
     b = changed;
@@ -267,6 +277,10 @@ async fn strict_observer_failure_retains_only_safe_partial_facts() {
     let safe = observation(&result);
     assert_eq!(safe["status"], "failed");
     assert!(safe["verified"].is_object());
+    assert!(
+        safe["verified"]["reduction"].is_object(),
+        "observer failure retains settled reduction"
+    );
     assert_eq!(safe["probe"]["known_completed_calls"], 1);
     assert!(safe["capture_processing_ns"].is_null());
     for canary in [

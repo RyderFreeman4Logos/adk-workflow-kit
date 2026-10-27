@@ -387,7 +387,10 @@ fn verified(bundle: &VerifiedTrajectoryBundle) -> Value {
         "report_event_count":bundle.report.event_count(),"events":bundle.projection.events(),
         "stop":bundle.projection.stop(),"raw_visibility":bundle.raw_visibility,
         "claims_status":bundle.claims_status,"claims":bundle.claims,
-        "deterministic_weak_signals":bundle.deterministic_weak_signals})
+        "deterministic_weak_signals":bundle.deterministic_weak_signals,
+        "reduction":bundle.reduction().map(|r| json!({"identity":r.identity(),
+            "policy_version":r.policy_version(),"policy_digest":r.policy_digest(),
+            "output":serde_json::from_str::<Value>(&r.output().to_json().expect("admitted reduction output")).expect("typed JSON")}))})
 }
 fn observation(result: &Result<TrajectoryMonitorObservation, TrajectoryMonitorFailure>) -> Value {
     match result {
@@ -408,7 +411,9 @@ fn pair(a: &TrajectoryMonitorObservation, b: &TrajectoryMonitorObservation) -> R
         "claims_status":o.verified.claims_status,"claims":o.verified.claims,
         "deterministic":o.verified.deterministic_weak_signals})
     };
-    if a.probe.provenance.is_none()
+    if a.verified.reduction().is_none()
+        || b.verified.reduction().is_none()
+        || a.probe.provenance.is_none()
         || a.probe.provenance != b.probe.provenance
         || features(a) != features(b)
         || a.observer_status != ObserverStatus::Disabled

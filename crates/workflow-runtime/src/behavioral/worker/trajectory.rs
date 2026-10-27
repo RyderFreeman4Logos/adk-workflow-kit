@@ -182,3 +182,70 @@ fn project(event: &super::WorkerEvent, action: &super::ModelAction) -> Trajector
     }
     feature
 }
+
+/// Expected host context, checked against a genuine sealed-worker report.
+/// These ordinary fields alone cannot construct verified evidence.
+pub struct ModelTrajectoryBinding<'a> {
+    pub source: &'a crate::ArtifactId,
+    pub worker_digest: &'a str,
+    pub ir_hash: &'a str,
+    pub declaration_digest: &'a str,
+}
+
+/// Opaque source/run/report facts admitted from an independently verified worker.
+/// No Serde or public constructor; weak model declarations cannot create hard facts.
+#[derive(Debug)]
+pub struct ModelTrajectoryEvidence {
+    pub(crate) source: crate::ArtifactId,
+    pub(crate) identity: String,
+    pub(crate) report_digest: String,
+    pub(crate) stop: ProbeStop,
+}
+impl super::UnpublishedWorkerReport {
+    /// Freeze expected approval/source/run/deployment and exact report/projection
+    /// equality. A copied digest or deserialized JSON is never a worker proof.
+    pub fn bind_trajectory(
+        &self,
+        approval: &super::TrustedModelProbe,
+        workdir: &crate::RunWorkdir,
+        projection: &CanonicalModelTrajectory,
+        binding: ModelTrajectoryBinding<'_>,
+    ) -> Result<ModelTrajectoryEvidence, WorkerError> {
+        let approval_id = approval.identity();
+        let scope = super::worker_scope(
+            &approval_id,
+            workdir.run_id().as_str(),
+            binding.worker_digest,
+        )?;
+        let report_digest = digest(self.to_json()?.as_bytes());
+        if !approval.approves_source(binding.source)
+            || !approval.matches_approval(
+                binding.ir_hash,
+                approval.limits(),
+                binding.declaration_digest,
+            )
+            || self.0.protocol != super::PROTOCOL
+            || self.0.scope != scope
+            || projection.report_digest != report_digest
+            || projection.stop != self.0.stop
+            || projection.events.len() != self.0.events.len()
+        {
+            return Err(WorkerError::InvalidReport);
+        }
+        let identity = digest(
+            &serde_json::to_vec(&serde_json::json!({
+                "version":"model-trajectory-reduction-input-v1","protocol":super::PROTOCOL,
+                "source":binding.source,"approval":approval_id,"run":workdir.run_id().as_str(),
+                "worker":binding.worker_digest,"scope":scope,"report":report_digest,
+                "projection":projection.identity,"declaration":binding.declaration_digest,
+            }))
+            .map_err(|_| WorkerError::InvalidReport)?,
+        );
+        Ok(ModelTrajectoryEvidence {
+            source: binding.source.clone(),
+            identity,
+            report_digest,
+            stop: self.0.stop,
+        })
+    }
+}

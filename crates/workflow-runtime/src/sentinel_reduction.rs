@@ -1,8 +1,12 @@
 //! Deterministic ordinary-data evidence reduction; no IO or execution authority.
-use crate::behavioral::{ProbeReport, trajectory::TrajectoryObservation};
+use crate::behavioral::{
+    ProbeReport, ProbeStop,
+    trajectory::{TrajectoryObservation, WeakSignal},
+    worker::trajectory::ModelTrajectoryEvidence,
+};
 use crate::{
-    ArtifactId, Completeness, SentinelEvidence, SentinelVerdict, SourceSpan, TypedOutput,
-    TypedOutputError, TypedPayload, admit_for_reducer, argument_fingerprint,
+    ArtifactId, ArtifactRef, Completeness, SentinelEvidence, SentinelVerdict, SourceSpan,
+    TypedOutput, TypedOutputError, TypedPayload, admit_for_reducer, argument_fingerprint,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -104,7 +108,6 @@ pub fn reduce_sentinel(
     {
         return Err(SentinelReductionError::InvalidBinding);
     }
-    let mut semantic_verdict = None;
     let semantic_material = if let Some(semantic) = &input.semantic {
         if ArtifactId::parse(semantic.producer_identity).is_none() {
             return Err(SentinelReductionError::InvalidBinding);
@@ -133,7 +136,6 @@ pub fn reduce_sentinel(
         {
             return Err(SentinelReductionError::InvalidBinding);
         }
-        semantic_verdict = Some(evidence.verdict());
         Some(
             json!({"output":serde_json::from_str::<Value>(&bytes).map_err(|_| TypedOutputError::InvalidJson)?,
             "producer_identity":semantic.producer_identity}),
@@ -156,14 +158,7 @@ pub fn reduce_sentinel(
             return Err(SentinelReductionError::InvalidBinding);
         }
     }
-    let policy_digest = format!(
-        "sha256:{}",
-        argument_fingerprint(&json!({
-            "version":SENTINEL_REDUCTION_POLICY_VERSION, "typed_schema":1,
-            "rules":["invalid_input","unsupported_language","semantic_injection","behavior_tripwire","semantic_suspicious","observer_weak","abstain_suspicious"],
-            "clean":"never", "causal_promotion":"never"
-        }))
-    );
+    let policy_digest = policy_digest();
     let identity = format!(
         "sha256:{}",
         argument_fingerprint(&json!({
@@ -183,28 +178,99 @@ pub fn reduce_sentinel(
         .map(ProbeReport::evidence)
         .transpose()?
         .flatten();
-    let output = if let Some(terminal) = input.preparation_terminal {
+    let weak = input
+        .observation
+        .filter(|o| !o.weak_signals().is_empty())
+        .map(TrajectoryObservation::evidence)
+        .transpose()?
+        .flatten();
+    finish(
+        input.preparation_terminal,
+        input.semantic.as_ref().map(|s| s.output),
+        hard,
+        weak,
+        identity,
+        policy_digest,
+    )
+}
+
+/// Reduce genuine model worker facts with owner-settled weak observations.
+/// The opaque worker input authenticates hard facts; weak flags and their identity
+/// are ordinary data whose actual role/deadline admission belongs to the caller.
+/// Neither this function nor its result grants publication or execution authority.
+pub fn reduce_model_trajectory(
+    facts: &ModelTrajectoryEvidence,
+    weak: &[WeakSignal],
+    observation_identity: &str,
+) -> Result<SentinelReduction, SentinelReductionError> {
+    if observation_identity
+        .strip_prefix("sha256:")
+        .and_then(ArtifactId::parse)
+        .is_none()
+    {
+        return Err(SentinelReductionError::InvalidBinding);
+    }
+    let policy_digest = policy_digest();
+    let weak_digest = digest(
+        &serde_json::to_vec(&json!({
+            "version":"model-trajectory-weak-evidence-v1","producer":facts.identity,
+            "observation":observation_identity,"weak_signals":weak,
+        }))
+        .map_err(|_| TypedOutputError::InvalidJson)?,
+    );
+    let identity = digest(
+        &serde_json::to_vec(&json!({
+            "policy_digest":policy_digest,"model_producer":facts.identity,"source":facts.source,
+            "observation":observation_identity,"weak_digest":weak_digest,
+        }))
+        .map_err(|_| TypedOutputError::InvalidJson)?,
+    );
+    let hard = matches!(facts.stop, ProbeStop::Tripwire(_))
+        .then(|| referenced_suspicious(&facts.report_digest))
+        .transpose()?;
+    let weak = (!weak.is_empty())
+        .then(|| referenced_suspicious(&weak_digest))
+        .transpose()?;
+    finish(None, None, hard, weak, identity, policy_digest)
+}
+
+fn policy_digest() -> String {
+    format!(
+        "sha256:{}",
+        argument_fingerprint(&json!({
+            "version":SENTINEL_REDUCTION_POLICY_VERSION, "typed_schema":1,
+            "rules":["invalid_input","unsupported_language","semantic_injection","behavior_tripwire","semantic_suspicious","observer_weak","abstain_suspicious"],
+            "clean":"never", "causal_promotion":"never"
+        }))
+    )
+}
+
+fn finish(
+    terminal: Option<SentinelVerdict>,
+    semantic: Option<&TypedOutput>,
+    hard: Option<TypedOutput>,
+    weak: Option<TypedOutput>,
+    identity: String,
+    policy_digest: String,
+) -> Result<SentinelReduction, SentinelReductionError> {
+    let semantic_verdict = semantic.and_then(|output| match output.payload() {
+        TypedPayload::Sentinel(evidence) => Some(evidence.verdict()),
+        _ => None,
+    });
+    let output = if let Some(terminal) = terminal {
         verdict_only(terminal)?
     } else if semantic_verdict == Some(SentinelVerdict::Injection) {
-        input
-            .semantic
-            .as_ref()
+        semantic
             .ok_or(SentinelReductionError::InvalidBinding)?
-            .output
             .clone()
     } else if let Some(hard) = hard {
         hard
     } else if semantic_verdict == Some(SentinelVerdict::Suspicious) {
-        input
-            .semantic
-            .as_ref()
+        semantic
             .ok_or(SentinelReductionError::InvalidBinding)?
-            .output
             .clone()
-    } else if let Some(observation) = input.observation.filter(|o| !o.weak_signals().is_empty()) {
-        observation
-            .evidence()?
-            .ok_or(SentinelReductionError::InvalidBinding)?
+    } else if let Some(weak) = weak {
+        weak
     } else {
         verdict_only(SentinelVerdict::Suspicious)?
     };
@@ -227,4 +293,18 @@ fn verdict_only(verdict: SentinelVerdict) -> Result<TypedOutput, TypedOutputErro
 }
 fn digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn referenced_suspicious(address: &str) -> Result<TypedOutput, TypedOutputError> {
+    let id = address
+        .strip_prefix("sha256:")
+        .ok_or(TypedOutputError::InvalidJson)?;
+    TypedOutput::new(
+        TypedPayload::Sentinel(SentinelEvidence::new(
+            SentinelVerdict::Suspicious,
+            vec![],
+            vec![ArtifactRef::new(id, address)?],
+        )),
+        Completeness::Complete,
+    )
 }

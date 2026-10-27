@@ -171,7 +171,7 @@ pub use sentinel_language::{
 };
 pub use sentinel_reduction::{
     SENTINEL_REDUCTION_POLICY_VERSION, SemanticReductionInput, SentinelReduction,
-    SentinelReductionError, SentinelReductionInput, reduce_sentinel,
+    SentinelReductionError, SentinelReductionInput, reduce_model_trajectory, reduce_sentinel,
 };
 pub use sentinel_segments::{
     LanguageScreening, SENTINEL_SCRIPT_DATA_VERSION, SENTINEL_SEGMENTATION_VERSION, ScriptEvidence,

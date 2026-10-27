@@ -55,7 +55,24 @@ fn verified_fixture(label: &str) -> VerifiedTrajectoryBundle {
     )
     .unwrap();
     let observed=worker.observe_batch_with_trajectory(&approval,&workdir,br#"{"schema_version":1,"steps":[{"kind":"call","tool":"host_command","arguments":{}}]}"#).unwrap();
-    VerifiedTrajectoryBundle {
+    let facts = observed
+        .report
+        .bind_trajectory(
+            &approval,
+            &workdir,
+            &observed.projection,
+            workflow_runtime::behavioral::worker::trajectory::ModelTrajectoryBinding {
+                source: &workflow_runtime::ArtifactId::parse("a".repeat(64)).unwrap(),
+                worker_digest: &expected,
+                ir_hash: &digest,
+                declaration_digest: &digest,
+            },
+        )
+        .unwrap();
+    let mut bundle = VerifiedTrajectoryBundle {
+        reduction: None,
+        reduction_facts: Some(facts),
+        producer_identity: digest,
         report: observed.report,
         projection: observed.projection,
         identity: "sealed-identity".into(),
@@ -63,7 +80,9 @@ fn verified_fixture(label: &str) -> VerifiedTrajectoryBundle {
         claims_status: ReasoningStatus::Unavailable,
         claims: None,
         deterministic_weak_signals: vec![],
-    }
+    };
+    bundle.reduction = Some(bundle.reduce(&[], None).unwrap());
+    bundle
 }
 
 #[test]

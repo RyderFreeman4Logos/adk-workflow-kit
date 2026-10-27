@@ -212,6 +212,13 @@ fn assert_retained(failure: &workflow_adk::behavioral::TrajectoryMonitorFailure)
         ProbeStop::Tripwire(ProbeSignal::HostCommand)
     );
     assert_eq!(verified.projection.stop(), verified.report.stop());
+    let reduced = reduction::evidence(verified);
+    assert_eq!(reduced.artifacts().len(), 1);
+    assert_eq!(
+        reduced.artifacts()[0].sha256(),
+        verified.projection.report_digest(),
+        "late or failed observer cannot replace the established hard reference"
+    );
     assert_eq!(
         verified.projection.events().len(),
         verified.report.event_count()
@@ -262,3 +269,6 @@ impl adk_rust::Llm for Controlled {
 
 #[path = "observer_controls.rs"]
 mod controls;
+
+#[path = "reduction.rs"]
+mod reduction;

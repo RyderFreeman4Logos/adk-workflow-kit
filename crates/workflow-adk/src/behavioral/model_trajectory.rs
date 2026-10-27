@@ -43,8 +43,12 @@ impl RoleMetadata {
     }
 }
 /// One sealed unpublished report and its immutable host-produced safe projection.
-/// This is not authenticated publication, a Sentinel verdict, or tool permission.
+/// Reduction is immutable ordinary evidence, never publication or tool permission.
 pub struct VerifiedTrajectoryBundle {
+    reduction: Option<workflow_runtime::SentinelReduction>,
+    reduction_facts:
+        Option<workflow_runtime::behavioral::worker::trajectory::ModelTrajectoryEvidence>,
+    producer_identity: String,
     pub report: workflow_runtime::behavioral::worker::UnpublishedWorkerReport,
     pub projection: CanonicalModelTrajectory,
     pub identity: String,
@@ -52,6 +56,31 @@ pub struct VerifiedTrajectoryBundle {
     pub claims_status: ReasoningStatus,
     pub claims: Option<workflow_runtime::behavioral::trajectory::ClosedTrajectoryClaims>,
     pub deterministic_weak_signals: Vec<WeakSignal>,
+}
+impl VerifiedTrajectoryBundle {
+    /// Source-bound reduction computed by the monitor owner; public observation
+    /// fields cannot rewrite this immutable result. Never execution permission.
+    pub fn reduction(&self) -> Option<&workflow_runtime::SentinelReduction> {
+        self.reduction.as_ref()
+    }
+
+    fn reduce(
+        &self,
+        weak: &[WeakSignal],
+        observer: Option<&InvocationProvenance>,
+    ) -> Result<workflow_runtime::SentinelReduction, workflow_runtime::SentinelReductionError> {
+        let facts = self
+            .reduction_facts
+            .as_ref()
+            .ok_or(workflow_runtime::SentinelReductionError::InvalidBinding)?;
+        // Only this private owner can consume the genuine capture and settled
+        // role result. Public fields are never an authority reconstruction API.
+        let observation = crate::model_invocation::digest(crate::model_invocation::canonical_json(&serde_json::json!({
+            "version":"model-trajectory-reduction-observation-v1","verified":self.identity,
+            "probe":self.producer_identity,"observer":observer.map(InvocationProvenance::invocation_identity),
+        })).as_bytes());
+        workflow_runtime::reduce_model_trajectory(facts, weak, &observation)
+    }
 }
 /// Disabled and completed are explicit; all-false never exculpates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,7 +168,7 @@ impl HostModelProbe<'_> {
     /// Explicit schema3 path; semantic requires one separately approved Reviewer.
     /// Static identities are checked before either role resolves credentials.
     /// The original deadline/cancellation owns capture and every late failure.
-    /// Returned worker observations are unpublished and confer no Sentinel verdict.
+    /// Returned worker observations and their reduction are unpublished ordinary data.
     pub async fn observe_trajectory(
         self,
         observer: Option<&ModelRoutePolicy>,
@@ -189,12 +218,20 @@ impl HostModelProbe<'_> {
         let (captured, reasoning, probe) = self
             .capture_core(super::model_probe::CaptureMode::Trajectory)
             .await?;
+        let producer_identity = captured
+            .observation
+            .provenance
+            .invocation_identity()
+            .to_owned();
         let ModelProbeObservation { report, .. } = captured.observation;
         let projection = captured
             .projection
             .expect("trajectory capture always returns its verified projection");
         let identity = crate::model_invocation::digest(crate::model_invocation::canonical_json(&serde_json::json!({"version":"model-trajectory-v1","projection":projection.identity(),"approval":approval,"task_digest":task_digest})).as_bytes());
-        let verified = VerifiedTrajectoryBundle {
+        let mut verified = VerifiedTrajectoryBundle {
+            reduction: None,
+            reduction_facts: captured.reduction_facts,
+            producer_identity,
             report,
             projection,
             identity,
@@ -207,6 +244,16 @@ impl HostModelProbe<'_> {
             claims: None,
             deterministic_weak_signals: vec![],
         };
+        verified.reduction = Some(match verified.reduce(&[], None) {
+            Ok(reduction) => reduction,
+            Err(_) => {
+                return Err(after_failure(
+                    verified,
+                    probe,
+                    TrajectoryMonitorErrorKind::WorkerVerification,
+                ));
+            }
+        });
         let started = Instant::now();
         let (verified, probe) = settle_verified(verified, probe, deadline, cancellation)?;
         let read = super::reasoning_capture::read_closed_claims(
@@ -215,7 +262,8 @@ impl HostModelProbe<'_> {
             deadline,
             cancellation,
         );
-        let (verified, probe) = settle_claims_read(verified, probe, read, deadline, cancellation)?;
+        let (mut verified, probe) =
+            settle_claims_read(verified, probe, read, deadline, cancellation)?;
         let capture_processing_ns = u64::try_from(started.elapsed().as_nanos()).ok();
         let mut weak_signals = verified.deterministic_weak_signals.clone();
         let Some(route) = observer else {
@@ -297,6 +345,31 @@ impl HostModelProbe<'_> {
                 weak_signals.push(hint);
             }
         }
+        if observer_metadata.provenance.as_ref() != Some(result.provenance()) {
+            return Err(observer_failure(
+                verified,
+                probe,
+                observer_metadata,
+                TrajectoryMonitorErrorKind::AuthorizationDenied,
+            ));
+        }
+        let reduction = match verified.reduce(&weak_signals, Some(result.provenance())) {
+            Ok(reduction) => reduction,
+            Err(_) => {
+                return Err(observer_failure(
+                    verified,
+                    probe,
+                    observer_metadata,
+                    TrajectoryMonitorErrorKind::AuthorizationDenied,
+                ));
+            }
+        };
+        // Compute before the final admission check: reduction work cannot admit
+        // hints after the original clock or replace prior facts on late failure.
+        if let Some(kind) = stopped(deadline.min(route.deadline()), cancellation) {
+            return Err(observer_failure(verified, probe, observer_metadata, kind));
+        }
+        verified.reduction = Some(reduction);
         Ok(TrajectoryMonitorObservation {
             verified,
             observer_status: ObserverStatus::Completed,
@@ -372,6 +445,18 @@ fn settle_claims_read(
         verified.claims = claims;
         verified.identity = crate::model_invocation::digest(crate::model_invocation::canonical_json(&serde_json::json!({"base":verified.identity,"raw_visibility":verified.raw_visibility,"claims_status":verified.claims_status,"claims":verified.claims})).as_bytes());
     }
+    verified.reduction = Some(
+        match verified.reduce(&verified.deterministic_weak_signals, None) {
+            Ok(reduction) => reduction,
+            Err(_) => {
+                return Err(after_failure(
+                    verified,
+                    probe,
+                    TrajectoryMonitorErrorKind::WorkerVerification,
+                ));
+            }
+        },
+    );
     if read.disposition.is_err() {
         return Err(after_failure(
             verified,
