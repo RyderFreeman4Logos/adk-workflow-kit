@@ -263,6 +263,52 @@ continuation has no serialization or public constructor. Full canary lifecycle,
 checkpoint/crash recovery, automatic resume and live model quality/cost acceptance
 remain unfinished #233 work; this bounded continuation does not complete #233.
 
+## Explicit source counterfactuals
+
+`TrustedCounterfactualReplay` consumes a separately authenticated single-source
+approval and a nonempty exact original-byte `SourceSpan`. Its fixed policy derives
+Original, Remove, Neutralize and Isolate, in that order. Neutralize replaces the
+selected non-CR/LF bytes with spaces; all offsets must be UTF-8 scalar boundaries.
+Empty derivatives have no invented artifact or approval. The grant is neither
+serializable nor cloneable and exposes no general source-replacement operation.
+
+`HostCounterfactualProbe` compiles each exact derivative through the existing
+schema2 compiler and uses the existing ADK route and independently sealed worker.
+The host supplies four distinct allocated run scopes from the same deployment.
+One entry clock admits only a live deadline at most 30 seconds away; every phase
+uses that original deadline. Each fresh source preparation retains its existing
+one-second limit. At most four logical calls request 512 output tokens each;
+these ceilings do not authorize or measure real-model use. There are no retries,
+observers, fallback calls or changes to ordinary workflow/profile/CLI defaults.
+
+Only privately verified executed trajectories enter comparison. Ordered closed
+action features and terminal stops determine the bounded class; action-digest
+equality is recorded separately. A digest-only difference is not disappearance
+of dangerous behavior. Complete attenuation can show that the original tripwire
+was not observed in that execution; it cannot establish source causality or
+calibrated Clean/Injection. An invalid or incomplete derivative is inconclusive.
+Removal can join tokens, and isolation changes context rather than guaranteeing
+semantic attenuation.
+
+The exact original `SentinelReduction` remains unchanged. Reports, projections
+and that reduction are protected before the separate content-addressed comparison
+artifact is retained. The owner-private `CounterfactualReceipt` acknowledges only
+that complete retention sequence. Cancellation, deadline, binding failure, wrong
+content ID or retention failure denies acknowledgment; genuine earlier captures
+and completed-call usage remain forensic. Strict completion facts are recorded
+before late cancellation/deadline checks without requesting reasoning. Missing
+usage remains unknown. Retention does not promise a durable checkpoint, cache,
+directory synchronization, power-loss recovery or permission to resume/retry.
+
+`just issue-233-model-worker counterfactual::` uses a source-responsive injected
+ADK `Llm` and actual sealed workers, including a hard original tripwire, conservative
+comparisons, exact-byte bounds, cancellation/deadline and protected-store faults.
+This is offline wiring evidence. Full #235 still requires calibration/weights,
+mixed-host aggregation, escalation/HITL, checkpoint/cache policy and live model
+quality, latency and token-cost acceptance. See the
+[Sentinel architecture](architecture/sentinel-probes.md#explicit-counterfactual-owner)
+for the authority and accounting boundary.
+
 ## Verification
 
 Run `just issue-233-runtime`, `just issue-233-adk` (including authored execution and public default denial), and `just issue-233-doc` with the repository's safe

@@ -2,6 +2,8 @@
 #![cfg(feature = "test-support")]
 #[path = "issue_234_capture/mod.rs"]
 mod capture;
+#[path = "issue_233_model_worker/counterfactual.rs"]
+mod counterfactual;
 use std::time::Duration;
 use workflow_adk::model_profiles::{CredentialHandle, OpenAiCompatibleProfile};
 use workflow_adk::{

@@ -25,7 +25,12 @@ use workflow_runtime::{
     SentinelReductionInput, SourceSpan, reduce_sentinel,
 };
 
+mod counterfactual;
 pub(crate) mod model_probe;
+pub use counterfactual::{
+    CounterfactualAttempt, CounterfactualErrorKind, CounterfactualFailure, CounterfactualPhase,
+    CounterfactualReceipt, CounterfactualWorker, HostCounterfactualProbe,
+};
 mod model_trajectory;
 pub(crate) mod trajectory_observer;
 pub use model_trajectory::{

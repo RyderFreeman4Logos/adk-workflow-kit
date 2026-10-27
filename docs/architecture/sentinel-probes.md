@@ -92,8 +92,8 @@ wall-time guarantees. No unbounded task text or semantic prose is serialized.
 
 Adapter identity is `sentinel-workflow-preparation-v7`; the preparation key binds
 both probe versions and fixed budgets, retaining raw-byte, workflow/IR, language
-policy and preparation identities. The semantic path also binds `sentinel-reduction-policy-v1`;
-scripted behavioral preparation retains its prior policy identity without this unused version.
+policy and preparation identities. Semantic and authored behavioral preparation both bind
+`sentinel-reduction-policy-v1`; scripted preparation retains its existing semantic probe version.
 The existing eight-field framing remains `WORKFLOW_ID`, `WORKFLOW_VERSION`,
 `NODE_ID`, `NODE_VERSION`, `INVOCATION_IDENTITY`, `INPUT_ARTIFACT_HASHES`,
 `REQUEST_INPUT_DIGEST`, and `POLICY_DIGEST`; the reducer version belongs inside
@@ -250,3 +250,37 @@ redirection, decoded material and adjacent overlapping chunks through the existi
 authenticated host-goal API. Scripted fixtures and prefix equality do not establish
 those model-quality results or physical cache benefits. Final Clean authorization,
 new goal ingress, expanded scheduling and causal experiments are separate contracts.
+
+## Explicit counterfactual owner
+
+The separate Rust-host counterfactual owner consumes an opaque replay grant for
+one independently authenticated original-byte span. It derives exactly four
+ordered sources and preserves the existing schema2 compiler, ADK route,
+credential broker, strict complete-text response policy and sealed worker.
+A single captured entry/deadline bounds all preparation, calls, synchronous worker
+returns and comparison retention; existing worker cleanup remains owned even
+when acceptance time expires. Duplicate run scopes fail before credential/model
+entry. Independently valid allocations are accepted; genuine reports paired with
+another actual run or projection fail private binding.
+
+`CanonicalOnly` is an internal capture mode: it uses the ordinary model declaration
+with no reasoning lease, observer or additional call. The strict completion
+callback preserves genuine provenance and optional provider usage before a late
+route stop. Execution failure remains separate from Completed accounting. A late
+valid response cannot authorize a worker or another call; malformed/incomplete
+responses cannot manufacture completion.
+
+Only closed verified action features, stops, content identities and optional token
+counts enter the bounded comparison artifact. It binds grant/span/operator policy,
+actual source/run/allocation, declaration/deployment/completion facts and the exact
+original reduction identity/policy. No raw source, model argument, canary or tool
+output is included. Expected source/run identity differences do not themselves
+count as behavioral changes. Variants cannot erase original hard evidence, change
+tool permissions or yield calibrated Clean/Injection. The private receipt follows
+protected retention, with cancellation and the original deadline rechecked before
+and after it; failures leave earlier forensic evidence without a success receipt.
+This does not add cache/resume authority or checkpoint/power-loss guarantees.
+
+See [explicit source counterfactuals](../behavioral-simulation.md#explicit-source-counterfactuals)
+for exact operators, offline verification and remaining #235 acceptance. Semantic
+quality, robust causal conclusions and live cost/latency remain separate gates.

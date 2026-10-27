@@ -1,6 +1,6 @@
 //! Host approval of model observation; contains no model output or executor.
 use super::{BEHAVIORAL_VERSION, PROBE_TOOL_CATALOG, ProbeError, ProbeLimits};
-use crate::{ArtifactId, ContentProvenance, TrustDomain};
+use crate::{ArtifactId, ContentProvenance, SourceSpan, TrustDomain};
 use std::fmt;
 
 /// Opaque host approval of one exact model-observation contract, not a signature.
@@ -155,6 +155,52 @@ fn valid_digest(value: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
+}
+
+/// Consume-once host authorization for exactly three fixed source interventions.
+/// Authenticate the original approval and original-byte span independently of
+/// workflow, state and model output. Single-source approval alone is insufficient.
+/// This capability has no Serde, Clone, writable fields or generic rebinding API.
+pub struct TrustedCounterfactualReplay {
+    original: TrustedModelProbe,
+    span: SourceSpan,
+}
+impl TrustedCounterfactualReplay {
+    /// Admit one nonempty original-byte span; exact length and UTF-8 boundaries
+    /// are checked against retained bytes when this grant is consumed.
+    pub fn authorize(original: TrustedModelProbe, span: SourceSpan) -> Result<Self, ProbeError> {
+        if original.approved_source.as_str() != span.artifact_id()
+            || original.reasoning_capture
+            || original.monitor.is_some()
+        {
+            return Err(ProbeError::InvalidIdentity);
+        }
+        Ok(Self { original, span })
+    }
+
+    /// Derive Original, Remove, Neutralize and Isolate exactly once. No caller
+    /// can substitute derivative source IDs or retain a clone of this grant.
+    pub fn derive(
+        self,
+        original: &[u8],
+    ) -> Result<super::counterfactual::CounterfactualSources, ProbeError> {
+        super::counterfactual::derive(self.original, self.span, original)
+    }
+}
+impl TrustedModelProbe {
+    // Only the fixed sibling derivation owner may use this private approval seam.
+    pub(super) fn exact_derivative(&self, source: ArtifactId) -> Self {
+        Self {
+            approved_ir_hash: self.approved_ir_hash.clone(),
+            approved_source: source,
+            provenance: self.provenance.clone(),
+            revision: self.revision.clone(),
+            model_route_digest: self.model_route_digest.clone(),
+            limits: self.limits,
+            reasoning_capture: false,
+            monitor: None,
+        }
+    }
 }
 
 /// Separate independently authenticated admission for one exact observer declaration.

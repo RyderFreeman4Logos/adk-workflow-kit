@@ -29,6 +29,7 @@ pub(super) enum CaptureMode {
     Ordinary,
     Reasoning,
     Trajectory,
+    CanonicalOnly,
 }
 
 impl HostModelProbe<'_> {
@@ -101,7 +102,7 @@ impl HostModelProbe<'_> {
         let before = |phase, kind| {
             TrajectoryMonitorFailure::before(phase, kind, RoleMetadata::not_started())
         };
-        let reasoning_capture = mode != CaptureMode::Ordinary;
+        let reasoning_capture = matches!(mode, CaptureMode::Reasoning | CaptureMode::Trajectory);
         use workflow_runtime::{StructuredOutputError, behavioral::ProbeLimits};
         let policy = self
             .plan
@@ -123,7 +124,7 @@ impl HostModelProbe<'_> {
         .map_err(|_| before(Phase::Preflight, Kind::AuthorizationDenied))?;
         if policy.schema_version != 2
             || match mode {
-                CaptureMode::Ordinary => {
+                CaptureMode::Ordinary | CaptureMode::CanonicalOnly => {
                     policy.trajectory.is_some() || self.approval.trajectory_monitor().is_some()
                 }
                 CaptureMode::Reasoning => {
@@ -170,7 +171,7 @@ impl HostModelProbe<'_> {
             *raw.lock().map_err(|_| StructuredOutputError::InvalidJson)? = bytes.to_vec();
             Ok(())
         };
-        let result = if reasoning_capture {
+        let result = if reasoning_capture || mode == CaptureMode::CanonicalOnly {
             self.route
                 .invoke_model_probe_with_capture(
                     &spec,
@@ -178,7 +179,7 @@ impl HostModelProbe<'_> {
                     self.broker,
                     self.cancellation,
                     validate,
-                    (Some(&mut reasoning), |result| {
+                    (reasoning_capture.then_some(&mut reasoning), |result| {
                         completed_probe = Some(RoleMetadata::completed(result, started));
                     }),
                 )
@@ -228,7 +229,7 @@ impl HostModelProbe<'_> {
             }
         };
         // The worker owns strict parsing and spawn admission over these same bytes.
-        let observed = if mode == CaptureMode::Trajectory {
+        let observed = if matches!(mode, CaptureMode::Trajectory | CaptureMode::CanonicalOnly) {
             self.worker
                 .observe_batch_with_trajectory(self.approval, self.workdir, &raw)
                 .map(|v| (v.report, Some(v.projection)))
