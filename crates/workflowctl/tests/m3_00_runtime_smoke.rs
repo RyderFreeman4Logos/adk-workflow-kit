@@ -1415,8 +1415,6 @@ fn smoke_observation_protocol_preflight() {
         MAX_FIXTURE_BYTES,
         Some(&observation),
     );
-    // Keep the authenticated producer alive for the lossy collector's terminal read.
-    thread::sleep(Duration::from_millis(250));
     let output = result.expect("protocol-only Bash child must settle");
     assert!(output.status.success());
     assert_eq!(output.stdout, b"valid\n");
@@ -1438,8 +1436,6 @@ fn smoke_observation_timeout_protocol_preflight() {
     );
     let elapsed = started.elapsed();
     drop(observation);
-    // Keep the authenticated producer alive for the collector's terminal read.
-    thread::sleep(Duration::from_millis(250));
     assert_eq!(result, Err("subprocess timed out"));
     assert!(elapsed >= SUBPROCESS_TIMEOUT);
     assert!(elapsed < SUBPROCESS_TIMEOUT + CLEANUP_TIMEOUT);
