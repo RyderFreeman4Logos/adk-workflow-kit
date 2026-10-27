@@ -20,6 +20,10 @@ use sha2::{Digest, Sha256};
 #[path = "support/owned_tree.rs"]
 mod owned_tree;
 
+#[path = "support/smoke_observation.rs"]
+mod smoke_observation;
+use smoke_observation::SmokeObservation;
+
 static TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 static NON_REAPING_OBSERVATION_USED: AtomicBool = AtomicBool::new(false);
 
@@ -237,6 +241,7 @@ fn bounded_output(
     command: &mut Command,
     timeout: Duration,
     output_limit: usize,
+    observation: Option<&SmokeObservation>,
 ) -> Result<Output, &'static str> {
     command
         .process_group(0)
@@ -265,7 +270,14 @@ fn bounded_output(
         spawn_capped_reader(stdout_pipe, output_limit, Arc::clone(&stdout_exceeded));
     let stderr_reader =
         spawn_capped_reader(stderr_pipe, output_limit, Arc::clone(&stderr_exceeded));
+    let lower = observation
+        .map(|_| SmokeObservation::monotonic_ns())
+        .unwrap_or(0);
     let deadline = Instant::now() + timeout;
+    if let Some(observation) = observation {
+        let upper = SmokeObservation::monotonic_ns();
+        observation.arm(child.id(), lower, upper, timeout);
+    }
     let (status, failure) = loop {
         if stdout_exceeded.load(Ordering::Acquire) || stderr_exceeded.load(Ordering::Acquire) {
             break (
@@ -286,6 +298,9 @@ fn bounded_output(
                 break (status, None);
             }
             Ok(false) if Instant::now() >= deadline => {
+                if let Some(observation) = observation {
+                    observation.pre_kill(child.id());
+                }
                 break (
                     reap_after_kill(&mut child, process_group),
                     Some("subprocess timed out"),
@@ -304,6 +319,17 @@ fn bounded_output(
         (stdout_exceeded.load(Ordering::Acquire) || stderr_exceeded.load(Ordering::Acquire))
             .then_some("subprocess output limit exceeded")
     });
+    if let Some(observation) = observation {
+        observation.emit(
+            3,
+            [
+                stdout.len() as u64,
+                stderr.len() as u64,
+                smoke_observation::last_observed_output(&stdout),
+            ],
+        );
+        observation.emit(4, [u64::from(failure.is_some()), 0, 0]);
+    }
     if let Some(failure) = failure {
         if failure == "subprocess timed out" {
             eprintln!("{}", timeout_summary(stdout.len(), stderr.len()));
@@ -321,6 +347,7 @@ fn run_documented_shell_block_with_path(
     block: &str,
     workdir: &Path,
     path: &std::ffi::OsStr,
+    observe: bool,
 ) -> Result<Output, &'static str> {
     let mut command =
         Command::new(executable_on_path("bash").ok_or("Bash executable unavailable")?);
@@ -329,11 +356,17 @@ fn run_documented_shell_block_with_path(
         .current_dir(repository_root())
         .env("PATH", path)
         .env("WORKDIR", workdir);
-    bounded_output(&mut command, SUBPROCESS_TIMEOUT, MAX_FIXTURE_BYTES)
+    let observation = SmokeObservation::connect(observe);
+    bounded_output(
+        &mut command,
+        SUBPROCESS_TIMEOUT,
+        MAX_FIXTURE_BYTES,
+        observation.as_ref(),
+    )
 }
 
 fn run_documented_shell_block(block: &str, workdir: &Path) -> Result<Output, &'static str> {
-    run_documented_shell_block_with_path(block, workdir, &documented_path())
+    run_documented_shell_block_with_path(block, workdir, &documented_path(), true)
 }
 
 fn temp_root(label: &str) -> TempRoot {
@@ -347,8 +380,13 @@ fn temp_root(label: &str) -> TempRoot {
 }
 
 fn command(args: &[&str]) -> Output {
-    bounded_output(binary().args(args), SUBPROCESS_TIMEOUT, MAX_FIXTURE_BYTES)
-        .unwrap_or_else(|error| panic!("workflowctl failed before exit: {error}"))
+    bounded_output(
+        binary().args(args),
+        SUBPROCESS_TIMEOUT,
+        MAX_FIXTURE_BYTES,
+        None,
+    )
+    .unwrap_or_else(|error| panic!("workflowctl failed before exit: {error}"))
 }
 
 fn read_bounded_regular(path: &Path, limit: usize) -> Result<Vec<u8>, &'static str> {
@@ -838,7 +876,7 @@ fn executable_prerequisite_contract_is_explicit_and_fail_closed() {
         .expect("python3 prerequisite link");
     let workdir = root.path().join("must-not-exist");
     let path = std::env::join_paths([prerequisite_bin]).expect("missing workflowctl PATH");
-    let output = run_documented_shell_block_with_path(block, &workdir, &path)
+    let output = run_documented_shell_block_with_path(block, &workdir, &path, false)
         .expect("missing prerequisite shell must exit");
     assert!(!output.status.success());
     assert_eq!(output.stderr, b"prerequisite missing: workflowctl\n");
@@ -904,7 +942,8 @@ fn committed_example_privacy_is_recursive_and_bounded() {
 fn subprocess_and_file_helpers_are_bounded() {
     let mut normal = Command::new("bash");
     normal.args(["-c", "printf ok; printf err >&2"]);
-    let output = bounded_output(&mut normal, Duration::from_secs(1), 32).expect("bounded output");
+    let output =
+        bounded_output(&mut normal, Duration::from_secs(1), 32, None).expect("bounded output");
     assert!(output.status.success());
     assert_eq!(output.stdout, b"ok");
     assert_eq!(output.stderr, b"err");
@@ -912,7 +951,7 @@ fn subprocess_and_file_helpers_are_bounded() {
     let mut oversized = Command::new("bash");
     oversized.args(["-c", "while :; do printf 12345678; done"]);
     assert_eq!(
-        bounded_output(&mut oversized, Duration::from_secs(1), 32),
+        bounded_output(&mut oversized, Duration::from_secs(1), 32, None),
         Err("subprocess output limit exceeded")
     );
 
@@ -920,7 +959,7 @@ fn subprocess_and_file_helpers_are_bounded() {
     timed_out.args(["-c", "sleep 30 & wait"]);
     let started = Instant::now();
     assert_eq!(
-        bounded_output(&mut timed_out, Duration::from_millis(50), 32),
+        bounded_output(&mut timed_out, Duration::from_millis(50), 32, None),
         Err("subprocess timed out")
     );
     assert!(started.elapsed().as_secs() < 2);
@@ -932,7 +971,7 @@ fn timeout_diagnostic_fixture() {
     let mut command = Command::new("bash");
     command.args(["-c", "sleep 30 & wait"]);
     assert_eq!(
-        bounded_output(&mut command, Duration::from_millis(50), 32),
+        bounded_output(&mut command, Duration::from_millis(50), 32, None),
         Err("subprocess timed out")
     );
 }
@@ -947,7 +986,7 @@ fn timeout_diagnostic_is_emitted_after_settlement() {
         "--nocapture",
         "--test-threads=1",
     ]);
-    let output = bounded_output(&mut command, SUBPROCESS_TIMEOUT, MAX_FIXTURE_BYTES)
+    let output = bounded_output(&mut command, SUBPROCESS_TIMEOUT, MAX_FIXTURE_BYTES, None)
         .expect("synthetic timeout fixture must settle");
     assert!(output.status.success(), "synthetic timeout fixture failed");
     let stdout = String::from_utf8(output.stdout).expect("test runner UTF-8");
@@ -971,8 +1010,13 @@ fn timeout_summary_is_finite_and_content_free() {
         "-c",
         "printf 'private stdout canary'; printf 'private stderr canary!' >&2",
     ]);
-    let output = bounded_output(&mut command, Duration::from_secs(1), MAX_FIXTURE_BYTES)
-        .expect("synthetic output must settle");
+    let output = bounded_output(
+        &mut command,
+        Duration::from_secs(1),
+        MAX_FIXTURE_BYTES,
+        None,
+    )
+    .expect("synthetic output must settle");
     assert!(output.status.success(), "synthetic output child failed");
     assert!(
         output.stdout == b"private stdout canary" && output.stderr == b"private stderr canary!",
@@ -1055,7 +1099,7 @@ fn normal_completion_signals_owned_group_before_reaping_leader() {
     let absolute_bound = timeout + CLEANUP_TIMEOUT;
     NON_REAPING_OBSERVATION_USED.store(false, Ordering::Release);
     let started = Instant::now();
-    let result = bounded_output(&mut command, timeout, MAX_FIXTURE_BYTES);
+    let result = bounded_output(&mut command, timeout, MAX_FIXTURE_BYTES, None);
     let elapsed = started.elapsed();
     assert!(
         NON_REAPING_OBSERVATION_USED.load(Ordering::Acquire),
@@ -1357,4 +1401,46 @@ fn runtime_smoke_example_executes_full_provider_free_sequence() {
     assert!(expected.contains("<run-id>"));
     assert!(expected.contains("<run-root>"));
     assert!(expected.contains("<artifact-id>"));
+}
+
+#[test]
+#[ignore = "Temporary #374 protocol-only preflight requires the external collector"]
+fn smoke_observation_protocol_preflight() {
+    let observation = SmokeObservation::connect(true).expect("external observation collector");
+    let mut command = Command::new(executable_on_path("bash").expect("Bash executable"));
+    command.args(["-c", "sleep 0.25; printf 'valid\\n'"]);
+    let result = bounded_output(
+        &mut command,
+        SUBPROCESS_TIMEOUT,
+        MAX_FIXTURE_BYTES,
+        Some(&observation),
+    );
+    // Keep the authenticated producer alive for the lossy collector's terminal read.
+    thread::sleep(Duration::from_millis(250));
+    let output = result.expect("protocol-only Bash child must settle");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"valid\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+#[ignore = "Temporary #374 timeout protocol qualification requires the external collector"]
+fn smoke_observation_timeout_protocol_preflight() {
+    let observation = SmokeObservation::connect(true).expect("external observation collector");
+    let mut command = Command::new(executable_on_path("bash").expect("Bash executable"));
+    command.args(["-c", "printf 'valid\\n'; sleep 30 & wait"]);
+    let started = Instant::now();
+    let result = bounded_output(
+        &mut command,
+        SUBPROCESS_TIMEOUT,
+        MAX_FIXTURE_BYTES,
+        Some(&observation),
+    );
+    let elapsed = started.elapsed();
+    drop(observation);
+    // Keep the authenticated producer alive for the collector's terminal read.
+    thread::sleep(Duration::from_millis(250));
+    assert_eq!(result, Err("subprocess timed out"));
+    assert!(elapsed >= SUBPROCESS_TIMEOUT);
+    assert!(elapsed < SUBPROCESS_TIMEOUT + CLEANUP_TIMEOUT);
 }
