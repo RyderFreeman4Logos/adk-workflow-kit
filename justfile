@@ -52,6 +52,9 @@ issue-332-compiler test_name="":
 issue-376-contracts:
     {{_io}} cargo +1.98.0 test -p workflow-spec -p workflow-ir -p workflow-compiler --locked -- --test-threads=2
 
+m3-00-cli test_name:
+    {{_io}} cargo +1.98.0 test -p workflowctl --test m3_00_runtime_smoke --locked {{quote(test_name)}} -- --exact --nocapture --test-threads=1
+
 # Focused M3-02 per-node binding tests.
 m3-02-spec test_name:
     {{_io}} cargo +1.98.0 test -p workflow-spec --test m3_02_node_bindings {{test_name}} --locked -- --exact --nocapture
