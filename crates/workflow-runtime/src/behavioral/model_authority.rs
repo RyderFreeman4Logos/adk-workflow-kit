@@ -183,7 +183,7 @@ pub struct TrustedTrajectoryMonitor {
 }
 impl TrustedTrajectoryMonitor {
     /// Authenticate task independently of model/source/config data; nonblank <=2048 bytes.
-    /// Disabled forbids a grant; semantic requires one but is rejected until M3.
+    /// Disabled forbids a grant; semantic requires one exact observer declaration.
     pub fn authorize(
         task: &str,
         mode: workflow_ir::TrajectoryObserverMode,
@@ -219,11 +219,31 @@ impl TrustedTrajectoryMonitor {
             "trust_domain":"trusted-task-safe-features-v1", "observer_digest":self.observer.as_ref().map(|o| &o.declaration_digest),
             "input_bytes":32768,"output_bytes":1024,"requested_output_tokens":128,"candidates":1,"attempts":1,"retries":0,"fallbacks":0})
     }
-    /// Rechecks the task and fixed grant shape without exposing task content.
-    pub fn valid_disabled(&self) -> bool {
+    /// Borrow the authenticated task solely to construct the bounded observer input.
+    /// Never forward this text into reports, events, diagnostics or telemetry.
+    pub fn observer_task(&self) -> &str {
+        &self.task
+    }
+    /// Exact separately authenticated declaration; absent only in disabled mode.
+    pub fn observer_declaration_digest(&self) -> Option<&str> {
+        self.observer
+            .as_ref()
+            .map(|grant| grant.declaration_digest.as_str())
+    }
+    /// Recheck the closed mode/grant shape before compilation and live admission.
+    pub fn valid(&self) -> bool {
         !self.task.trim().is_empty()
             && self.task.len() <= 2048
-            && self.mode == workflow_ir::TrajectoryObserverMode::Disabled
-            && self.observer.is_none()
+            && match self.mode {
+                workflow_ir::TrajectoryObserverMode::Disabled => self.observer.is_none(),
+                workflow_ir::TrajectoryObserverMode::Semantic => self
+                    .observer
+                    .as_ref()
+                    .is_some_and(|grant| valid_digest(&grant.declaration_digest)),
+            }
+    }
+    /// Rechecks the task and fixed grant shape without exposing task content.
+    pub fn valid_disabled(&self) -> bool {
+        self.valid() && self.mode == workflow_ir::TrajectoryObserverMode::Disabled
     }
 }

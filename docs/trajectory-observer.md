@@ -120,7 +120,7 @@ Live-provider availability, semantic quality, token/decode overhead measurement,
 raw-artifact access/retention tests and independent OS isolation
 remain deferred. This milestone does not close #234 or #233.
 
-## Explicit model trajectory monitoring (schema3, deterministic only)
+## Explicit model trajectory monitoring (schema3)
 
 The separate public `HostModelProbe::observe_trajectory(None)` consumes the exact
 `CompiledPlan`, live `TrustedModelProbe`, actual ADK binding and sealed worker.
@@ -143,11 +143,23 @@ Schema3 requires its closed mode; v1/v2 forbid a mode field. The new selector us
 canonical wire v15; omitted/v1/v2 policies, including compact-state v14 plans,
 retain their exact existing bytes and behavior. M1 capture APIs remain unchanged.
 
-`semantic` is recognized as a declarative mode but compilation and live execution
-reject it in this milestone, even with a separately constructed observer grant.
-An observer route supplied to the disabled entry is rejected before credentials
-or SDK invocation. Existing default/capture/feedback entries cannot reinterpret
-a schema3 approval. No second call, retry, fallback or new deadline is admitted.
+The separate `observer_mode = "semantic"` path requires a separately authenticated
+Reviewer route declaration. Obtain its pure identity with
+`observer_route.snapshot().trajectory_observer_declaration_digest()`, authenticate
+it out of band, then pass a `TrustedTrajectoryObserverGrant::authorize(digest)`
+to `TrustedTrajectoryMonitor::authorize(task, TrajectoryObserverMode::Semantic,
+Some(grant))`. Compile using the same model-probe API, then call
+`host.observe_trajectory(Some(&observer_route))`. Compiler identity seals the
+mode, trusted-task digest and exact observer grant; live admission compares the
+actual probe and observer declarations before either resolves credentials.
+
+Disabled requires no observer grant or route and makes only the original probe
+call. Semantic requires exactly one authorized Reviewer candidate and makes at
+most one additional existing ADK invocation: 128 requested output tokens, no
+retries or fallback. The original absolute probe deadline and cancellation cover
+both roles; the observer route's earlier deadline wins. The observer declaration
+and authorization are checked again immediately before its credential bind.
+Existing default/capture/feedback entries cannot reinterpret schema3 approval.
 
 The worker compares actual output with its independently reconstructed reply.
 Only after equality does the host expose the prepared safe executed-prefix
@@ -180,12 +192,44 @@ cooperative. Role usage retains the existing optional provider counters, where
 unknown differs from zero. Capture processing is local elapsed time; server
 `decode_ns` remains unavailable and is not inferred from client latency.
 
+Semantic input is the authenticated task plus this verified safe prefix and
+optional typed untrusted claims/status, bounded to 32768 UTF-8 prompt bytes before
+observer binding. No source envelope, raw Thinking, unknown names, argument values,
+media or tool messages enter that input. The model is asked only for the entire
+closed schema1 object with required booleans `goal_override`, `secret_seeking`,
+`tool_manipulation` and `reasoning_action_inconsistency`. Original output bytes
+must fit 1024 bytes; unknown/duplicate fields, wrong types, wrappers, trailing JSON,
+Thinking, tools and incomplete responses fail closed through the existing strict
+ADK collector. Valid affirmative flags add only typed weak hints; all-false adds
+nothing. Withheld arbitrary-prose reasoning remains unobservable, including an
+injection expressed solely in that prose.
+
+After worker equality, observer bind/provider/schema/cancel/expiry failure returns
+the same owned verified bundle with known claims and deterministic facts. Separate
+probe/observer metadata retains genuinely completed provenance and provider usage;
+a pending or failed SDK call does not imply completed usage. Even valid bytes
+arriving after cancellation cannot publish weak hints. No new Sentinel verdict,
+publication or production-tool authority is granted.
+
 Run `just issue-233-model-worker capture::trajectory::`,
 `just issue-234-capture-unit` and `just issue-376-contracts` for this milestone.
 The public FIFO cancellation control sets cancellation after actual worker exit
 but before host equality; the late failure retains the subsequently verified
 bundle. An internal settlement control introduces cancellation/expiry strictly
-after obtaining a verified bundle. A future semantic observer needs its own
-separate admission and public post-verification provider callback controls.
-Live semantic/provider visibility and separate decode-overhead acceptance remain
-unmet; this deterministic milestone does not close the original #234.
+after obtaining a verified bundle. The semantic controls instead enter a fake
+observer SDK callback strictly after host equality and claim settlement, then
+cancel or wait past the original deadline. Both return failure while preserving
+the verified bundle. The synchronous valid-response cancellation case preserves
+actual completed accounting while discarding late hints; the pending expiry case
+has unknown usage and no completed provenance.
+
+Run `just issue-233-model-worker capture::observer::` for these public fake-ADK,
+real-worker controls. They cover safe actual input, separate authority, strict
+output, preflight zero-call/credential denials, late failures and optional usage.
+Live semantic/provider visibility and token/decode-work overhead remain unmeasured;
+this code milestone does not close the original #234. Future matched disabled /
+semantic measurements may count attributable extra generated tokens (including
+provider-reported reasoning within completion tokens), while keeping input-token
+work, per-role client elapsed and local capture processing separate. Client elapsed
+or JSON decoding is never pure server decode duration; unknown counters remain
+unknown. No live provider call or model-service change is admitted by these docs.

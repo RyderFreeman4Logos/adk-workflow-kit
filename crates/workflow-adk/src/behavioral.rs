@@ -24,6 +24,7 @@ use workflow_runtime::{ArtifactId, ArtifactStore, CanonicalUntrustedText, RunId}
 
 pub(crate) mod model_probe;
 mod model_trajectory;
+pub(crate) mod trajectory_observer;
 pub use model_trajectory::{
     ObserverStatus, RoleMetadata, RolePhase, TrajectoryMonitorErrorKind, TrajectoryMonitorFailure,
     TrajectoryMonitorObservation, TrajectoryMonitorPhase, VerifiedTrajectoryBundle,

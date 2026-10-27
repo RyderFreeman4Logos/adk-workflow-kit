@@ -62,13 +62,12 @@ pub(super) fn validate_admission(
                             }
                             Some(3) => {
                                 probe.reasoning_capture_enabled()
-                                    && policy.trajectory.is_some_and(|p| {
-                                        p.observer_mode
-                                            == Some(workflow_ir::TrajectoryObserverMode::Disabled)
+                                    && probe.trajectory_monitor().is_some_and(|monitor| {
+                                        monitor.valid()
+                                            && policy.trajectory.is_some_and(|p| {
+                                                p.observer_mode == Some(monitor.mode())
+                                            })
                                     })
-                                    && probe
-                                        .trajectory_monitor()
-                                        .is_some_and(|m| m.valid_disabled())
                             }
                             _ => false,
                         }

@@ -1,4 +1,4 @@
-//! Explicit schema3 model monitor; semantic invocation is not admitted in M2.
+//! Explicit schema3 monitor with one independently admitted safe weak observer.
 #[cfg(test)]
 #[path = "model_trajectory_tests.rs"]
 mod tests;
@@ -136,7 +136,8 @@ impl TrajectoryMonitorFailure {
     }
 }
 impl HostModelProbe<'_> {
-    /// Explicit disabled schema3 path. Semantic remains rejected before binding.
+    /// Explicit schema3 path; semantic requires one separately approved Reviewer.
+    /// Static identities are checked before either role resolves credentials.
     /// The original deadline/cancellation owns capture and every late failure.
     /// Returned worker observations are unpublished and confer no Sentinel verdict.
     pub async fn observe_trajectory(
@@ -150,14 +151,37 @@ impl HostModelProbe<'_> {
                 RoleMetadata::not_started(),
             )
         };
-        if observer.is_some() {
-            return Err(denied());
-        }
         let monitor = self
             .approval
             .trajectory_monitor()
-            .filter(|m| m.valid_disabled())
+            .filter(|monitor| monitor.valid())
             .ok_or_else(denied)?;
+        match (monitor.mode(), observer) {
+            (workflow_ir::TrajectoryObserverMode::Disabled, None) => {}
+            (workflow_ir::TrajectoryObserverMode::Semantic, Some(route)) => {
+                let digest = route
+                    .snapshot()
+                    .trajectory_observer_declaration_digest()
+                    .map_err(|_| denied())?;
+                if monitor.observer_declaration_digest() != Some(digest.as_str()) {
+                    return Err(denied());
+                }
+            }
+            _ => return Err(denied()),
+        }
+        if let Some(kind) = stopped(
+            observer.map_or(self.route.deadline(), |route| {
+                route.deadline().min(self.route.deadline())
+            }),
+            self.cancellation,
+        ) {
+            return Err(TrajectoryMonitorFailure::before(
+                TrajectoryMonitorPhase::Preflight,
+                kind,
+                RoleMetadata::not_started(),
+            ));
+        }
+        let broker = self.broker;
         let task_digest = monitor.task_digest().to_owned();
         let approval = self.approval.identity();
         let deadline = self.route.deadline();
@@ -192,15 +216,94 @@ impl HostModelProbe<'_> {
             cancellation,
         );
         let (verified, probe) = settle_claims_read(verified, probe, read, deadline, cancellation)?;
-        let weak_signals = verified.deterministic_weak_signals.clone();
-
+        let capture_processing_ns = u64::try_from(started.elapsed().as_nanos()).ok();
+        let mut weak_signals = verified.deterministic_weak_signals.clone();
+        let Some(route) = observer else {
+            return Ok(TrajectoryMonitorObservation {
+                verified,
+                observer_status: ObserverStatus::Disabled,
+                weak_signals,
+                probe,
+                observer: RoleMetadata::not_started(),
+                capture_processing_ns,
+            });
+        };
+        let spec =
+            match super::trajectory_observer::invocation_spec(monitor.observer_task(), &verified) {
+                Ok(spec) => spec,
+                Err(_) => {
+                    return Err(observer_failure(
+                        verified,
+                        probe,
+                        RoleMetadata::not_started(),
+                        TrajectoryMonitorErrorKind::Configuration,
+                    ));
+                }
+            };
+        let started = Instant::now();
+        let mut observer_metadata = RoleMetadata {
+            phase: RolePhase::Failed,
+            provenance: None,
+            usage: None,
+            elapsed_ns: None,
+        };
+        let result = route
+            .invoke_trajectory_observer(
+                &spec,
+                monitor
+                    .observer_declaration_digest()
+                    .expect("semantic monitor has a validated grant"),
+                broker,
+                cancellation,
+                deadline,
+                |completed| observer_metadata = RoleMetadata::completed(completed, started),
+            )
+            .await;
+        if observer_metadata.elapsed_ns.is_none() {
+            observer_metadata.elapsed_ns = u64::try_from(started.elapsed().as_nanos()).ok();
+        }
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(observer_failure(
+                    verified,
+                    probe,
+                    observer_metadata,
+                    route_error(error.kind()),
+                ));
+            }
+        };
+        // The route and this owner both check the original clock. Late results
+        // may retain completed accounting but never publish their weak hints.
+        if let Some(kind) = stopped(deadline.min(route.deadline()), cancellation) {
+            return Err(observer_failure(verified, probe, observer_metadata, kind));
+        }
+        let hints = match super::trajectory_observer::weak_signals(result.output()) {
+            Ok(hints) => hints,
+            Err(_) => {
+                return Err(observer_failure(
+                    verified,
+                    probe,
+                    observer_metadata,
+                    TrajectoryMonitorErrorKind::OutputSchema,
+                ));
+            }
+        };
+        if let Some(kind) = stopped(deadline.min(route.deadline()), cancellation) {
+            return Err(observer_failure(verified, probe, observer_metadata, kind));
+        }
+        for hint in hints {
+            if !weak_signals.contains(&hint) {
+                weak_signals.push(hint);
+            }
+        }
         Ok(TrajectoryMonitorObservation {
             verified,
-            observer_status: ObserverStatus::Disabled,
+            observer_status: ObserverStatus::Completed,
             weak_signals,
             probe,
-            observer: RoleMetadata::not_started(),
-            capture_processing_ns: u64::try_from(started.elapsed().as_nanos()).ok(),
+            observer: observer_metadata,
+            capture_processing_ns,
         })
     }
 }
@@ -278,4 +381,33 @@ fn settle_claims_read(
         ));
     }
     settle_verified(verified, probe, deadline, cancellation)
+}
+
+/// Preserve every established fact while returning a closed observer failure.
+fn observer_failure(
+    verified: VerifiedTrajectoryBundle,
+    probe: RoleMetadata,
+    observer: RoleMetadata,
+    kind: TrajectoryMonitorErrorKind,
+) -> TrajectoryMonitorFailure {
+    TrajectoryMonitorFailure {
+        phase: TrajectoryMonitorPhase::Observer,
+        kind,
+        verified: Some(Box::new(verified)),
+        probe: Box::new(probe),
+        observer: Box::new(observer),
+    }
+}
+fn route_error(kind: crate::ModelRouteTerminalErrorKind) -> TrajectoryMonitorErrorKind {
+    use crate::ModelRouteTerminalErrorKind as Route;
+    match kind {
+        Route::AuthorizationDenied | Route::RouteMismatch => {
+            TrajectoryMonitorErrorKind::AuthorizationDenied
+        }
+        Route::Configuration => TrajectoryMonitorErrorKind::Configuration,
+        Route::DeadlineExceeded => TrajectoryMonitorErrorKind::Deadline,
+        Route::Cancelled => TrajectoryMonitorErrorKind::Cancelled,
+        Route::Protocol => TrajectoryMonitorErrorKind::OutputSchema,
+        _ => TrajectoryMonitorErrorKind::Provider,
+    }
 }

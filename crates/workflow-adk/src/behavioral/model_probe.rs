@@ -133,18 +133,15 @@ impl HostModelProbe<'_> {
                         || self.approval.trajectory_monitor().is_some()
                 }
                 CaptureMode::Trajectory => {
-                    policy.trajectory.is_none_or(|p| {
-                        p.schema_version != 3
-                            || p.observer_mode
-                                != Some(workflow_ir::TrajectoryObserverMode::Disabled)
-                    }) || !self
-                        .approval
-                        .trajectory_monitor()
-                        .is_some_and(|m| m.valid_disabled())
-                        || snapshot
-                            .candidates()
-                            .first()
-                            .is_none_or(|c| c.role() != crate::ModelRole::Worker)
+                    !self.approval.trajectory_monitor().is_some_and(|monitor| {
+                        monitor.valid()
+                            && policy.trajectory.is_some_and(|p| {
+                                p.schema_version == 3 && p.observer_mode == Some(monitor.mode())
+                            })
+                    }) || snapshot
+                        .candidates()
+                        .first()
+                        .is_none_or(|c| c.role() != crate::ModelRole::Worker)
                 }
             }
             || self.approval.reasoning_capture_enabled() != reasoning_capture

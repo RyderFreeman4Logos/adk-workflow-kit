@@ -215,8 +215,8 @@ async fn selectors_grants_routes_and_default_entries_reject_before_model() {
         .probe_reasoning_capture_declaration_digest()
         .unwrap();
     assert!(
-        monitor_approval(&digest, TASK, TrajectoryObserverMode::Semantic).is_err(),
-        "M2 must not admit semantic even with a separate grant"
+        monitor_approval(&digest, TASK, TrajectoryObserverMode::Semantic).is_ok(),
+        "semantic compile requires a separate host grant; live declaration is rechecked"
     );
     for task in ["".to_owned(), " ".to_owned(), "x".repeat(2049)] {
         assert!(
