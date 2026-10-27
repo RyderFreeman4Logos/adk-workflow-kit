@@ -39,7 +39,7 @@ fn cli(args: &[&str]) -> Output {
         .output()
         .unwrap()
 }
-fn success(output: Output) -> Value {
+fn assert_cli_success(output: &Output) {
     assert!(
         output.status.success(),
         "CLI failed: status={}; stdout_bytes={}; stdout_sha256={:x}; stderr_bytes={}; stderr_sha256={:x}",
@@ -49,6 +49,10 @@ fn success(output: Output) -> Value {
         output.stderr.len(),
         Sha256::digest(&output.stderr)
     );
+}
+
+fn success(output: Output) -> Value {
+    assert_cli_success(&output);
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
@@ -79,7 +83,7 @@ fn cli_failure_diagnostic_retains_status_without_payloads() {
             stdout: stdout.to_vec(),
             stderr: stderr.to_vec(),
         };
-        let panic = std::panic::catch_unwind(|| success(output)).unwrap_err();
+        let panic = std::panic::catch_unwind(|| assert_cli_success(&output)).unwrap_err();
         let message = panic.downcast_ref::<String>().unwrap();
         assert!(!message.contains("PRIVATE_STDOUT_NEVER_REPORT"));
         assert!(!message.contains("PRIVATE_STDERR_NEVER_REPORT"));
@@ -89,6 +93,11 @@ fn cli_failure_diagnostic_retains_status_without_payloads() {
         assert!(message.contains(&format!("stdout_sha256={stdout_sha256}")));
         assert!(message.contains(&format!("stderr_sha256={stderr_sha256}")));
     }
+    assert_cli_success(&Output {
+        status: ExitStatus::from_raw(0),
+        stdout: b"1 passed; 0 failed".to_vec(),
+        stderr: b"PRIVATE_STDERR_NEVER_REPORT".to_vec(),
+    });
     assert_eq!(
         success(Output {
             status: ExitStatus::from_raw(0),
@@ -475,7 +484,7 @@ fn wire_measurement_is_runtime_evidence_and_rejects_tampering() {
         .args(["rev-parse", "HEAD"])
         .output()
         .unwrap();
-    assert!(revision.status.success());
+    assert_cli_success(&revision);
     assert_eq!(
         manifest["source_revision"],
         String::from_utf8(revision.stdout).unwrap().trim()

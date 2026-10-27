@@ -1,5 +1,5 @@
 //! Typed provider options and one fixed semantic case; opt-in reuses the retained predicate.
-use super::{PathBuf, Value, fs, json, repo, success, wire_case, wire_options};
+use super::{PathBuf, Value, assert_cli_success, fs, json, repo, success, wire_case, wire_options};
 use sha2::{Digest, Sha256};
 use std::{io::Write, os::unix::fs::OpenOptionsExt, path::Path};
 fn input() -> Value {
@@ -171,7 +171,7 @@ fn explicit_live_entry_is_exercised_with_only_a_loopback_fixture() {
     fs::write(root.join("enabled-entry.stdout.txt"), &result.stdout).unwrap();
     fs::write(root.join("enabled-entry.stderr.txt"), &result.stderr).unwrap();
     println!("loopback-entry evidence: {}", root.display());
-    assert!(result.status.success(), "loopback enabled-entry rejected");
+    assert_cli_success(&result);
     assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed; 0 failed"));
     let request = request.unwrap();
     assert_eq!(request["wire_request_count"], 2);
