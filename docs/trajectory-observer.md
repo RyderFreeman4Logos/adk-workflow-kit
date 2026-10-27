@@ -70,7 +70,7 @@ Identity binds the versioned input (including exact report and trusted task),
 mode, availability and canonical parsed claims. Invalid fixture bytes are neither
 retained nor hashed. Provider/model are explicitly absent from this offline
 identity; changing fixture key order/whitespace is immaterial. Existing #233
-report bytes and non-opted workflow cache identities are unchanged.
+report bytes are unchanged.
 
 ## Authored host-only execution
 
