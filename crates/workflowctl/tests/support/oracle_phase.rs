@@ -551,9 +551,41 @@ fn summarize(
         && parent_start.is_some()
         && open_pairs == 0
         && pair_errors == 0;
+    // These authenticated markers describe supervision, never fixture success.
+    // A returned Output can still carry a nonzero exit. Missing or ambiguous
+    // parent evidence must not invent an outcome or qualify a child tail.
+    let parent_complete = parent_tail
+        && invalid == 0
+        && duplicate == 0
+        && received.overflow == 0
+        && !received.io_error
+        && rows
+            .iter()
+            .filter(|row| row[2] == u64::from(std::process::id()))
+            .enumerate()
+            .all(|(index, row)| row[3] == index as u64);
+    let marker = |stage| {
+        rows.iter()
+            .filter(|row| row[0] == 1 && row[1] == stage)
+            .map(|row| row[4])
+            .collect::<Vec<_>>()
+    };
+    let server_result = marker(74);
+    let child_result = marker(75);
+    let inner_outcome = if parent_complete {
+        match (server_result.as_slice(), child_result.as_slice()) {
+            ([1], [0 | 1]) => "server-error",
+            ([2], [0 | 1]) => "server-panicked",
+            ([] | [0], [1]) => "child-supervision-error",
+            ([] | [0], [0]) => "child-supervision-completed",
+            _ => "UNKNOWN",
+        }
+    } else {
+        "UNKNOWN"
+    };
     // SAFETY: read-only effective UID query has no pointer arguments.
     let uid = unsafe { libc::geteuid() };
-    json!({"version":1,"capture_qualified":qualified,"rows_qualified":rows_qualified,"open_pairs":open_pairs,"pair_errors":pair_errors,"rows":rows,"child_pid":child.map(|c|c.pid),"child_start":child.map(|c|c.starttime),"parent_pid":std::process::id(),"parent_start":parent_start,"uid":uid,"child_reaped":reaped,"server_joined":joined,"child_tail":if tail {"complete"} else {"UNKNOWN"},"invalid":invalid,"duplicate":duplicate,"missing_before_max":gaps,"overflow":received.overflow,"receive_error":received.io_error,"wire_cap_bytes":196608})
+    json!({"version":1,"inner_outcome":inner_outcome,"capture_qualified":qualified,"rows_qualified":rows_qualified,"open_pairs":open_pairs,"pair_errors":pair_errors,"rows":rows,"child_pid":child.map(|c|c.pid),"child_start":child.map(|c|c.starttime),"parent_pid":std::process::id(),"parent_start":parent_start,"uid":uid,"child_reaped":reaped,"server_joined":joined,"child_tail":if tail {"complete"} else {"UNKNOWN"},"invalid":invalid,"duplicate":duplicate,"missing_before_max":gaps,"overflow":received.overflow,"receive_error":received.io_error,"wire_cap_bytes":196608})
 }
 fn publish(path: &std::ffi::OsStr, value: &Value) {
     if let Some(file) = oracle_failure_file(path) {
