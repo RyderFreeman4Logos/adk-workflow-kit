@@ -15,6 +15,8 @@ use std::{
 mod aggregate;
 #[path = "issue_230_telemetry/kv.rs"]
 mod kv;
+#[path = "support/m1_15_command_owner.rs"]
+mod m1_15_command;
 #[path = "issue_230_telemetry/measured.rs"]
 mod measured;
 #[path = "issue_230_telemetry/semantic.rs"]
@@ -23,6 +25,19 @@ mod semantic;
 mod sentinel;
 #[path = "issue_230_telemetry/sentinel_finite.rs"]
 mod sentinel_finite;
+
+fn report_path() -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    PathBuf::from(std::env::var_os("TMPDIR").expect("explicit SSD TMPDIR")).join(format!(
+        "wire230-owner-{}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+}
 
 fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -319,7 +334,10 @@ fn wire_scenario(
 
 enum FixtureWindows {
     Shared(Duration),
+    // The first CLI uses listener readiness; the caller admits only the second.
     PerCli(Duration),
+    // The nested testbin explicitly admits both CLIs before spawning either one.
+    NestedCli(Duration),
 }
 
 fn wire_scenario_with_windows(
@@ -329,11 +347,17 @@ fn wire_scenario_with_windows(
     case: (&str, &str, Value, Value),
     replies: usize,
     windows: FixtureWindows,
-    run: impl FnOnce(&std::path::Path, &std::path::Path, &dyn Fn()) -> Output,
+    run: impl FnOnce(&std::path::Path, &std::path::Path, &(dyn Fn() + Sync)) -> Output,
 ) -> (PathBuf, Output, Result<Value, String>) {
-    let separate_cli_windows = matches!(&windows, FixtureWindows::PerCli(_));
+    let admit_first = matches!(&windows, FixtureWindows::NestedCli(_));
+    let separate_cli_windows = matches!(
+        &windows,
+        FixtureWindows::PerCli(_) | FixtureWindows::NestedCli(_)
+    );
     let budget = match windows {
-        FixtureWindows::Shared(budget) | FixtureWindows::PerCli(budget) => budget,
+        FixtureWindows::Shared(budget)
+        | FixtureWindows::PerCli(budget)
+        | FixtureWindows::NestedCli(budget) => budget,
     };
     assert!((1..=2).contains(&replies));
     assert!(!separate_cli_windows || (replies == 2 && !retry));
@@ -372,10 +396,11 @@ fn wire_scenario_with_windows(
         let mut salts = Vec::new();
         let mut requests = Vec::new();
         for attempt in 0..replies + usize::from(retry && !sentinel) {
-            if separate_cli_windows && attempt == 1 {
-                deadline = admitted_window
-                    .recv()
-                    .map_err(|_| "second fixture window was not admitted".to_owned())?;
+            if separate_cli_windows && (admit_first || attempt == 1) {
+                deadline = admitted_window.recv().map_err(|_| {
+                    let ordinal = if attempt == 0 { "first" } else { "second" };
+                    format!("{ordinal} fixture window was not admitted")
+                })?;
             }
             let mut socket = match accept_request(&listener, deadline) {
                 Ok(socket) => socket,
