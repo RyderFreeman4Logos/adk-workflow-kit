@@ -13,7 +13,8 @@ use workflow_runtime::{
     SENTINEL_NORMALIZATION_VERSION, SENTINEL_PREPARATION_BUDGET_MS,
     SENTINEL_REDUCTION_POLICY_VERSION, SENTINEL_SCRIPT_DATA_VERSION, SENTINEL_SEGMENTATION_VERSION,
     SegmentationLimits, SentinelPreparation, SentinelVerdict, SourceSpan,
-    TYPED_OUTPUT_SCHEMA_VERSION_V1, TrustDomain, prepare_untrusted_text,
+    TYPED_OUTPUT_SCHEMA_VERSION_V1, TrustDomain, prepare_retained_untrusted_text,
+    prepare_untrusted_text,
 };
 use workflow_spec::UntrustedTextPreparation;
 
@@ -175,8 +176,13 @@ impl PreparationWorkflow {
         })
         .map_err(|_| AdkGraphError::Failed)?;
         report["cache_key"] = json!(key.digest());
-        let prepared = prepare_untrusted_text(store, &raw, normalization, preparation_started)
-            .map_err(|_| AdkGraphError::Failed)?;
+        let prepared = match original.as_ref() {
+            Some(id) => {
+                prepare_retained_untrusted_text(&raw, id, normalization, preparation_started)
+            }
+            None => prepare_untrusted_text(store, &raw, normalization, preparation_started)
+                .map_err(|_| AdkGraphError::Failed)?,
+        };
         let text = match prepared {
             SentinelPreparation::Invalid { reason, .. } => {
                 return set_outcome(report, UntrustedTextState::InvalidInput, json!(reason));

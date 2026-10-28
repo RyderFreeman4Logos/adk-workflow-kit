@@ -17,7 +17,7 @@ use std::num::NonZeroU64;
 
 use workflow_runtime::{
     ArtifactStore, InMemoryArtifactStore, NormalizationLimits, NormalizationReason, PageRequest,
-    SentinelPreparation, prepare_untrusted_text,
+    SentinelPreparation, prepare_retained_untrusted_text, prepare_untrusted_text,
 };
 
 fn store() -> InMemoryArtifactStore {
@@ -25,6 +25,117 @@ fn store() -> InMemoryArtifactStore {
         NonZeroU64::new(1_000_000).unwrap(),
         NonZeroU64::new(1_000_000).unwrap(),
     )
+}
+
+fn preparation_value(result: SentinelPreparation) -> serde_json::Value {
+    match result {
+        SentinelPreparation::Prepared(text) => serde_json::json!({
+            "telemetry": text.telemetry(),
+            "envelope": text.envelope(),
+            "source_map": text.source_map(),
+            "annotations": text.annotations(),
+        }),
+        SentinelPreparation::Invalid {
+            reason,
+            original_id,
+        } => {
+            serde_json::json!({"reason":reason,"original_id":original_id})
+        }
+    }
+}
+
+#[test]
+fn retained_entry_preserves_storage_entry_admission_and_normalization() {
+    let limits = NormalizationLimits::default();
+    let started = std::time::Instant::now();
+    for (raw, limits, started) in [
+        (&b"A\xe2\x80\x8bB"[..], limits, started),
+        (&b"\xff"[..], limits, started),
+        (&b""[..], limits, started),
+        (
+            b"abc",
+            NormalizationLimits {
+                max_input_bytes: 1,
+                ..limits
+            },
+            started,
+        ),
+        (
+            b"abc",
+            NormalizationLimits {
+                max_input_bytes: 0,
+                ..limits
+            },
+            started,
+        ),
+        (
+            b"abc",
+            NormalizationLimits {
+                max_input_bytes: usize::MAX,
+                ..limits
+            },
+            started,
+        ),
+        (
+            b"abc",
+            NormalizationLimits {
+                max_output_bytes: usize::MAX,
+                ..limits
+            },
+            started,
+        ),
+        (
+            b"abc",
+            NormalizationLimits {
+                max_work_units: usize::MAX,
+                ..limits
+            },
+            started,
+        ),
+        (
+            b"abc",
+            NormalizationLimits {
+                max_output_bytes: 1,
+                ..limits
+            },
+            started,
+        ),
+        (
+            b"abc",
+            NormalizationLimits {
+                max_work_units: 1,
+                ..limits
+            },
+            started,
+        ),
+        (b"abc", limits, started - std::time::Duration::from_secs(2)),
+        (b"abc", limits, started + std::time::Duration::from_secs(60)),
+    ] {
+        let mut artifacts = store();
+        let id = artifacts
+            .put(if raw.is_empty() { b"placeholder" } else { raw })
+            .unwrap();
+        let retained = prepare_retained_untrusted_text(raw, &id, limits, started);
+        let stored = prepare_untrusted_text(&mut artifacts, raw, limits, started).unwrap();
+        assert_eq!(preparation_value(retained), preparation_value(stored));
+    }
+}
+
+#[test]
+fn retained_entry_denies_foreign_id_without_attaching_it_to_evidence() {
+    let id = store().put(b"foreign").unwrap();
+    assert!(matches!(
+        prepare_retained_untrusted_text(
+            b"abc",
+            &id,
+            NormalizationLimits::default(),
+            std::time::Instant::now(),
+        ),
+        SentinelPreparation::Invalid {
+            reason: NormalizationReason::InvalidPolicy,
+            original_id: None,
+        }
+    ));
 }
 
 #[test]
