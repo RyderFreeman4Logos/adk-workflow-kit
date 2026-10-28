@@ -15,6 +15,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[path = "dataset_sentinel/carriers.rs"]
+mod carriers;
+pub use carriers::derive_sentinel_carrier_suite;
+
 const MAX_ARTIFACT_BYTES: usize = 1_048_576;
 const REGISTRY: &str = include_str!("../../../config/datasets.toml");
 const ORIGINAL_REVIEW: &str = "source_documented_original_not_human_translation_review";
@@ -63,7 +67,7 @@ impl From<DatasetError> for SentinelDatasetError {
     }
 }
 
-/// Immutable v1 canonical source case. Only checked native decoders construct it.
+/// Immutable v1 canonical source case built by checked native decoders or fixed carrier derivation.
 /// JSON retains declared upstream lineage separately from actual manual DatasetReport identity.
 #[derive(Clone, Serialize)]
 pub struct SentinelDatasetCase {
@@ -810,6 +814,155 @@ fn case_header(index: usize) -> Result<Value, SentinelDatasetError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_carrier_encoders_preserve_text_and_exact_body_coordinates() {
+        assert_eq!(
+            carriers::encode_html("&<>\"'").expect("escape control").0,
+            "<pre>&amp;&lt;&gt;&quot;&#39;</pre>"
+        );
+        assert_eq!(
+            carriers::encode_markdown("````é\r\n")
+                .expect("fence control")
+                .0,
+            "`````\n````é\r\n\n`````"
+        );
+        for raw in ["", "&<>\"'", "é\r\n雪\n", "`a``b````end\n", "&amp;"] {
+            let escaped = raw
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+                .replace('\'', "&#39;");
+            let (html, body) = carriers::encode_html(raw).expect("bounded HTML");
+            assert_eq!(html, format!("<pre>{escaped}</pre>"));
+            assert_eq!(body, 5..html.len() - 6);
+            assert_eq!(&html[body], escaped);
+            let longest = raw.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
+            let fence = "`".repeat(3.max(longest + 1));
+            let (markdown, body) = carriers::encode_markdown(raw).expect("bounded Markdown");
+            assert_eq!(markdown, format!("{fence}\n{raw}\n{fence}"));
+            assert_eq!(body, fence.len() + 1..fence.len() + 1 + raw.len());
+            assert_eq!(&markdown[body], raw);
+        }
+    }
+
+    #[test]
+    fn fixed_carrier_encoders_check_expanded_limits_before_allocation() {
+        let limit = crate::NormalizationLimits::default().max_input_bytes;
+        for (input, output) in [(65_524, 65_535), (65_525, 65_536)] {
+            let (text, body) = carriers::encode_html(&"x".repeat(input)).expect("under/exact HTML");
+            assert_eq!(text.len(), output);
+            assert_eq!(body, 5..output - 6);
+        }
+        assert_eq!(
+            carriers::encode_html(&"x".repeat(65_526)),
+            Err(SentinelDatasetError::Limit)
+        );
+        assert_eq!(
+            carriers::encode_html(&"&".repeat(limit / 5)),
+            Err(SentinelDatasetError::Limit)
+        );
+        assert_eq!(
+            carriers::encode_html(&"x".repeat(limit + 1)),
+            Err(SentinelDatasetError::Limit)
+        );
+        for length in [limit - 9, limit - 8] {
+            assert_eq!(
+                carriers::encode_markdown(&"x".repeat(length))
+                    .expect("under/exact Markdown")
+                    .0
+                    .len(),
+                length + 8
+            );
+        }
+        assert_eq!(
+            carriers::encode_markdown(&"x".repeat(limit - 7)),
+            Err(SentinelDatasetError::Limit)
+        );
+        assert_eq!(
+            carriers::encode_markdown(&"`".repeat(limit)),
+            Err(SentinelDatasetError::Limit)
+        );
+        assert_eq!(
+            carriers::encode_markdown(&"x".repeat(limit + 1)),
+            Err(SentinelDatasetError::Limit)
+        );
+    }
+
+    #[test]
+    fn fixed_carrier_producer_rejects_invalid_original_structure_and_recursive_input() {
+        let originals: Vec<_> = (0..4).map(golden_case).collect();
+        for length in [0, 1, 3] {
+            assert!(derive_sentinel_carrier_suite(&originals[..length]).is_err());
+        }
+        let mut extra = originals.clone();
+        extra.push(originals[0].clone());
+        assert!(derive_sentinel_carrier_suite(&extra).is_err());
+        let mut duplicate = originals.clone();
+        duplicate[1] = originals[0].clone();
+        assert!(derive_sentinel_carrier_suite(&duplicate).is_err());
+        let mut reordered = originals.clone();
+        reordered.swap(0, 1);
+        assert!(derive_sentinel_carrier_suite(&reordered).is_err());
+        let mut wrong_id = originals.clone();
+        wrong_id[0].case_id = "wrong-prefix".into();
+        assert!(derive_sentinel_carrier_suite(&wrong_id).is_err());
+        for key in [
+            "source",
+            "parent_case_id",
+            "family_group_id",
+            "upstream_revision_declared",
+            "transformation",
+            "language",
+            "review",
+            "split",
+        ] {
+            let mut wrong = originals.clone();
+            wrong[0].fields.insert(key.into(), json!("wrong"));
+            assert!(
+                derive_sentinel_carrier_suite(&wrong).is_err(),
+                "reject {key}"
+            );
+            wrong[0].fields.remove(key);
+            assert!(
+                derive_sentinel_carrier_suite(&wrong).is_err(),
+                "reject absent {key}"
+            );
+        }
+        let mut wrong_label = originals.clone();
+        wrong_label[0].label = SentinelDatasetLabel::BenignHardNegative;
+        assert!(derive_sentinel_carrier_suite(&wrong_label).is_err());
+        let suite = derive_sentinel_carrier_suite(&originals).expect("opaque fixture originals");
+        assert!(derive_sentinel_carrier_suite(&suite).is_err());
+        let mut recursive = originals.clone();
+        recursive[0] = suite[1].clone();
+        assert!(derive_sentinel_carrier_suite(&recursive).is_err());
+        let mut invalid_text = originals.clone();
+        invalid_text[0]
+            .fields
+            .insert("untrusted_text".into(), Value::Null);
+        assert_eq!(
+            derive_sentinel_carrier_suite(&invalid_text).expect_err("text required"),
+            SentinelDatasetError::Schema
+        );
+        invalid_text[0]
+            .fields
+            .insert("untrusted_text".into(), json!("x".repeat(65_526)));
+        assert_eq!(
+            derive_sentinel_carrier_suite(&invalid_text).expect_err("expanded cap"),
+            SentinelDatasetError::Limit
+        );
+        assert_eq!(
+            originals[0].canonical_json().expect("immutable input"),
+            golden_case(0).canonical_json().expect("golden")
+        );
+        let mut hidden_derivation = originals.clone();
+        hidden_derivation[0]
+            .fields
+            .insert("derivation".into(), Value::Null);
+        assert!(derive_sentinel_carrier_suite(&hidden_derivation).is_err());
+    }
 
     fn fixture() -> Value {
         serde_json::from_str(include_str!("../tests/fixtures/issue_236/goldens.json"))

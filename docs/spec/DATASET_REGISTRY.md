@@ -157,3 +157,33 @@ and other transformations, stratified human translation review, cross-source and
 adaptive-holdout isolation, and live semantic acceptance remain separate work.
 An agent is not a human reviewer, and the evaluated model cannot be the sole
 labeler of its final holdout.
+
+### Opt-in fixed regression carriers
+
+`derive_sentinel_carrier_suite(&originals)` accepts the four opaque admitted originals in
+AgentDojo, InjecAgent, BIPIA, NotInject order. It returns each unchanged original followed
+by HtmlPreV1 and MarkdownFenceV1: twelve cases, eight descendants. The importer and its
+default four canonical originals are unchanged. The producer checks the fixed original
+recipe and existing split predicates; it does not reauthenticate arbitrary source bodies.
+Only these four regression seeds are derived; broader source-lineage admission remains future work.
+
+HTML uses `<pre>` with one-pass escaping of `&`, `<`, `>`, double quote and apostrophe,
+then `</pre>`. Markdown uses a backtick fence one longer than the longest body run, at
+least three, with one LF before and after the unchanged UTF-8 body. Both precheck expanded
+lengths against the existing default 65,536 input-byte cap and fail with `Limit` without
+truncation or partial results. Existing 1 MiB artifact admission limits still apply.
+
+Derivation v1 binds the original case ID/canonical digest, raw text digest/full byte interval,
+derived text digest and encoded body interval. Coordinates refer to canonical parent UTF-8,
+not upstream JSON/Python offsets. Markdown has an exact body-offset translation; HTML
+records only whole-parent cover because escaping changes internal byte offsets.
+Source components, complete notices, native fields, parent/family/tool/revision and `en`
+are retained. Descendants are `unreviewed` with inherited parent intent bound to its
+canonical digest; publisher intent on originals and Manual import provenance do not confer
+publisher, human, translation or semantic review on descendants. Existing split checks keep
+parents and siblings in regression together. These exposed seeds are not a sealed final holdout.
+
+The existing `issue-236-offline` invocation above now verifies all twelve cases through
+default untrusted-input preparation and compares full canonical bytes on two cache-only
+reruns. Its finite receipt separates original publisher intent, unreviewed descendants and
+Manual provenance. No live model evaluation or broader #236 completion follows from it.

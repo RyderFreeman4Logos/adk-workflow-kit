@@ -80,8 +80,8 @@ pub use dataset::{
 };
 pub use dataset::{DatasetCase, ParquetCaseError, decode_parquet_cases};
 pub use dataset::{
-    SentinelDatasetCase, SentinelDatasetError, SentinelDatasetLabel, prepare_sentinel_goldens,
-    validate_sentinel_splits,
+    SentinelDatasetCase, SentinelDatasetError, SentinelDatasetLabel, derive_sentinel_carrier_suite,
+    prepare_sentinel_goldens, validate_sentinel_splits,
 };
 pub use effect_journal::{
     EffectCommit, EffectJournal, EffectJournalError, EffectJournalErrorKind, EffectKey,

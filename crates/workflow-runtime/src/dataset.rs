@@ -188,8 +188,8 @@ mod dataset_parquet;
 #[path = "dataset_sentinel.rs"]
 mod dataset_sentinel;
 pub use dataset_sentinel::{
-    SentinelDatasetCase, SentinelDatasetError, SentinelDatasetLabel, prepare_sentinel_goldens,
-    validate_sentinel_splits,
+    SentinelDatasetCase, SentinelDatasetError, SentinelDatasetLabel, derive_sentinel_carrier_suite,
+    prepare_sentinel_goldens, validate_sentinel_splits,
 };
 
 #[cfg(test)]
