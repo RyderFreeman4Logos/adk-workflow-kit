@@ -348,6 +348,8 @@ struct ScriptedServer {
     bodies: Arc<std::sync::Mutex<Vec<String>>>,
     stall_admission: Option<std::sync::mpsc::Sender<Instant>>,
     stall_acceptance: Arc<OnceLock<Result<Instant, &'static str>>>,
+    stall_publication: std::sync::mpsc::Receiver<()>,
+    stall_asserting: Option<std::sync::mpsc::Sender<()>>,
     handle: Option<thread::JoinHandle<()>>,
     stop_deadline: Option<Instant>,
     _run_guard: MutexGuard<'static, ()>,
@@ -363,17 +365,21 @@ impl ScriptedServer {
     }
 
     fn assert_stall_accepted(&self, admitted_at: Instant) {
-        let accepted = self
-            .stall_acceptance
-            .get()
-            .expect("stall worker reported admission")
-            .expect("stall worker accepted the provider");
-        assert!(
-            accepted
-                .checked_duration_since(admitted_at)
-                .expect("accept followed admission")
-                < Duration::from_secs(2),
-            "stall accept retained its two-second admission budget"
+        if self.stall_acceptance.get().is_none() {
+            if let Some(asserting) = &self.stall_asserting {
+                let _ = asserting.send(());
+            }
+            let deadline = admitted_at + Duration::from_secs(2);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let _ = self.stall_publication.recv_timeout(remaining);
+        }
+        // The result is authoritative even if notification timed out or disconnected.
+        server_owner::assert_accepted_result(
+            *self
+                .stall_acceptance
+                .get()
+                .expect("stall worker reported admission"),
+            admitted_at,
         );
     }
 
@@ -437,7 +443,7 @@ fn accept_stall(
     listener: &TcpListener,
     done: &AtomicBool,
     admission: std::sync::mpsc::Receiver<Instant>,
-) -> Result<(std::net::TcpStream, Instant), &'static str> {
+) -> Result<(std::net::TcpStream, Instant, Instant), &'static str> {
     let deadline = loop {
         if done.load(Ordering::Acquire) {
             return Err("stopped");
@@ -462,7 +468,7 @@ fn accept_stall(
                     return Err("stopped");
                 }
                 return if accepted < deadline {
-                    Ok((socket, accepted))
+                    Ok((socket, accepted, deadline))
                 } else {
                     Err("accept_deadline")
                 };
@@ -585,16 +591,16 @@ impl Drop for ScriptedServer {
 }
 
 fn serve_script(responses: Vec<String>, stall: bool) -> ScriptedServer {
-    serve_provider(responses, stall, 0, false, false, Duration::ZERO)
+    serve_provider(responses, stall, 0, false, false, Duration::ZERO, None)
 }
 
 fn serve_retrying(responses: Vec<String>) -> ScriptedServer {
-    serve_provider(responses, false, 1, false, false, Duration::ZERO)
+    serve_provider(responses, false, 1, false, false, Duration::ZERO, None)
 }
 
 fn serve_interrupted_script(mut responses: Vec<String>) -> ScriptedServer {
     responses.insert(0, finished("interrupted"));
-    serve_provider(responses, false, 0, true, false, Duration::ZERO)
+    serve_provider(responses, false, 0, true, false, Duration::ZERO, None)
 }
 
 fn serve_partial_body_stall(rate_limits: usize, rate_limit_delay: Duration) -> ScriptedServer {
@@ -605,6 +611,7 @@ fn serve_partial_body_stall(rate_limits: usize, rate_limit_delay: Duration) -> S
         false,
         true,
         rate_limit_delay,
+        None,
     )
 }
 
@@ -615,6 +622,27 @@ fn serve_provider(
     hold_first_response: bool,
     stall_body: bool,
     rate_limit_delay: Duration,
+    acceptance_pause: Option<server_owner::AcceptancePause>,
+) -> ScriptedServer {
+    serve_provider_inner(
+        responses,
+        stall,
+        rate_limits,
+        hold_first_response,
+        stall_body,
+        rate_limit_delay,
+        acceptance_pause.map(|pause| (pause, server_owner::PausePosition::BeforeResult)),
+    )
+}
+
+fn serve_provider_inner(
+    responses: Vec<String>,
+    stall: bool,
+    rate_limits: usize,
+    hold_first_response: bool,
+    stall_body: bool,
+    rate_limit_delay: Duration,
+    acceptance_pause: Option<(server_owner::AcceptancePause, server_owner::PausePosition)>,
 ) -> ScriptedServer {
     let run_guard = live_run();
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
@@ -632,7 +660,11 @@ fn serve_provider(
         (None, None)
     };
     let stall_acceptance = Arc::new(OnceLock::new());
+    let (publish_stall, stall_publication) = std::sync::mpsc::channel();
     let accepted_stall = Arc::clone(&stall_acceptance);
+    let stall_asserting = acceptance_pause
+        .as_ref()
+        .map(|(pause, _)| pause.asserting.clone());
     let first_response_released = Arc::new(AtomicBool::new(!hold_first_response));
     let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
     let request_count = Arc::clone(&requests);
@@ -671,12 +703,29 @@ fn serve_provider(
         };
         if let Some(admission) = admission {
             let result = accept_stall(&listener, &finished, admission);
-            if result.is_ok() {
+            if let Ok((_, accepted, deadline)) = &result {
                 request_count.fetch_add(1, Ordering::Relaxed);
+                if let Some((pause, server_owner::PausePosition::BeforeResult)) = &acceptance_pause
+                {
+                    // Test scheduling settles within cleanup; physical acceptance is unchanged.
+                    pause.wait(*accepted, *deadline + Duration::from_secs(1), &finished);
+                }
             }
-            let _ =
-                accepted_stall.set(result.as_ref().map(|(_, at)| *at).map_err(|reason| *reason));
-            let Ok((socket, _)) = result else {
+            let _ = accepted_stall.set(
+                result
+                    .as_ref()
+                    .map(|(_, at, _)| *at)
+                    .map_err(|reason| *reason),
+            );
+            if let (
+                Ok((_, accepted, deadline)),
+                Some((pause, server_owner::PausePosition::BeforeNotification)),
+            ) = (&result, &acceptance_pause)
+            {
+                pause.wait(*accepted, *deadline + Duration::from_secs(1), &finished);
+            }
+            let _ = publish_stall.send(());
+            let Ok((socket, _, _)) = result else {
                 return;
             };
             if !server_io::delay(Duration::from_secs(2), &finished) {
@@ -797,6 +846,8 @@ fn serve_provider(
         bodies,
         stall_admission,
         stall_acceptance,
+        stall_publication,
+        stall_asserting,
         handle: Some(handle),
         stop_deadline: None,
         _run_guard: run_guard,
