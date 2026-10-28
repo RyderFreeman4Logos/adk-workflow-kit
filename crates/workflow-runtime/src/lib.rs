@@ -73,6 +73,9 @@ pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
 };
 pub use dataset::{
+    AgentDojoDatasetError, AgentDojoEpisode, AgentDojoProjectionError, prepare_agentdojo_episodes,
+};
+pub use dataset::{
     ByteSource, DatasetDistribution, DatasetEntry, DatasetError, DatasetErrorKind, DatasetManifest,
     DatasetProvenance, DatasetReport, DatasetSourceIdentity, EvalSuite, HttpByteSource,
     LocalFileSource, PrepareRequest, PreparedDataset, prepare_dataset,

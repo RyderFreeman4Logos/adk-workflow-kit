@@ -177,6 +177,8 @@ pub use dataset_identity::{
 use dataset_identity::{expected_identity, is_pinned_entry, is_sha256, valid_source_identity};
 pub use dataset_parquet::{DatasetCase, ParquetCaseError, decode_parquet_cases};
 
+#[path = "dataset_agentdojo.rs"]
+mod dataset_agentdojo;
 #[path = "dataset_cache_security.rs"]
 mod dataset_cache_security;
 #[path = "dataset_http.rs"]
@@ -185,6 +187,9 @@ mod dataset_http;
 mod dataset_identity;
 #[path = "dataset_parquet.rs"]
 mod dataset_parquet;
+pub use dataset_agentdojo::{
+    AgentDojoDatasetError, AgentDojoEpisode, AgentDojoProjectionError, prepare_agentdojo_episodes,
+};
 #[path = "dataset_sentinel.rs"]
 mod dataset_sentinel;
 pub use dataset_sentinel::{
