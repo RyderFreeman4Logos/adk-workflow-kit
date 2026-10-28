@@ -3,12 +3,18 @@
 //! The in-process scripted reducer is not an OS sandbox or model evaluator.
 //! Its only executor is a sealed data-only catalog, with no real handlers or IO.
 //! The worker module adds fixed-executable containment, never a live model binding.
+mod counterfactual;
 mod model_authority;
 #[path = "trajectory.rs"]
 pub mod trajectory;
 pub mod worker;
+pub use counterfactual::{
+    COUNTERFACTUAL_POLICY, CounterfactualClass, CounterfactualDerivation, CounterfactualOperator,
+    CounterfactualSource, CounterfactualSources, compare_counterfactual,
+};
 pub use model_authority::{
-    TrustedModelProbe, TrustedTrajectoryMonitor, TrustedTrajectoryObserverGrant,
+    TrustedCounterfactualReplay, TrustedModelProbe, TrustedTrajectoryMonitor,
+    TrustedTrajectoryObserverGrant,
 };
 
 use crate::{

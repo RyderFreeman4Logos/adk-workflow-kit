@@ -33,6 +33,109 @@ const LANGUAGES: [(&str, &str, &str, &str); 4] = [
     ),
 ];
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FiniteFailure {
+    schema_version: u8,
+    expected_state: workflow_adk::UntrustedTextState,
+    observed_state: workflow_adk::UntrustedTextState,
+    expected_reason: workflow_adk::PreparationReason,
+    observed_reason: workflow_adk::PreparationReason,
+    state_mismatch: bool,
+    reason_mismatch: bool,
+    original_mismatch: bool,
+}
+
+// Decode only the finite public contract; arbitrary CLI stderr remains hash-only.
+fn finite_failure(stderr: &[u8]) -> Option<FiniteFailure> {
+    if stderr.len() > 512 {
+        return None;
+    }
+    let bytes = stderr
+        .strip_prefix(b"Sentinel finite preparation contract failed: ")?
+        .strip_suffix(b"\n")?;
+    let shape: Value = serde_json::from_slice(bytes).ok()?;
+    if !shape.is_object()
+        || [
+            "expected_state",
+            "observed_state",
+            "expected_reason",
+            "observed_reason",
+        ]
+        .iter()
+        .any(|field| !shape.get(*field).is_some_and(Value::is_string))
+    {
+        return None;
+    }
+    // Decode the original bytes so duplicate fields still fail closed.
+    let failure: FiniteFailure = serde_json::from_slice(bytes).ok()?;
+    (failure.schema_version == 1
+        && failure.expected_state == workflow_adk::UntrustedTextState::PendingClassification
+        && failure.expected_reason == workflow_adk::PreparationReason::PendingClassification
+        && failure.state_mismatch == (failure.expected_state != failure.observed_state)
+        && failure.reason_mismatch == (failure.expected_reason != failure.observed_reason)
+        && (failure.state_mismatch || failure.reason_mismatch || failure.original_mismatch))
+        .then_some(failure)
+}
+
+#[test]
+fn finite_failure_projection_rejects_unclosed_or_private_values() {
+    let valid = json!({"schema_version":1,
+        "expected_state":"pending_classification","observed_state":"invalid_input",
+        "expected_reason":"pending_classification","observed_reason":"deadline_exceeded",
+        "state_mismatch":true,"reason_mismatch":true,"original_mismatch":false});
+    let stderr = |value: &Value| {
+        format!("Sentinel finite preparation contract failed: {value}\n").into_bytes()
+    };
+    let projection = finite_failure(&stderr(&valid)).unwrap();
+    assert_eq!(
+        projection.observed_state,
+        workflow_adk::UntrustedTextState::InvalidInput
+    );
+    assert_eq!(
+        projection.observed_reason,
+        workflow_adk::PreparationReason::DeadlineExceeded
+    );
+    let positional = json!([
+        1,
+        "pending_classification",
+        "invalid_input",
+        "pending_classification",
+        "deadline_exceeded",
+        true,
+        true,
+        false
+    ]);
+    assert!(finite_failure(&stderr(&positional)).is_none());
+    for (field, value) in [
+        ("expected_state", json!({"pending_classification":null})),
+        ("observed_state", json!({"invalid_input":null})),
+        ("expected_reason", json!({"pending_classification":null})),
+        ("observed_reason", json!({"deadline_exceeded":null})),
+        ("observed_state", json!("PRIVATE_STATE_NEVER_REPORT")),
+        ("observed_reason", json!("PRIVATE_REASON_NEVER_REPORT")),
+        ("raw", json!("PRIVATE_PAYLOAD_NEVER_REPORT")),
+        ("schema_version", json!(2)),
+        ("state_mismatch", json!(false)),
+        ("reason_mismatch", json!("PRIVATE_REASON_NEVER_REPORT")),
+    ] {
+        let mut changed = valid.clone();
+        changed[field] = value;
+        assert!(finite_failure(&stderr(&changed)).is_none(), "{field}");
+    }
+    let duplicate = String::from_utf8(stderr(&valid)).unwrap().replace(
+        "\"schema_version\":1",
+        "\"schema_version\":1,\"schema_version\":1",
+    );
+    assert!(finite_failure(duplicate.as_bytes()).is_none());
+    for bytes in [b"PRIVATE_STDERR_NEVER_REPORT\xff".to_vec(), vec![b'x'; 513]] {
+        assert!(finite_failure(&bytes).is_none());
+    }
+    let mut trailing = stderr(&valid);
+    trailing.extend_from_slice(b"PRIVATE_TRAILING_NEVER_REPORT");
+    assert!(finite_failure(&trailing).is_none());
+}
+
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -212,6 +315,16 @@ fn sentinel_language_http_contract() {
                     output.to_str().unwrap(),
                 ])
             },
+        );
+        assert!(
+            output.status.success(),
+            "case={name}; finite_preparation={:?}; CLI failed: status={}; stdout_bytes={}; stdout_sha256={}; stderr_bytes={}; stderr_sha256={}",
+            finite_failure(&output.stderr),
+            output.status,
+            output.stdout.len(),
+            digest(&output.stdout),
+            output.stderr.len(),
+            digest(&output.stderr),
         );
         let report = success(output);
         assert!(

@@ -248,17 +248,43 @@ fn read_fixture_capture(output: &Output, sink: &Path, kind: &'static str) -> Val
             }
         }
     }
-    let rows = value["rows"].as_array();
+    let rows = value.get("rows").and_then(Value::as_array);
+    // A parsed sink is not permission to print arbitrary strings or JSON.
+    // Keep the existing closed outcome and numeric protocol content-free even
+    // if a malformed capture reaches this failed-status boundary.
+    let inner_outcome = match value.get("inner_outcome").and_then(Value::as_str) {
+        Some("server-error") => "server-error",
+        Some("server-panicked") => "server-panicked",
+        Some("child-supervision-error") => "child-supervision-error",
+        Some("child-supervision-completed") => "child-supervision-completed",
+        _ => "UNKNOWN",
+    };
+    let child_tail = match value.get("child_tail").and_then(Value::as_str) {
+        Some("complete") => "complete",
+        _ => "UNKNOWN",
+    };
+    let numeric_row = |row: &Value| -> Option<[u64; 6]> {
+        let fields = row.as_array()?;
+        let mut numeric = [0; 6];
+        if fields.len() != numeric.len() {
+            return None;
+        }
+        for (number, field) in numeric.iter_mut().zip(fields) {
+            *number = field.as_u64()?;
+        }
+        Some(numeric)
+    };
     assert!(
         output.status.success(),
-        "owned {kind} fixture failed; exit={:?} rows={} invalid={} duplicate={} tail={} first={:?} last={:?}",
+        "owned {kind} fixture failed; exit={:?} inner_outcome={inner_outcome} child_reaped={:?} server_joined={:?} rows={} invalid={:?} duplicate={:?} tail={child_tail} first={:?} last={:?}",
         output.status.code(),
+        value.get("child_reaped").and_then(Value::as_bool),
+        value.get("server_joined").and_then(Value::as_bool),
         rows.map_or(0, Vec::len),
-        value["invalid"],
-        value["duplicate"],
-        value["child_tail"],
-        rows.and_then(|r| r.first()),
-        rows.and_then(|r| r.last())
+        value.get("invalid").and_then(Value::as_u64),
+        value.get("duplicate").and_then(Value::as_u64),
+        rows.and_then(|r| r.first()).and_then(numeric_row),
+        rows.and_then(|r| r.last()).and_then(numeric_row)
     );
     value
 }

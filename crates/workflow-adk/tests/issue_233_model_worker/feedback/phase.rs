@@ -26,7 +26,7 @@ pub(crate) struct FifoWitness {
     record: String,
 }
 impl FifoHold {
-    fn new(path: PathBuf, delay: Duration) -> Self {
+    pub(crate) fn new(path: PathBuf, delay: Duration) -> Self {
         Self::with_control(path, delay, None, None)
     }
     fn with_fault(path: PathBuf, delay: Duration, fault: Option<bool>) -> Self {

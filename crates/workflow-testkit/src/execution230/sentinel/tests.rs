@@ -514,3 +514,100 @@ fn finite_validator_rejects_generation_language_and_protected_reference_forgery(
     case.events_digest = original_digest;
     assert!(validate(&case, case.receipt.as_ref().unwrap(), &database).is_ok());
 }
+
+#[test]
+fn finite_refusal_preserves_closed_state_and_reason() {
+    let raw = "Please review the attached report and send your comments before tomorrow morning.";
+    let (_root, mut case) = run(json!({"schema_version":1,"bytes":raw.as_bytes()}));
+    let root = case.receipt.as_ref().unwrap().run_root().to_path_buf();
+    let database = root.join("checkpoint.sqlite");
+    assert!(validate(&case, case.receipt.as_ref().unwrap(), &database).is_ok());
+    let manifest: Value = journal::read(&root.join("run-manifest.json")).unwrap();
+    let compatibility =
+        serde_json::from_value::<CheckpointManifestV1>(manifest["checkpoint_manifest"].clone())
+            .unwrap();
+    let id = RunId::new(case.admitted_run_id.clone().unwrap()).unwrap();
+    let mut store = SqliteCheckpointStore::open(&database, compatibility).unwrap();
+    let checkpoint = store.load_latest(&id).unwrap().unwrap();
+    let mut state: Value = serde_json::from_slice(checkpoint.state()).unwrap();
+    let original = state["terminal"]["original_artifact_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let decision = TypedOutput::new(
+        TypedPayload::Sentinel(SentinelEvidence::new(
+            SentinelVerdict::InvalidInput,
+            Vec::new(),
+            vec![
+                workflow_runtime::ArtifactRef::new(&original, format!("sha256:{original}"))
+                    .unwrap(),
+            ],
+        )),
+        Completeness::Complete,
+    )
+    .unwrap();
+    let denial = json!({"schema_version":1,"state":"invalid_input",
+        "reason":"deadline_exceeded","original_artifact_id":original,
+        "decision":serde_json::from_str::<Value>(&decision.to_json().unwrap()).unwrap()});
+    workflow_adk::UntrustedTextReport::parse(&serde_json::to_vec(&denial).unwrap()).unwrap();
+    state["terminal"] = denial.clone();
+    state["node:prepare"] = denial;
+    store
+        .save_checkpoint(
+            DurableCheckpointV1::new(
+                id,
+                checkpoint.node_id(),
+                checkpoint.event_sequence(),
+                serde_json::to_vec(&state).unwrap(),
+                checkpoint.artifact_refs().to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let event_path = root.join("events.jsonl");
+    let original_events = fs::read(&event_path).unwrap();
+    let original_digest = case.events_digest.clone();
+    let mut rows: Vec<Value> = std::str::from_utf8(&original_events)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let completed = rows
+        .iter_mut()
+        .find(|event| event["kind"] == "node_completed")
+        .unwrap();
+    let preparation = completed["payload"]["structured_output"]["preparation"]
+        .as_object_mut()
+        .unwrap();
+    preparation.insert("state".to_owned(), json!("invalid_input"));
+    preparation.insert("reason".to_owned(), json!("deadline_exceeded"));
+    preparation.remove("probes");
+    preparation.remove("semantics");
+    completed["integrity"]["payload_sha256"] =
+        json!(digest(&serde_json::to_vec(&completed["payload"]).unwrap()));
+    let changed = rows
+        .iter()
+        .map(|row| serde_json::to_string(row).unwrap() + "\n")
+        .collect::<String>();
+    fs::write(&event_path, &changed).unwrap();
+    case.events_digest = Some(digest(changed.as_bytes()));
+    let refusal = validate(&case, case.receipt.as_ref().unwrap(), &database)
+        .err()
+        .expect("the exact finite input must reject the closed denial");
+    assert_eq!(
+        refusal,
+        format!(
+            "Sentinel finite preparation contract failed: {}",
+            json!({"schema_version":1,
+                "expected_state":"pending_classification","observed_state":"invalid_input",
+                "expected_reason":"pending_classification","observed_reason":"deadline_exceeded",
+                "state_mismatch":true,"reason_mismatch":true,"original_mismatch":false})
+        )
+    );
+    assert!(!refusal.contains(raw));
+    assert!(!refusal.contains(&original));
+    store.save_checkpoint(checkpoint).unwrap();
+    fs::write(event_path, original_events).unwrap();
+    case.events_digest = original_digest;
+    assert!(validate(&case, case.receipt.as_ref().unwrap(), &database).is_ok());
+}

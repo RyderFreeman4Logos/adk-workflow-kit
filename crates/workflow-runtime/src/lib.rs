@@ -163,7 +163,7 @@ pub use sentinel_envelope::{
     CanonicalUntrustedText, CarrierAnnotation, CarrierKind, NormalizationLimits,
     NormalizationReason, NormalizedSourceSpan, SENTINEL_ENVELOPE_SCHEMA_VERSION,
     SENTINEL_NORMALIZATION_VERSION, SENTINEL_PREPARATION_BUDGET_MS, SentinelPreparation,
-    prepare_untrusted_text,
+    prepare_retained_untrusted_text, prepare_untrusted_text,
 };
 pub use sentinel_language::{
     LanguageAssessment, LanguageAttribution, LanguagePolicy, SENTINEL_LANGUAGE_MODEL_ID,

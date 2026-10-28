@@ -1,6 +1,36 @@
 use super::*;
 
 #[test]
+fn failed_real_fixture_reports_finite_outcome_without_external_sink() {
+    let root = temp_root("phase-default-diagnostic");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "oracle_phase_tests::custody_tests::capture_assertion_fixture",
+            "--nocapture",
+        ])
+        .env(PHASE_TEST, "default-normal-control")
+        .env_remove(ORACLE_FAILURE_BOUNDARY_OPERATION_ENV)
+        .env_remove(ORACLE_FAILURE_BOUNDARY_SINK_ENV);
+    let budget = 2 * (2 * ORACLE_TIMEOUT + ORACLE_D_STATE_TIMEOUT + ORACLE_CLEANUP_TIMEOUT);
+    let output = abort_fixture_output(&mut command, &root, budget).unwrap();
+    assert_eq!(output.status.code(), Some(101));
+    let missing_outcome = [&output.stdout, &output.stderr].iter().any(|bytes| {
+        bytes
+            .windows(b"default diagnostic omitted finite inner outcome".len())
+            .any(|part| part == b"default diagnostic omitted finite inner outcome")
+    });
+    assert!(
+        output
+            .stdout
+            .windows(b"default_diagnostic_verified=true".len())
+            .any(|part| part == b"default_diagnostic_verified=true"),
+        "default diagnostic control failed; missing_inner_outcome={missing_outcome}"
+    );
+}
+
+#[test]
 fn failed_real_fixture_retains_exact_capture_after_owned_cleanup() {
     let retained = temp_root("phase-custody-retained");
     for kind in ["normal-control", "forced-control"] {
@@ -123,6 +153,7 @@ fn capture_assertion_fixture() {
         Some(value) if value == std::ffi::OsStr::new("normal-control") => "normal-control",
         Some(value) if value == std::ffi::OsStr::new("forced-control") => "forced-control",
         Some(value) if value == std::ffi::OsStr::new("reject-normal-control") => "normal-control",
+        Some(value) if value == std::ffi::OsStr::new("default-normal-control") => "normal-control",
         _ => return,
     };
     let root = temp_root("phase-custody-original");
@@ -153,6 +184,73 @@ fn capture_assertion_fixture() {
     root.cleanup().unwrap();
     drop(root);
     assert!(!root_path.exists(), "original capture must be cleaned up");
+    if std::env::var_os(PHASE_TEST).as_deref()
+        == Some(std::ffi::OsStr::new("default-normal-control"))
+    {
+        let message = failed_assertion
+            .downcast_ref::<String>()
+            .expect("formatted fixture failure");
+        assert!(
+            message.contains("inner_outcome=child-supervision-completed"),
+            "default diagnostic omitted finite inner outcome"
+        );
+        assert!(message.contains("exit=Some(101)"));
+        assert!(message.contains("child_reaped=Some(true)"));
+        assert!(message.contains("server_joined=Some(false)"));
+        // The same real failed Output exercises projection only: no synthetic
+        // exit status or arbitrary child output is substituted for the witness.
+        let retained = temp_root("phase-default-projection");
+        let sink = retained.join("capture");
+        let mut value: Value = serde_json::from_slice(&expected).unwrap();
+        for outcome in [
+            "server-error",
+            "server-panicked",
+            "child-supervision-error",
+            "child-supervision-completed",
+            "UNKNOWN",
+        ] {
+            value["inner_outcome"] = json!(outcome);
+            fs::write(&sink, serde_json::to_vec(&value).unwrap()).unwrap();
+            let failure = std::panic::catch_unwind(|| read_fixture_capture(&output, &sink, kind))
+                .expect_err("real failed fixture must remain failed");
+            let message = failure.downcast_ref::<String>().unwrap();
+            assert!(message.contains(&format!("inner_outcome={outcome}")));
+            assert!(message.contains("exit=Some(101)"));
+        }
+        let canary = "private-default-diagnostic-canary";
+        for outcome in [
+            json!(canary),
+            json!({"private":canary}),
+            json!([canary]),
+            json!(17),
+            Value::Null,
+        ] {
+            value["inner_outcome"] = outcome;
+            value["invalid"] = json!(canary);
+            value["duplicate"] = json!({"private":canary});
+            value["child_tail"] = json!(canary);
+            value["child_reaped"] = json!(canary);
+            value["server_joined"] = json!({"private":canary});
+            value["rows"] = json!([[canary], {"private":canary}]);
+            fs::write(&sink, serde_json::to_vec(&value).unwrap()).unwrap();
+            let failure = std::panic::catch_unwind(|| read_fixture_capture(&output, &sink, kind))
+                .expect_err("real failed fixture must remain failed");
+            let message = failure.downcast_ref::<String>().unwrap();
+            assert!(message.contains("inner_outcome=UNKNOWN"));
+            assert!(!message.contains(canary), "capture payload leaked");
+        }
+        fs::write(&sink, b"{}").unwrap();
+        let failure = std::panic::catch_unwind(|| read_fixture_capture(&output, &sink, kind))
+            .expect_err("real failed fixture must remain failed");
+        assert!(
+            failure
+                .downcast_ref::<String>()
+                .unwrap()
+                .contains("inner_outcome=UNKNOWN")
+        );
+        println!("default_diagnostic_verified=true");
+        std::panic::resume_unwind(failed_assertion);
+    }
     if std::env::var_os(PHASE_TEST).as_deref()
         == Some(std::ffi::OsStr::new("reject-normal-control"))
     {

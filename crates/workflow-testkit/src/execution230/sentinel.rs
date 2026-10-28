@@ -101,8 +101,9 @@ pub(super) fn validate(
     {
         return Err("Sentinel terminal generation mismatch".to_owned());
     }
-    workflow_adk::UntrustedTextReport::parse(&serde_json::to_vec(selected).map_err(error)?)
-        .map_err(|_| "invalid closed Sentinel terminal")?;
+    let selected_report =
+        workflow_adk::UntrustedTextReport::parse(&serde_json::to_vec(selected).map_err(error)?)
+            .map_err(|_| "invalid closed Sentinel terminal")?;
     let preparation = completed
         .payload()
         .pointer("/structured_output/preparation")
@@ -224,10 +225,17 @@ pub(super) fn validate(
         )?
     };
     let quality = expected(&input).map(|expected| {
-        if selected["state"] != expected.state || selected["reason"] != expected.reason
-            || original.as_deref() != expected.raw.as_deref().filter(|bytes| !bytes.is_empty())
-        {
-            return Err("Sentinel finite preparation contract failed".to_owned());
+        let state_mismatch = selected["state"] != expected.state;
+        let reason_mismatch = selected["reason"] != expected.reason;
+        let original_mismatch = original.as_deref()
+            != expected.raw.as_deref().filter(|bytes| !bytes.is_empty());
+        if state_mismatch || reason_mismatch || original_mismatch {
+            return Err(format!("Sentinel finite preparation contract failed: {}",
+                json!({"schema_version":1,
+                    "expected_state":expected.state,"observed_state":selected_report.state(),
+                    "expected_reason":expected.reason,"observed_reason":selected_report.reason(),
+                    "state_mismatch":state_mismatch,"reason_mismatch":reason_mismatch,
+                    "original_mismatch":original_mismatch})));
         }
         if let Some(language) = expected.language {
             let raw = expected.raw.as_deref().ok_or("missing finite source")?;

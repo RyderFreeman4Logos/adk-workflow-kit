@@ -44,6 +44,13 @@ m1-03-red:
 m1-03-green:
     {{_io}} cargo +1.98.0 test -p workflow-compiler --test runtime_plan --locked
 
+# Exact ignored #374 protocol controls; each requires the external collector.
+issue-374-observer-preflight:
+    {{_io}} cargo +1.98.0 test -p workflowctl --test m3_00_runtime_smoke --locked smoke_observation_protocol_preflight -- --exact --ignored --nocapture --test-threads=1
+
+issue-374-observer-timeout-preflight:
+    {{_io}} cargo +1.98.0 test -p workflowctl --test m3_00_runtime_smoke --locked smoke_observation_timeout_protocol_preflight -- --exact --ignored --nocapture --test-threads=1
+
 # Focused skill frontmatter compatibility during the YAML parser migration.
 issue-332-compiler test_name="":
     {{_io}} cargo +1.98.0 test -p workflow-compiler --test skill_contracts {{test_name}} --locked -- --nocapture

@@ -68,7 +68,7 @@ pub enum EffectCommit {
 /// Closed failures from the durable effect journal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EffectJournalErrorKind {
-    /// The journal path or database is not usable.
+    /// The journal path or database is not usable, including transient contention.
     Unavailable,
     /// The existing journal is malformed or has an incompatible schema.
     Corrupt,
@@ -126,11 +126,11 @@ impl EffectJournal {
             .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Unavailable))?;
         connection
             .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")
-            .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Corrupt))?;
+            .map_err(initialization_error)?;
         // Acquire the writer before schema reads instead of upgrading a stale snapshot.
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Corrupt))?;
+            .map_err(initialization_error)?;
         transaction
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS kit_effect_journal_meta (
@@ -145,20 +145,18 @@ impl EffectJournal {
                  VALUES (1, 1)
                  ON CONFLICT(id) DO NOTHING;",
             )
-            .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Corrupt))?;
+            .map_err(initialization_error)?;
         let version: i64 = transaction
             .query_row(
                 "SELECT schema_version FROM kit_effect_journal_meta WHERE id = 1",
                 [],
                 |row| row.get(0),
             )
-            .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Corrupt))?;
+            .map_err(initialization_error)?;
         if version != 1 {
             return Err(EffectJournalError::new(EffectJournalErrorKind::Corrupt));
         }
-        transaction
-            .commit()
-            .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Corrupt))?;
+        transaction.commit().map_err(initialization_error)?;
         Ok(Self {
             path,
             connection: Mutex::new(connection),
@@ -250,6 +248,16 @@ impl EffectJournal {
                     .map_err(|_| EffectJournalError::new(EffectJournalErrorKind::Corrupt))
             })
     }
+}
+
+fn initialization_error(error: rusqlite::Error) -> EffectJournalError {
+    let kind = match error.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+            EffectJournalErrorKind::Unavailable
+        }
+        _ => EffectJournalErrorKind::Corrupt,
+    };
+    EffectJournalError::new(kind)
 }
 
 fn secure_path(path: &Path) -> Result<(), EffectJournalError> {

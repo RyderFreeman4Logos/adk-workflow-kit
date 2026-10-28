@@ -312,7 +312,61 @@ pub fn prepare_untrusted_text(
     limits: NormalizationLimits,
     started: Instant,
 ) -> Result<SentinelPreparation, ArtifactError> {
-    let rejection = if started > Instant::now()
+    if let Some(reason) = admission_rejection(raw, limits, started) {
+        return Ok(SentinelPreparation::Invalid {
+            reason,
+            original_id: None,
+        });
+    }
+    let original_id = store.put(raw)?;
+    Ok(prepare_retained_untrusted_text(
+        raw,
+        &original_id,
+        limits,
+        started,
+    ))
+}
+
+/// Prepares bytes already retained and verified by the caller, without IO.
+/// The ID is checked against `raw`, but this cannot establish physical retention
+/// or durability: the caller owns both. Admission and the fixed preparation
+/// deadline match [`prepare_untrusted_text`]; `started` must precede ingress.
+/// Invalid IDs are denied without attaching them to evidence or retrying storage.
+pub fn prepare_retained_untrusted_text(
+    raw: &[u8],
+    original_id: &ArtifactId,
+    limits: NormalizationLimits,
+    started: Instant,
+) -> SentinelPreparation {
+    if let Some(reason) = admission_rejection(raw, limits, started) {
+        return SentinelPreparation::Invalid {
+            reason,
+            original_id: None,
+        };
+    }
+    // A trusted IO dependency can still violate its content-address contract.
+    if original_id.as_str() != crate::encode_hex(&Sha256::digest(raw)) {
+        return SentinelPreparation::Invalid {
+            reason: NormalizationReason::InvalidPolicy,
+            original_id: None,
+        };
+    }
+    let deadline = started + Duration::from_millis(SENTINEL_PREPARATION_BUDGET_MS);
+    match normalize(raw, original_id, limits, deadline) {
+        Ok(text) => SentinelPreparation::Prepared(text),
+        Err(reason) => SentinelPreparation::Invalid {
+            reason,
+            original_id: Some(original_id.clone()),
+        },
+    }
+}
+
+fn admission_rejection(
+    raw: &[u8],
+    limits: NormalizationLimits,
+    started: Instant,
+) -> Option<NormalizationReason> {
+    if started > Instant::now()
         || limits.max_input_bytes > 1_048_576
         || limits.max_output_bytes > 4_194_304
         || limits.max_work_units > 16_777_216
@@ -324,30 +378,7 @@ pub fn prepare_untrusted_text(
         Some(NormalizationReason::InputLimit)
     } else {
         None
-    };
-    if let Some(reason) = rejection {
-        return Ok(SentinelPreparation::Invalid {
-            reason,
-            original_id: None,
-        });
     }
-    let original_id = store.put(raw)?;
-    // ArtifactStore is a trusted IO dependency, but never attach a mismatched ID
-    // to evidence even if an implementation violates its content-address contract.
-    if original_id.as_str() != crate::encode_hex(&Sha256::digest(raw)) {
-        return Ok(SentinelPreparation::Invalid {
-            reason: NormalizationReason::InvalidPolicy,
-            original_id: None,
-        });
-    }
-    let deadline = started + Duration::from_millis(SENTINEL_PREPARATION_BUDGET_MS);
-    Ok(match normalize(raw, &original_id, limits, deadline) {
-        Ok(text) => SentinelPreparation::Prepared(text),
-        Err(reason) => SentinelPreparation::Invalid {
-            reason,
-            original_id: Some(original_id),
-        },
-    })
 }
 
 fn normalize(

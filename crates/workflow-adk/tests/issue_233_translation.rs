@@ -38,6 +38,8 @@ mod behavioral_backend;
 mod behavioral_oracles;
 #[path = "support/behavioral_order.rs"]
 mod behavioral_order;
+#[path = "support/behavioral_reduction.rs"]
+mod behavioral_reduction;
 #[path = "support/model_admission.rs"]
 mod model_admission;
 use behavioral_oracles::no_report;
@@ -280,7 +282,7 @@ async fn host_approved_authored_terminal_executes_and_retains_typed_report() {
     let mut mapper = AdkEventMapper::new("authored-run", "sentinel-preparation").unwrap();
     let mut store =
         InMemoryArtifactStore::new(100_000.try_into().unwrap(), 100_000.try_into().unwrap());
-    let (state, report) = graph
+    let (state, report, _) = graph
         .invoke_observed_with_sentinel_script(
             state,
             ExecutionConfig::new("authored-run"),
@@ -541,7 +543,7 @@ async fn translator_authority_and_sibling_matrix() {
     // Same exact IR with live host authority can use the resolved sibling, never its hash alone.
     let graph = translator.translate_resolved(&resolved, &ir).unwrap();
     let mut mapper = AdkEventMapper::new("resolved-run", "sentinel-preparation").unwrap();
-    let (_, report) = graph
+    let (_, report, _) = graph
         .invoke_observed_with_sentinel_script(
             input_state(),
             ExecutionConfig::new("resolved-run"),
@@ -635,7 +637,7 @@ async fn observed_controls_source_model_and_forgery_fail_closed() {
                     },
                 )
                 .await
-                .map(|(state, _)| state),
+                .map(|(state, _, _)| state),
         };
         assert!(result.is_err(), "{case}");
         assert_eq!(entries.0.load(Ordering::SeqCst), 0, "{case}");
@@ -688,7 +690,7 @@ async fn concurrent_invocations_and_discarded_future_cannot_exchange_reports() {
         tasks.push(tokio::spawn(async move {
             let mut mapper = AdkEventMapper::new(run, "sentinel-preparation").unwrap();
             let mut artifacts = store();
-            let (state, report) = graph
+            let (state, report, _) = graph
                 .invoke_observed_with_sentinel_script(
                     input_state(),
                     ExecutionConfig::new(run),
@@ -832,7 +834,7 @@ async fn cancellation_during_preparation_and_report_failure_do_not_publish_stale
             assert!(result.is_err());
             no_report(&mapper);
         } else {
-            let (_, report) = result.unwrap();
+            let (_, report, _) = result.unwrap();
             assert_eq!(
                 report.stop(),
                 match case {
@@ -868,7 +870,7 @@ async fn authored_crash_and_step_exhaustion_never_reach_later_completion() {
     ] {
         let graph = authored(steps);
         let mut mapper = AdkEventMapper::new("bounds", "sentinel-preparation").unwrap();
-        let (_, report) = graph
+        let (_, report, _) = graph
             .invoke_observed_with_sentinel_script(
                 input_state(),
                 ExecutionConfig::new("bounds"),

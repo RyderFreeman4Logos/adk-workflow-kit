@@ -20,9 +20,17 @@ use workflow_compiler::CompiledPlan;
 use workflow_ir::WorkflowIr;
 use workflow_runtime::behavioral::{BEHAVIORAL_VERSION, BehavioralProbe, ProbeReport};
 use workflow_runtime::behavioral::{ProbeLimits, TrustedScript};
-use workflow_runtime::{ArtifactId, ArtifactStore, CanonicalUntrustedText, RunId};
+use workflow_runtime::{
+    ArtifactId, ArtifactStore, CanonicalUntrustedText, RunId, SentinelReduction,
+    SentinelReductionInput, SourceSpan, reduce_sentinel,
+};
 
+mod counterfactual;
 pub(crate) mod model_probe;
+pub use counterfactual::{
+    CounterfactualAttempt, CounterfactualErrorKind, CounterfactualFailure, CounterfactualPhase,
+    CounterfactualReceipt, CounterfactualWorker, HostCounterfactualProbe,
+};
 mod model_trajectory;
 pub(crate) mod trajectory_observer;
 pub use model_trajectory::{
@@ -133,6 +141,8 @@ struct Invocation {
     probe: Option<BehavioralProbe>,
     report: Option<ProbeReport>,
     trajectory: Option<workflow_runtime::behavioral::trajectory::TrajectoryObservation>,
+    source_binding: Option<(SourceSpan, String)>,
+    reduction: Option<SentinelReduction>,
     retained: bool,
 }
 fn with_run<T>(
@@ -143,7 +153,8 @@ fn with_run<T>(
 }
 impl AdkGraph {
     /// Execute a host-approved authored terminal with explicit host controls. Returns
-    /// its invocation-local typed report only after content-addressed retention.
+    /// its invocation-local typed report and reduction after their content-addressed
+    /// retention. The reduction never grants authority or promotes weak evidence.
     /// `thread_id` must match the fresh mapper's run; no checkpoint continuation,
     /// model binding, implicit controls, or caller-state report is accepted.
     /// Cancellation/deadlines are cooperative bounds, not OS containment.
@@ -155,7 +166,7 @@ impl AdkGraph {
         artifacts: &mut S,
         cancelled: Arc<AtomicBool>,
         deadline: Instant,
-    ) -> Result<(State, ProbeReport), AdkGraphError> {
+    ) -> Result<(State, ProbeReport, SentinelReduction), AdkGraphError> {
         let script = self
             .sentinel_script
             .as_ref()
@@ -185,19 +196,24 @@ impl AdkGraph {
             probe: None,
             report: None,
             trajectory: None,
+            source_binding: None,
+            reduction: None,
             retained: false,
         });
         RUN.scope(invocation, async {
             let state = self
                 .invoke_observed_inner(state, config, mapper, artifacts)
                 .await?;
-            let report = with_run(|run| {
+            let (report, reduction) = with_run(|run| {
                 if !run.retained {
                     return Err(AdkGraphError::Failed);
                 }
-                run.report.take().ok_or(AdkGraphError::Failed)
+                Ok((
+                    run.report.take().ok_or(AdkGraphError::Failed)?,
+                    run.reduction.take().ok_or(AdkGraphError::Failed)?,
+                ))
             })?;
-            Ok((state, report))
+            Ok((state, report, reduction))
         })
         .await
     }
@@ -277,6 +293,46 @@ impl AdkGraph {
                 preparation["trajectory"] =
                     serde_json::json!({"artifact_id": id, "evidence": evidence});
             }
+            let (source_cover, preparation_identity) =
+                run.source_binding.as_ref().ok_or(AdkGraphError::Failed)?;
+            let reduction = reduce_sentinel(SentinelReductionInput {
+                source_cover: Some(source_cover),
+                preparation_terminal: None,
+                preparation_identity,
+                semantic: None,
+                behavior: Some(report),
+                observation: run.trajectory.as_ref(),
+            })
+            .map_err(|_| AdkGraphError::Failed)?;
+            let decision: serde_json::Value = serde_json::from_str(
+                &reduction
+                    .output()
+                    .to_json()
+                    .map_err(|_| AdkGraphError::Failed)?,
+            )
+            .map_err(|_| AdkGraphError::Failed)?;
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "policy_version": reduction.policy_version(),
+                "policy_digest": reduction.policy_digest(),
+                "identity": reduction.identity(),
+                "decision": decision,
+            }))
+            .map_err(|_| AdkGraphError::Failed)?;
+            let id = crate::sentinel_workflow::put_verified(
+                artifacts,
+                &bytes,
+                mapper,
+                node,
+                "reduction",
+            )?;
+            preparation["reduction"] = serde_json::json!({
+                "artifact_id": id,
+                "identity": reduction.identity(),
+                "policy_version": reduction.policy_version(),
+                "policy_digest": reduction.policy_digest(),
+            });
+            run.reduction = Some(reduction);
             run.retained = true;
             Ok(())
         })
@@ -296,7 +352,11 @@ pub(crate) fn admit_source(raw: &[u8]) -> Result<(), AdkGraphError> {
         Ok(())
     })
 }
-pub(crate) fn prepare_probe(text: &CanonicalUntrustedText) -> Result<String, AdkGraphError> {
+pub(crate) fn prepare_probe(
+    text: &CanonicalUntrustedText,
+    source_cover: SourceSpan,
+    preparation_identity: &str,
+) -> Result<String, AdkGraphError> {
     with_run(|run| {
         if run.probe.is_some() || run.report.is_some() {
             return Err(AdkGraphError::Failed);
@@ -306,6 +366,8 @@ pub(crate) fn prepare_probe(text: &CanonicalUntrustedText) -> Result<String, Adk
             .bind(text, run.run_id.clone())
             .map_err(|_| AdkGraphError::AuthorizationDenied)?;
         let identity = probe.identity().to_owned();
+        // Bind the base preparation key before the report-specific cache key exists.
+        run.source_binding = Some((source_cover, preparation_identity.to_owned()));
         run.probe = Some(probe);
         Ok(identity)
     })

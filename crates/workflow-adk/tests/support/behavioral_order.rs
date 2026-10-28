@@ -80,7 +80,7 @@ async fn behavioral_order(resolved: bool) {
             result.is_ok(),
             "node={node}, resolved={resolved}, events={events:?}"
         );
-        let (state, report) = result.unwrap();
+        let (state, report, _) = result.unwrap();
         assert_eq!(state[&format!("visits:{node}")], 1);
         assert_eq!(report.stop(), ProbeStop::NoCompromiseObserved);
         assert_eq!(report.events().len(), 1);

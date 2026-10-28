@@ -2,6 +2,9 @@
 use super::{PathBuf, Value, assert_cli_success, fs, json, repo, success, wire_case, wire_options};
 use sha2::{Digest, Sha256};
 use std::{io::Write, os::unix::fs::OpenOptionsExt, path::Path};
+
+#[path = "semantic_windows.rs"]
+mod windows;
 fn input() -> Value {
     json!({"request":"Sort [7,2,7,1] ascending and compute their sum. Return the output object with exactly sorted and sum."})
 }
@@ -120,7 +123,17 @@ fn minimal_semantic_predicate_rejects_a_real_finished_wrong_value() {
 
 #[test]
 fn explicit_live_entry_is_exercised_with_only_a_loopback_fixture() {
-    let (root, result, request) = super::wire_scenario(
+    paired_fixture(false);
+}
+
+#[test]
+fn nested_semantic_pair_owns_each_cli_window() {
+    paired_fixture(true);
+}
+
+fn paired_fixture(expire_first: bool) {
+    let mut admissions = None;
+    let (root, result, request) = super::wire_scenario_with_windows(
         Some(
             json!({"prompt_tokens":19,"completion_tokens":11,"prompt_tokens_details":{"cached_tokens":0}}),
         ),
@@ -133,7 +146,8 @@ fn explicit_live_entry_is_exercised_with_only_a_loopback_fixture() {
             expected(),
         ),
         2,
-        |binding, output| {
+        super::FixtureWindows::NestedCli(windows::CLI_WINDOW),
+        |binding, output, admit_next_window| {
             let mut value: Value = serde_json::from_slice(&fs::read(binding).unwrap()).unwrap();
             value["origin"] = json!("live_provider");
             value["profile"]["model"]["runtime"]["timeout_ms"] = json!(30000);
@@ -145,7 +159,8 @@ fn explicit_live_entry_is_exercised_with_only_a_loopback_fixture() {
                 .as_str()
                 .unwrap()
                 .trim_end_matches("/v1");
-            std::process::Command::new(std::env::current_exe().unwrap())
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
                 .args([
                     "--ignored",
                     "--exact",
@@ -163,15 +178,20 @@ fn explicit_live_entry_is_exercised_with_only_a_loopback_fixture() {
                 .env("ALL_PROXY", "")
                 .env_remove("all_proxy")
                 .env("NO_PROXY", "")
-                .env_remove("no_proxy")
-                .output()
-                .unwrap()
+                .env_remove("no_proxy");
+            let (result, phases) = windows::run(command, admit_next_window, expire_first).unwrap();
+            admissions = Some(phases);
+            result
         },
     );
     fs::write(root.join("enabled-entry.stdout.txt"), &result.stdout).unwrap();
     fs::write(root.join("enabled-entry.stderr.txt"), &result.stderr).unwrap();
     println!("loopback-entry evidence: {}", root.display());
     assert_cli_success(&result);
+    let admissions = admissions.unwrap().unwrap();
+    if expire_first {
+        assert!(admissions[1].duration_since(admissions[0]) > windows::CLI_WINDOW);
+    }
     assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed; 0 failed"));
     let request = request.unwrap();
     assert_eq!(request["wire_request_count"], 2);
@@ -220,22 +240,25 @@ fn minimal_semantic_live_pair_from_explicit_binding() {
             .is_empty()
     );
     fs::create_dir(&output).unwrap();
+    let mut fixture = windows::inherited().expect("fixture CLI control");
     let mut previous_run = None;
-    for name in ["first", "second"] {
+    for (phase, name) in ["first", "second"].into_iter().enumerate() {
         assert_eq!(fs::read(&binding).unwrap(), binding_bytes);
         let run = output.join(name);
         // Caller-owned credentials and proxy policy belong to this explicit invocation.
-        let report = success(
-            std::process::Command::new(env!("CARGO_BIN_EXE_bench-230"))
-                .current_dir(repo())
-                .args([
-                    "measure-live",
-                    binding.to_str().unwrap(),
-                    run.to_str().unwrap(),
-                ])
-                .output()
-                .unwrap(),
-        );
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_bench-230"));
+        command.current_dir(repo()).args([
+            "measure-live",
+            binding.to_str().unwrap(),
+            run.to_str().unwrap(),
+        ]);
+        let output = if let Some(control) = fixture.as_mut() {
+            windows::admit(control, phase as u8).expect("fresh fixture CLI window");
+            super::m1_15_command::output(&mut command, true)
+        } else {
+            command.output()
+        };
+        let report = success(output.unwrap());
         assert_eq!(report["binding_digest"], binding_digest);
         let evidence = check(&run, &report).unwrap();
         retain(&run, &evidence);
