@@ -392,6 +392,14 @@ issue-230-smoke:
 issue-230-fixture:
     {{_io}} cargo +1.98.0 run -p workflow-testkit --bin bench-230 --locked -- fixture
 
+# Fixed AgentDojo archive admission and private decoder/projection controls.
+issue-241-runtime:
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_241_agentdojo --locked -- --nocapture
+    {{_io}} cargo +1.98.0 test -p workflow-runtime --lib dataset::dataset_agentdojo::tests:: --locked -- --nocapture
+
+issue-241-offline source_dir cache_dir:
+    ADK_DATASET_SOURCE_DIR={{quote(source_dir)}} ADK_DATASET_CACHE_DIR={{quote(cache_dir)}} {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_241_agentdojo actual_sources_and_two_cache_only_reruns --locked -- --exact --ignored --nocapture
+
 # Four-source Sentinel adapters; public API controls plus private native parsers.
 issue-236-runtime:
     {{_io}} cargo +1.98.0 test -p workflow-runtime --test issue_236_dataset_adapters --locked -- --nocapture

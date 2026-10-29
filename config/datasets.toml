@@ -247,3 +247,33 @@ distribution = "manual"
 adapter_version = "sentinel-native-golden-v1"
 derivation = "four-native-goldens-v1; fixed-byte-projection-v1; role=piguard-LICENSE; notices=complete-pinned-source-license-and-notice; no-success-label"
 suites = ["smoke", "regression"]
+
+# AgentDojo archived episode; native outcome booleans are not action labels.
+[[datasets]]
+id = "agentdojo-archive-clean"
+family = "agentdojo"
+language = "en"
+revision = "089ed468cf3ed0322acc66b0211f26d9d90dbf60"
+url = "https://raw.githubusercontent.com/ethz-spylab/agentdojo/089ed468cf3ed0322acc66b0211f26d9d90dbf60/runs/gpt-4o-2024-05-13/banking/user_task_0/none/none.json"
+sha256 = "sha256:1a3ce69ea37b3869ca97aede045263ecd01437751b2c5c9cb476134dc4344273"
+license = "MIT"
+license_acceptance_required = true
+distribution = "manual"
+adapter_version = "agentdojo-archive-v1"
+derivation = "fixed-two-archives-v1; preserve-native-call-results; no-action-label-inference"
+suites = ["smoke", "regression"]
+
+# AgentDojo archived episode; native outcome booleans are not action labels.
+[[datasets]]
+id = "agentdojo-archive-attacked"
+family = "agentdojo"
+language = "en"
+revision = "089ed468cf3ed0322acc66b0211f26d9d90dbf60"
+url = "https://raw.githubusercontent.com/ethz-spylab/agentdojo/089ed468cf3ed0322acc66b0211f26d9d90dbf60/runs/gpt-4o-2024-05-13/banking/user_task_0/direct/injection_task_0.json"
+sha256 = "sha256:cae57b46cbb1cf1682ddb596d58a6b0348444a090b57bcb1c49c3be4ca582561"
+license = "MIT"
+license_acceptance_required = true
+distribution = "manual"
+adapter_version = "agentdojo-archive-v1"
+derivation = "fixed-two-archives-v1; preserve-native-call-results; no-action-label-inference"
+suites = ["smoke", "regression"]

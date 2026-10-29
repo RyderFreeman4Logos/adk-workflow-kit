@@ -7,7 +7,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 use workflow_runtime::{DatasetErrorKind, SentinelDatasetLabel, validate_sentinel_splits};
-use workflow_runtime::{DatasetManifest, SentinelDatasetError, prepare_sentinel_goldens};
+use workflow_runtime::{
+    DatasetManifest, SentinelDatasetError, derive_sentinel_carrier_suite, prepare_sentinel_goldens,
+};
 
 const MANIFEST: &str = include_str!("../../../config/datasets.toml");
 
@@ -382,6 +384,124 @@ fn just_path_parameters_are_literal_shell_data() {
     }
 }
 
+fn assert_fixed_carriers(
+    originals: &[workflow_runtime::SentinelDatasetCase],
+) -> Vec<workflow_runtime::SentinelDatasetCase> {
+    use sha2::{Digest, Sha256};
+    let suite = derive_sentinel_carrier_suite(originals).expect("checked fixed carriers");
+    let descendants = suite
+        .iter()
+        .filter(|case| {
+            !originals
+                .iter()
+                .any(|parent| parent.case_id() == case.case_id())
+        })
+        .count();
+    assert_eq!(
+        (suite.len(), descendants),
+        (12, 8),
+        "real carrier cardinality"
+    );
+    let expected_hashes = [
+        "sha256:953385c97621047c583bf90e00378612c073d5a7bcf24210b5147d48c4557946",
+        "sha256:2ecb0017f77bec92117c202e53aa33b9c034f9c91d4483b0a349b86f0f431d1d",
+        "sha256:2f2ed1c3ff1bef1fc3f5f4b6e311cd4f1a1951669cb2ae3a22d14ebd87899425",
+        "sha256:307d8c0c733135022910f58122401a97fbfa7c5422a13185a01970488616e2e5",
+        "sha256:82969fa804ec7f13031be661327aff20bba867811987f8529766510af6374b39",
+        "sha256:f9f05b65b147f9326f734948ab96e6833bd384f0c3b7fa3a139c8a31162afd99",
+        "sha256:10f9adfafae5e0fd97a3872ff3d279c1e376a2f3e67ce851add77b02b99f64c2",
+        "sha256:6fc48eef29260e7fd6c2f5f2f631976b92d90d60e282c95d9d6b75819adb0743",
+    ];
+    let mut ids = std::collections::BTreeSet::new();
+    for (index, original) in originals.iter().enumerate() {
+        let parent: Value =
+            serde_json::from_slice(&original.canonical_json().expect("parent")).expect("JSON");
+        let raw = parent["untrusted_text"].as_str().expect("text");
+        assert_eq!(
+            suite[index * 3].canonical_json().expect("original"),
+            original.canonical_json().expect("unchanged")
+        );
+        // Independent expected bytes: sequential replacement cannot re-escape an entity.
+        let html = format!(
+            "<pre>{}</pre>",
+            raw.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('\"', "&quot;")
+                .replace('\'', "&#39;")
+        );
+        let longest = raw.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+        let fence = "`".repeat(3.max(longest + 1));
+        let markdown = format!("{fence}\n{raw}\n{fence}");
+        for (offset, (operator, suffix, carrier, transformation, expected, start, projection)) in [
+            (
+                "HtmlPreV1",
+                "html-pre-v1",
+                "html_pre",
+                "html_pre_v1",
+                html.as_str(),
+                5,
+                "whole_parent_cover",
+            ),
+            (
+                "MarkdownFenceV1",
+                "markdown-fence-v1",
+                "markdown_fence",
+                "markdown_fence_v1",
+                markdown.as_str(),
+                fence.len() + 1,
+                "exact_body_translation",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let case = &suite[index * 3 + offset + 1];
+            let actual: Value =
+                serde_json::from_slice(&case.canonical_json().expect("carrier")).expect("JSON");
+            let digest = format!("sha256:{:x}", Sha256::digest(expected.as_bytes()));
+            assert_eq!(
+                digest,
+                expected_hashes[index * 2 + offset],
+                "independently pinned text hash"
+            );
+            let end = if offset == 0 {
+                expected.len() - 6
+            } else {
+                start + raw.len()
+            };
+            let mut wanted = parent.clone();
+            wanted["case_id"] = json!(format!("{}/{suffix}", original.case_id()));
+            wanted["untrusted_text"] = json!(expected);
+            wanted["carrier"] = json!(carrier);
+            wanted["transformation"] = json!(transformation);
+            wanted["review"] = json!("unreviewed");
+            wanted["label_authority"] = json!({"kind":"unreviewed_carrier_inheriting_parent_intent", "parent_canonical_sha256":original.canonical_sha256().expect("hash")});
+            wanted["derivation"] = json!({"schema_version":1,"operator":operator,"version":1,"original_case_id":original.case_id(),"original_canonical_sha256":original.canonical_sha256().expect("hash"),"original_text_sha256":format!("sha256:{:x}",Sha256::digest(raw.as_bytes())),"original_text_interval":[0,raw.len()],"derived_text_sha256":digest,"output_body_interval":[start,end],"projection":projection});
+            assert_eq!(
+                actual, wanted,
+                "complete independently expected descendant and preserved provenance"
+            );
+        }
+    }
+    for case in &suite {
+        assert!(ids.insert(case.case_id()), "unique IDs");
+    }
+    let assignments: Vec<_> = suite.iter().map(|case| (case, "regression")).collect();
+    assert!(validate_sentinel_splits(&assignments).is_ok());
+    for moved in 0..suite.len() {
+        for split in ["train", "adaptive", "final"] {
+            let mut assignments = assignments.clone();
+            assignments[moved].1 = split;
+            assert!(
+                validate_sentinel_splits(&assignments).is_err(),
+                "parent, carrier and sibling stay together"
+            );
+        }
+    }
+    suite
+}
+
 #[test]
 #[ignore = "requires the explicit pinned local source and cache arguments through just issue-236-offline"]
 fn actual_sources_and_two_cache_only_reruns() {
@@ -449,6 +569,22 @@ fn actual_sources_and_two_cache_only_reruns() {
         );
         assert!(validate_sentinel_splits(&[(case, "regression")]).is_ok());
         assert!(validate_sentinel_splits(&[(case, "regression"), (case, "final")]).is_err());
+        println!(
+            "{} {}",
+            case.case_id(),
+            case.canonical_sha256().expect("hash")
+        );
+        canonical.push(bytes);
+    }
+    assert_eq!(cases[3].label(), SentinelDatasetLabel::BenignHardNegative);
+    let suite = assert_fixed_carriers(&cases);
+    let suite_canonical: Vec<_> = suite
+        .iter()
+        .map(|case| case.canonical_json().expect("suite canonical"))
+        .collect();
+    for case in &suite {
+        let value: Value =
+            serde_json::from_slice(&case.canonical_json().expect("case")).expect("JSON");
         let mut store = InMemoryArtifactStore::new(
             NonZeroU64::new(1_000_000).expect("nonzero"),
             NonZeroU64::new(1_000_000).expect("nonzero"),
@@ -463,14 +599,8 @@ fn actual_sources_and_two_cache_only_reruns() {
             .expect("runtime envelope"),
             SentinelPreparation::Prepared(_)
         ));
-        println!(
-            "{} {}",
-            case.case_id(),
-            case.canonical_sha256().expect("hash")
-        );
-        canonical.push(bytes);
     }
-    assert_eq!(cases[3].label(), SentinelDatasetLabel::BenignHardNegative);
+
     for _ in 0..2 {
         let rerun = prepare_sentinel_goldens(&manifest, &cache, None, true)
             .expect("cache-only offline rerun");
@@ -480,6 +610,14 @@ fn actual_sources_and_two_cache_only_reruns() {
                 .map(|case| case.canonical_json().expect("case JSON"))
                 .collect::<Vec<_>>(),
             canonical
+        );
+        let rerun_suite = assert_fixed_carriers(&rerun);
+        assert_eq!(
+            rerun_suite
+                .iter()
+                .map(|case| case.canonical_json().expect("case JSON"))
+                .collect::<Vec<_>>(),
+            suite_canonical
         );
     }
     assert_eq!(
@@ -507,10 +645,11 @@ fn actual_sources_and_two_cache_only_reruns() {
         missing_notice.is_err(),
         "all source and notice admissions precede cases"
     );
-    let report = json!({"schema_version":1,"cases":cases,"cache_only_reruns":2,
-        "semantic_evaluation":"not_run","source_authority":"publisher_documented_not_human_translation_review"});
+    let records: Vec<_> = suite.iter().enumerate().map(|(index, case)| json!({"case_id":case.case_id(),"canonical_sha256":case.canonical_sha256().expect("hash"),"intent_authority":if index % 3 == 0 {"publisher_documented_original"} else {"unreviewed_carrier_inheriting_parent_intent"}})).collect();
+    let report = json!({"schema_version":1,"case_count":12,"original_count":4,"descendant_count":8,"records":records,"cache_only_reruns":2,
+        "semantic_evaluation":"not_run","resolved_byte_provenance":"manual","human_review":"not_present"});
     fs::write(
-        cache.join("four-golden-acceptance.json"),
+        cache.join("fixed-carrier-acceptance.json"),
         serde_json::to_vec_pretty(&report).expect("acceptance evidence"),
     )
     .expect("durable local receipt");

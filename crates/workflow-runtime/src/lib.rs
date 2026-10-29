@@ -73,6 +73,9 @@ pub use controller::{
     RunControlError, RunController, RunTerminalCause, RunTermination, ToolCallCleanup,
 };
 pub use dataset::{
+    AgentDojoDatasetError, AgentDojoEpisode, AgentDojoProjectionError, prepare_agentdojo_episodes,
+};
+pub use dataset::{
     ByteSource, DatasetDistribution, DatasetEntry, DatasetError, DatasetErrorKind, DatasetManifest,
     DatasetProvenance, DatasetReport, DatasetSourceIdentity, EvalSuite, HttpByteSource,
     LocalFileSource, PrepareRequest, PreparedDataset, prepare_dataset,
@@ -80,8 +83,8 @@ pub use dataset::{
 };
 pub use dataset::{DatasetCase, ParquetCaseError, decode_parquet_cases};
 pub use dataset::{
-    SentinelDatasetCase, SentinelDatasetError, SentinelDatasetLabel, prepare_sentinel_goldens,
-    validate_sentinel_splits,
+    SentinelDatasetCase, SentinelDatasetError, SentinelDatasetLabel, derive_sentinel_carrier_suite,
+    prepare_sentinel_goldens, validate_sentinel_splits,
 };
 pub use effect_journal::{
     EffectCommit, EffectJournal, EffectJournalError, EffectJournalErrorKind, EffectKey,

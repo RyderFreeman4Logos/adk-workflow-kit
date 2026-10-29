@@ -157,3 +157,68 @@ and other transformations, stratified human translation review, cross-source and
 adaptive-holdout isolation, and live semantic acceptance remain separate work.
 An agent is not a human reviewer, and the evaluated model cannot be the sole
 labeler of its final holdout.
+
+### Opt-in fixed regression carriers
+
+`derive_sentinel_carrier_suite(&originals)` accepts the four opaque admitted originals in
+AgentDojo, InjecAgent, BIPIA, NotInject order. It returns each unchanged original followed
+by HtmlPreV1 and MarkdownFenceV1: twelve cases, eight descendants. The importer and its
+default four canonical originals are unchanged. The producer checks the fixed original
+recipe and existing split predicates; it does not reauthenticate arbitrary source bodies.
+Only these four regression seeds are derived; broader source-lineage admission remains future work.
+
+HTML uses `<pre>` with one-pass escaping of `&`, `<`, `>`, double quote and apostrophe,
+then `</pre>`. Markdown uses a backtick fence one longer than the longest body run, at
+least three, with one LF before and after the unchanged UTF-8 body. Both precheck expanded
+lengths against the existing default 65,536 input-byte cap and fail with `Limit` without
+truncation or partial results. Existing 1 MiB artifact admission limits still apply.
+
+Derivation v1 binds the original case ID/canonical digest, raw text digest/full byte interval,
+derived text digest and encoded body interval. Coordinates refer to canonical parent UTF-8,
+not upstream JSON/Python offsets. Markdown has an exact body-offset translation; HTML
+records only whole-parent cover because escaping changes internal byte offsets.
+Source components, complete notices, native fields, parent/family/tool/revision and `en`
+are retained. Descendants are `unreviewed` with inherited parent intent bound to its
+canonical digest; publisher intent on originals and Manual import provenance do not confer
+publisher, human, translation or semantic review on descendants. Existing split checks keep
+parents and siblings in regression together. These exposed seeds are not a sealed final holdout.
+
+The existing `issue-236-offline` invocation above now verifies all twelve cases through
+default untrusted-input preparation and compares full canonical bytes on two cache-only
+reruns. Its finite receipt separates original publisher intent, unreviewed descendants and
+Manual provenance. No live model evaluation or broader #236 completion follows from it.
+
+### Fixed AgentDojo archived episodes
+
+`prepare_agentdojo_episodes` admits two registered banking archives and the complete existing
+MIT notice at declared upstream revision `089ed468cf3ed0322acc66b0211f26d9d90dbf60`.
+Exact descriptors and explicit license acceptance precede path access. Imports retain actual
+Manual/content-digest reports; declared upstream lineage does not authenticate an upstream fetch.
+All acquisition, cache verification and post-admission reads keep the existing 1 MiB cap.
+Configured directory links retain their identities and the secure cache contract still applies.
+
+The opaque episode retains native messages, original call IDs/arguments and exact one-to-one
+call/result bindings privately. Public canonical records contain counts, closed metadata and
+digests, excluding raw dialogue, injection values and argument text. Native utility/security
+booleans retain unknown evaluator polarity; they grant no policy authority or action labels.
+Both variants share the banking/user_task_0 source-parent group and are exposed smoke/regression
+inputs, with no holdout or independent-trial claim.
+
+Each versioned call fingerprint binds complete source bytes, episode/native-call identity,
+message/call coordinates, function and sorted native arguments. `project_call` selects a finite
+host-owned `BTreeMap` entry, validates its source/argument digests and existing bounded proposal
+schema, and returns a borrowed untrusted proposal. It never copies arbitrary native strings.
+Token syntax alone does not filter attacker text. The host separately supplies its trusted goal,
+registered rules and target snapshot to the existing `FirewallPolicy::evaluate` method.
+The two `read_file` calls and `get_most_recent_transactions` have explicit supported shapes;
+the native float `send_money.amount` remains preserved and yields `UnsupportedScalar`, without
+coercion, dropped fields or a substitute action. No executor or policy wrapper is added.
+
+`just issue-241-runtime` checks public admission and private synthetic decoder/projection
+contracts. `just issue-241-offline SOURCE_DIR CACHE_DIR` explicitly imports the two retained
+JSON files and complete notice, verifies 2 episodes / 14 messages / 4 calls / 4 bound results,
+composes three host projections with the existing Allow/Deny policy checks, and repeats complete
+canonical records and decisions twice using cache only. Its independent metadata/host oracle
+contains no raw archive. No download, model, tool execution or live service operation occurs.
+This first unit leaves #241 open: other source families, the risk matrix, broader ADK evidence,
+adaptive evaluation and live acceptance remain unfinished.
