@@ -15,6 +15,12 @@ use std::{
 use serde_json::{Value, json};
 use workflow_testkit::live_conformance::{ConformanceDisposition, LiveConformance};
 
+#[path = "support/cli_child.rs"]
+mod cli_child;
+
+#[path = "m3_07_live_conformance/child_lifecycle.rs"]
+mod child_lifecycle;
+
 #[path = "support/owned_tree.rs"]
 mod owned_tree;
 
@@ -1333,24 +1339,29 @@ fn resume_replays_runtime_on_provider_requests() {
     let mut profile = openai_profile(&server.base_url, json!({}));
     profile["model"]["runtime"] = runtime.clone();
     profile["reviewer_model"]["runtime"] = runtime;
+    let resume_budget = LiveConformance::command_budget(
+        &serde_json::to_vec(&profile).expect("profile budget bytes"),
+    )
+    .expect("finite profile command budget");
     let profile = write_profile(&root.0, &profile);
     let workflow = example_root().join("workflow.toml");
     let input = fs::read_to_string(example_root().join("input.example.json")).expect("input");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_workflowctl"))
-        .args([
-            "--json",
-            "run",
-            workflow.to_str().expect("workflow"),
-            "--profile",
-            profile.to_str().expect("profile"),
-            "--input",
-            input.trim(),
-            "--workdir",
-            workdir.to_str().expect("workdir"),
-        ])
-        .env(HANDLE, CANARY)
-        .spawn()
-        .expect("run");
+    let mut child = cli_child::ChildGuard::spawn(
+        Command::new(env!("CARGO_BIN_EXE_workflowctl"))
+            .args([
+                "--json",
+                "run",
+                workflow.to_str().expect("workflow"),
+                "--profile",
+                profile.to_str().expect("profile"),
+                "--input",
+                input.trim(),
+                "--workdir",
+                workdir.to_str().expect("workdir"),
+            ])
+            .env(HANDLE, CANARY),
+        "run",
+    );
     let started = Instant::now();
     let run_root = loop {
         if let Some(path) = fs::read_dir(&workdir)
@@ -1373,8 +1384,7 @@ fn resume_replays_runtime_on_provider_requests() {
         assert!(started.elapsed() < Duration::from_secs(10), "first request");
         thread::sleep(Duration::from_millis(20));
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    child.cleanup_with(std::process::Child::try_wait);
     let before = server.request_bodies().len();
     assert_eq!(before, 1, "only the interrupted request may precede resume");
     server.release_first_response();
@@ -1385,18 +1395,20 @@ fn resume_replays_runtime_on_provider_requests() {
         .as_str()
         .expect("run_id")
         .to_owned();
-    let resumed = Command::new(env!("CARGO_BIN_EXE_workflowctl"))
-        .args([
-            "--json",
-            "resume",
-            "--run-id",
-            &run_id,
-            "--workdir",
-            workdir.to_str().expect("workdir"),
-        ])
-        .env(HANDLE, CANARY)
-        .output()
-        .expect("resume");
+    let resumed = cli_child::output_with_stdout(
+        Command::new(env!("CARGO_BIN_EXE_workflowctl"))
+            .args([
+                "--json",
+                "resume",
+                "--run-id",
+                &run_id,
+                "--workdir",
+                workdir.to_str().expect("workdir"),
+            ])
+            .env(HANDLE, CANARY),
+        true,
+        resume_budget,
+    );
     assert!(
         resumed.status.success(),
         "resume must run: {}",
